@@ -656,12 +656,14 @@ fn locked_values_match_repository_case_manifests() {
             serde_json::from_slice(&std::fs::read(&path).expect("read case manifest JSON"))
                 .expect("parse case manifest JSON");
         assert_eq!(json["case_id"], lock.case_id);
-        assert_eq!(json["primary_artifact_sha256"], lock.protected_input_sha256);
-        assert_eq!(json["artifacts"][0]["sha256"], lock.protected_input_sha256);
-        assert_eq!(
-            json["artifacts"][0]["size_bytes"],
-            lock.protected_input_size_bytes
-        );
+        // The gate's protected-input identity is loaded from the manifest (the
+        // contract data source), so the loader must agree with the manifest's
+        // declared protected_input artifact.
+        let identity = mida_acceptance::load_locked_manifest_identity(&lock)
+            .expect("locked case manifest must load");
+        assert_eq!(json["primary_artifact_sha256"], identity.sha256);
+        assert_eq!(json["artifacts"][0]["sha256"], identity.sha256);
+        assert_eq!(json["artifacts"][0]["size_bytes"], identity.size_bytes);
     }
 }
 

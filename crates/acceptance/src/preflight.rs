@@ -192,26 +192,19 @@ pub fn check_case_identity(
         ));
     }
 
-    // Cross-check against the embedded locked manifest (v8 gate source) for
-    // the Oreans fixed lane. The GTO generic/no-gate lane has no locked
-    // manifest (it is not an accepted sample); its identity is bound from the
-    // manifest declaration and the on-disk recompute below.
+    // Membership check against the fixed Oreans gate-case set. The protected-
+    // input identity is NOT cross-checked against an embedded hash literal:
+    // the manifest itself is the contract data source (it lives in the repo
+    // and is independently verified below by recomputing the actual input
+    // file's SHA-256/size against the manifest declaration). The GTO
+    // generic/no-gate lane has no locked manifest (it is not an accepted
+    // sample); its identity is bound from the manifest declaration and the
+    // on-disk recompute below.
     let gto_lane = is_gto_lane_manifest(
         &manifest.case_id,
         &manifest.capability_cell.protection_family,
     );
-    let locked = if gto_lane {
-        None
-    } else {
-        locked_manifest(&manifest.case_id).map(|l| {
-            (
-                l.case_id,
-                l.protected_input_sha256,
-                l.protected_input_size_bytes,
-            )
-        })
-    };
-    if locked.is_none() && !gto_lane {
+    if !gto_lane && locked_manifest(&manifest.case_id).is_none() {
         reasons.push(format!(
             "case_id {:?} is not one of the two fixed Oreans cases",
             manifest.case_id
@@ -239,21 +232,6 @@ pub fn check_case_identity(
             (String::new(), 0)
         }
     };
-
-    if let Some((locked_case_id, locked_sha, locked_size)) = locked {
-        if manifest.case_id != locked_case_id {
-            reasons.push(format!(
-                "case_id mismatch: manifest {:?} vs locked {:?}",
-                manifest.case_id, locked_case_id
-            ));
-        }
-        if declared_sha != locked_sha.to_lowercase() || declared_size != locked_size {
-            reasons.push(format!(
-                "declared protected input ({declared_sha}/{declared_size}) does not match the locked manifest ({}/{})",
-                locked_sha, locked_size
-            ));
-        }
-    }
 
     if manifest.capability_cell.architecture != "x86_64" {
         reasons.push(format!(

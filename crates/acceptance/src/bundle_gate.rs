@@ -9,9 +9,10 @@
 //!    schema drift and unknown fields are rejected before any gate logic
 //!    runs;
 //! 2. the bundle `case_id` must be one of the two fixed Oreans cases, and
-//!    the bundle's `protected_input` identity must match the locked
-//!    manifest (cross-checked against `lab/cases/v2` via
-//!    [`locked_manifest`]);
+//!    the bundle's `protected_input` identity must match the identity
+//!    declared by the case manifest (`lab/cases/v2/<case_id>.json`, cross-
+//!    checked via [`crate::oreans_gate::load_locked_manifest_identity`]).
+//!    A manifest that cannot be read fails the gate closed;
 //! 3. every required sidecar is re-parsed from the envelope bytes into the
 //!    gate's structured types — a sidecar that the independent consumer
 //!    cannot parse aborts the gate;
@@ -28,10 +29,11 @@ use thiserror::Error;
 
 use crate::evidence_bundle::{validate_evidence_bundle, OreansEvidenceBundle};
 use crate::oreans_gate::{
-    evaluate_oreans_two_sample_gate, OreansArtifactIdentity, OreansBehaviorEvidence,
-    OreansEvidenceRef, OreansFinalBehaviorVerdict, OreansIsolatedReplay, OreansPrerequisites,
-    OreansSampleObservation, OreansTwoSampleGateReport, OREANS_BEHAVIOR_ORACLE_SCHEMA_VERSION,
-    OREANS_ISOLATED_REPLAY_SCHEMA_VERSION, OREANS_PREREQUISITE_EVIDENCE_SCHEMA_VERSION,
+    evaluate_oreans_two_sample_gate, load_locked_manifest_identity, OreansArtifactIdentity,
+    OreansBehaviorEvidence, OreansEvidenceRef, OreansFinalBehaviorVerdict, OreansIsolatedReplay,
+    OreansPrerequisites, OreansSampleObservation, OreansTwoSampleGateReport,
+    OREANS_BEHAVIOR_ORACLE_SCHEMA_VERSION, OREANS_ISOLATED_REPLAY_SCHEMA_VERSION,
+    OREANS_PREREQUISITE_EVIDENCE_SCHEMA_VERSION,
 };
 
 /// Schema id of the bundle-gate report.
@@ -76,6 +78,8 @@ pub enum BundleGateError {
     SidecarParse(String, String),
     #[error("gate evaluation failed: {0}")]
     Gate(String),
+    #[error("locked case manifest could not supply the protected-input identity: {0}")]
+    Manifest(String),
 }
 
 /// Report binding the two-sample gate verdict to the envelope digests.
@@ -137,7 +141,10 @@ fn parse_member<T: serde::de::DeserializeOwned>(
         // is not declared in bundle.members; a member declared there but with
         // no bytes in the files map silently passes validation, so this
         // .expect() was a reachable panic. Surface it as an error instead.
-        BundleGateError::SidecarParse(name.to_string(), "member declared but no bytes in envelope".to_string())
+        BundleGateError::SidecarParse(
+            name.to_string(),
+            "member declared but no bytes in envelope".to_string(),
+        )
     })?;
     serde_json::from_slice(bytes)
         .map_err(|e| BundleGateError::SidecarParse(name.to_string(), e.to_string()))
@@ -177,26 +184,36 @@ fn parse_observation(
 /// `inputs` must contain exactly one valid envelope per fixed Oreans case.
 /// Any invalid envelope, non-gate case, manifest mismatch, or unparsable
 /// sidecar aborts the whole gate (fail-closed, nothing is reported as
-/// passed). This is the **production** entry: the locked manifest comes from
-/// the fixed [`crate::oreans_gate::locked_manifest`].
+/// passed). This is the **production** entry: the protected-input identity is
+/// loaded from the fixed case manifest via
+/// [`crate::oreans_gate::load_locked_manifest_identity`] (the manifest is the
+/// contract data source; a manifest that cannot be read fails the gate).
 pub fn evaluate_bundle_gate(
     inputs: &[BundleInput<'_>],
 ) -> Result<BundleGateReport, BundleGateError> {
-    let production_provider = |case_id: &str| crate::oreans_gate::locked_manifest(case_id).cloned();
+    let production_provider =
+        |case_id: &str| -> Result<Option<OreansArtifactIdentity>, BundleGateError> {
+            let lock = crate::oreans_gate::locked_manifest(case_id)
+                .ok_or_else(|| BundleGateError::CaseNotAllowed(case_id.to_string()))?;
+            load_locked_manifest_identity(lock)
+                .map(Some)
+                .map_err(|e| BundleGateError::Manifest(e.to_string()))
+        };
     evaluate_bundle_gate_with_manifest(inputs, &production_provider)
 }
 
-/// Pure core with an injected locked-manifest provider (P9-Prep-D #8: hermetic
-/// test fixture dependency injection). Production callers use
-/// [`evaluate_bundle_gate`], which injects the real locked manifest. A provider
-/// returns the locked manifest for a case id (or `None` if the case is not a
-/// fixed Oreans case).
+/// Pure core with an injected identity provider (P9-Prep-D #8: hermetic test
+/// fixture dependency injection). Production callers use
+/// [`evaluate_bundle_gate`], which injects a provider that loads the identity
+/// from the real case manifest. A provider returns the protected-input
+/// identity for a case id (`None` if the case is not a fixed Oreans case),
+/// or an error to fail the gate closed.
 pub fn evaluate_bundle_gate_with_manifest<F>(
     inputs: &[BundleInput<'_>],
     manifest_provider: &F,
 ) -> Result<BundleGateReport, BundleGateError>
 where
-    F: Fn(&str) -> Option<crate::oreans_gate::OreansSampleManifestLock>,
+    F: Fn(&str) -> Result<Option<OreansArtifactIdentity>, BundleGateError>,
 {
     let mut observations = Vec::with_capacity(inputs.len());
     let mut envelopes = Vec::with_capacity(inputs.len());
@@ -205,11 +222,11 @@ where
         if !verdict.valid {
             return Err(BundleGateError::InvalidBundle(verdict.reasons));
         }
-        let manifest = manifest_provider(&input.bundle.case_id)
+        let identity = manifest_provider(&input.bundle.case_id)?
             .ok_or_else(|| BundleGateError::CaseNotAllowed(input.bundle.case_id.clone()))?;
         let protected_matched = input.bundle.protected_input.sha256.to_lowercase()
-            == manifest.protected_input_sha256.to_lowercase()
-            && input.bundle.protected_input.size_bytes == manifest.protected_input_size_bytes;
+            == identity.sha256.to_lowercase()
+            && input.bundle.protected_input.size_bytes == identity.size_bytes;
         if !protected_matched {
             return Err(BundleGateError::ProtectedInputMismatch {
                 case_id: input.bundle.case_id.clone(),

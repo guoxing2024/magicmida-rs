@@ -549,8 +549,35 @@ fn check_imports_iat(ctx: &mut GateCtx<'_>, image: &PeImage<'_>) {
         if thunk_rva != 0 {
             check_thunk_chain(ctx, image, thunk_rva);
         }
+        // G-6 §①-5: OFT 有效时 (INT 已重建), FirstThunk 指向 loader 现填目标
+        // (dump 保留的原位 IAT, 已预填系统地址)。磁盘态该区含解析值,
+        // 不应按未解析 thunk 链检查 —— 只验它落在 IAT 目录范围内即可。
         if first_thunk != 0 && first_thunk != thunk_rva {
-            check_thunk_chain(ctx, image, first_thunk);
+            if original_first_thunk != 0 {
+                // INT 已提供: FirstThunk 是 loader 写目标, 验目录内即可
+                let iat_dir = image.directory(IMAGE_DIRECTORY_ENTRY_IAT);
+                let iat_slot = if image.optional.is_pe32_plus {
+                    8u32
+                } else {
+                    4u32
+                };
+                let in_iat_range = iat_dir
+                    .map(|d| {
+                        first_thunk >= d.virtual_address
+                            && first_thunk.saturating_add(iat_slot)
+                                <= d.virtual_address.saturating_add(d.size)
+                    })
+                    .unwrap_or(false);
+                if !in_iat_range {
+                    ctx.fail(
+                        "imports_iat",
+                        "first_thunk_outside_iat",
+                        format!("FirstThunk RVA 0x{first_thunk:x} outside IAT directory"),
+                    );
+                }
+            } else {
+                check_thunk_chain(ctx, image, first_thunk);
+            }
         }
 
         match desc_rva.checked_add(SIZEOF_IMPORT_DESCRIPTOR as u32) {

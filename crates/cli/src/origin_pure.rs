@@ -6,15 +6,54 @@
 //! `--pure-rebuild` is explicit.
 //!
 //! This is **not** a global pure flip.
+//!
+//! The discriminator hash is **not** a production literal: it is loaded from
+//! the case manifest (`lab/cases/v2/origin_macro.json`), which is embedded at
+//! build time — the manifest is the contract data source, so swapping a
+//! sample never requires a code edit. If the manifest cannot be resolved at
+//! build time (compile error) or its `protected_input` artifact is absent /
+//! malformed (runtime `None`), the resolver fails closed: the input is never
+//! treated as Origin, and the reason string makes the fallback explicit.
 
 use std::fs;
 use std::path::Path;
 
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-/// Vault `origin_macro` protected_input SHA-256 (lab/cases/v2/origin_macro.json).
-pub const ORIGIN_MACRO_PROTECTED_SHA256: &str =
-    "1af62999cf5be0b2f21abc39034c122a42aa46cfbfdb546faa184de37ac09ac7";
+/// Minimal case-manifest v2 subset: only the fields the Origin discriminator
+/// consumes. Unknown manifest fields are ignored (the full strict shape is
+/// validated by the acceptance side's `CaseManifestV2`).
+#[derive(Debug, Deserialize)]
+struct OriginMacroManifest {
+    case_id: String,
+    artifacts: Vec<ManifestArtifact>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestArtifact {
+    sha256: String,
+    role: String,
+}
+
+/// Resolve the Origin Macro protected-input SHA-256 from its case manifest.
+///
+/// The manifest (`lab/cases/v2/origin_macro.json`) is embedded at build time,
+/// so this never depends on the current working directory. Returns `None`
+/// when the manifest does not parse or does not declare a `protected_input`
+/// artifact — callers then fail closed (never treated as Origin).
+pub fn origin_macro_protected_sha256() -> Option<String> {
+    let bytes = include_str!("../../../lab/cases/v2/origin_macro.json");
+    let manifest: OriginMacroManifest = serde_json::from_str(bytes).ok()?;
+    if manifest.case_id != "origin_macro" {
+        return None;
+    }
+    manifest
+        .artifacts
+        .into_iter()
+        .find(|artifact| artifact.role == "protected_input")
+        .map(|artifact| artifact.sha256.to_ascii_lowercase())
+}
 
 /// Compute lowercase hex SHA-256 of an on-disk file.
 pub fn file_sha256_hex(path: &Path) -> Result<String, std::io::Error> {
@@ -25,11 +64,14 @@ pub fn file_sha256_hex(path: &Path) -> Result<String, std::io::Error> {
 }
 
 /// True when `path` bytes match the Origin Macro protected corpus object.
+///
+/// Fail-closed: when the manifest-declared identity cannot be resolved, the
+/// input is never treated as Origin.
 pub fn is_origin_macro_protected_input(path: &Path) -> bool {
-    match file_sha256_hex(path) {
-        Ok(hex) => hex.eq_ignore_ascii_case(ORIGIN_MACRO_PROTECTED_SHA256),
-        Err(_) => false,
-    }
+    let Some(expected) = origin_macro_protected_sha256() else {
+        return false;
+    };
+    file_sha256_hex(path).is_ok_and(|hex| hex.eq_ignore_ascii_case(&expected))
 }
 
 /// Resolve pure-rebuild for unpack after CLI flags are parsed.
@@ -37,6 +79,8 @@ pub fn is_origin_macro_protected_input(path: &Path) -> bool {
 /// - `cli_pure`: `--pure-rebuild` was set
 /// - `cli_no_pure`: `--no-pure-rebuild` was set (wins over Origin default)
 /// - Origin protected input → default true unless `cli_no_pure`
+/// - Manifest unavailable → fail closed to the legacy default (never an
+///   unverified pure default) with an explicit reason
 #[must_use]
 pub fn resolve_pure_rebuild(
     input: &Path,
@@ -52,6 +96,12 @@ pub fn resolve_pure_rebuild(
     if is_origin_macro_protected_input(input) {
         return (true, "origin_macro protected input default (D3)");
     }
+    if origin_macro_protected_sha256().is_none() {
+        return (
+            false,
+            "origin_macro manifest unavailable (fail-closed legacy default)",
+        );
+    }
     (false, "legacy default (non-Origin)")
 }
 
@@ -60,8 +110,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn origin_constant_is_64_hex() {
-        assert_eq!(ORIGIN_MACRO_PROTECTED_SHA256.len(), 64);
+    fn origin_manifest_identity_is_64_hex() {
+        // The discriminator must come from the embedded manifest and be a
+        // well-formed SHA-256 (64 lowercase hex chars).
+        let sha = origin_macro_protected_sha256().expect("embedded origin_macro manifest");
+        assert_eq!(sha.len(), 64);
+        assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(sha, sha.to_ascii_lowercase());
     }
 
     #[test]

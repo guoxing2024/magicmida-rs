@@ -15,6 +15,7 @@
 //! the gate validates their contract and binds them to the two locked cases.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -41,29 +42,93 @@ pub const OREANS_SECTION_REBUILD_EVIDENCE_SCHEMA_VERSION: &str =
     "mida.oreans-section-rebuild-evidence/v1";
 pub const OREANS_ISOLATED_REPLAY_ATTEMPTS: usize = 10;
 
-/// The only cases that can satisfy this gate.
+/// Locked gate-case binding: which `case_id`s are the fixed Oreans gate cases
+/// and where each case's manifest lives (`lab/cases/v2/<case_id>.json`).
+///
+/// The protected-input identity is **not** embedded here — it is loaded from
+/// the manifest (the contract data source) at gate time via
+/// [`load_locked_manifest_identity`], so swapping a sample never requires a
+/// code edit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct OreansSampleManifestLock {
     pub case_id: &'static str,
     pub manifest_path: &'static str,
-    pub protected_input_sha256: &'static str,
-    pub protected_input_size_bytes: u64,
 }
 
 pub const OREANS_SAMPLE_MANIFESTS: [OreansSampleManifestLock; 2] = [
     OreansSampleManifestLock {
         case_id: "origin_macro",
         manifest_path: "lab/cases/v2/origin_macro.json",
-        protected_input_sha256: "1af62999cf5be0b2f21abc39034c122a42aa46cfbfdb546faa184de37ac09ac7",
-        protected_input_size_bytes: 5_232_656,
     },
     OreansSampleManifestLock {
         case_id: "lunlun_software",
         manifest_path: "lab/cases/v2/lunlun_software.json",
-        protected_input_sha256: "8a0118d04e03752728999c845536c29215d2a626ac65845c22e3f1149de0db07",
-        protected_input_size_bytes: 4_976_144,
     },
 ];
+
+/// Why a locked case's manifest could not supply the protected-input identity.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum OreansManifestError {
+    #[error("cannot read locked case manifest {0}: {1}")]
+    Read(String, String),
+    #[error("locked case manifest {0} rejected (malformed/unknown fields): {1}")]
+    Parse(String, String),
+    #[error("locked case manifest {0} declares case_id {1:?}, expected {2:?}")]
+    CaseIdMismatch(String, String, String),
+    #[error("locked case manifest {0} has no protected_input artifact")]
+    NoProtectedInput(String),
+}
+
+/// Resolve a locked manifest path: as given (relative to the current working
+/// directory), falling back to the workspace-root-anchored location
+/// (`CARGO_MANIFEST_DIR/../..`). The fallback keeps `cargo test` and
+/// repo-checkout invocations working regardless of the CWD.
+fn resolve_manifest_path(manifest_path: &str) -> std::path::PathBuf {
+    let as_given = Path::new(manifest_path);
+    if as_given.exists() {
+        return as_given.to_path_buf();
+    }
+    let anchored = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(manifest_path);
+    if anchored.exists() {
+        anchored
+    } else {
+        as_given.to_path_buf()
+    }
+}
+
+/// Load the protected-input identity declared by a locked case's manifest.
+///
+/// Fail-closed: a missing or malformed manifest, a `case_id` mismatch, or the
+/// absence of a `protected_input` artifact is an explicit error — never a
+/// silent default. The manifest is the contract data source; production code
+/// carries no sample hash literal.
+pub fn load_locked_manifest_identity(
+    lock: &OreansSampleManifestLock,
+) -> Result<OreansArtifactIdentity, OreansManifestError> {
+    let path = resolve_manifest_path(lock.manifest_path);
+    let bytes = std::fs::read(&path)
+        .map_err(|e| OreansManifestError::Read(lock.manifest_path.to_string(), e.to_string()))?;
+    let manifest: crate::preflight::CaseManifestV2 = serde_json::from_slice(&bytes)
+        .map_err(|e| OreansManifestError::Parse(lock.manifest_path.to_string(), e.to_string()))?;
+    if manifest.case_id != lock.case_id {
+        return Err(OreansManifestError::CaseIdMismatch(
+            lock.manifest_path.to_string(),
+            manifest.case_id,
+            lock.case_id.to_string(),
+        ));
+    }
+    manifest
+        .artifacts
+        .into_iter()
+        .find(|artifact| artifact.role == "protected_input")
+        .map(|artifact| OreansArtifactIdentity {
+            sha256: artifact.sha256.to_ascii_lowercase(),
+            size_bytes: artifact.size_bytes,
+        })
+        .ok_or_else(|| OreansManifestError::NoProtectedInput(lock.manifest_path.to_string()))
+}
 
 /// Historical or adjacent workstreams are explicitly not gate inputs.
 pub const OREANS_NON_GATE_CASES: [&str; 3] = ["gto_launcher", "xiongxiong_duokai", "shiguang"];
@@ -3257,11 +3322,18 @@ fn align_up_u64(value: u64, alignment: u64) -> u64 {
 
 fn evaluate_sample(observation: &OreansSampleObservation) -> OreansSampleGateReport {
     let manifest = locked_manifest(&observation.case_id).expect("validated by caller");
-    let expected = OreansArtifactIdentity {
-        sha256: manifest.protected_input_sha256.to_string(),
-        size_bytes: manifest.protected_input_size_bytes,
-    };
-    let manifest_matched = observation.protected_input == expected;
+    // Protected-input identity comes from the case manifest (the contract data
+    // source), never from a production literal. A manifest that cannot supply
+    // the identity fails closed: the sample is not bound, with an explicit
+    // failure reason.
+    let loaded_identity = load_locked_manifest_identity(manifest);
+    let expected = loaded_identity
+        .as_ref()
+        .map(|identity| OreansArtifactIdentity {
+            sha256: identity.sha256.clone(),
+            size_bytes: identity.size_bytes,
+        });
+    let manifest_matched = expected.as_ref().ok() == Some(&observation.protected_input);
     let candidate_well_formed = observation.candidate.is_well_formed();
     let pe_failures = validate_pe_evidence(&observation.pe_evidence, &observation.candidate);
     let oep_failures = validate_oep_evidence(
@@ -3322,7 +3394,14 @@ fn evaluate_sample(observation: &OreansSampleObservation) -> OreansSampleGateRep
     let mut failures = Vec::new();
 
     if !manifest_matched {
-        failures.push("protected input does not match locked manifest SHA-256/size".to_string());
+        failures.push(match &loaded_identity {
+            Err(e) => format!(
+                "protected input cannot be bound: locked case manifest unavailable: {e} (fail-closed)"
+            ),
+            Ok(_) => {
+                "protected input does not match locked manifest SHA-256/size".to_string()
+            }
+        });
     }
     if !candidate_well_formed {
         failures
@@ -3378,7 +3457,10 @@ fn evaluate_sample(observation: &OreansSampleObservation) -> OreansSampleGateRep
         manifest: OreansManifestBindingReport {
             manifest_path: manifest.manifest_path.to_string(),
             case_id: manifest.case_id.to_string(),
-            expected_protected_input: expected,
+            expected_protected_input: expected.unwrap_or_else(|_| OreansArtifactIdentity {
+                sha256: String::new(),
+                size_bytes: 0,
+            }),
             observed_protected_input: observation.protected_input.clone(),
             matched: manifest_matched,
         },
@@ -3414,21 +3496,128 @@ mod tests {
     fn lock_contains_exactly_the_two_mainline_manifests() {
         assert_eq!(OREANS_SAMPLE_MANIFESTS.len(), 2);
         assert_eq!(OREANS_SAMPLE_MANIFESTS[0].case_id, "origin_macro");
-        assert_eq!(
-            OREANS_SAMPLE_MANIFESTS[0].protected_input_size_bytes,
-            5_232_656
-        );
         assert_eq!(OREANS_SAMPLE_MANIFESTS[1].case_id, "lunlun_software");
-        assert_eq!(
-            OREANS_SAMPLE_MANIFESTS[1].protected_input_size_bytes,
-            4_976_144
-        );
+        // The locked case binding carries no hash literal; the protected-input
+        // identity is loaded from the repository manifest (contract source).
         for manifest in OREANS_SAMPLE_MANIFESTS {
-            assert_eq!(manifest.protected_input_sha256.len(), 64);
+            let identity = load_locked_manifest_identity(&manifest)
+                .expect("repository case manifest must load");
+            assert_eq!(identity.sha256.len(), 64);
+            assert!(identity.size_bytes > 0);
+            assert_eq!(
+                identity.sha256,
+                identity.sha256.to_ascii_lowercase(),
+                "manifest sha256 must be lowercase"
+            );
         }
         for excluded in OREANS_NON_GATE_CASES {
             assert!(locked_manifest(excluded).is_none());
         }
+    }
+
+    #[test]
+    fn manifest_loader_fails_closed_on_missing_manifest() {
+        // A lock whose manifest does not exist anywhere must surface an
+        // explicit Read error, never a silent empty/default identity.
+        let lock = OreansSampleManifestLock {
+            case_id: "origin_macro",
+            manifest_path: "lab/cases/v2/definitely-missing-oreans-case.json",
+        };
+        let err =
+            load_locked_manifest_identity(&lock).expect_err("missing manifest must fail closed");
+        assert!(matches!(err, OreansManifestError::Read(_, _)));
+    }
+
+    #[test]
+    fn manifest_loader_rejects_case_id_mismatch_and_missing_protected_input() {
+        let dir = std::env::temp_dir().join(format!("mida-oreans-manifest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Minimal but schema-complete case-manifest v2 (the loader parses the
+        // strict `CaseManifestV2` shape, so required fields are present).
+        fn manifest_json(case_id: &str, artifact_role: &str) -> Vec<u8> {
+            serde_json::to_vec(&serde_json::json!({
+                "$schema": "./case-manifest.schema.json",
+                "schema_version": "mida.case-manifest/v2",
+                "manifest_revision": 1,
+                "case_id": case_id,
+                "display_name": "test",
+                "primary_artifact_sha256": "11",
+                "artifacts": [{"sha256": "11", "size_bytes": 1, "role": artifact_role}],
+                "capability_cell": {
+                    "platform": "windows",
+                    "binary_format": "pe",
+                    "architecture": "x86_64",
+                    "execution_model": "native",
+                    "protection_family": "oreans_candidate",
+                    "engine_route": "mida_plugin_oreans",
+                    "corpus_role": "regression"
+                },
+                "static_fingerprint": {},
+                "execution_policy": {},
+                "oracle": {}
+            }))
+            .unwrap()
+        }
+
+        // Case_id mismatch.
+        let mismatch_path = dir.join("mismatch.json");
+        std::fs::write(
+            &mismatch_path,
+            manifest_json("lunlun_software", "protected_input"),
+        )
+        .unwrap();
+        let mismatch_lock = OreansSampleManifestLock {
+            case_id: "origin_macro",
+            // Test-only: leak the path string to satisfy the 'static lock.
+            manifest_path: Box::leak(
+                mismatch_path
+                    .to_string_lossy()
+                    .into_owned()
+                    .into_boxed_str(),
+            ),
+        };
+        let err = load_locked_manifest_identity(&mismatch_lock)
+            .expect_err("case_id mismatch must fail closed");
+        assert!(matches!(err, OreansManifestError::CaseIdMismatch(_, _, _)));
+
+        // No protected_input artifact.
+        let no_protected_path = dir.join("no_protected.json");
+        std::fs::write(
+            &no_protected_path,
+            manifest_json("origin_macro", "legacy_oracle_candidate"),
+        )
+        .unwrap();
+        let no_protected_lock = OreansSampleManifestLock {
+            case_id: "origin_macro",
+            manifest_path: Box::leak(
+                no_protected_path
+                    .to_string_lossy()
+                    .into_owned()
+                    .into_boxed_str(),
+            ),
+        };
+        let err = load_locked_manifest_identity(&no_protected_lock)
+            .expect_err("missing protected_input artifact must fail closed");
+        assert!(matches!(err, OreansManifestError::NoProtectedInput(_)));
+
+        // Malformed manifest.
+        let malformed_path = dir.join("malformed.json");
+        std::fs::write(&malformed_path, b"{ not json !").unwrap();
+        let malformed_lock = OreansSampleManifestLock {
+            case_id: "origin_macro",
+            manifest_path: Box::leak(
+                malformed_path
+                    .to_string_lossy()
+                    .into_owned()
+                    .into_boxed_str(),
+            ),
+        };
+        let err = load_locked_manifest_identity(&malformed_lock)
+            .expect_err("malformed manifest must fail closed");
+        assert!(matches!(err, OreansManifestError::Parse(_, _)));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
     #[test]
     fn tls_disk_reread_accepts_matching_file_and_skips_missing() {

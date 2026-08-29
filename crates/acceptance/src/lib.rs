@@ -105,14 +105,14 @@ pub use generic_bundle::{
     REQUIRED_UNPACK_MEMBERS, UNPACK_EVIDENCE_BUNDLE_SCHEMA_VERSION,
 };
 pub use oreans_gate::{
-    evaluate_oreans_two_sample_gate, locked_manifest, OreansArtifactIdentity,
-    OreansAslrSimulationCase, OreansAslrSimulationEvidence, OreansBehaviorEvidence,
-    OreansBehaviorObservable, OreansBehaviorStimulus, OreansEvidenceRef,
+    evaluate_oreans_two_sample_gate, load_locked_manifest_identity, locked_manifest,
+    OreansArtifactIdentity, OreansAslrSimulationCase, OreansAslrSimulationEvidence,
+    OreansBehaviorEvidence, OreansBehaviorObservable, OreansBehaviorStimulus, OreansEvidenceRef,
     OreansFinalBehaviorVerdict, OreansFinalImportEvidence, OreansFinalRelocationBlockEvidence,
     OreansFinalRelocationEvidence, OreansFinalRelocationTargetEvidence, OreansFinalTlsEvidence,
     OreansGateError, OreansGateVerdict, OreansIatArtifactIdentity, OreansIatEvidence,
     OreansIatReasonCounts, OreansIatReportEvidence, OreansIatSlotEvidence, OreansIsolatedReplay,
-    OreansManifestBindingReport, OreansPrerequisites,
+    OreansManifestBindingReport, OreansManifestError, OreansPrerequisites,
     OreansRelocationEvidence as OreansGateRelocationEvidence,
     OreansRelocationPreservationComparison, OreansReplayAttempt, OreansRuntimeRelocationEvidence,
     OreansRuntimeRelocationTargetEvidence, OreansRuntimeTlsCallbackEvidence,

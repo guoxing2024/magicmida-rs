@@ -711,8 +711,6 @@ mod tests {
 
     // --- P9-Prep-D: two-bundle envelope consumer ---
 
-    use mida_acceptance::oreans_gate::OreansSampleManifestLock;
-
     /// Read a produced bundle + files from a Run into a BundleInput.
     fn bundle_input(run: &Run) -> mida_acceptance::BundleInput<'static> {
         let bundle: mida_acceptance::OreansEvidenceBundle =
@@ -725,31 +723,33 @@ mod tests {
         mida_acceptance::BundleInput { bundle, files }
     }
 
-    /// A synthetic locked-manifest provider: returns a manifest whose
-    /// protected_input matches the given bundle's protected_input, so the
-    /// hermetic test can pass the two-bundle envelope consumer without reading
-    /// a real Vault sample. Production uses the real locked manifest via
+    /// A synthetic identity provider: returns the protected-input identity
+    /// matching the given bundle's protected_input, so the hermetic test can
+    /// pass the two-bundle envelope consumer without reading a real manifest
+    /// file. Production uses the real case manifests via
     /// `evaluate_bundle_gate`; this injection is the P9-Prep-D #8 test-fixture
     /// seam (never a production bypass).
     fn synthetic_manifest_provider(
         inputs: &[mida_acceptance::BundleInput<'_>],
-    ) -> impl Fn(&str) -> Option<OreansSampleManifestLock> {
-        let map: std::collections::BTreeMap<String, OreansSampleManifestLock> = inputs
-            .iter()
-            .map(|input| {
-                let case_id = input.bundle.case_id.clone();
-                let lock = OreansSampleManifestLock {
-                    case_id: Box::leak(case_id.clone().into_boxed_str()),
-                    manifest_path: Box::leak("synthetic/manifest.json".to_owned().into_boxed_str()),
-                    protected_input_sha256: Box::leak(
-                        input.bundle.protected_input.sha256.clone().into_boxed_str(),
-                    ),
-                    protected_input_size_bytes: input.bundle.protected_input.size_bytes,
-                };
-                (case_id, lock)
-            })
-            .collect();
-        move |case_id| map.get(case_id).cloned()
+    ) -> impl Fn(
+        &str,
+    ) -> Result<
+        Option<mida_acceptance::OreansArtifactIdentity>,
+        mida_acceptance::BundleGateError,
+    > {
+        let map: std::collections::BTreeMap<String, mida_acceptance::OreansArtifactIdentity> =
+            inputs
+                .iter()
+                .map(|input| {
+                    let case_id = input.bundle.case_id.clone();
+                    let identity = mida_acceptance::OreansArtifactIdentity {
+                        sha256: input.bundle.protected_input.sha256.clone(),
+                        size_bytes: input.bundle.protected_input.size_bytes,
+                    };
+                    (case_id, identity)
+                })
+                .collect();
+        move |case_id| Ok(map.get(case_id).cloned())
     }
 
     /// P9-Prep-D positive: two genuinely independent production-assembled
@@ -817,8 +817,10 @@ mod tests {
         let provider = synthetic_manifest_provider(&inputs);
         // Feeding one bundle that is not a valid run is rejected at validation.
         assert!(inputs[0].bundle.case_id == "origin_macro");
-        // Confirm lunlun has no synthetic manifest here.
-        assert!(provider("lunlun_software").is_none());
+        // Confirm lunlun has no synthetic identity here.
+        assert!(provider("lunlun_software")
+            .expect("provider must not error")
+            .is_none());
     }
 
     #[test]
@@ -859,27 +861,22 @@ mod tests {
 
         // A fixed trusted provider: origin expects protected_input = hash("protected"),
         // which differs from the synthetic bundles' actual protected_input.
-        let origin_expected = OreansSampleManifestLock {
-            case_id: Box::leak("origin_macro".to_owned().into_boxed_str()),
-            manifest_path: Box::leak("synthetic/manifest.json".to_owned().into_boxed_str()),
-            protected_input_sha256: Box::leak(
-                mida_acceptance::sha256_hex(b"protected").into_boxed_str(),
-            ),
-            protected_input_size_bytes: 0,
+        let origin_expected = mida_acceptance::OreansArtifactIdentity {
+            sha256: mida_acceptance::sha256_hex(b"protected"),
+            size_bytes: 0,
         };
-        let lunlun_expected = OreansSampleManifestLock {
-            case_id: Box::leak("lunlun_software".to_owned().into_boxed_str()),
-            manifest_path: Box::leak("synthetic/manifest.json".to_owned().into_boxed_str()),
-            protected_input_sha256: Box::leak(
-                mida_acceptance::sha256_hex(b"lunlun-protected").into_boxed_str(),
-            ),
-            protected_input_size_bytes: 0,
+        let lunlun_expected = mida_acceptance::OreansArtifactIdentity {
+            sha256: mida_acceptance::sha256_hex(b"lunlun-protected"),
+            size_bytes: 0,
         };
-        let fixed_provider = move |case_id: &str| -> Option<OreansSampleManifestLock> {
+        let fixed_provider = move |case_id: &str| -> Result<
+            Option<mida_acceptance::OreansArtifactIdentity>,
+            mida_acceptance::BundleGateError,
+        > {
             match case_id {
-                "origin_macro" => Some(origin_expected),
-                "lunlun_software" => Some(lunlun_expected),
-                _ => None,
+                "origin_macro" => Ok(Some(origin_expected.clone())),
+                "lunlun_software" => Ok(Some(lunlun_expected.clone())),
+                _ => Ok(None),
             }
         };
         let err = mida_acceptance::evaluate_bundle_gate_with_manifest(&inputs, &fixed_provider)

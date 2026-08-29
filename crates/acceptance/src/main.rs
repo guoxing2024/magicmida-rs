@@ -1602,7 +1602,9 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
                 ));
             }
             // Oreans-only: the manifest-declared protected identity for this
-            // case_id must match the envelope's protected_input exactly.
+            // case_id must match the envelope's protected_input exactly. The
+            // identity is loaded from the case manifest (contract data
+            // source); an unreadable manifest fails closed.
             let locked = mida_acceptance::locked_manifest(&case.case_id);
             match locked {
                 None => {
@@ -1611,22 +1613,28 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
                         case.case_id
                     ));
                 }
-                Some(manifest) => {
-                    if case.protected_input.sha256.to_lowercase()
-                        != manifest.protected_input_sha256.to_lowercase()
-                        || case.protected_input.size_bytes != manifest.protected_input_size_bytes
-                    {
-                        reasons.push(format!(
-                            "case {} protected_input identity does not match the locked manifest \
-                             (envelope {}/{} vs manifest {}/{})",
-                            case.case_id,
-                            case.protected_input.sha256.to_lowercase(),
-                            case.protected_input.size_bytes,
-                            manifest.protected_input_sha256.to_lowercase(),
-                            manifest.protected_input_size_bytes,
-                        ));
+                Some(lock) => match mida_acceptance::load_locked_manifest_identity(lock) {
+                    Ok(identity) => {
+                        if case.protected_input.sha256.to_lowercase()
+                            != identity.sha256.to_lowercase()
+                            || case.protected_input.size_bytes != identity.size_bytes
+                        {
+                            reasons.push(format!(
+                                "case {} protected_input identity does not match the locked manifest \
+                                 (envelope {}/{} vs manifest {}/{})",
+                                case.case_id,
+                                case.protected_input.sha256.to_lowercase(),
+                                case.protected_input.size_bytes,
+                                identity.sha256.to_lowercase(),
+                                identity.size_bytes,
+                            ));
+                        }
                     }
-                }
+                    Err(e) => reasons.push(format!(
+                        "case {} locked case manifest unavailable: {e} (fail-closed)",
+                        case.case_id
+                    )),
+                },
             }
         }
         // Independent reparse + per-case digest recompute keyed by case_id. This

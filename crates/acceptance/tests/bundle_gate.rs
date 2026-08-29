@@ -735,36 +735,32 @@ fn unparsable_sidecar_is_rejected() {
 
 // --- P9-Prep-D: two-bundle envelope consumer attack tests ---
 //
-// These use `evaluate_bundle_gate_with_manifest` with a synthetic locked-manifest
-// provider (the P9-Prep-D #8 test-fixture seam). The provider returns a manifest
-// whose protected_input matches the synthetic bundles, so no real Vault sample is
-// read. Production uses the real locked manifest via `evaluate_bundle_gate`.
+// These use `evaluate_bundle_gate_with_manifest` with a synthetic identity
+// provider (the P9-Prep-D #8 test-fixture seam). The provider returns the
+// protected-input identity matching the synthetic bundles, so no real
+// manifest file is read. Production uses the real case manifests via
+// `evaluate_bundle_gate`.
 
-use mida_acceptance::oreans_gate::OreansSampleManifestLock;
-
-/// Build a synthetic manifest provider for the given bundles' protected inputs.
+/// Build a synthetic identity provider for the given bundles' protected inputs.
 fn synthetic_provider(
     origin_sha: &str,
     origin_size: u64,
     lunlun_sha: &str,
     lunlun_size: u64,
-) -> impl Fn(&str) -> Option<OreansSampleManifestLock> {
-    let origin = OreansSampleManifestLock {
-        case_id: "origin_macro",
-        manifest_path: "synthetic/manifest.json",
-        protected_input_sha256: Box::leak(origin_sha.to_owned().into_boxed_str()),
-        protected_input_size_bytes: origin_size,
-    };
-    let lunlun = OreansSampleManifestLock {
-        case_id: "lunlun_software",
-        manifest_path: "synthetic/manifest.json",
-        protected_input_sha256: Box::leak(lunlun_sha.to_owned().into_boxed_str()),
-        protected_input_size_bytes: lunlun_size,
-    };
+) -> impl Fn(&str) -> Result<Option<OreansArtifactIdentity>, BundleGateError> {
+    // Leak the digest strings so the returned closure is 'static (test-only).
+    let origin_sha = Box::leak(origin_sha.to_owned().into_boxed_str());
+    let lunlun_sha = Box::leak(lunlun_sha.to_owned().into_boxed_str());
     move |case_id| match case_id {
-        "origin_macro" => Some(origin),
-        "lunlun_software" => Some(lunlun),
-        _ => None,
+        "origin_macro" => Ok(Some(OreansArtifactIdentity {
+            sha256: origin_sha.to_string(),
+            size_bytes: origin_size,
+        })),
+        "lunlun_software" => Ok(Some(OreansArtifactIdentity {
+            sha256: lunlun_sha.to_string(),
+            size_bytes: lunlun_size,
+        })),
+        _ => Ok(None),
     }
 }
 
