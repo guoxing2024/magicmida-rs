@@ -1,7 +1,7 @@
 # TASK-003 — 堵住 `check_clippy_baseline.ps1` 的软通过
 
 - **优先级**：P0
-- **状态**：📋 待领取
+- **状态**：🔁 第 1 轮打回（2026-08-29），返工要求见文末「第 1 轮打回」一节
 - **岗位**：developer
 - **预估**：30 分钟
 
@@ -84,3 +84,29 @@ sed -i 's/$/\r/' _run.cmd && cmd //c _run.cmd; rm -f _run.cmd
 
 同一条验收标准连续 2 次不通过就停下来报告。
 如果你发现无法在不误伤"deny 级 lint 命中"这个合法场景的前提下区分两者，**停下来把你的分析写出来**，不要用"退出码非 0 就失败"这种会误伤的粗暴方案糊过去。
+
+---
+
+## 第 1 轮打回（2026-08-29，验收人：总指挥）
+
+第 1 轮交付被**打回**，完整记录在 `runs/20260829-TASK-003-REJECT-1.md`。返工者读下面即可，两处内容冲突时以本节为准。
+
+### 打回理由
+
+1. **致命：E 前缀 rustc 编译错误被放行。** 验收人亲自在 `crates/cli/src/main.rs` 注入 `let probe: u32 = "deliberate type error";`（E0308），MSVC 环境下运行脚本，输出 `NOTE: cargo clippy exited 101 (deny-level lint present).` + `OK: clippy warn baseline holds` + **exit 0**。真正的编译错误被判成基线通过。原因：分类器以「有无 lint code」区分，但 rustc 编译错误带 `E` 前缀 code（E0308/E0277/E0432…），`$msg.code.code` 非空，全被计入 deny 命中桶放行。工单「具体要求」第 2 条明文要求识别 "rustc 编译错误 / 链接错误"，只覆盖链接错误不算覆盖。
+2. **违规：具体要求第 4 条未执行。** `NOTE: ... (deny-level lint present)` 那句原文未改，在编译错误场景原形毕露。
+
+### 返工要求
+
+- 只改 `tools/check_clippy_baseline.ps1`；`runs/20260829-TASK-003.md` 覆盖重写（含第 2 轮全部验收输出，保留第 1 轮已验证结论也可）。
+- 修正分类器，建议按 code 前缀三分：无 code → 编译/链接失败；`clippy::` 前缀 → deny 命中（合法放行）；其他（`E` 前缀、rustc lint 名如 `unused_variables`）→ 编译失败。**注意**：rustc 自身 lint（deny 级，如 `unused_variables`）code 无前缀，如何归类要在注释里写清理由。
+- 第 4 条一并补：改成不预设原因的措辞（例如 `NOTE: cargo clippy exited non-zero, analyzing whether analysis completed...`）。
+
+### 第 2 轮验收标准（四条全过才收）
+
+1. **负面（链接失败）**：Git Bash 直接跑 → exit 非 0，说明是"未完成分析"。
+2. **负面（编译错误 E 前缀）**：临时在 `crates/cli/src/main.rs` 注入一行类型错误（如 `let probe: u32 = "x";`），MSVC 环境跑 → **exit 非 0**；跑完恢复原文件，`git diff --stat` 证明无残留并粘进报告。
+3. **正面（OK 路径）**：健康树 + 镜像基线（把 `_clippy_baseline` 复制到临时文件，按实际计数上调 5 项、补 3 条新 lint，TOTAL=359）→ `OK: ... holds` + exit 0。跑完删临时基线。
+4. **正面（deny 命中不误杀）**：`CARGO_CLIPPY_EXTRA_ARGS="-- -D clippy::let_unit_value"` 环境变量注入 → 脚本继续做基线比较，**不得**报"未完成分析"。
+
+注意本机 Git Bash 无法链接（E-1），第 2/3/4 条都在 `tools/_enter_msvc_env.cmd` 环境下跑；临时 `.cmd` 必须 CRLF。镜像基线数据点（2026-08-29 实测）：unnecessary_cast 18、manual_saturating_arithmetic 16、let_unit_value 4、type_complexity 8、unnecessary_map_or 14，新 lint 三条 inconsistent_digit_grouping=1 / unused_unsafe=1 / unused_variables=1，TOTAL=359。

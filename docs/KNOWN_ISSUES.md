@@ -38,13 +38,13 @@ Git Bash 用 heredoc/`printf` 生成的 `.cmd` 是 LF 行尾，cmd.exe 会错解
 
 ## 门禁类
 
-### G-1 `tools/check_clippy_baseline.ps1` 会把编译失败读成"全绿" [已验证，未修]
+### G-1 `tools/check_clippy_baseline.ps1` 会把编译失败读成"全绿" [已验证，R1 修复被打回]
 
 脚本第 44-50 行拿到 `$LASTEXITCODE` 后只打印一句 `NOTE: cargo clippy exited $code (deny-level lint present)` 就继续，然后只比较各 lint 的警告计数。
 clippy 因任何原因（链接失败、语法错误、环境缺失）没跑起来时，警告计数全为 0，全部 ≤ 基线 → 打印 `OK: clippy warn baseline holds` 并 exit 0。
 本次实测复现：无 MSVC 环境下 clippy exit 101、0 条警告，脚本仍然报 OK。
 **当初为什么这么做**：clippy 在 deny-level lint 命中时确实会非零退出，而这时仍需要解析警告 —— 意图正确，但没有区分"lint 失败"和"根本没跑起来"。
-**怎么办**：TASK-003。区分方式：要求解析到的 target 数 > 0，或检查 JSON 里有无 `compiler-message` 级别的 `error`。
+**R1 进展（2026-08-29）**：worker 交付的第 1 版已堵住**链接失败**路径（code=null 的 error → exit 3，总指挥亲测），但**E 前缀 rustc 编译错误（E0308 等）仍被放行 exit 0** —— 总指挥注入类型错误实测坐实，工单打回。其判据"deny 命中必然带 code"只对链接失败成立。返工要求见 `tickets/TASK-003.md` 文末「第 1 轮打回」，打回记录 `runs/20260829-TASK-003-REJECT-1.md`。
 
 ### G-2 `cargo fmt --all -- --check` 曾红 216 处 [已修，归因已纠正]
 
@@ -81,6 +81,15 @@ CI 是 fresh checkout 且 `CARGO_TARGET_DIR` 指向仓库外，这些都不会�
 按 `ARTIFACT_POLICY.md` 它们属于内容寻址 vault（`D:/MidaVault/lab/evidence/`），不属于仓库工作区。
 **为什么还在这**：不知道，接管前就在。**没动的原因**：搬移证据是有风险的操作（万一 vault 里没有副本就成了删除），
 且不属于任何已批工单。**怎么办**：需要先确认 vault 里已有副本，再决定搬或删。这件事要老板或熟悉 vault 布局的会话来定。
+
+### G-7 clippy 基线自 WO-24 锁定后已漂移，HEAD 上 WO-23 门禁是红的 [已验证，TASK-008 修复中]
+
+WO-24 于 2026-08-27（提交 `607276d`）锁定 `_clippy_baseline`（TOTAL=349）后，28 个提交（XX-8..XX-11、`exception_final.rs`、rustfmt 全局整理等）让实际 warn 计数漂到 **354**：
+5 个 lint 超基线（unnecessary_cast 18/17、manual_saturating_arithmetic 16/15、let_unit_value 4/2、type_complexity 8/7、unnecessary_map_or 14/12），3 个 lint 不在基线表（unused_variables=1、clippy::inconsistent_digit_grouping=1、unused_unsafe=1）。
+2026-08-29 总指挥在 TASK-003 验收中实测：新旧两版基线脚本同环境输出**逐字节一致、双双 exit 1**（漂移是既有债务，与 TASK-003 改动无关）；换全新 `CARGO_TARGET_DIR` 复现一致，排除缓存污染。
+**含义**：当前 HEAD 若推送，CI `windows-clippy` job 必红。之前 PROJECT_STATUS 写"五道门禁本机全过"是**口径错误**——那五道是分阶段 `-D` 门，WO-23 基线门从未在本机对真基线跑过。
+**当初为什么会漂**：基线政策要求"修代码降计数时同 commit 降基线"，但没有反向约束——加代码升计数时没人复查基线，28 个提交就这么滑过去了。
+**怎么办**：TASK-008（10 个机械修复位点已定位到 file:line）。推送前必须完成。
 
 ### G-3 `cargo fix` 会误删测试依赖的重导出 [已验证，已绕过]
 

@@ -19,10 +19,11 @@ Windows PE 脱壳研究平台（Rust，221k 行，11 个 crate）。把受保护
 
 ## 最要紧的一件事
 
-**`tickets/TASK-003.md`：`tools/check_clippy_baseline.ps1` 会把编译失败读成"全绿"。**
+**TASK-003 返工 R2：`tools/check_clippy_baseline.ps1` 第 1 轮修复被打回**——总指挥注入 E0308 编译错误实测仍被判成基线通过 exit 0（打回记录 `runs/20260829-TASK-003-REJECT-1.md`，返工要求在工单文末）。
+**新增推送前置：TASK-008 清还 clippy 基线漂移**——WO-23 基线门在 HEAD 上是红的（实际 354 > 基线 349，见 `KNOWN_ISSUES.md` G-7），推送前必须完成。
 （接管时的头号风险"两天成果未提交 + fmt 红 216 处"已解决：10 个本地提交，fmt exit 0，**推送按老板裁定停在本地**，等他逐次确认。）
 
-工单顺序建议：TASK-003 → TASK-004 → TASK-006；TASK-005 可并行（纯离线），完成后再开 TASK-007。
+工单顺序建议：TASK-003 R2 → TASK-004 → TASK-006；TASK-008 可与 R2 并行（文件不相交）；TASK-005 纯离线可并行，完成后再开 TASK-007。
 
 ## 30 秒把它跑起来
 
