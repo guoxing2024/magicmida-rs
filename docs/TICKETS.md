@@ -9,7 +9,7 @@
 | ID | P | 标题 | 状态 | 负责人 | 一条命令判生死 |
 |---|---|---|---|---|---|
 | [TASK-001](../tickets/TASK-001.md) | P0 | 修复 216 处 rustfmt 差异，让 CI 第一个 job 能过 | ✅ **完成**（2026-08-29，归档 [runs/20260829-TASK-001.md](../runs/20260829-TASK-001.md)） | 总指挥 | `cargo fmt --all -- --check` exit 0 ✅ |
-| [TASK-002](../tickets/TASK-002.md) | P0 | 把在飞的两天成果分批提交（**只本地，不推送**） | ✅ **本地提交完成**（8 个提交，2026-08-29，归档 [runs/20260829-TASK-002.md](../runs/20260829-TASK-002.md））；⏸ **推送待老板逐次确认**（D-010） | 总指挥 | `git status --short` 无未提交生产源码 ✅ |
+| [TASK-002](../tickets/TASK-002.md) | P0 | 把在飞的两天成果分批提交（**只本地，不推送**） | ✅ **本地提交完成**（10 个提交，2026-08-29，归档 [runs/20260829-TASK-002.md](../runs/20260829-TASK-002.md)）；⏸ **推送待老板逐次确认**（D-010） | 总指挥 | `git status --short` 无未提交生产源码 ✅ |
 | [TASK-003](../tickets/TASK-003.md) | P0 | 堵住 `check_clippy_baseline.ps1` 的软通过 | 📋 待领取 | developer | 编译失败时脚本必须 exit≠0 |
 | [TASK-004](../tickets/TASK-004.md) | P1 | T0.7 会话绑定修复：补齐可离线验证的闭环 | 📋 待领取 | developer | `cargo test -p mida-pe --lib --offline` 全绿且含新增闭环用例 |
 | [TASK-005](../tickets/TASK-005.md) | P1 | GVM Phase 1：`0x8c000` 区归属矛盾复核 | 📋 待领取 | qa | 复算脚本给出唯一结论并自证口径 |

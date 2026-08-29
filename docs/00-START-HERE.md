@@ -14,12 +14,15 @@ Windows PE 脱壳研究平台（Rust，221k 行，11 个 crate）。把受保护
 
 ## 现在在做什么（2026-08-29）
 
-主攻线是 **GVM-0 反虚拟化战役**（`gto_launcher` 的 VM 语义还原 → lifter → 整镜像去虚拟化，账本 GVM 0/8，Phase 1 门 1 未过）。
+主攻线是 **GVM-0 反虚拟化战役**（`gto_launcher` 的 VM 语义还原 → lifter → 整镜像去虚拟化，账本 GVM 0/8，Phase 1 门 1 未过；老板已批一格定向 dump 实弹 → `tickets/TASK-007.md`）。
 `origin_macro` + `lunlun_software` 是必须一直绿的回归门。`xiongxiong_duokai` rev2 战役已于 2026-08-28 关闭。
 
 ## 最要紧的一件事
 
-**两天的成果全部未提交，且 CI 因 `cargo fmt` 红 216 处处于必红状态。** 先做 `tickets/TASK-001.md` 和 `TASK-002.md`。
+**`tickets/TASK-003.md`：`tools/check_clippy_baseline.ps1` 会把编译失败读成"全绿"。**
+（接管时的头号风险"两天成果未提交 + fmt 红 216 处"已解决：10 个本地提交，fmt exit 0，**推送按老板裁定停在本地**，等他逐次确认。）
+
+工单顺序建议：TASK-003 → TASK-004 → TASK-006；TASK-005 可并行（纯离线），完成后再开 TASK-007。
 
 ## 30 秒把它跑起来
 
@@ -31,6 +34,10 @@ sed -i 's/$/\r/' _run.cmd && cmd //c _run.cmd; rm -f _run.cmd
 
 期望：`65 个 target / 2801 passed / 0 failed / 2 ignored`，`EXIT=0`。
 **不要**直接在 Git Bash 里 `cargo test`：`link.exe` 会解析到 Git 的 GNU coreutils，链接必失败。`cargo fmt` / `cargo check` 不受影响。
+`tools/_enter_msvc_env.cmd` 同时会设 `CARGO_INCREMENTAL=0` —— 增量编译会让 rustc 1.97.1 在 `mida-disasm` 上 ICE（`KNOWN_ISSUES.md` E-5）。
+
+**注意 `tools/verify_workspace_hygiene.ps1` 在本机永远 exit 1**，这是本机杂物（`target/`、1.3 GB 实弹证据、`__pycache__`）导致的，
+不代表 CI 红；它不能当推送前自检。判读方式见 `KNOWN_ISSUES.md` G-5。
 
 ## 固定的六份文件（只维护这些，禁止新增同类文档）
 
