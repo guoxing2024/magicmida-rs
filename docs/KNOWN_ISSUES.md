@@ -165,7 +165,7 @@ WO-24 于 2026-08-27（提交 `607276d`）锁定 `_clippy_baseline`（TOTAL=349�
 - 已交付：`ini_path` 接线（去 dead_code）+ 日志行 `SCYLLAHIDE_HOOK_CONFIG_SOURCE=` + walker/failure 两个证据 sidecar 新增 `scylla_hide_config_source` 字段 + 受控 ini `D:/MidaVault/lab/config/scylla_hide_no_excdispatch.ini`（与参考基线逐键一致 42/42，异常分发两开关显式 0）。
 - **注意混杂变量（TASK-006R4 设计要点）**：受控 ini 相对"无 ini 全默认"的差异**不止两个开关**，是整套 UncoverEngine profile（约 30 键）。若 R4 走通，归因到具体开关需后续最小差分 ini 变体（另立单）。
 - **受控 ini 生效的唯一路径（授权内）= 实弹前操作员落位 `C:\Windows\scylla_hide.ini`，跑完必须删**。已核验当前 `C:\Windows` 无 scylla/test_profile 残留 ini。
-- **熊熊线旁证（2026-08-30 老板提问触发，总指挥查 scratch 现场坐实）**：熊熊线成功运行（`2026-08-28 15:26`，`D:/MidaVault/scratch/cargo-target/debug/`）时 `scylla_hide.ini` 就放在 InjectorCLI 旁边、`KiUserExceptionDispatcherHook=0`/`NtContinueHook=0` 都写着——但那次运行的 `scylla_hide.log` 显示 **15 个 hook 全装**，包括 `_KiUserExceptionDispatcher` 与 `_NtContinue`。**即熊熊线的成功是在"ini 被无视、全默认 hook"状态下取得的**——成功靠的是那条线的壳容忍默认 hook，不是靠配置生效。"放项目文件夹就行"是幸存者偏差，不是工作方法。
+- **熊熊线旁证（2026-08-30 老板追问触发，总指挥复核后修正——初版归因有误）**：初版写"熊熊线成功是在 ini 被无视、全默认 hook 状态下取得的"——**这是错误归因**。复核 XC-2 特征化档案后定案：scratch 里那份 15:26 的 `scylla_hide.log`（ini 就在注入器旁、两开关=0，但 15 hook 全装）对应的运行是**失败的实弹探针**（档案原话："stub-EXE 启动 → ScyllaHide 注入成功 → AV 风暴（seq>10M）→ 永不达 .text-stable"，`MIDA_LEGACY_ANTIDEBUG=1`）。而熊熊线**真正的成功路径**（XX21 step1-3 → XX21B 固化，`core_perfect_candidate.dll` sha256 `3650ea6c…`，R0B 12/12 + S1-S4 全过）走的是 **LoadLibraryW 真宿主 + 模块感知 dump**，全程**没有注入 ScyllaHide**（scylla_hide.log 无成功路径时段的条目）。两个结论：① 老板"用了的"记忆对了一半——注入发生过，但那次是失败探针，不在成功路径上；② "放项目文件夹就行"的说法双重不成立：那份 ini 既没被读到（Windows-dir-only 实证），成功也不靠它。
 
 
 ### C-7 text-poll 阶段无 AV 风暴终止机制（引擎结构缺口，TASK-010 发现）[**已修 + 实弹验证通过** —— TASK-011 修 / TASK-012 加固 / TASK-006R2 实弹坐实]
