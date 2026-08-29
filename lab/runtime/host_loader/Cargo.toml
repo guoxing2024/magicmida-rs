@@ -1,0 +1,21 @@
+[package]
+name = "host_loader"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "host_loader"
+path = "src/lib.rs"
+
+[[bin]]
+name = "host_loader"
+path = "src/main.rs"
+
+[dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_Security",
+] }

@@ -1,0 +1,20 @@
+[package]
+name = "xx21_monitor"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "xx21_monitor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "xx21_monitor"
+path = "src/main.rs"
+
+[dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+] }

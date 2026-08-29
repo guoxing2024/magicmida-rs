@@ -201,6 +201,16 @@
             "ahk_gto_candidate",
             "packed_managed_candidate",
             "unprotected_fixture",
+            "unknown",
+            "unclassified_candidate"
+          ]
+        },
+        "family_hypothesis": {
+          "description": "XC 追加节（2026-08-28，owner 指令）：样品身份由自身特征决定，不由节名表观或伴随关系推断。正式分类用 protection_family=unclassified_candidate 时，此处保留待验假设（不入正式分类）。",
+          "enum": [
+            "oreans_candidate",
+            "ahk_gto_candidate",
+            "packed_managed_candidate",
             "unknown"
           ]
         },

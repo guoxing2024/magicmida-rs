@@ -1,19 +1,19 @@
 {
   "$schema": "./case-manifest.schema.json",
   "schema_version": "mida.case-manifest/v2",
-  "manifest_revision": 3,
-  "case_id": "xiongxiong_duokai",
-  "display_name": "Xiongxiong multi-open holdout (family unclassified, hypothesis oreans)",
-  "primary_artifact_sha256": "7800980301207bf2f851d00a50f7f18e0dcd61a0f2b1581ca609ddcc0f2f1ea7",
+  "manifest_revision": 2,
+  "case_id": "xiongxiong_core",
+  "display_name": "Xiongxiong core.dll companion (family unclassified, hypothesis oreans)",
+  "primary_artifact_sha256": "09f3dd344215c6aa608bc6a8e8ae24486e3bf425c3f3541272d065a1d9999144",
   "artifacts": [
     {
-      "sha256": "7800980301207bf2f851d00a50f7f18e0dcd61a0f2b1581ca609ddcc0f2f1ea7",
-      "size_bytes": 5793808,
+      "sha256": "09f3dd344215c6aa608bc6a8e8ae24486e3bf425c3f3541272d065a1d9999144",
+      "size_bytes": 6038032,
       "role": "protected_input"
     },
     {
-      "sha256": "2848fcc0d61fb4ccacc7004c1d5393382068756fdc531025a10f31d20be81bc9",
-      "size_bytes": 4245008,
+      "sha256": "7800980301207bf2f851d00a50f7f18e0dcd61a0f2b1581ca609ddcc0f2f1ea7",
+      "size_bytes": 5793808,
       "role": "analysis_reference"
     }
   ],
@@ -25,29 +25,32 @@
     "protection_family": "unclassified_candidate",
     "family_hypothesis": "oreans_candidate",
     "engine_route": "mida_plugin_oreans",
-    "corpus_role": "holdout"
+    "corpus_role": "research"
   },
   "static_fingerprint": {
-    "artifact_sha256": "7800980301207bf2f851d00a50f7f18e0dcd61a0f2b1581ca609ddcc0f2f1ea7",
+    "artifact_sha256": "09f3dd344215c6aa608bc6a8e8ae24486e3bf425c3f3541272d065a1d9999144",
     "evidence_basis": "direct_header_parse",
     "pe_kind": "PE32+",
     "coff_machine": "0x8664",
-    "image_base": "0x1",
-    "entry_rva": "0x83e058",
+    "image_base": "0x3205c0000",
+    "entry_rva": "0x8a0108",
     "entry_section": ".boot",
-    "section_count": 16,
-    "import_descriptor_count": 9,
-    "has_tls": false,
+    "section_count": 18,
+    "import_descriptor_count": 12,
+    "has_tls": true,
     "has_relocations": true,
     "observed_markers": [
       "section:.winlice",
-      "section:.boot"
+      "section:.boot",
+      "dll",
+      "export:GetAppVersion",
+      "export:Run"
     ]
   },
   "execution_policy": {
     "dynamic": {
       "mode": "explicit_authorization_required",
-      "fixed_sha256": "7800980301207bf2f851d00a50f7f18e0dcd61a0f2b1581ca609ddcc0f2f1ea7",
+      "fixed_sha256": "09f3dd344215c6aa608bc6a8e8ae24486e3bf425c3f3541272d065a1d9999144",
       "timeout_seconds": 240,
       "process_tree_accounting_required": true
     },

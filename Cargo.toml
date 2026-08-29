@@ -10,6 +10,8 @@ members = [
     "crates/acceptance",
     "crates/antidebug",
     "crates/antidebug-runtime",
+    "lab/runtime/host_loader",
+    "lab/runtime/xx21_monitor",
 ]
 resolver = "2"
 
