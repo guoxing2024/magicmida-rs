@@ -157,7 +157,14 @@ WO-24 于 2026-08-27（提交 `607276d`）锁定 `_clippy_baseline`（TOTAL=349�
 - 每次运行内**恒同元组唯一**（`sort -u` 恰 1 条）× 1024 次，C-7 判据形状再次被证实。
 - 累计 **13/13 次跨 3 个 boot** 确定性撞同一故障环（006R 9 + 006R2 2 + 006R3 2）。**"重启后重试"这条路已经走到头了**——TASK-006R2 时我把它列为"近乎免费的探测"，探测做了，结果是阴性，这条路可以关掉了。
 - **总指挥读日志发现的抓手（TASK-013 的起点）**：`target/release/` 下**没有 `scylla_hide.ini`**，运行日志里也无任何读 ini/config 的痕迹，而 `scylla_hide.log` 显示 `Hooking KiUserExceptionDispatcher` 与 `Hooking NtContinue` **都装上了**；对照 vault 参考 ini（`D:/MidaVault/quarantine/20260722/workspace/magicmida-rs/scylla_hide.ini`）那里 `KiUserExceptionDispatcherHook=0`。→ **我们是在无配置状态下注入，ScyllaHide 默认把所有 hook 都装上**，包括跟壳打架的异常分发链。引擎里配置口子其实留着（`antidebug_controller.rs:507` 的 `OracleMode.ini_path`，挂着 `#[allow(dead_code)]`），**留了没接线**。[已验证]
-- **待办**：`tickets/TASK-013.md`（纯离线：把 hook 选择变成可控可记录）→ 之后才值得再申请一格实弹带着受控 ini 重跑。
+- **待办**：~~TASK-013~~ **已完成并验收（2026-08-30，见下块）** → 下一格实弹 TASK-006R4 带受控 ini 重跑（待老板批格 + `C:\Windows` 落位放行）。
+
+**TASK-013 追加（2026-08-30，已验收，总指挥亲验）：配置为何从未被读——ini 查找规则已实证。**
+- `InjectorCLIx64.exe` 用 `GetPrivateProfileStringW` + **裸相对名** `scylla_hide.ini` 读配置，相对名只搜 **Windows 目录**（原生 API 实证：cwd 放同名 ini NOTFOUND、绝对路径命中、Windows 目录命中）。二进制导入表亲验：`GetCurrentDirectoryW` / `SetCurrentDirectoryW` / `SearchPathW` / `GetFullPathNameW` 全部 **0 命中** → 改 cwd、把 ini 放 exe 旁**都没用**。这同时解释了 scratch 目录里与注入器同目录的 ini（两开关=0）为何从未生效——**此前所有实弹（13/13）全部处于"无 ini、全默认 hook"状态**。[已验证]
+- `NtContinueHook` 是真实配置键（二进制 wide 字符串命中 + 两份 vault 参考 ini 均含 `NtContinueHook=0`）。**工单前提修正**：我当初写"参考 ini 里没有这个键"是**读漏了**（总指挥亲验 grep：quarantine 版行 35、Magicmida 版行 13），worker 如实纠正——前提错了，修法未受影响。
+- 已交付：`ini_path` 接线（去 dead_code）+ 日志行 `SCYLLAHIDE_HOOK_CONFIG_SOURCE=` + walker/failure 两个证据 sidecar 新增 `scylla_hide_config_source` 字段 + 受控 ini `D:/MidaVault/lab/config/scylla_hide_no_excdispatch.ini`（与参考基线逐键一致 42/42，异常分发两开关显式 0）。
+- **注意混杂变量（TASK-006R4 设计要点）**：受控 ini 相对"无 ini 全默认"的差异**不止两个开关**，是整套 UncoverEngine profile（约 30 键）。若 R4 走通，归因到具体开关需后续最小差分 ini 变体（另立单）。
+- **受控 ini 生效的唯一路径（授权内）= 实弹前操作员落位 `C:\Windows\scylla_hide.ini`，跑完必须删**。已核验当前 `C:\Windows` 无 scylla/test_profile 残留 ini。
 
 
 ### C-7 text-poll 阶段无 AV 风暴终止机制（引擎结构缺口，TASK-010 发现）[**已修 + 实弹验证通过** —— TASK-011 修 / TASK-012 加固 / TASK-006R2 实弹坐实]
@@ -241,6 +248,11 @@ CI 的 `on.push.branches` 已经把 `oreans/two-sample-mainline` 列为一等分
 `D:\Tools\RE\dumps\gto\启动器.exe` 现在的字节是 `11473d2e6b00d8a7f079e0e2d7eff9cfd0c7134af3c6bd3ca2e600b637895c86`（**GTO 线样品**），而 xiongxiong_duokai 的 manifest `protected_input` / `primary_artifact_sha256` 是 `7800980301207bf2f851d00a50f7f18e0dcd61a0f2b1581ca609ddcc0f2f1ea7`。**两者不是同一个文件。**
 红线机制本身工作正常——"定位符不是身份、必须先解析到 vault 对象再比对 manifest"这条规矩正是为此而立，TASK-006R2 的 worker 照做了，直接从 `D:/MidaVault/objects/sha256/78/78009803…` 加载，身份核验 PASS 后才执行（日志 `Input:` 行可复核）。**但我在工单里照抄那个路径当红线示例，本身就是个坑**：下一个 worker 未必这么小心。
 **规矩**：① 派单红线里**直接写 vault 对象路径 + 期望 sha256**（`D:/MidaVault/objects/sha256/78/78009803…`），不再引用 `启动器.exe`；② 保留"定位符不是身份"这条原则的表述，但把它作为**通则**而非指向某个具体路径；③ 已有工单里的该路径引用，下次修改这些工单时顺手清掉。
+
+### P-7 证据显示串里混入了西里尔同形字母 `hооk`（U+043E）[已验证，2026-08-30 TASK-013 验收时总指挥发现]
+
+TASK-013 落地代码里 "hook" 一词有 6+ 处写成了西里尔 `о`（U+043E）而非 ASCII `o`（`helpers.rs` 的显示串 `"无 ini（ScyllaHide 默认全 hооk）"` 与注释、`antidebug_controller.rs` 的测试断言与断言消息、报告标题同源）。测试内部自洽所以全绿，**但按 ASCII `hook` 去 grep 日志/sidecar 会漏**（`SCYLLAHIDE_HOOK_CONFIG_SOURCE=` 前缀和 `无 ini` 子串仍可 grep，实际影响面小）。
+**规矩**：① 下次任何 worker 获授权碰这三个文件时，顺手把西里尔 о 归一为 ASCII o（含对应测试断言，一处不漏）；② 我以后验收新增用户可见字符串时加一条"纯 ASCII/CJK 检查"。
 
 ### P-5 报告里的 `EXIT=0` 有可能是 grep/findstr 的退出码，不是 cargo 的 [已验证，2026-08-29 TASK-011 验收时发现]
 

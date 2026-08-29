@@ -28,7 +28,7 @@ Windows PE 脱壳研究平台（Rust，221k 行，11 个 crate）。把受保护
 **TASK-006R3 已执行（2026-08-30，1 格，终态 = 路径 C）：换 boot 没换掉故障环 —— 缺陷 A 结构性不可达。**
 新 boot（`01:28:40`）的 ASLR 全变（ntdll `0x7ffa952a0000`→`0x7ff857620000`、debuggee image_base `0x7ff799fc0000`→`0x7ff729430000`），但风暴 RIP **恒等于 ScyllaHide 的 NtContinue hook 地址 +8**（两 boot 各自自洽，偏移都是 ntdll+0x160bd8）。**同一现象在两套完全不同地址下复现 = 实锤：不是 ASLR 运气，是 ScyllaHide 的 NtContinue hook 与壳的异常分发确定性打架。** 累计 **13/13 次跨 3 个 boot**。C-7 再次 2/2 主动中止（AV 恰 1024、20ms、312KB、无产物无残留），但它在 dump 之前，所以缺陷 A 三个证据点仍 0 命中。见 `runs/20260830-TASK-006R3.md`。
 **"重启后重试"这条路已经走到头**：TASK-006R2 时我把它列为"近乎免费的探测"，探测做了，结果阴性，关掉。
-**下一票：TASK-013（纯离线，零实弹，可直接派）** —— 抓手是我这轮读日志发现的：`target/release/` 下**没有 `scylla_hide.ini`**、运行日志无任何读 ini 痕迹，而 `scylla_hide.log` 显示 `Hooking KiUserExceptionDispatcher` 和 `Hooking NtContinue` **都装上了**（vault 参考 ini 里 `KiUserExceptionDispatcherHook=0`）。**我们是在无配置状态下注入，ScyllaHide 默认把所有 hook 都装上**，而引擎里配置口子其实留着没接线（`antidebug_controller.rs:507` 的 `ini_path`，挂着 `#[allow(dead_code)]`）。TASK-013 把 hook 选择变成可控可记录，之后才值得再申请一格实弹带受控 ini 重跑。工单 `tickets/TASK-013.md`。
+**TASK-013 已完成并验收（2026-08-30，零实弹）**：ScyllaHide hook 选择已可控可记录——`ini_path` 接线（去 dead_code）、日志行 `SCYLLAHIDE_HOOK_CONFIG_SOURCE=` + 两个证据 sidecar 新增 `scylla_hide_config_source` 字段、受控 ini 入 vault（`D:/MidaVault/lab/config/scylla_hide_no_excdispatch.ini`，异常分发两开关显式 0）。TASK-013 实证：InjectorCLI 用裸相对名读 ini **只搜 Windows 目录**（cwd/exe 旁都没用）→ 受控 ini 生效的唯一路径是实弹前落位 `C:\Windows\scylla_hide.ini`（跑完必删）。**下一票：TASK-006R4（一格实弹，待老板批）**——带受控 ini 重跑，看 text-poll 能否首次收敛到 dump（缺陷 A 路径 A/B 首次真正可达）。工单 `tickets/TASK-006R4.md`。
 
 
 **TASK-010 已完成（只读调查，定性 (c)）**：C-6 的基址差异与 AV 风暴**无因果**（同基址成败并存），两时段风暴不同型（04:0x = VM 取指环；21:1x = ScyllaHide NtContinue-hook 区故障环）；真正的放大器是引擎缺口 **C-7**——text-poll 阶段无风暴终止（guardless 无条件 Continue + `text_poll_start` 每事件重置致 30s idle 结构上永不触发）。见 `runs/20260829-TASK-010.md`。
@@ -37,7 +37,7 @@ Windows PE 脱壳研究平台（Rust，221k 行，11 个 crate）。把受保护
 **流程新规（P-4）**：产物固化类工单必须含"当场存活探针"——产物写完立即跑一次，非 0/259 即阻塞上报。
 （推送按老板裁定停在本地，等他逐次确认；推送前建议补跑 `cargo deny check advisories`。）
 
-工单顺序（**串行派发，同一时间只派一单**——D-014）：**TASK-013（离线，解锁 text-poll）→ 再申请一格实弹 TASK-006R4（带受控 ini 重跑，验缺陷 A）** → T0.5 续跑 → TASK-007。TASK-005/009/010/011/012 已完成；TASK-006R 首跑已收口（BLOCKED，验证点不可达，实弹 3/4）。**离线侧无待办工单。**
+工单顺序（**串行派发，同一时间只派一单**——D-014）：**TASK-006R4（一格实弹，待老板批格 + `C:\Windows` 落位放行）→ T0.5 续跑 → TASK-007**。TASK-005/009/010/011/012/013 已完成；TASK-006R/R2/R3 已收口（终态均路径 C，实弹 5/4）。**离线侧无待办工单。**
 
 ## 30 秒把它跑起来
 

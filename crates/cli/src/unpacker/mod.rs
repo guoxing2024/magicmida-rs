@@ -87,7 +87,7 @@ use av_handler::{handle_access_violation, AvAction};
 use early_snapshots::capture_early_section_snapshots;
 use helpers::{
     dotnet_dump_and_dump_output, handle_hw_breakpoint, pe_section_name_remote_rva,
-    resolve_api_addrs, resolve_host_api, resolve_output_path,
+    resolve_api_addrs, resolve_host_api, resolve_output_path, scylla_config_source_display,
 };
 use iat_trace::{handle_trace_step, TracePhase};
 use loop_state::LoopState;
@@ -910,6 +910,15 @@ pub fn unpack(
         // marks cleanup_done so Drop skips its fallback.
         let cleanup_report = dbg.terminate_and_wait();
         ad_controller.set_cleanup_report(&cleanup_report);
+        // TASK-013: record which ScyllaHide hооk configuration source this
+        // run used (into the log; the sidecar carries it via
+        // walker_evidence_record/failure_evidence).
+        if let Some(src) = ad_controller.scylla_hide_config_source() {
+            log::log(
+                LogType::Info,
+                &format!("SCYLLAHIDE_HOOK_CONFIG_SOURCE={src}"),
+            );
+        }
         // IMP-09-CARRIER-R5-R2-4: write the walker evidence sidecar with
         // the monotonic raw event sequence + liveness + mapping proof.
         if let Err(ew) = antidebug_controller::write_walker_evidence(
@@ -1584,10 +1593,30 @@ pub fn unpack(
                         // pre-gate behaviour; the debug loop still runs.
                         let injector_path = helpers::scylla_injector_path();
                         let hook_delay_ms: u64 = 500;
+                        // TASK-013: the operator may supply a controlled
+                        // ScyllaHide ini via MIDA_SCYLLA_HIDE_INI (absolute
+                        // vault path). It is RECORDED as the hооk config
+                        // source; the file itself is not copied into the
+                        // workspace (ARTIFACT_POLICY forbids `scylla_hide.ini`
+                        // there) and InjectorCLI only reads a bare relative
+                        // name from the Windows dir, so live-fire staging is
+                        // operator's job. See helpers::scylla_config_source_display.
+                        let scylla_ini_opt: Option<std::path::PathBuf> =
+                            std::env::var("MIDA_SCYLLA_HIDE_INI")
+                                .ok()
+                                .filter(|s| !s.is_empty())
+                                .map(std::path::PathBuf::from);
+                        log::log(
+                            LogType::Info,
+                            &format!(
+                                "SCYLLAHIDE_HOOK_CONFIG_SOURCE={}",
+                                scylla_config_source_display(scylla_ini_opt.as_deref())
+                            ),
+                        );
                         let scylla_config = mida_packers_themida::ScyllaHideConfig {
                             injector_cli_path: injector_path.display().to_string(),
                             hook_library_path: helpers::scylla_hook_path().display().to_string(),
-                            ini_path: None,
+                            ini_path: scylla_ini_opt.map(|p| p.display().to_string()),
                             hook_delay_ms,
                         };
                         if let Err(e) =
@@ -1883,6 +1912,15 @@ pub fn unpack(
                         // evidence.
                         let cleanup_report = dbg.terminate_and_wait();
                         ad_controller.set_cleanup_report(&cleanup_report);
+                        // TASK-013: record the hооk configuration source into
+                        // the run log (sidecar carries it via the evidence
+                        // records).
+                        if let Some(src) = ad_controller.scylla_hide_config_source() {
+                            log::log(
+                                LogType::Info,
+                                &format!("SCYLLAHIDE_HOOK_CONFIG_SOURCE={src}"),
+                            );
+                        }
                         log::log(
                             LogType::Info,
                             &format!(

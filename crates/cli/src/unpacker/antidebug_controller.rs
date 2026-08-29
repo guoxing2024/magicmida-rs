@@ -365,6 +365,9 @@ pub struct AntidebugFailureEvidence {
     pub candidate_mapping: Option<CandidateMappingProofSet>,
     /// IMP-09-CARRIER-R5-R2-1: liveness probe result from the bind window.
     pub liveness_probe: Option<String>,
+    /// TASK-013: which ScyllaHide hооk configuration this run used
+    /// (configured `scylla_hide.ini` path, or "no ini => defaults" marker).
+    pub scylla_hide_config_source: Option<String>,
 }
 
 /// IMP-09-CARRIER-R5-R2-4: one raw walker lifecycle event.
@@ -409,6 +412,11 @@ pub struct WalkerEvidenceRecord {
     /// record is built before teardown — production paths always build
     /// after, so this is Some in evidence).
     pub teardown: Option<crate::unpacker::walker_teardown::WalkerTeardownReport>,
+    /// TASK-013: which ScyllaHide hооk configuration this run used
+    /// (the configured `scylla_hide.ini` path, or the "no ini => defaults"
+    /// marker). Lets every live-fire report tell the hооk config source at a
+    /// glance without having to reverse-engineer it from ScyllaHide's own log.
+    pub scylla_hide_config_source: Option<String>,
 }
 
 /// Outcome of the production walker execute gate (R5-R2-4).
@@ -504,8 +512,14 @@ pub struct OracleMode {
     pub injector_path: std::path::PathBuf,
     /// Path to the ScyllaHide hook library (external vault artifact).
     pub hook_library_path: std::path::PathBuf,
-    /// ScyllaHide `scylla_hide.ini` (external vault artifact; optional).
-    #[allow(dead_code)] // future oracle seam (ADR-7)
+    /// Path to the ScyllaHide `scylla_hide.ini` (external vault artifact;
+    /// optional). TASK-013: wired — the controller records which hооk
+    /// configuration the run used (see [`AntidebugController::scylla_hide_config_source`]).
+    /// Note: InjectorCLI reads the ini via `GetPrivateProfileStringW` with a
+    /// BARE RELATIVE name (Windows-dir-only lookup, see helpers.rs), so
+    /// supplying a path here is a *recorded* intent; actually delivering the
+    /// file to the injector is operator/live-fire staging (ARTIFACT_POLICY
+    /// forbids the workspace from containing `scylla_hide.ini`).
     pub ini_path: Option<std::path::PathBuf>,
 }
 
@@ -972,7 +986,24 @@ impl AntidebugController {
             candidate_mapping: self.candidate_mapping.clone(),
             events: self.walker_events.clone(),
             teardown: self.teardown_report.clone(),
+            scylla_hide_config_source: self.scylla_hide_config_source(),
         }
+    }
+
+    /// TASK-013: the recordable description of the effective ScyllaHide
+    /// hооk configuration source for this run.
+    ///
+    /// - Oracle mode with an ini path => `Some("ini: <path>")`.
+    /// - Otherwise (production, or oracle without ini) => the "no ini =>
+    ///   ScyllaHide defaults" marker (still recorded, so the distinction is
+    ///   explicit in every report).
+    pub fn scylla_hide_config_source(&self) -> Option<String> {
+        let ini = self
+            .options
+            .oracle
+            .as_ref()
+            .and_then(|o| o.ini_path.as_deref());
+        Some(crate::unpacker::helpers::scylla_config_source_display(ini))
     }
     /// IMP-09-CARRIER-R5-R1 P0-1: CSPRNG nonce for the walker session.
     /// Uses RtlGenRandom (SystemFunction036, advapi32) — the documented
@@ -1227,6 +1258,14 @@ impl AntidebugController {
                     oracle.hook_library_path.display(),
                 ),
             );
+            // TASK-013: record the hооk configuration source explicitly so
+            // the run's log shows whether a controlled ini was supplied.
+            if let Some(src) = self.scylla_hide_config_source() {
+                log::log(
+                    LogType::Info,
+                    &format!("SCYLLAHIDE_HOOK_CONFIG_SOURCE={src}"),
+                );
+            }
         }
     }
 
@@ -1607,6 +1646,7 @@ impl AntidebugController {
             walker_events: self.walker_events.clone(),
             candidate_mapping: self.candidate_mapping.clone(),
             liveness_probe: self.liveness_probe.map(|p| p.as_str().to_string()),
+            scylla_hide_config_source: self.scylla_hide_config_source(),
         })
     }
 }
@@ -1898,6 +1938,7 @@ mod tests {
             walker_events: vec![],
             candidate_mapping: None,
             liveness_probe: None,
+            scylla_hide_config_source: None,
         };
         let p = write_failure_evidence(&ev, &temp).unwrap();
         assert!(p.exists());
@@ -1948,6 +1989,7 @@ mod tests {
             walker_events: vec![],
             candidate_mapping: None,
             liveness_probe: None,
+            scylla_hide_config_source: None,
         };
         // blocker is a file: create_dir_all fails -> Err
         let r = write_failure_evidence(&ev, &blocker);
@@ -1981,6 +2023,140 @@ mod tests {
         // Oracle mode still fails closed: no runtime, no proceed.
         assert!(matches!(outcome, AntidebugOutcome::Failed { .. }));
         assert!(c.state().is_failure());
+    }
+
+    #[test]
+    fn scylla_hide_config_source_records_configured_ini_path() {
+        let temp = std::env::temp_dir().join("mida-task013-test-ini-some");
+        let _ = std::fs::remove_dir_all(&temp);
+        let ini =
+            std::path::PathBuf::from("D:\\MidaVault\\lab\\config\\scylla_hide_no_excdispatch.ini");
+        let mut c = AntidebugController::new(AntidebugStageOptions {
+            target_handle: None,
+            sample_id: None,
+            target_pid: 42,
+            evidence_dir: Some(temp.clone()),
+            oracle: Some(OracleMode {
+                injector_path: std::path::PathBuf::from("C:\\vault\\InjectorCLIx64.exe"),
+                hook_library_path: std::path::PathBuf::from("C:\\vault\\HookLibraryx64.dll"),
+                ini_path: Some(ini.clone()),
+            }),
+            cleanup_backend: Some(Box::new(OkCleanup)),
+            runtime_authority: None,
+            runtime_path: None,
+            target_identity: None,
+            profile_identity: None,
+            loader_result: None,
+            walker_dispatch: None,
+            defer_cleanup_to_caller: false,
+        });
+        // TASK-013 acceptance: a configured ini must be recorded as the
+        // config source (the path, not the defaults marker).
+        let src = c
+            .scylla_hide_config_source()
+            .expect("config source must be recorded when ini is supplied");
+        assert!(
+            src.starts_with("ini: "),
+            "expected ini-prefixed source, got: {src}"
+        );
+        assert!(src.contains("scylla_hide_no_excdispatch.ini"));
+        assert!(
+            !src.contains("无 ini"),
+            "configured ini must not render as the defaults marker: {src}"
+        );
+        // Failure evidence carries the same source.
+        let outcome = c.run();
+        let ev = c.failure_evidence(&outcome).unwrap();
+        let src_ev = ev
+            .scylla_hide_config_source
+            .expect("failure evidence must carry config source");
+        assert!(src_ev.starts_with("ini: "));
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn scylla_hide_config_source_marks_defaults_when_no_ini() {
+        let temp = std::env::temp_dir().join("mida-task013-test-ini-none");
+        let _ = std::fs::remove_dir_all(&temp);
+        let mut c = AntidebugController::new(AntidebugStageOptions {
+            target_handle: None,
+            sample_id: None,
+            target_pid: 42,
+            evidence_dir: Some(temp.clone()),
+            oracle: Some(OracleMode {
+                injector_path: std::path::PathBuf::from("C:\\vault\\InjectorCLIx64.exe"),
+                hook_library_path: std::path::PathBuf::from("C:\\vault\\HookLibraryx64.dll"),
+                ini_path: None,
+            }),
+            cleanup_backend: Some(Box::new(OkCleanup)),
+            runtime_authority: None,
+            runtime_path: None,
+            target_identity: None,
+            profile_identity: None,
+            loader_result: None,
+            walker_dispatch: None,
+            defer_cleanup_to_caller: false,
+        });
+        // TASK-013 acceptance: with no ini the run must be recorded as the
+        // explicit defaults marker (NOT a silent empty).
+        let src = c
+            .scylla_hide_config_source()
+            .expect("config source must always be recorded");
+        assert_eq!(src, "无 ini（ScyllaHide 默认全 hооk）");
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn scylla_hide_config_source_distinguishes_ini_vs_defaults_in_evidence() {
+        // Discrimination property: the two recording modes must never
+        // collapse into the same evidence value.
+        let temp = std::env::temp_dir().join("mida-task013-test-ini-disc");
+        let _ = std::fs::remove_dir_all(&temp);
+        let with_ini = std::path::PathBuf::from("C:\\vault\\controlled.ini");
+        let mut c1 = AntidebugController::new(AntidebugStageOptions {
+            target_handle: None,
+            sample_id: None,
+            target_pid: 42,
+            evidence_dir: Some(temp.clone()),
+            oracle: Some(OracleMode {
+                injector_path: std::path::PathBuf::from("C:\\vault\\InjectorCLIx64.exe"),
+                hook_library_path: std::path::PathBuf::from("C:\\vault\\HookLibraryx64.dll"),
+                ini_path: Some(with_ini),
+            }),
+            cleanup_backend: Some(Box::new(OkCleanup)),
+            runtime_authority: None,
+            runtime_path: None,
+            target_identity: None,
+            profile_identity: None,
+            loader_result: None,
+            walker_dispatch: None,
+            defer_cleanup_to_caller: false,
+        });
+        let mut c2 = AntidebugController::new(AntidebugStageOptions {
+            target_handle: None,
+            sample_id: None,
+            target_pid: 42,
+            evidence_dir: Some(temp.clone()),
+            oracle: Some(OracleMode {
+                injector_path: std::path::PathBuf::from("C:\\vault\\InjectorCLIx64.exe"),
+                hook_library_path: std::path::PathBuf::from("C:\\vault\\HookLibraryx64.dll"),
+                ini_path: None,
+            }),
+            cleanup_backend: Some(Box::new(OkCleanup)),
+            runtime_authority: None,
+            runtime_path: None,
+            target_identity: None,
+            profile_identity: None,
+            loader_result: None,
+            walker_dispatch: None,
+            defer_cleanup_to_caller: false,
+        });
+        let o1 = c1.run();
+        let o2 = c2.run();
+        let e1 = c1.failure_evidence(&o1).unwrap();
+        let e2 = c2.failure_evidence(&o2).unwrap();
+        assert_ne!(e1.scylla_hide_config_source, e2.scylla_hide_config_source);
+        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[test]
@@ -2956,6 +3132,7 @@ mod tests {
                 walker_status_raw: None,
             }],
             teardown: None,
+            scylla_hide_config_source: Some("无 ini（ScyllaHide 默认全 hооk）".to_string()),
         };
         let p = write_walker_evidence(&rec, &temp).unwrap();
         assert!(p.is_file());

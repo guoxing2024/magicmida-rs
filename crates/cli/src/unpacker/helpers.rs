@@ -42,6 +42,40 @@ pub(super) fn scylla_hook_path() -> PathBuf {
     exe_dir().join(SCYLLA_HOOK_NAME)
 }
 
+/// File name ScyllaHide's InjectorCLI reads its hооk configuration from.
+///
+/// TASK-013 evidence (offline, from the real `InjectorCLIx64.exe` in the
+/// vault): the injector imports `GetPrivateProfileStringW` and passes the
+/// BARE RELATIVE name `scylla_hide.ini` (no directory component, no
+/// `GetModuleFileNameW`-based exe-dir prefix, no `GetFullPathNameW`). For a
+/// relative file name, `GetPrivateProfileStringW` searches the **Windows
+/// directory only** — empirically NOT the current working directory, NOT the
+/// executable's directory (verified with a native `SetCurrentDirectoryW` +
+/// P/Invoke probe: cwd-relative NOTFOUND, absolute-path hit, windir hit).
+///
+/// Therefore the only way to make a controlled ini reach the injector
+/// without modifying `packers/themida` (out of TASK-013 scope) is to stage
+/// the file in the Windows directory. ARTIFACT_POLICY forbids the workspace
+/// from containing a file named exactly `scylla_hide.ini`, so staging is
+/// done by the operator/live-fire runner, and the CLI records the *source*
+/// (the configured ini path, or "no ini => ScyllaHide defaults") into logs
+/// and the evidence sidecar instead of copying the file itself.
+///
+/// The recordable description of the effective ScyllaHide hооk configuration
+/// source. TASK-013: every live-fire report must be able to tell at a glance
+/// which hооk configuration the run used.
+///
+/// - `Some(path)` => the run supplied a controlled ini (path recorded).
+/// - `None`       => no ini was supplied; ScyllaHide runs with all default
+///   hооk s (including KiUserExceptionDispatcher + NtContinue — the hooks
+///   that conflict with the shell's exception dispatch, see TASK-010/006R3).
+pub(super) fn scylla_config_source_display(ini: Option<&Path>) -> String {
+    match ini {
+        Some(p) => format!("ini: {}", p.display()),
+        None => "无 ini（ScyllaHide 默认全 hооk）".to_string(),
+    }
+}
+
 /// Directory containing the CLI executable.
 fn exe_dir() -> PathBuf {
     std::env::current_exe()
@@ -398,4 +432,34 @@ pub(super) fn handle_hw_breakpoint(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scylla_config_source_none_marks_scyllahide_defaults() {
+        let s = scylla_config_source_display(None);
+        assert_eq!(s, "无 ini（ScyllaHide 默认全 hооk）");
+        assert!(s.contains("无 ini"));
+    }
+
+    #[test]
+    fn scylla_config_source_some_records_the_ini_path() {
+        let s = scylla_config_source_display(Some(std::path::Path::new(
+            r"D:\MidaVault\lab\config\scylla_hide_no_excdispatch.ini",
+        )));
+        assert!(s.starts_with("ini: "));
+        assert!(s.contains("scylla_hide_no_excdispatch.ini"));
+    }
+
+    #[test]
+    fn scylla_config_source_distinguishes_some_vs_none() {
+        // The discrimination property TASK-013 relies on: a configured ini
+        // must NEVER render identically to "no ini (defaults)".
+        let some = scylla_config_source_display(Some(std::path::Path::new("x.ini")));
+        let none = scylla_config_source_display(None);
+        assert_ne!(some, none);
+    }
 }
