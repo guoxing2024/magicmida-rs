@@ -148,6 +148,17 @@ pub fn print_help() {
     println!("  /unpack <file> [options]           Themida-oriented unpack");
     println!("  /generic-unpack <file> [options]   Packer-agnostic full dump (no shrink)");
     println!("  /dump-process <pid> <file> [--module=<name>]  Dump .text from running process (optionally a loaded module)");
+    println!("  /rebase-fixed <input> <output> --old-base=<0x..> --new-base=<0x..>");
+    println!(
+        "                                  Rebase absolute pointers frozen to an old image base"
+    );
+    println!("  /session-clean <input> --old-table=<path> --new-table=<path> [--output=<path>] [--report=<path>]");
+    println!(
+        "                                  Rewrite an old-session PE artifact against the current"
+    );
+    println!(
+        "                                  session's module table (consume .session_modules.json)"
+    );
     println!("  /verify <unpacked> <ref>           Verify against reference");
     println!("  /offline-preflight <dir> [options] Emit runner-config envelope and run the");
     println!("                                    independent offline preflight gate");

@@ -5482,3 +5482,97 @@ mod transform_manifest_tests {
         assert_eq!(calls3.load(Ordering::SeqCst), 1);
     }
 }
+
+#[cfg(test)]
+mod session_sidecar_round_trip_tests {
+    use super::*;
+
+    fn temp(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mida_ssc_{}_{}_{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Minimal DumpOptions that only exercises the sidecar writer.
+    fn opts_for(output_path: std::path::PathBuf) -> DumpOptions {
+        DumpOptions {
+            image_base: 0x140_0000_00,
+            entry_point: 0x1000,
+            fix_imports: false,
+            create_data_sections: false,
+            shrink: false,
+            output_path,
+            iat_location: None,
+            additional_iat_locations: Vec::new(),
+            executable_path: None,
+            early_section_snapshots: Vec::new(),
+            container_restore: crate::ContainerRestoreMode::Off,
+            profile: crate::DumpProfile::OreansClassic,
+            security_cookie_rva: None,
+            security_cookie_complement_rva: None,
+            pure_rebuild: false,
+            dump_timing: crate::DumpTiming::Immediate,
+            section_content_reference: None,
+            capture_policy: crate::DumpCapturePolicy::default(),
+            keep_runtime_base: false,
+        }
+    }
+
+    #[test]
+    fn persist_sidecar_round_trips_through_parse_session_table() {
+        // The T0.7 writer (persist_session_modules_sidecar) and the T0.11
+        // consumer reader (parse_session_table) must agree on the
+        // mida.session-modules/v1 schema: what the dump pipeline archives,
+        // the sidecar consumer must read back identically. This test drives
+        // the REAL writer to a temp file, then the REAL reader, and asserts
+        // the entries round-trip (name/base/end) unchanged.
+        let dir = temp("roundtrip");
+        let candidate = dir.join("candidate.exe");
+        let session_modules: Vec<(String, u64, u64)> = vec![
+            ("ntdll.dll".to_string(), 0x7ffe_eb32_0000, 0x7ffe_eb58_6000),
+            (
+                "kernel32.dll".to_string(),
+                0x7ffa_952a_0000,
+                0x7ffa_9537_0000,
+            ),
+            ("urlmon.dll".to_string(), 0x7ff9_f100_0000, 0x7ff9_f140_0000),
+            ("".to_string(), 0x7ffe_e950_0000, 0x7ffe_e951_0000),
+        ];
+        let candidate_bytes = b"candidate image bytes";
+        persist_session_modules_sidecar(
+            &opts_for(candidate.clone()),
+            candidate_bytes,
+            &session_modules,
+        );
+
+        let sidecar = candidate.with_extension("session_modules.json");
+        assert!(sidecar.is_file(), "sidecar written next to candidate");
+        let text = std::fs::read_to_string(&sidecar).unwrap();
+        let parsed = super::super::sidecar_consumer::parse_session_table(&text)
+            .expect("reader parses the writer's JSON");
+
+        // Same entry count; every (name, base, end) round-trips.
+        assert_eq!(parsed.len(), session_modules.len());
+        for (got, want) in parsed.iter().zip(session_modules.iter()) {
+            assert_eq!(got.name, want.0);
+            assert_eq!(got.base, want.1);
+            assert_eq!(got.end, want.2);
+        }
+        // The writer's candidate digest is present and correct.
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["schema_version"], "mida.session-modules/v1");
+        assert_eq!(
+            value["candidate_sha256"],
+            candidate_sha256_hex(candidate_bytes)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

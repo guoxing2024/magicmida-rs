@@ -534,4 +534,182 @@ mod tests {
         assert_eq!(stats.cleared, 0);
         assert_eq!(buf, original, "cleanup must not touch non-data bytes");
     }
+
+    // -----------------------------------------------------------------------
+    // T0.7 end-to-end offline closure: build a synthetic PE with a writable
+    // .data section, drive the full serialize → cleanup_artifact chain against
+    // two ASLR-differing session tables, and assert the artifact no longer
+    // embeds any pointer inside an old-session module range.
+    // -----------------------------------------------------------------------
+
+    const OLD_KERNEL32: u64 = 0x7ffe_e000_0000;
+    const OLD_KERNEL32_END: u64 = OLD_KERNEL32 + 0x40_0000;
+    const NEW_KERNEL32: u64 = 0x7ffa_9100_0000;
+    const NEW_KERNEL32_END: u64 = NEW_KERNEL32 + 0x40_0000;
+
+    /// Minimal PE32+ with two sections (.text executable at file offset
+    /// 0x200, .data writable at file offset 0x400). Each section's
+    /// VirtualAddress is set equal to its PointerToRawData so cleanup's
+    /// `buf[section.virtual_address..+virtual_size]` slice lands on the raw
+    /// bytes (real dumps keep RVA == raw offset for data sections). Headers
+    /// occupy 0x200 bytes; .text raw data sits at file offset 0x200 (0x200
+    /// bytes); .data raw data sits at file offset 0x400 (0x1000 bytes).
+    /// Returns the full file image.
+    fn synthetic_pe_with_data() -> Vec<u8> {
+        let mut buf = vec![0u8; 0x400 + 0x1000]; // headers + .text raw + .data raw
+        buf[0] = 0x4D; // 'M'
+        buf[1] = 0x5A; // 'Z'
+        buf[60..64].copy_from_slice(&0x40u32.to_le_bytes()); // e_lfanew
+        let nt = 0x40usize;
+        buf[nt..nt + 4].copy_from_slice(b"PE\0\0");
+        let fh = nt + 4;
+        buf[fh..fh + 2].copy_from_slice(&0x8664u16.to_le_bytes()); // machine AMD64
+        buf[fh + 2..fh + 4].copy_from_slice(&2u16.to_le_bytes()); // NumberOfSections
+        buf[fh + 16..fh + 18].copy_from_slice(&0xF0u16.to_le_bytes()); // SizeOfOptionalHeader
+        buf[fh + 18..fh + 20].copy_from_slice(&0x22u16.to_le_bytes()); // Characteristics
+        let oh = nt + 24;
+        buf[oh..oh + 2].copy_from_slice(&0x20Bu16.to_le_bytes()); // PE32+ magic
+        buf[oh + 16..oh + 18].copy_from_slice(&0x1000u16.to_le_bytes()); // AddressOfEntryPoint
+        buf[oh + 24..oh + 32].copy_from_slice(&0x140_0000_00u64.to_le_bytes()); // ImageBase
+        buf[oh + 32..oh + 36].copy_from_slice(&0x1000u32.to_le_bytes()); // SectionAlignment
+        buf[oh + 36..oh + 40].copy_from_slice(&0x200u32.to_le_bytes()); // FileAlignment
+        buf[oh + 56..oh + 60].copy_from_slice(&0x4000u32.to_le_bytes()); // SizeOfImage
+        buf[oh + 60..oh + 64].copy_from_slice(&0x200u32.to_le_bytes()); // SizeOfHeaders
+        buf[oh + 108..oh + 112].copy_from_slice(&16u32.to_le_bytes()); // NumberOfRvaAndSizes
+                                                                       // Section 1: .text — VA == raw offset 0x200.
+        let s1 = nt + 24 + 240;
+        buf[s1..s1 + 8].copy_from_slice(b".text\0\0\0");
+        buf[s1 + 8..s1 + 12].copy_from_slice(&0x200u32.to_le_bytes()); // VirtualSize
+        buf[s1 + 12..s1 + 16].copy_from_slice(&0x200u32.to_le_bytes()); // VirtualAddress
+        buf[s1 + 16..s1 + 20].copy_from_slice(&0x200u32.to_le_bytes()); // SizeOfRawData
+        buf[s1 + 20..s1 + 24].copy_from_slice(&0x200u32.to_le_bytes()); // PointerToRawData
+        buf[s1 + 36..s1 + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes()); // READ|EXEC|CODE
+                                                                              // Section 2: .data — VA == raw offset 0x400.
+        let s2 = s1 + 40;
+        buf[s2..s2 + 8].copy_from_slice(b".data\0\0\0");
+        buf[s2 + 8..s2 + 12].copy_from_slice(&0x1000u32.to_le_bytes()); // VirtualSize
+        buf[s2 + 12..s2 + 16].copy_from_slice(&0x400u32.to_le_bytes()); // VirtualAddress
+        buf[s2 + 16..s2 + 20].copy_from_slice(&0x1000u32.to_le_bytes()); // SizeOfRawData
+        buf[s2 + 20..s2 + 24].copy_from_slice(&0x400u32.to_le_bytes()); // PointerToRawData
+        buf[s2 + 36..s2 + 40].copy_from_slice(&0xC000_0040u32.to_le_bytes()); // READ|WRITE|INIT
+        buf
+    }
+
+    /// Old-session table matching the synthetic PE's embedded pointers: ntdll
+    /// and kernel32 at their old ASLR bases, plus an unnamed high-ASLR range.
+    fn e2e_old_table() -> Vec<SessionTableEntry> {
+        vec![
+            entry("ntdll.dll", OLD_NTDLL, OLD_NTDLL_END),
+            entry("kernel32.dll", OLD_KERNEL32, OLD_KERNEL32_END),
+            entry("", 0x7ffe_e950_0000, 0x7ffe_e950_0000 + 0x1_0000),
+        ]
+    }
+
+    /// Current-session table: same module names at new ASLR bases.
+    fn e2e_new_table() -> Vec<SessionTableEntry> {
+        vec![
+            entry("ntdll.dll", NEW_NTDLL, NEW_NTDLL_END),
+            entry("kernel32.dll", NEW_KERNEL32, NEW_KERNEL32_END),
+        ]
+    }
+
+    #[test]
+    fn e2e_cleanup_relocates_old_session_pointers_and_leaves_none_behind() {
+        // Build the synthetic artifact with 4 embedded absolute pointers in
+        // .data (file offset 0x400):
+        //   +0x00 old-ntdll  ptr (named → relocate)
+        //   +0x08 old-kernel32 ptr (named → relocate)
+        //   +0x10 unnamed old range ptr (→ zero)
+        //   +0x18 old-ntdll offset that overflows new module end (→ zero)
+        let mut artifact = synthetic_pe_with_data();
+        let data_off = 0x400usize;
+        let stale_ntdll = OLD_NTDLL + 0x10_6390;
+        let stale_kernel32 = OLD_KERNEL32 + 0x1234;
+        let unnamed_ptr: u64 = 0x7ffe_e950_0000 + 0x2000;
+        let too_far_kernel32: u64 = OLD_KERNEL32 + 0x20_0000; // inside old kernel32 range
+        artifact[data_off..data_off + 8].copy_from_slice(&stale_ntdll.to_le_bytes());
+        artifact[data_off + 8..data_off + 16].copy_from_slice(&stale_kernel32.to_le_bytes());
+        artifact[data_off + 16..data_off + 24].copy_from_slice(&unnamed_ptr.to_le_bytes());
+        artifact[data_off + 24..data_off + 32].copy_from_slice(&too_far_kernel32.to_le_bytes());
+
+        // Serialize both tables with the exact writer schema (same JSON
+        // contract persist_session_modules_sidecar uses), then parse them back
+        // through the consumer's reader. The new kernel32 is SMALLER than the
+        // old one so an intra-old-range offset can fall outside the new range
+        // and must be zeroed (relocate_to_current refuses out-of-range targets).
+        let mut new_table = e2e_new_table();
+        let small_kernel32_end = NEW_KERNEL32 + 0x10_0000;
+        for e in new_table.iter_mut() {
+            if e.name == "kernel32.dll" {
+                e.end = small_kernel32_end;
+            }
+        }
+        let old_text = serialize_session_table(&e2e_old_table(), Some("deadbeef"))
+            .expect("old table serializes");
+        let new_text =
+            serialize_session_table(&new_table, Some("cafebabe")).expect("new table serializes");
+        let old = parse_session_table(&old_text).expect("old table parses");
+        let new = parse_session_table(&new_text).expect("new table parses");
+
+        let pe = PeHeader::from_bytes(&artifact).expect("synthetic PE parses");
+        let stats = cleanup_artifact(&pe, &mut artifact, &old, &new);
+
+        // Named modules relocated to current base + same intra-module offset.
+        let relocated_ntdll = NEW_NTDLL + 0x10_6390;
+        let relocated_kernel32 = NEW_KERNEL32 + 0x1234;
+        assert_eq!(read_qword(&artifact, data_off), relocated_ntdll);
+        assert_eq!(read_qword(&artifact, data_off + 8), relocated_kernel32);
+        // Unnamed and unmappable → zeroed.
+        assert_eq!(read_qword(&artifact, data_off + 16), 0);
+        assert_eq!(read_qword(&artifact, data_off + 24), 0);
+
+        // Counters match actual rewrites.
+        assert_eq!(stats.relocated, 2);
+        assert_eq!(stats.cleared, 2);
+        assert_eq!(stats.preserved_image, 0);
+        assert_eq!(stats.untouched_high, 0);
+        // .data has 0x1000 bytes = 512 QWORDs; 4 carry our planted pointers,
+        // the remaining 508 are zero (low band) → preserved as untouched_low.
+        assert_eq!(stats.untouched_low, 508);
+
+        // Static self-check: no absolute pointer in the artifact falls inside
+        // any old-session module range anymore.
+        let data_end = data_off + 0x1000;
+        let mut off = data_off;
+        while off + 8 <= data_end {
+            let v = read_qword(&artifact, off);
+            if v >= HIGH_ASLR_MODULE_MIN {
+                for e in &old {
+                    assert!(
+                        !(e.base <= v && v < e.end),
+                        "stale old-session pointer {v:#x} survives at file offset {off:#x}"
+                    );
+                }
+            }
+            off += 8;
+        }
+    }
+
+    #[test]
+    fn e2e_cleanup_scan_only_reports_without_rewrite() {
+        // With an empty old table (no stale session known), cleanup must not
+        // touch the artifact: the high-ASLR pointers survive for rebase and
+        // every counter stays zero (mirrors data_reinit's no-table contract).
+        let mut artifact = synthetic_pe_with_data();
+        let data_off = 0x400usize;
+        let stale_ntdll = OLD_NTDLL + 0x10_6390;
+        artifact[data_off..data_off + 8].copy_from_slice(&stale_ntdll.to_le_bytes());
+        let original = artifact.clone();
+
+        let pe = PeHeader::from_bytes(&artifact).expect("synthetic PE parses");
+        let stats = cleanup_artifact(&pe, &mut artifact, &[], &e2e_new_table());
+        assert_eq!(stats.relocated, 0);
+        assert_eq!(stats.cleared, 0);
+        assert_eq!(stats.untouched_high, 1);
+        assert_eq!(artifact, original, "no-table scan must be a no-op");
+    }
+
+    fn read_qword(buf: &[u8], off: usize) -> u64 {
+        u64::from_le_bytes(buf[off..off + 8].try_into().unwrap_or_default())
+    }
 }
