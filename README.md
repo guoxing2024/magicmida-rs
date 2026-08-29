@@ -10,9 +10,12 @@ historical output, including the Origin macro oracle candidate, is regression
 input only and is never proof that a new output is correct.
 
 Strategically, the primary long-term target is `gto_launcher`
-(`D:\Tools\RE\dumps\gto\启动器.exe`). The Oreans `origin_macro` +
-`lunlun_software` pair remains the active regression gate, but GTO is now a
-first-class support line, not a side quest.
+(`D:\Tools\RE\dumps\gto\启动器.exe`), now pursued as the **GVM-0
+anti-virtualization campaign** (ruling 2026-08-28). The Oreans
+`origin_macro` + `lunlun_software` pair remains the active regression gate,
+and the closed `xiongxiong_duokai` rev2 campaign (2026-08-28) is the
+WinLicense-tier reference; GTO remains a first-class support line, not a side
+quest.
 
 ### Mutable GTO acquisition path (mandatory)
 
@@ -70,24 +73,47 @@ do not imply that those boundaries have already been achieved.
 
 ### Current sample lines
 
-The repository now has two explicit sample tracks:
+The repository's active sample tracks are:
 
-- **Primary strategic line:** `gto_launcher`
-  (`D:\Tools\RE\dumps\gto\启动器.exe`), with manifest
-  `lab/cases/v2/gto_launcher.json`.
+- **Completed campaign:** `xiongxiong_duokai` (熊熊 rev2, WinLicense tier)
+  — perfect-unpack campaign **closed 2026-08-28** (S1 structural 12/12, S2
+  plaintext .text 100%, S3 load_no_crash 10/10, S4 behavior alignment). See
+  [AUTHORIZATION_XX_20260827.md](AUTHORIZATION_XX_20260827.md).
+- **Perfect candidate (XC-XXI/XXI-B, 2026-08-29):** `xiongxiong_core`
+  (core.dll) — the WinLicense-DLL companion of the above, **independently
+  characterized per the 2026-08-28 XC owner directive** (identity from its own
+  features; manifest family `unclassified_candidate`, `oreans_candidate` kept
+  as hypothesis). XX-III delivered an equivalence-grade candidate; the
+  **XC-XXI/XXI-B campaigns upgraded it to a perfect candidate**
+  (`core_perfect_candidate.dll`, sha256 `3650ea6c…`): VM mechanism confirmed
+  as **runtime-decrypt-materializes** (path A, no interpreter), S1 12/12, S2
+  plaintext 100%, S3 load_no_crash 6/6, S4 GetAppVersion×10 equivalent;
+  **Run business chain FULL but download call not actually fired (GUI
+  message-loop bound, deny_all kept) → Run verdict PARTIAL**. See
+  [AUTHORIZATION_XX_20260827.md](AUTHORIZATION_XX_20260827.md) (XC section),
+  [docs/XX21B_CORE_PERFECT_REPORT_20260829.md](docs/XX21B_CORE_PERFECT_REPORT_20260829.md).
 - **Active regression gate:** `origin_macro` + `lunlun_software`, with fixed
   identities and fail-closed gates documented in
   [archive/routes/OREANS_TWO_SAMPLE_PERFECT_UNPACK_PLAN.md](archive/routes/OREANS_TWO_SAMPLE_PERFECT_UNPACK_PLAN.md).
+- **Primary strategic line:** `gto_launcher`, now as the **anti-virtualization
+  campaign (GVM-0, ruling 2026-08-28)** — VM semantics recovery, lifter, and
+  whole-image devirtualization in three gated phases. See
+  [docs/GVM-0_RULING_20260828.md](docs/GVM-0_RULING_20260828.md).
 
-A structural `Accepted`, historical oracle match, Shiguang server/icon patch,
-GTO holdout result, or retry-selected replay is not proof of perfect unpacking
-for any line. The gate remains open until each declared line passes the
-relevant OEP, IAT, TLS, relocation, section rebuild, behavior equivalence, and
-10 consecutive isolated-run requirements. The evidence-bundle inventory contract
-that makes a run record auditable is defined in
+**Retired sample lines:** `shiguang` and `dali` (and any other legacy tracks
+from before the XX campaign) are **withdrawn** — they are no longer active
+sample lines and are not acceptance gates. Their historical manifests/evidence
+stay in the repository as archive only.
+
+A structural `Accepted`, historical oracle match, GTO holdout result, or
+retry-selected replay is not proof of perfect unpacking for any line. The gate
+remains open until each declared line passes the relevant OEP, IAT, TLS,
+relocation, section rebuild, behavior equivalence, and 10 consecutive isolated-
+run requirements. The evidence-bundle inventory contract that makes a run
+record auditable is defined in
 [docs/VNEXT_EVIDENCE_BUNDLE_V1.md](docs/VNEXT_EVIDENCE_BUNDLE_V1.md).
-**Current status: not closed; this README makes no claim of perfect or
-universal unpacking.**
+**Current status: not closed for the open lines; this README makes no claim of
+perfect or universal unpacking beyond the closed XX campaigns.**
 
 ### GTO default entry (G0) and shared mainline skeleton (G1)
 
@@ -249,12 +275,59 @@ This is NOT a claim of perfect/universal unpacking — see Release rule below.
 The GTO line remains an experimental research line with honest graded
 wording (suspected-SecureEngine-class, Themida version unverified).
 
+## XX campaign closeout — xiongxiong_duokai rev2 (2026-08-28)
+
+The `xiongxiong_duokai` rev2 (WinLicense tier) perfect-unpack campaign is
+**CLOSED** (AUTHORIZATION-XX-FULL terminal sign-off, 2026-08-28). All four
+criteria verified against the anchored candidate
+(`rev2_unpacked.exe`, attempt 20260828-112236):
+
+- **S1 structural R0B:** 12/12 PASS;
+- **S2 plaintext:** `.text` 100% readable (222/222 blocks ent<6.5, 2688
+  prologues, OEP=0x1010 native MSVC CRT, shell sections stripped);
+- **S3 survival:** load_no_crash 10/10 (isolated runs, no retry-picked);
+- **S4 behavior alignment:** window title / module set / `config.ini`
+  byte-identical, no disclosed behavioral differences.
+
+Per the authorization, the campaign then transitions to the GTO launcher
+campaign (next section). This closeout is a claim about this one case line
+only, not a general "universal/perfect" label.
+
+## GVM-0 anti-virtualization campaign (2026-08-28)
+
+Ruling `docs/GVM-0_RULING_20260828.md` (owner-signed 2026-08-28) opens the
+**GTO anti-virtualization campaign** on vault-anchored sample `11473d2e…`:
+
+- **Direction:** the GTO dump route stays TERMINAL; the campaign does not
+  retry it. The bet is **VM semantics recovery**: the protector is
+  suspected-SecureEngine-class and owns execution, so the new line recovers
+  the VM interpreter/handlers and rebuilds a native image instead of dumping.
+- **Authorization extension:** protection-semantics reverse engineering
+  (VM interpreter + handler semantics, bytecode format, data-plane decryption
+  triggers) is unblocked for the anchored sample, isolation-only, outputs
+  vaulted (`D:/MidaVault/lab/evidence/gvm/`), NO_BYPASS=1 throughout.
+- **Three gated phases (ledger GVM 0/8):**
+  1. Phase 1 — `0x3d610` mapping: dispatcher semantics, handler inventory,
+     bytecode format, data-plane decryption schedule (2-4 wks; gate: self-
+     consistent ISA spec, 3-function manual push-down vs trace);
+  2. Phase 2 — Lifter: VM bytecode → IR → compilable native (3-6 wks; gate:
+     end-to-end devirt of `0x3d610` with trace-equivalent semantics);
+  3. Phase 3 — whole-image devirtualization + native rebuild (4-8 wks; gate:
+     S1-S4 full acceptance per 熊熊 standard).
+- **Honest risk disclosure:** B1 is the hardest of the three paths (gate 1
+  pass ~60-70%, full-path ~40-50%); Phase 1 outputs (ISA spec) are valuable
+  regardless of gate outcome.
+
+The Oreans fixed two-sample regression wall stays green during this work.
+
 ## Long-term plan
 
-1. Make `gto_launcher` a first-class product path with a dedicated replay and
-   evidence bundle, not just an experimental profile.
+1. Execute the **GVM-0 anti-virtualization campaign** on `gto_launcher`
+   (VM semantics recovery → lifter → whole-image devirtualization) through its
+   gated phases, with the GTO dump route kept TERMINAL and never retried.
 2. Keep `origin_macro` + `lunlun_software` as the regression wall so GTO work
-   cannot quietly break the Oreans baseline.
+   cannot quietly break the Oreans baseline; the closed `xiongxiong_duokai`
+   rev2 campaign remains the WinLicense-tier reference (S1-S4 criteria).
 3. Finish runtime/event and family-plugin separation so GTO and Oreans share
    the engine but not the policy.
 4. Keep structured OEP, IAT, TLS, relocation, section rebuild, and behavior
@@ -266,8 +339,10 @@ wording (suspected-SecureEngine-class, Themida version unverified).
 "Universal" and "perfect" are goals, not status labels. A production release
 requires an independent acceptance kernel, deterministic replay evidence,
 holdout cases, and at least two production-quality packer-family plugins. The
-GTO launcher line must be first-class, and the Oreans suite must still pass ten
-consecutive isolated runs before it can satisfy its family gate.
+GTO launcher line must pass its anti-virtualization campaign gates, and the
+Oreans suite must still pass ten consecutive isolated runs before it can
+satisfy its family gate. The `xiongxiong_duokai` rev2 closeout is a
+single-case milestone, not a release.
 
 ## License
 

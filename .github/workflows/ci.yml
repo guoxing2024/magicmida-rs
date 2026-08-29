@@ -30,6 +30,10 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
 
+      - name: Hard-coding gate (general-purpose policy)
+        shell: powershell
+        run: python tools\_hardcode_scan.py --gate
+
       - name: Artifact policy hygiene
         shell: powershell
         run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/verify_workspace_hygiene.ps1

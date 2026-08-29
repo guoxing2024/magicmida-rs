@@ -49,6 +49,14 @@ claims.
 
 ## Delivery sequence
 
+> **Status note (2026-08-29):** The `gto_launcher` line is now governed by the
+> owner-signed **GVM-0 anti-virtualization campaign** (2026-08-28,
+> [GVM-0_RULING_20260828.md](GVM-0_RULING_20260828.md)): VM semantics recovery
+> → lifter → whole-image devirtualization, three gated phases, dump route stays
+> TERMINAL. The `xiongxiong_duokai` rev2 (WinLicense) perfect-unpack campaign
+> closed 2026-08-28 (S1-S4). The R0B-R4 sequence below remains the engine/
+> architecture contract and is not replaced by those campaigns.
+
 1. `VNEXT-R0B`: build the independent acceptance kernel
    ([ACCEPTANCE_CONTRACT.md](ACCEPTANCE_CONTRACT.md); crate `mida-acceptance`).
 2. `VNEXT-R1`: extract a pure PE model and rebuild pipeline

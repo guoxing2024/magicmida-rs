@@ -14,6 +14,14 @@
 > "R4 候选 / 未来第二族 / 非主线"的旧措辞，均按此定位解读：GTO 不再是附属支线，
 > 但 Oreans 回归门契约本身（本文 §4、[OREANS_TWO_SAMPLE_PERFECT_UNPACK_PLAN.md](OREANS_TWO_SAMPLE_PERFECT_UNPACK_PLAN.md)）不因此放宽。
 
+> **战略定位更新（2026-08-29 补注）：** 目标已进一步演进——
+> ① `xiongxiong_duokai`（熊熊 rev2，WinLicense 族）**完美脱壳战役已收官**
+> （2026-08-28，S1-S4 全过，见 [AUTHORIZATION_XX_20260827.md](../AUTHORIZATION_XX_20260827.md)）；
+> ② `gto_launcher` 主攻线已由 owner 裁决立项 **GVM-0 反虚拟化战役**
+> （2026-08-28，[GVM-0_RULING_20260828.md](GVM-0_RULING_20260828.md)）：
+> GTO dump 路线维持 TERMINAL 不翻案，新线走 VM 语义还原 + lifter + 整机反虚拟化
+> （三阶段门禁制，账本 GVM 0/8）。README 已同步（三条样品线）。
+
 **审计日期:** 2026-07-24（无人值守计划 + host thin-split 续；文首状态已纠偏）  
 **基线分支:** `baseline/legacy-recovery-20260722`  
 **HEAD:** 见 `git log -1`；纠偏序 [COURSE_CORRECTION_WORK_ORDER.md](COURSE_CORRECTION_WORK_ORDER.md)  
