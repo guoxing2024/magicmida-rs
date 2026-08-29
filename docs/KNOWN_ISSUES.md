@@ -127,7 +127,8 @@ WO-24 于 2026-08-27（提交 `607276d`）锁定 `_clippy_baseline`（TOTAL=349�
 **当初为什么会这样**：partial-accept 链路（`iat_partial_accept.rs`）设计上允许部分接受，但没有区分"可安全部分接受"与"启动路径上的必崩指针"。
 **修复（TASK-009，2026-08-29 验收通过）**：兜底清零（`zero_fill_iat_region`：IAT span 未重建槽整段清零，honest hole）+ fail-closed 门（`call_sites_targeting_slots`：存在直接 call/jmp 指向不可解析槽 → `Err` 拒绝写出，`[GOOD]` 不再打印）。**修复验证级别 = 离线**（单元级缺陷几何 +7 用例、判别力探针红→绿）；`bb5ee568` 上的实弹替换验证留待 TASK-006 复跑（消耗实弹格，另行授权）。
 **注意**：C-5（会话绑定 B）未修，与本项独立——修好 A 产物才能在当前会话活，修好 B 才能跨重启活。
-**实弹验证状态：仍不可达（2 次尝试，2 次都没跑到）**。TASK-006R（9/9）与 TASK-006R2（2/2）都在 dump **之前**的 text-poll 阶段结束——首跑烧到外部超时，本跑由 C-7 主动 fail-closed 中止。两次的 `zero-filled IAT region` / `TASK-009 fail-closed` / `[GOOD] Candidate written` 三个证据点**都是 0 命中**。**这既不证实也不证伪修复**（"没跑到 dump"无法说明 dump 门是否生效）。要验它必须先有一次 text-poll 能收敛的会话 —— 本 boot（BootTime `2026-08-29 07:58:23`）下 11/11 次全部撞同一个 ntdll hook 故障环，确定性不收敛，所以**下一次尝试必须在重启之后**。
+**实弹验证状态：结构性不可达（3 次工单、跨 3 个 boot、13/13 次都没跑到）**。TASK-006R（9/9）、TASK-006R2（2/2）、TASK-006R3（2/2，**已换 boot**）全部在 dump **之前**的 text-poll 阶段结束——首跑烧到外部超时，后两次由 C-7 主动 fail-closed 中止（20ms 级）。三次的 `zero-filled IAT region` / `TASK-009 fail-closed` / `[GOOD] Candidate written` 三个证据点**都是 0 命中**。**这既不证实也不证伪修复**（"没跑到 dump"无法说明 dump 门是否生效）。
+**阻塞点已定位到 C-6 的 ScyllaHide NtContinue-hook 故障环**（换 boot 后仍确定性复现，风暴 RIP 恒 = hook 地址 +8）。**继续按原方式开格重跑没有信息增量**——解锁路径是先做 `tickets/TASK-013.md`（离线：把 ScyllaHide 的 hook 选择变成可控可记录，关掉异常分发那条链），再带着受控 ini 申请一格实弹。
 
 ### C-5 `keep_runtime_base` 产物 .bss 固化当次会话 ntdll（缺陷 B，C-1 的残留形态）[已验证，未修]
 
@@ -149,6 +150,14 @@ WO-24 于 2026-08-27（提交 `607276d`）锁定 `_clippy_baseline`（TOTAL=349�
 - **本 boot 合计 11/11 次确定性不收敛**（首跑 9 + 本跑 2），同一 ScyllaHide NtContinue-hook 故障环。C-6 的"共因表象"定性不变，但可以加一句更强的：**在这个 boot 上它不是偶发，是确定性的。**
 - **重试的成本模型已经彻底变了**：C-7 修好之后，一次撞环的运行从"小时级 + 3.5GB 日志 + 需要外部杀进程"变成 **20ms + 312KB + 自己干净退出**。所以"重启后重试"从"烧格赌运气"变成了**近乎免费的探测**——TASK-010 当时"不建议靠重启重试当解法"的判断基于旧成本模型，现在应当更新：重启后重试是廉价且合理的下一步，代价不再是格数而是一次重启。
 - ScyllaHide-NtContinue-hook 的微指令级根因**仍未定性**（需专项 trace）。绕过它的备选路线（关 ScyllaHide 的 NtContinue hook 单项、换注入时机）尚未评估。
+
+**TASK-006R3 追加实测（2026-08-30，已换 boot，总指挥亲验）：换 boot 没换掉故障环，因果链实锤。**
+- 新 boot（`2026-08-30 01:28:40`）的 ASLR 布局完全不同：ntdll `0x7ffa952a0000` → `0x7ff857620000`，debuggee image_base `0x7ff799fc0000` → `0x7ff729430000`。
+- 但风暴 RIP **恒等于 ScyllaHide 的 NtContinue hook 地址 + 8**，两个 boot 各自自洽：旧 boot `scylla_hide.log` 记 `_NtContinue 00007FFA95400BD0` / 风暴 exc `0x7ffa95400bd8`；新 boot 记 `_NtContinue 00007FF857780BD0` / 风暴 exc `0x7ff857780bd8`；相对 ntdll 偏移都是 **+0x160bd8**。→ **同一现象在两套完全不同的地址下复现，不再是"相关"而是实锤**：不是 ASLR 运气，是 ScyllaHide 的 NtContinue hook 与壳的异常分发确定性打架。[已验证]
+- 每次运行内**恒同元组唯一**（`sort -u` 恰 1 条）× 1024 次，C-7 判据形状再次被证实。
+- 累计 **13/13 次跨 3 个 boot** 确定性撞同一故障环（006R 9 + 006R2 2 + 006R3 2）。**"重启后重试"这条路已经走到头了**——TASK-006R2 时我把它列为"近乎免费的探测"，探测做了，结果是阴性，这条路可以关掉了。
+- **总指挥读日志发现的抓手（TASK-013 的起点）**：`target/release/` 下**没有 `scylla_hide.ini`**，运行日志里也无任何读 ini/config 的痕迹，而 `scylla_hide.log` 显示 `Hooking KiUserExceptionDispatcher` 与 `Hooking NtContinue` **都装上了**；对照 vault 参考 ini（`D:/MidaVault/quarantine/20260722/workspace/magicmida-rs/scylla_hide.ini`）那里 `KiUserExceptionDispatcherHook=0`。→ **我们是在无配置状态下注入，ScyllaHide 默认把所有 hook 都装上**，包括跟壳打架的异常分发链。引擎里配置口子其实留着（`antidebug_controller.rs:507` 的 `OracleMode.ini_path`，挂着 `#[allow(dead_code)]`），**留了没接线**。[已验证]
+- **待办**：`tickets/TASK-013.md`（纯离线：把 hook 选择变成可控可记录）→ 之后才值得再申请一格实弹带着受控 ini 重跑。
 
 
 ### C-7 text-poll 阶段无 AV 风暴终止机制（引擎结构缺口，TASK-010 发现）[**已修 + 实弹验证通过** —— TASK-011 修 / TASK-012 加固 / TASK-006R2 实弹坐实]
@@ -190,6 +199,7 @@ WO-24 于 2026-08-27（提交 `607276d`）锁定 `_clippy_baseline`（TOTAL=349�
 - 总指挥独立复核（不采信报告表格，直接读 vault 证据）：exe `0c407a97…` 里四条门字符串各命中 1 次；两份日志各 `grep -c AccessViolation` = **1024**；abort 行含完整元组；`[GOOD]` / `zero-filled IAT region` / `TASK-009 fail-closed` 三者各 **0 命中**；时间戳算差 19.6ms / 23.9ms。
 - **顺带解决 TASK-011 的一个 [存疑]**：21:1x 几何的 `exc_type` 实测 = **0（read）**，与当初测试里按 `test byte ptr` 读操作结构自洽选的 0 一致——猜对了。
 - **元组判据被实弹验证是对的**：`target` 在**不同进程间会变**（首跑 0x204、本跑 attempt1 0x25a / attempt2 0x20e，都是低值句柄），但在**同一次运行内恒定** 1024 次——正好落在"同一运行内恒同即风暴"的判据上，且跨运行的变化不会污染计数（每次运行状态独立）。
+- **跨 boot 稳定性（TASK-006R3，2026-08-30）**：换 boot 后再次 2/2 主动中止，AV 恰 1024、19.4/21.5ms、日志 312225/310154 B、无产物、无残留；每次运行内恒同元组 `sort -u` 恰 1 条。**C-7 是这一串修复里唯一已经实弹闭环、且跨 boot 复现过的**。
 - 未验证：中止后的清理只确认了"进程无残留"，**未做句柄/内存泄漏检查**；`C-7 FATAL` 与 CLI 最终 `Fatal error:` 之间有恒定 **5.01s** 间隔（疑似固定拆除等待），teardown 路径**无日志**——都不影响 fail-closed 结论，记为观察项。
 
 
