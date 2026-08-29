@@ -44,6 +44,12 @@ __pycache__/
 *.dll
 *.dmp
 *.log
+# Object / import-library build products. lab/runtime/veh_probe compiles a .c
+# probe in-tree, so its .obj slipped into a commit once (2026-08-29) before
+# this rule existed.
+*.obj
+*.lib
+*.exp
 log/
 logs/
 
