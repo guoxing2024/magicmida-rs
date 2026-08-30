@@ -277,6 +277,24 @@ impl IatRecoveryReport {
         }
     }
 
+    /// TASK-014: number of non-resolved (unresolvable) slots — the "honest
+    /// hole" count. On the current sample this was 201 (the whole IAT span)
+    /// and the startup-path gate fired on 192 of them. Diagnostic only;
+    /// never used for gating (the strict `is_complete` predicate stays the
+    /// authority).
+    #[must_use]
+    pub fn unresolved_slot_count(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| {
+                !matches!(
+                    slot.status,
+                    IatSlotStatus::Resolved | IatSlotStatus::ZeroTerminator
+                )
+            })
+            .count()
+    }
+
     fn validation_reasons(&self) -> Vec<String> {
         let mut reasons = Vec::new();
         let aligned = self.slot_size != 0 && self.requested_bytes % self.slot_size == 0;

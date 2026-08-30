@@ -94,6 +94,43 @@ pub struct GapRetargetStats {
     pub sites_patched: usize,
 }
 
+/// TASK-014: full startup-path site list with per-slot diagnostic fields.
+///
+/// The fail-closed gate only needs the count + a sample; the diagnostic
+/// requirement (192 sites on this sample, plus per-slot runtime values /
+/// module attribution / back-fill attempt path) needs the COMPLETE list. This
+/// struct is emitted verbatim into the log so the operator can see every
+/// site -> slot pair, never a 16-entry truncation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupPathSiteReport {
+    /// Full `(site_rva, slot_rva)` pairs in scan order (never truncated).
+    pub sites: Vec<(u32, u32)>,
+}
+
+impl StartupPathSiteReport {
+    /// Render the full site list as one compact log string.
+    #[must_use]
+    pub fn render(&self) -> String {
+        self.sites
+            .iter()
+            .map(|(site, target)| format!("{site:#x}->{target:#x}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// TASK-014: identical scan semantics to [`call_sites_targeting_slots`]
+/// (判定逻辑不动) returning the COMPLETE list; the caller emits it verbatim
+/// into the log instead of truncating to 16 samples.
+#[must_use]
+pub(crate) fn all_call_sites_targeting_slots(
+    pe: &PeHeader,
+    dump_buf: &[u8],
+    target_slot_rvas: &std::collections::HashSet<u32>,
+) -> Vec<(u32, u32)> {
+    call_sites_targeting_slots(pe, dump_buf, target_slot_rvas)
+}
+
 /// Retarget call sites that reference interior IAT zero slots.
 ///
 /// Uses `builder` for authoritative slot→name mapping (Hint/Name already
@@ -462,6 +499,63 @@ mod tests {
         let got = i32::from_le_bytes(dump[site + 2..site + 6].try_into().unwrap());
         assert_eq!((next as i64 + got as i64) as u32, 0x1020);
         let _ = builder; // keep builder construction green
+    }
+
+    // -- TASK-014: full site list emission --
+
+    #[test]
+    fn all_sites_report_is_never_truncated() {
+        let pe_bytes = crate::header::make_minimal_pe64();
+        let mut pe = PeHeader::from_bytes(&pe_bytes).expect("minimal pe");
+        pe.sections[0].virtual_address = 0x1000;
+        pe.sections[0].virtual_size = 0x2000;
+        pe.sections[0].name = ".text".into();
+        pe.sections[0].characteristics = 0x6000_0020;
+
+        let mut dump_buf = vec![0u8; 0x4000];
+        let sites = [
+            (0x1200u32, 0x1138d0u32),
+            (0x1300, 0x113cb8),
+            (0x1400, 0x113cc0),
+        ];
+        for (site, slot) in sites {
+            dump_buf[site as usize] = 0xFF;
+            dump_buf[site as usize + 1] = 0x15;
+            let next_rva = site + 6;
+            let disp = slot as i64 - next_rva as i64;
+            dump_buf[site as usize + 2..site as usize + 6]
+                .copy_from_slice(&(disp as i32).to_le_bytes());
+        }
+
+        let unresolved = [0x1138d0u32, 0x113cb8, 0x113cc0].into_iter().collect();
+        let hits = all_call_sites_targeting_slots(&pe, &dump_buf, &unresolved);
+        assert_eq!(hits, sites.to_vec(), "full list, no truncation");
+
+        let mut dump_buf = vec![0u8; 0x8000];
+        let mut slots = Vec::new();
+        for i in 0..20u32 {
+            let site = 0x2000 + i * 8;
+            let slot = 0x113700 + i * 8;
+            slots.push((site, slot));
+            dump_buf[site as usize] = 0xFF;
+            dump_buf[site as usize + 1] = 0x25;
+            let next_rva = site + 6;
+            let disp = slot as i64 - next_rva as i64;
+            dump_buf[site as usize + 2..site as usize + 6]
+                .copy_from_slice(&(disp as i32).to_le_bytes());
+        }
+        let unresolved: std::collections::HashSet<u32> = slots.iter().map(|&(_, s)| s).collect();
+        let hits = all_call_sites_targeting_slots(&pe, &dump_buf, &unresolved);
+        assert_eq!(hits, slots, "20 sites, none dropped");
+    }
+
+    #[test]
+    fn site_report_render_round_trips() {
+        let report = StartupPathSiteReport {
+            sites: vec![(0x1123, 0x1138d0), (0x2c7c, 0x113700)],
+        };
+        let rendered = report.render();
+        assert_eq!(rendered, "0x1123->0x1138d0, 0x2c7c->0x113700");
     }
 
     // -- TASK-009: startup-path fail-closed scan (`bb5ee568`) --

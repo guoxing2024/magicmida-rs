@@ -77,6 +77,11 @@ pub fn rebuild_import_table_with_report(
 // -----------------------------------------------------------------------
 
 /// Internal version that also returns the raw IAT image and its size.
+///
+/// TASK-014: delegating wrapper so the original-import back-fill adapter
+/// ([`rebuild_import_table_complete_with_original`]) is the single
+/// implementation; this keeps the historical call shape for tests/legacy.
+#[allow(dead_code)]
 pub(crate) fn rebuild_import_table_complete(
     debugger: &mut dyn mida_core::DebuggerCore,
     pe: &mut PeHeader,
@@ -92,10 +97,41 @@ pub(crate) fn rebuild_import_table_complete(
     ),
     PeError,
 > {
-    // Find IAT location — either from the PE header or from the override.
+    rebuild_import_table_complete_with_original(
+        debugger,
+        pe,
+        image_base,
+        is_64bit,
+        iat_override,
+        None,
+    )
+}
+
+/// TASK-014: `rebuild_import_table_complete` + original-import back-fill.
+///
+/// The caller (dump_process) knows the on-disk executable path; this adapter
+/// reads the plaintext original import table (`"dll.func"` flat list) and
+/// threads it into the two-pass vote so `collect_candidates` can promote
+/// slots whose observed value equals a resolved original import. When the
+/// original list is unavailable (path read failure / empty), the behaviour is
+/// byte-identical to the historical [`rebuild_import_table_complete`].
+pub(crate) fn rebuild_import_table_complete_with_original(
+    debugger: &mut dyn mida_core::DebuggerCore,
+    pe: &mut PeHeader,
+    image_base: u64,
+    is_64bit: bool,
+    iat_override: Option<(usize, usize)>,
+    executable_path: Option<&std::path::Path>,
+) -> Result<
+    (
+        Vec<u8>,
+        usize,
+        Option<ImportTableBuilder>,
+        IatRecoveryReport,
+    ),
+    PeError,
+> {
     let (iat_address, iat_size) = if let Some((addr, size)) = iat_override {
-        info!("Using override IAT location: {addr:#x}, size {size:#x}");
-        // Update the PE header's IAT directory so the dump can find it.
         let iat_rva = (addr as u64).wrapping_sub(image_base) as u32;
         pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_IAT] =
             crate::header::ImageDataDirectory {
@@ -104,24 +140,18 @@ pub(crate) fn rebuild_import_table_complete(
             };
         (addr as u64, size)
     } else {
-        // Find IAT location from the PE header
         let iat_dir = pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_IAT];
         if iat_dir.virtual_address == 0 {
             return Err(PeError::Parse(
                 "No IAT data directory in target PE header".into(),
             ));
         }
-
         let addr = image_base + iat_dir.virtual_address as u64;
         let max_iat_bytes = MAX_IAT_SLOTS * iat_slot_size(is_64bit);
-
-        // Read the IAT
         let mut iat_data = vec![0u8; max_iat_bytes];
         let _read = debugger
             .read_memory(addr as usize, &mut iat_data)
             .map_err(|e| PeError::Parse(format!("Failed to read IAT: {e}")))?;
-
-        // Determine actual IAT size
         let size = determine_iat_size(
             debugger.process_handle(),
             debugger.pid(),
@@ -129,9 +159,6 @@ pub(crate) fn rebuild_import_table_complete(
             is_64bit,
             &iat_data,
         )?;
-        info!(iat_size = format!("{size:#x}"), "Determined IAT size");
-
-        // Update the PE header's IAT directory
         pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_IAT] =
             crate::header::ImageDataDirectory {
                 virtual_address: iat_dir.virtual_address,
@@ -140,14 +167,29 @@ pub(crate) fn rebuild_import_table_complete(
         (addr, size)
     };
 
-    // Read the IAT data at the determined location.
     let mut iat_data =
         super::helpers::alloc_capped(iat_size, super::helpers::MAX_IAT_READ_BYTES, "IAT read")?;
     let _read = debugger
         .read_memory(iat_address as usize, &mut iat_data)
         .map_err(|e| PeError::Parse(format!("Failed to read IAT: {e}")))?;
 
-    rebuild_import_table_inner(debugger, iat_address, iat_size, image_base, is_64bit, None)
+    // TASK-014: read the plaintext original import table from the on-disk
+    // executable when available (9 modules / 9 funcs on this sample) and
+    // thread it into the vote as a back-fill candidate source.
+    let original_imports = executable_path.and_then(|path| {
+        super::original_imports::get_original_imports(path)
+            .ok()
+            .filter(|list| !list.is_empty())
+    });
+
+    rebuild_import_table_inner(
+        debugger,
+        iat_address,
+        iat_size,
+        image_base,
+        is_64bit,
+        original_imports.as_deref(),
+    )
 }
 
 // -----------------------------------------------------------------------
@@ -173,7 +215,18 @@ fn rebuild_import_table_inner(
 > {
     let ptr_size = iat_slot_size(is_64bit);
 
-    // Read the IAT
+    // TASK-014 (rebuild emission adapter): the `_original_imports` param is
+    // now consumed — when provided, it carries the flat `"dll.func"` list of
+    // the original on-disk import table (plaintext: 9 modules / 9 funcs on
+    // this sample). Its RESOLVED addresses (GetProcAddress) form the back-fill
+    // candidate set: any IAT slot whose observed value equals a resolved
+    // original-import address becomes resolvable via that identity.
+    //
+    // Diagnostic expectation on this sample: the runtime IAT slots hold
+    // Themida VM wrapper addresses (inside the Themida section), NOT resolved
+    // API addresses, so this set is expected to match 0 slots — which is
+    // exactly the XX-10-A 0-coverage finding. The adapter is still correct:
+    // slots whose value IS a resolved address get promoted.
     let mut iat_data =
         super::helpers::alloc_capped(iat_size, super::helpers::MAX_IAT_READ_BYTES, "IAT rebuild")?;
     let bytes_read = debugger
@@ -282,6 +335,7 @@ fn rebuild_import_table_inner(
             &modules,
             &forward_map,
             &forward_string_map,
+            _original_imports,
         );
 
         if slot.candidates.is_empty() {
@@ -440,6 +494,7 @@ fn collect_candidates(
     modules: &[RemoteModule],
     forward_map: &std::collections::HashMap<u64, (usize, String)>,
     forward_string_map: &std::collections::HashMap<u64, (usize, String)>,
+    original_imports: Option<&[String]>,
 ) {
     // Variant A: direct match
     for (mi, m) in modules.iter().enumerate() {
@@ -478,6 +533,53 @@ fn collect_candidates(
             });
         }
     }
+
+    // TASK-014 (rebuild emission adapter, variant D): original-import-table
+    // back-fill. When the flat original import list (`"dll.func"` strings) is
+    // available, resolve each via GetProcAddress and match the slot's OBSERVED
+    // value. A hit means the slot holds a real resolved API address (post
+    // decrypt) — promote it under the matching loaded module.
+    if let Some(original_imports) = original_imports {
+        if !original_imports.is_empty() {
+            let resolved = crate::original_imports::resolve_imports_via_getprocaddress(
+                &split_flat_original_imports(original_imports),
+            );
+            for ((module, _function), address) in &resolved {
+                if *address as u64 == slot_val {
+                    // The module must be loaded for a valid candidate.
+                    if let Some(mi) = modules
+                        .iter()
+                        .position(|m| m.name.eq_ignore_ascii_case(module))
+                    {
+                        slot.candidates.push(ResolutionCandidate {
+                            address: slot_val,
+                            module_index: mi,
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// TASK-014: split the flat `"dll.func"` list (as produced by
+/// [`crate::dumper::original_imports::get_original_imports`]) into the
+/// `(module, functions)` shape expected by
+/// [`crate::original_imports::resolve_imports_via_getprocaddress`].
+fn split_flat_original_imports(flat: &[String]) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    for entry in flat {
+        let Some((module, function)) = entry.split_once('.') else {
+            continue;
+        };
+        let module_lower = module.to_lowercase();
+        match out.iter_mut().find(|(m, _)| m == &module_lower) {
+            Some((_, funcs)) => funcs.push(function.to_string()),
+            None => out.push((module_lower, vec![function.to_string()])),
+        }
+    }
+    out
 }
 
 // -----------------------------------------------------------------------

@@ -349,7 +349,6 @@ fn relocate_export_table_rvas(
 
 use super::helpers::{make_memory_readable, IMAGE_DIRECTORY_ENTRY_IAT};
 use super::iat_partial_accept::evaluate_partial_accept;
-use super::import_rebuild::rebuild_import_table_complete;
 use super::import_section::{build_import_table_from_original, create_import_section};
 use super::output_writer::write_output_file;
 use super::sections::{create_pdata_section, create_reloc_section};
@@ -906,13 +905,15 @@ pub fn dump_process_with_report(
 
     // 2. Rebuild import table if requested
     let (iat_image, _iat_image_size, mut import_builder, mut iat_report) = if opts.fix_imports {
-        let (iat_image, iat_size, import_builder, report) = rebuild_import_table_complete(
-            debugger,
-            &mut pe,
-            opts.image_base,
-            is_64bit,
-            opts.iat_location,
-        )?;
+        let (iat_image, iat_size, import_builder, report) =
+            super::import_rebuild::rebuild_import_table_complete_with_original(
+                debugger,
+                &mut pe,
+                opts.image_base,
+                is_64bit,
+                opts.iat_location,
+                opts.executable_path.as_deref(),
+            )?;
         (iat_image, iat_size, import_builder, Some(report))
     } else {
         (Vec::new(), 0usize, None, None)
@@ -2864,13 +2865,76 @@ pub fn dump_process_with_report(
     } else {
         Vec::new()
     };
+    // TASK-014: emit the COMPLETE startup-path site list + per-slot
+    // diagnostics BEFORE the gate fires. The gate decision itself is
+    // unchanged (fail_closed_sites non-empty => refuse); only the
+    // diagnostic detail in the error is no longer truncated to 16 samples.
+    let full_detail = if !fail_closed_sites.is_empty() {
+        // Re-run the complete (never-truncated) scan for the log: identical
+        // scan semantics to the gate, but emitted verbatim.
+        let unresolved_full = iat_report
+            .as_ref()
+            .map(super::iat_partial_accept::unresolvable_slot_rvas)
+            .unwrap_or_default();
+        let all_sites = if unresolved_full.is_empty() {
+            fail_closed_sites.clone()
+        } else {
+            super::iat_gap_retarget::all_call_sites_targeting_slots(
+                &pe,
+                &dump_buf,
+                &unresolved_full,
+            )
+        };
+        super::iat_gap_retarget::StartupPathSiteReport { sites: all_sites }.render()
+    } else {
+        String::new()
+    };
     if !fail_closed_sites.is_empty() {
-        let detail = fail_closed_sites
-            .iter()
-            .take(16)
-            .map(|(site, target)| format!("{site:#x}->{target:#x}"))
-            .collect::<Vec<_>>()
-            .join(", ");
+        // Per-slot diagnostics for the whole span (201 slots on this
+        // sample): runtime value + module attribution + back-fill path.
+        // Best-effort: module attribution uses the report's own slot data;
+        // the module snapshot is taken again here for names/ranges.
+        let (diag_block, diag_count) = match iat_report.as_ref() {
+            Some(report) => {
+                let modules = super::remote_modules::take_module_snapshot(
+                    debugger.process_handle(),
+                    debugger.pid(),
+                    debugger.image_base(),
+                    true,
+                )
+                .unwrap_or_default();
+                let ranges: Vec<(usize, usize)> = modules
+                    .iter()
+                    .map(|m| (m.base as usize, m.end_off as usize))
+                    .collect();
+                let names: Vec<String> = modules.iter().map(|m| m.name.clone()).collect();
+                let diags = super::iat_partial_accept::slot_diagnostics(report, &ranges, &names);
+                let block = diags.render();
+                let count = diags.slots.len();
+                (block, count)
+            }
+            None => (String::new(), 0),
+        };
+        warn!(
+            count = fail_closed_sites.len(),
+            "TASK-014: full startup-path site list (all sites, no truncation): {full_detail}"
+        );
+        if diag_count > 0 {
+            warn!(
+                slots = diag_count,
+                "TASK-014: per-slot IAT diagnostics (full span):\n{diag_block}"
+            );
+        }
+        let detail = if full_detail.is_empty() {
+            fail_closed_sites
+                .iter()
+                .take(16)
+                .map(|(site, target)| format!("{site:#x}->{target:#x}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            full_detail
+        };
         return Err(PeError::Parse(format!(
             "TASK-009 fail-closed: {} startup-path call/jmp site(s) target unresolved IAT slot(s): {detail}; zero-fill cannot make the product loadable — refusing to emit candidate",
             fail_closed_sites.len()

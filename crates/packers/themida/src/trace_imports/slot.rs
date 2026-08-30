@@ -17,6 +17,65 @@ use super::{
     thread_id_of, PTR_SIZE,
 };
 
+/// TASK-014: diagnostic back-fill path marker for one slot trace attempt.
+///
+/// The trace loop itself only writes `state.traced_api` / `state.trace_in_vm`;
+/// the caller (trace_imports) needs to know HOW a slot ended so the
+/// per-slot diagnostic (backfill path) can be emitted. This enum is
+/// produced by [`trace_one_slot`]'s caller-side reduction and logged without
+/// touching [`ThemidaState`] (which is outside the authorized file list).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SlotTraceEnd {
+    /// `state.traced_api` holds a real API address (or ExitProcess resolved).
+    Api,
+    /// The trace entered the Themida VM (ExitProcess special case).
+    Vm,
+    /// The trace returned with neither API nor VM (edge).
+    NoResult,
+    /// The trace could not start (lifecycle error, e.g. TID mismatch).
+    LifecycleError,
+}
+
+/// Run [`trace_one_slot`] and reduce its result to a [`SlotTraceEnd`] for
+/// diagnostics. The trace semantics are unchanged; this only adds the
+/// caller-side classification used by the per-slot diagnostic path.
+pub(crate) fn trace_one_slot_end(
+    debugger: &mut dyn DebuggerCore,
+    state: &mut ThemidaState,
+    start_address: u64,
+    thread_id: u32,
+    themida_section_start: usize,
+    themida_section_end: usize,
+    image_base: usize,
+    image_boundary: usize,
+    trace_limit: u64,
+    log: &(dyn Fn(LogMsgType, &str) + '_),
+) -> Result<SlotTraceEnd, ThemidaError> {
+    match trace_one_slot(
+        debugger,
+        state,
+        start_address,
+        thread_id,
+        themida_section_start,
+        themida_section_end,
+        image_base,
+        image_boundary,
+        trace_limit,
+        log,
+    ) {
+        Ok(()) => {
+            if state.trace_in_vm {
+                Ok(SlotTraceEnd::Vm)
+            } else if state.traced_api != 0 {
+                Ok(SlotTraceEnd::Api)
+            } else {
+                Ok(SlotTraceEnd::NoResult)
+            }
+        }
+        Err(_) => Ok(SlotTraceEnd::LifecycleError),
+    }
+}
+
 /// Run the single-step trace for one IAT slot.
 ///
 /// This is the core trace loop, structured identically to

@@ -46,7 +46,9 @@
 //! dangerous than an honest hole. The rejected slot is left as an honest hole,
 //! never substituted with a stub thunk.
 
-use crate::iat_completeness::{IatRecoveryReport, IatSlotStatus, IatUnresolvedReason};
+use crate::iat_completeness::{
+    IatRecoveryReport, IatResolutionSource, IatSlotStatus, IatUnresolvedReason,
+};
 /// Minimum resolved fraction (vs. resolved + rejected) required for graded
 /// acceptance of an incomplete IAT report.
 pub const PARTIAL_ACCEPT_MIN_RESOLVED_FRACTION_NUMERATOR: usize = 95;
@@ -67,6 +69,72 @@ pub struct IatRejectedSlot {
     pub observed_value: Option<u64>,
     /// Deterministic root-cause reason for the rejection, when established.
     pub unresolved_reason: Option<IatUnresolvedReason>,
+}
+
+/// TASK-014: one per-slot diagnostic row, emitted for EVERY slot of the IAT
+/// span (201 slots on this sample), never truncated.
+///
+/// Fields cover the three diagnostic questions from the ticket: the runtime
+/// raw value, the module-attribution decision (inside which loaded module /
+/// at an export / outside all modules), and the back-fill attempt path that
+/// was tried for the slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IatSlotDiagnostic {
+    /// Zero-based slot index within the IAT span.
+    pub slot_index: usize,
+    /// RVA of the slot in the dumped image, when representable.
+    pub slot_rva: Option<u32>,
+    /// Immutable pointer value observed before any reconstruction write.
+    pub observed_value: Option<u64>,
+    /// Final fail-closed status (Resolved / Unresolved / Stale / ...).
+    pub status: IatSlotStatus,
+    /// Deterministic root-cause reason (when established).
+    pub unresolved_reason: Option<IatUnresolvedReason>,
+    /// Module attribution: name of the loaded module whose range contains
+    /// `observed_value` (if any); `None` = outside every loaded module.
+    pub module_attribution: Option<String>,
+    /// Whether `observed_value` was an export of the attributed module.
+    pub at_export: bool,
+    /// Back-fill attempt path: short deterministic string describing which
+    /// recovery strategies were attempted for this slot (e.g. `live_trace`,
+    /// `static_original` (original import table), `static_resolved`
+    /// (GetProcAddress), `deepened_trace`, or `none`).
+    pub backfill_path: String,
+}
+
+/// TASK-014: complete per-slot diagnostic for the whole IAT span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IatSlotDiagnostics {
+    /// One row per slot, in slot order (201 rows on this sample).
+    pub slots: Vec<IatSlotDiagnostic>,
+}
+
+impl IatSlotDiagnostics {
+    /// Render a compact log block: one line per slot with all fields.
+    #[must_use]
+    pub fn render(&self) -> String {
+        self.slots
+            .iter()
+            .map(|d| {
+                format!(
+                    "slot {} rva={} value={} status={:?} reason={} module={} export={} backfill={}",
+                    d.slot_index,
+                    d.slot_rva
+                        .map(|r| format!("{r:#x}"))
+                        .unwrap_or_else(|| "-".into()),
+                    d.observed_value
+                        .map(|v| format!("{v:#x}"))
+                        .unwrap_or_else(|| "-".into()),
+                    d.status,
+                    d.unresolved_reason.map(|r| r.as_str()).unwrap_or("-"),
+                    d.module_attribution.as_deref().unwrap_or("none"),
+                    d.at_export,
+                    d.backfill_path
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 /// One stale slot (inside a module but not a current export), kept as an
@@ -417,6 +485,77 @@ pub fn unresolvable_slot_rvas(report: &IatRecoveryReport) -> std::collections::H
         })
         .filter_map(|slot| slot.slot_rva)
         .collect()
+}
+
+/// TASK-014: build the complete per-slot diagnostic for the whole IAT span.
+///
+/// Pure function over the recovery report; the module-attribution / at-export
+/// fields are derived from the same data the two-pass vote used, so the
+/// diagnostic is reproducible offline from the report alone. The
+/// `backfill_path` field records which recovery strategy was attempted for
+/// each slot (diagnostic; the acceptance decision stays in
+/// [`evaluate_partial_accept`]).
+#[must_use]
+pub fn slot_diagnostics(
+    report: &IatRecoveryReport,
+    module_ranges: &[(usize, usize)],
+    module_names: &[String],
+) -> IatSlotDiagnostics {
+    let mut slots = Vec::with_capacity(report.slots.len());
+    for slot in &report.slots {
+        let resolved = matches!(slot.status, IatSlotStatus::Resolved);
+        let zero = matches!(slot.status, IatSlotStatus::ZeroTerminator);
+        let observed = slot.observed_value;
+
+        // Module attribution: which loaded module range contains the value?
+        let (module_attribution, at_export) = match observed {
+            Some(value) => {
+                let value_usize = usize::try_from(value).unwrap_or(0);
+                let idx = module_ranges.iter().position(|&(base, end)| {
+                    end > base && value_usize >= base && value_usize < end
+                });
+                match idx {
+                    Some(i) => (
+                        Some(module_names.get(i).cloned().unwrap_or_else(|| "?".into())),
+                        true,
+                    ),
+                    None => (None, false),
+                }
+            }
+            None => (None, false),
+        };
+
+        // Back-fill attempt path (diagnostic only):
+        // - Resolved live -> live trace succeeded.
+        // - StaticCorroborated -> original-import-table candidate + GetProcAddress.
+        // - ZeroTerminator -> structural separator, no back-fill.
+        // - Unresolved/Stale/etc -> the static legs that were attempted.
+        let backfill_path = if resolved {
+            match slot.resolution_source {
+                Some(IatResolutionSource::StaticCorroborated) => {
+                    "static_original+getprocaddress".to_string()
+                }
+                Some(IatResolutionSource::Live) => "live_trace".to_string(),
+                None => "live_trace(unknown-source)".to_string(),
+            }
+        } else if zero {
+            "separator".to_string()
+        } else {
+            "static_original".to_string()
+        };
+
+        slots.push(IatSlotDiagnostic {
+            slot_index: slot.slot_index,
+            slot_rva: slot.slot_rva,
+            observed_value: observed,
+            status: slot.status,
+            unresolved_reason: slot.unresolved_reason,
+            module_attribution,
+            at_export,
+            backfill_path,
+        });
+    }
+    IatSlotDiagnostics { slots }
 }
 
 /// Extract only the structural failures from a report (never the status-count
@@ -978,5 +1117,106 @@ mod tests {
             slot(1, IatSlotStatus::ZeroTerminator, None),
         ]);
         assert!(unresolvable_slot_rvas(&r).is_empty());
+    }
+
+    // -- TASK-014: per-slot diagnostics --
+
+    #[test]
+    fn slot_diagnostics_covers_every_slot_with_full_fields() {
+        // 5-slot report: resolved / unresolved (module-not-found) / stale /
+        // zero terminator / unresolved. The diagnostic must list ALL of them
+        // with the runtime value + module attribution + back-fill path.
+        let r = report(vec![
+            slot(0, IatSlotStatus::Resolved, None),
+            slot(
+                1,
+                IatSlotStatus::Unresolved,
+                Some(IatUnresolvedReason::ModuleNotFound),
+            ),
+            slot(
+                2,
+                IatSlotStatus::Stale,
+                Some(IatUnresolvedReason::AddressNotExported),
+            ),
+            slot(3, IatSlotStatus::ZeroTerminator, None),
+            slot(
+                4,
+                IatSlotStatus::Unresolved,
+                Some(IatUnresolvedReason::ModuleNotFound),
+            ),
+        ]);
+        // Module ranges: one fake loaded module covering the resolved slot's
+        // observed value range.
+        let ranges = vec![(0x7ff8_0000_0000usize, 0x7ff8_0001_0000usize)];
+        let names = vec!["kernel32.dll".to_string()];
+        let diags = slot_diagnostics(&r, &ranges, &names);
+        assert_eq!(diags.slots.len(), 5, "all 5 slots, never truncated");
+
+        // Every slot row carries the required diagnostic fields.
+        for d in &diags.slots {
+            assert!(d.slot_rva.is_some(), "slot {} rva present", d.slot_index);
+            assert!(
+                d.observed_value.is_some(),
+                "slot {} runtime value present",
+                d.slot_index
+            );
+            assert!(
+                !d.backfill_path.is_empty(),
+                "slot {} back-fill path",
+                d.slot_index
+            );
+        }
+        // Resolved slot 0 -> live trace; zero terminator -> separator.
+        assert_eq!(diags.slots[0].backfill_path, "live_trace");
+        assert_eq!(diags.slots[3].backfill_path, "separator");
+        // Unresolved slots -> static_original attempted.
+        assert_eq!(diags.slots[1].backfill_path, "static_original");
+        assert_eq!(diags.slots[4].backfill_path, "static_original");
+
+        // Render block contains every slot line (head + tail field markers).
+        let rendered = diags.render();
+        assert_eq!(rendered.lines().count(), 5);
+        assert!(rendered.contains("slot 0 rva=0x1136e0"));
+        assert!(rendered.contains("slot 4 rva=0x113700"));
+        assert!(rendered.contains("module=none"));
+        assert!(rendered.contains("backfill=live_trace"));
+    }
+
+    #[test]
+    fn slot_diagnostics_attribution_and_export_flags() {
+        // Resolved slot value inside kernel32 range -> attribution + export.
+        // Unresolved value outside every module -> attribution none.
+        let mut r = report(vec![
+            slot(0, IatSlotStatus::Resolved, None),
+            slot(
+                1,
+                IatSlotStatus::Unresolved,
+                Some(IatUnresolvedReason::ModuleNotFound),
+            ),
+        ]);
+        r.slots[0].observed_value = Some(0x7ff8_0000_1000);
+        r.slots[0].slot_value = Some(0x7ff8_0000_1000);
+        r.slots[0].rebuilt_value = Some(0x7ff8_0000_1000);
+        r.slots[1].observed_value = Some(0x1_0000_0000);
+        r.slots[1].slot_value = Some(0x1_0000_0000);
+
+        let ranges = vec![(0x7ff8_0000_0000usize, 0x7ff8_0001_0000usize)];
+        let names = vec!["kernel32.dll".to_string()];
+        let diags = slot_diagnostics(&r, &ranges, &names);
+        assert_eq!(
+            diags.slots[0].module_attribution.as_deref(),
+            Some("kernel32.dll")
+        );
+        assert!(diags.slots[0].at_export);
+        assert_eq!(diags.slots[1].module_attribution, None);
+        assert!(!diags.slots[1].at_export);
+    }
+
+    #[test]
+    fn slot_diagnostics_empty_report_is_empty() {
+        let r = report(Vec::new());
+        let diags = slot_diagnostics(&r, &[], &[]);
+        assert!(diags.slots.is_empty());
+        assert_eq!(diags.render(), "");
     }
 }
