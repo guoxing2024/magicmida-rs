@@ -118,6 +118,6 @@
 
 ## 下一步
 
-① **TASK-018（T0.5 A' 路线）已授权在飞（D-035，2026-08-30，实弹 1 格 XC-XXI-B 10/4 → 11/4）**：老板批选项 A'——驱动脚本观测腿改调试端口泵（`DEBUG_ONLY_THIS_PROCESS` + 独立泵线程全量消费事件 + Run 线程句柄取自 CREATE_THREAD 调试事件 + EXCEPTION 全记录），重跑三态判定（语义与 T017 逐字一致）。前置：T017 终态 = 工具性阻塞（D-034）——B1' 产物 Run 已实调到 GUI 业务层（"授权验证"对话框、GUI 存活 3/3、无 AV、IAT 不变），RIP 证据因 P-11 环境垫零不可得；总指挥 P2 探针实测调试端口路径读得真实 Rip。其余暂缓：TASK-007 / clippy 基线门修复（D-031 F3）/ §九 GTO-UI / 推送（22 提交，D-010）。TASK-014（路径 A'）/ TASK-015（路径 B1'，XX-11 端点恢复）已验收（D-027/D-029）；遗留小项 = mod.rs LifecycleError 归类补专属行为测试、load 探针 cdb 变体（worker 已标注）。
+① **TASK-018 已执行完毕（D-036，2026-08-30，实弹 1 格 XC-XXI-B 10/4 → 11/4），终态 = AV 三态 5/5（按票面 STOP）；T0.5 总定案 = RIP 级判定结构性不可达**：非附加（T017）外部 RIP 采样被环境垫零（P-11）；调试附加（T018）RIP 可采样但 WinLicense 反调试扣住 core.dll `.text` 解密（**C-8**，字节级对照：附加密文 `586db5df…` vs 非附加明文 `41574156…`，5/5）→ Run 入口即 AV → 故障环 → 退出 0xC0000005。**观察与执行互斥**——熊熊 Run verdict 诚实停在 **PARTIAL**：B1'（结构 12/12 + load 10/10 + S4 对齐）+ GUI 层行为证据（"授权验证"对话框 3/3、无 AV）+ 不可达性证明（对照实验对在 vault 可复算）。**等老板裁定**：接受 T0.5 收官（推荐）/ 投非托管机器跑三态（harness 已就绪）/ 其它。其余暂缓：TASK-007 / clippy 基线门（D-031 F3）/ §九 GTO-UI / 推送（24 提交，D-010）。TASK-014（路径 A'）/ TASK-015（路径 B1'）已验收（D-027/D-029）；遗留小项 = mod.rs LifecycleError 归类补专属行为测试、load 探针 cdb 变体（worker 已标注）。
 另有两个可另立的专项：ScyllaHide-NtContinue-hook 交互的微指令级定性（需实弹 trace）、C-5 缺陷 B（会话绑定，`/session-clean` 消费端）。
 推送时机由老板定；推送前建议补跑 `cargo deny check advisories`（本机离线跑不了）。

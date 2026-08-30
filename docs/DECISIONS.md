@@ -283,3 +283,12 @@
 - **保险丝（写入工单）**：泵健康自证（GUI hung=0 贯穿 = 无冻结）；"附加改变行为"（调试附加下 GUI 层不再出现）→ 如实上报不许硬凑；BootTime/部署 sha/防火墙开跑前三自查；新阻塞/AV → STOP 不烧第 2 格；证据先入 vault。
 - **前置（总指挥亲验，2026-08-30）**：BootTime = `10:05:51` 同产产 boot；`lab/xx21b_run_ui/` 三件 sha 与 vault 逐位一致（a852880a / 09f3dd34 / config.ini `cde9be13…`）；HEAD = `e31d5ed`。
 - **落地**：`tickets/TASK-018.md` 首行已写授权令牌（worker 须原文回抄）。
+
+## D-036 TASK-018 审计通过（终态 = AV 三态，按票面 STOP；账本 10/4 → 11/4；新发现入 C-8/P-11 增补）
+
+- **日期**：2026-08-30（总指挥审计）
+- **审计结论**：worker 全部主张亲验成立——① 改动仅新增 `tools/xx21b_t05_ui_drive_dbg.py`（1361 行），原脚本/crates/门文件零触碰；② **AV 5/5 可复现**亲验（att1 泵 JSON：continues=878/continue_fails=0/wait_errors=[]，exceptions 821 条含真实 thread_rip；att5 时间线：CREATE_THREAD Run 线程 → 首 AV @run_va → 817× 恒同 core+0x2cc7a6 → second-chance → EXIT_PROCESS 0xC0000005）；③ **根因字节级亲验**（总指挥直读两代 vault 证据对照）：非附加 `41574156…` 明文 prologue vs 附加 `586db5df…` 密文，5/5——**调试附加 → WinLicense 反调试扣住 core.dll `.text` 解密 → Run 跳入密文 → 入口 AV**（入 KNOWN_ISSUES **C-8**）；④ vault 15 文件 MATCH 5/5 + INDEX 更新；⑤ 清理证明（探针/干跑 18+4 文件已删、无残留进程）。
+- **票面偏差处置（1 处，接受）**：worker 将 `0xc000008e`（引导期良性浮点）路由 DBG_CONTINUE（票面原写"其它 → NOT_HANDLED"）——probe 实证 NOT_HANDLED 会触发 WinLicense 对话框使实验不可能；**全程 EXCEPTION 仍全量记录**（AV 判据 = 事件记录 + 退出码，与 Continue 状态无关），披露方式 = 报告 §2.2 显式标注偏差与证据。接受。
+- **worker 超额贡献（并入 P-11）**：① ContextFlags 精化——`0x100000`（无 CONTROL 位）在调试路径也读出假 0，必须 `0x100001`（CONTEXT_CONTROL_AMD64，引擎同款）；② Windows 调试会话线程绑定——`WaitForDebugEvent` 必须与 `CreateProcessW` 同线程（probe 3/4 对照，跨线程 err=6）；③ 运行态采样可行（Suspend+GetContext+Resume 经调试句柄读得真实 RIP）。
+- **T0.5 总定案（结构性结论）**：三态 RIP 判定在本平台 + `NO_BYPASS` 红线内**结构性不可达**——外部观测被环境垫零（P-11），调试观测被壳反调试扣解密（C-8）。**观察与执行互斥**。T017/T018 构成对照实验对（同 run_va、两种附加方式、两种字节态），证据可复算。Run verdict 诚实停在 **PARTIAL**：结构门 12/12 + load 10/10 + S4 对齐（B1'）+ GUI 层行为证据（"授权验证"对话框 3/3、无 AV）+ 不可达性证明。剩余路线：非托管环境机器（两套 harness 已就绪）或壳进程内自证（红线外，改样品）——待老板裁定是否投入。
+- **账本**：XC-XXI-B 10/4 → **11/4**（1 格，5 次有效尝试 = 1 格，T015 先例）。
