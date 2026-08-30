@@ -171,3 +171,12 @@
 - **换 boot 追认**：令牌载 BootTime 01:28:40，实测 10:05:51（令牌签发后机器重启）。追认理由：① 差异非 worker 责任、亦非其可检测项；② 本单变量（ini 生效）与 boot 无关（D-020）；③ 新 boot 全新 ASLR（ntdll `0x7ffd379e0000`）反而强化跨布局判定。**今后规则：授权令牌的 BootTime 前置只约束"签发时刻"，执行时 boot 已变不构成 STOP 事由，照实记录即可。**
 - **科学结论（干预实验定案）**：D-020 的"配置差异"解释升级为干预证实——唯一变量 = 受控 ini 生效（关闭 KiUserExceptionDispatcher + NtContinue hook），14/14 撞环 → 0 AV。C-6 故障环研究线关闭。TASK-013 待验风险（壳反检）实测阴性。
 - **新前沿**：IAT 启动路径重建（192 槽：`0x1123→0x1138d0 … 0x2c7c→0x113700`）是路径 B（可加载产物）的硬前置，另立新单。
+
+## D-023 批 TASK-014 全案（crates/ 改动授权 + 再扩一格，XC-XXI-B 7/4 → 8/4）
+
+- **日期**：2026-08-30（老板裁定："可以开始"——回应总指挥列明的两件批准请求与可粘贴批准语，按全案解释：两件同时批）
+- **决策**：① 授权 `crates/` 改动（工单授权清单 8 文件：`iat_partial_accept.rs` / `iat_gap_retarget.rs` / `dump_process.rs` / `import_rebuild.rs` / `iat_completeness.rs` / `trace_imports/mod.rs` / `trace_imports/slot.rs` / `iat_evidence.rs` 及其测试模块；**fail-closed 门语义零改动**为硬约束）；② 批 1 格实弹冲路径 B。账本 7/4 → **8/4**。
+- **理由**：R5 实弹指认的唯一剩余阻塞 = IAT 重建（整个 201 槽区零覆盖，192 启动路径站点不可解析）；且运行时槽值只在会话内存中，逐槽诊断必须在下一格实弹前进入代码，否则离线永久补采不到。
+- **保险丝（写入工单）**：① 第一段判别力未过或离线证据显示零改善 → worker STOP 不烧格；② 不许把门改松制造"通过"；③ A' 未改善不许第 3 次。
+- **前置（总指挥亲验，2026-08-30）**：BootTime（签发时刻）= `10:05:51`（与 R5 实弹同 boot）；起点 HEAD = `be28951`（已核为 HEAD 祖先，be28951..HEAD 仅 docs/tickets）；vault ini sha `c88e94c3…` 与样品对象 sha `78009803…` 当场复核在位。
+- **落地**：`tickets/TASK-014.md` 首行已按 D-015 改写为授权令牌（worker 须原文回抄）。

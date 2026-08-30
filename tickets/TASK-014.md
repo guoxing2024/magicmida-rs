@@ -1,11 +1,12 @@
 # TASK-014 — IAT 启动路径重建：192 个启动路径站点可解析 + 一格实弹冲路径 B
 
-⛔ **未授权硬停：本单含①`crates/` 代码改动 与②一格实弹。未获老板批准前不许执行任何步骤——「继续」/「go on」不构成授权（D-015）。批准后总指挥会把本行改写为授权令牌，你必须在报告第一节原文回抄该行。**
+✅ **已授权 —— 授权令牌（必须在报告第一节原文回抄）**：
+> `老板 · 2026-08-30 · 原话"可以开始"（回应总指挥列明的两件批准请求，按全案解释：两件同时批）· ① 授权 crates/ 改动：crates/pe/src/dumper/iat_partial_accept.rs + iat_gap_retarget.rs + dump_process.rs + import_rebuild.rs、crates/pe/src/iat_completeness.rs、crates/packers/themida/src/trace_imports/mod.rs + slot.rs、crates/cli/src/unpacker/iat_evidence.rs 及其测试模块（仅限本单授权文件清单；fail-closed 门语义零改动为硬约束）· ② 批 1 格实弹 · XC-XXI-B 7/4 → 8/4（超原配额，老板明确扩额）· 前置由总指挥亲验：BootTime（令牌签发时刻）= 2026-08-30 10:05:51（执行时 boot 已变不构成 STOP 事由，照实记录即可——D-022 新规）· 起点 HEAD = be28951（TASK-006R5 已验收入栈；worker 须核验 be28951 为 HEAD 祖先、且 be28951..HEAD 的 diff 仅 docs/tickets 文件）· vault 受控 ini sha256 c88e94c3… 与样品对象 sha256 78009803… 已当场复核在位`
 
 - **优先级**：P1（TASK-006R5 实弹指认的最前沿；路径 B 的硬前置）
-- **状态**：📋 待授权（等老板批：`crates/` 改动授权 + 一格实弹 7/4 → 8/4）
+- **状态**：✅ 已授权（老板 2026-08-30 批准两件：crates/ 改动 + 一格实弹；记 D-023）
 - **岗位**：developer（第一段离线改代码，第二段实弹验证）
-- **账本**：XC-XXI-B **7/4 → 8/4**（需老板明确再扩一格）
+- **账本**：XC-XXI-B **7/4 → 8/4**（老板 2026-08-30 明确扩额授权）
 
 ## 背景：TASK-006R5 用一格实弹指认的现场 [已验证]
 
