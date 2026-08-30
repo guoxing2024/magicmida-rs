@@ -1,0 +1,55 @@
+# TASK-019 — T0.5 终跑（完美候选路线）：B1' 宿主 + 脱壳 core + 调试泵，三态判定
+
+⛔ **未授权，禁止执行任何实弹步骤 —— 见到本行即停，回复"等授权"**（本行在老板批准后由总指挥改写为 D-015 授权令牌；worker 不得以任何「继续」类提示替代授权——D-015）
+
+- **岗位**：developer（实弹：调试端口附加运行 B1' 宿主 + 脱壳 core 完美候选 + UI 事件驱动；单 worker 连续执行）
+- **账本**：XC-XXI-B 11/4 → **12/4**（1 格。本单内多次驱动尝试仍记 1 格——T015/T017/T018 先例；**若中途判断需要重新 `/unpack` → 停，另立单另批格**）
+
+## 背景（为什么这条路是治理红线内唯一的活路）
+
+- T0.5 三态判定的双重结构性障碍（D-036）：外部观测被环境垫零（P-11，仅调试端口可读）；调试附加被壳扣解密（**C-8**——但我 T017/T018 派单时部署了**原版** core.dll 09f3dd34，这是总指挥指出的设计失误，P-10 再犯，记入 D-037）。
+- **另一条线早已解决 core.dll**：T0.4「core.dll 完美候选产出化」（2026-08-29 完工，`docs/XX21B_CORE_PERFECT_REPORT_20260829.md`）产出 `core_perfect_candidate.dll`（sha `3650ea6c0a88c731d4b613eaa533ab1d48258ce782843a5661ca6c683fd9b64e`，14,435,328 B，23 节）：S1 12/12、**S2 `.text` 2059/2059 全低熵（静态明文，无解密可扣——C-8 对它结构性失效）**、S3 独立加载 6/6、S4 语义标记全 PASS、R0B 12/12、固定基址（DYNAMIC_BASE 已清除）、EP=NOP 桩（DLL 语义）；与老宿主配对跑通过老 T0.5 Step1 基线（业务链 FULL 到 GUI 消息循环，PARTIAL）。
+- **候选文件本体（总指挥 2026-08-30 定位并 sha 现算核对）**：`D:/MidaVault/lab/worktree_evidence_20260830/lab/xx21b_run/core_perfect_candidate.dll`（= 3650ea6c）。resume 线的 `fc98c187` 候选（runs/docs 零记录、无结论）**不采用**。
+- 三态语义与 T017/T018 票面逐字一致（FULL/新阻塞/AV），证据源 = 调试端口（T018 泵已实弹验证）。
+
+## 判定语义边界（诚实前提，写死）
+
+- 本单三态判定的对象 = **"B1' 宿主（a852880a）+ 脱壳 core 完美候选（3650ea6c）+ config.ini"组合**——与老 T0.5 Step1 基线同构（当时也是宿主+候选配对）。
+- 候选保留了 `.winlice`（明文）/`.boot`（加密）节：**附加下这些保留节是否还有行为级反调试（不动解密、纯分支）未测过**——若附加又改变行为（如对话框不再出现/引导异常），照 T018 先例如实上报（`attach_changed_behavior=true`），不硬凑三态。
+
+## 任务
+
+### 1. 新脚本 `tools/xx21b_t05_ui_drive_pcell.py`（fork 自 T018 版 `xx21b_t05_ui_drive_dbg.py`，原脚本不改）
+
+- **sha 双门更新**：CORE 期望 sha → `3650ea6c…`（14,435,328 B）；HOST 期望 sha → `a852880a…`（1,539,072 B）。
+- **Run/GetAppVersion 动态解析**：经 core.dll 导出表解析（T0.4 报告实证两导出在候选中存在：`Run@0x1C120` / `GetAppVersion@0xBB30`）——**不许硬编码 RVA**（解析失败 → fail-loud `FAIL_RUN_EXPORT`）。
+- **基址一致性自证**：候选为固定基址（首选 `0x7ffe1da10000`、DYNAMIC_BASE 清除）——动态解析结果与首选基址**分别记录、相互核对**（不一致 → 记录事实并继续，判定不依赖一致），不回退到钉死。
+- **保留 T018 全部机制**：`DEBUG_ONLY_THIS_PROCESS` + 同线程泵（全量即时消费，事件不消费 = 冻结）+ CREATE_THREAD 调试句柄 RIP 采样（不 OpenThread）+ EXCEPTION 全记录（`0x80000003`/`0xc000008e` 引导期 CONTINUE、其余 NOT_HANDLED）+ 泵健康自证 + `attach_changed_behavior` 上报 + sha fail-closed + 防火墙只读核实 + `NO_BYPASS=1`。
+
+### 2. 实弹执行（1 格）
+
+- 部署：vault 复制宿主 a852880a → `lab/xx21b_run_pcell/rev2_unpacked.exe`、完美候选 3650ea6c → `lab/xx21b_run_pcell/core.dll`、config.ini（`cde9be13…`）；sha 双核 fail-closed。
+- 执行 ≥2 次驱动（三态判定需 ≥2 次可复现）；每趟证据 JSON + 泵日志落 `lab/xx21b_run_pcell/`，**收尾前先拷入 vault** `D:/MidaVault/lab/evidence/xx21b_t05/`（并入 INDEX.md）。
+
+## 验收标准（每条要真原始输出含退出码）
+
+1. **三态判定（证据源 = 调试端口，语义与 T017/T018 逐字一致）**：
+   - **FULL**：Run 触发后 RIP 采样落入 urlmon.dll 模块区间、进程存活、≥2 次驱动可复现；
+   - **新阻塞**：RIP 稳定卡在新位置（真实采样值）→ verdict 仍 PARTIAL，证据上报 → **STOP**；
+   - **AV**：EXCEPTION 事件（地址/码）或异常退出 → 证据上报 → **STOP**；
+   - **附加改变行为**（GUI 层不再出现等）→ 如实上报 → **STOP**。
+2. **调试泵健康自证**：事件全消费、无冻结征兆（延续 T018 判据）。
+3. 脚本关键 diff/全文 + 判定 + 全部原始输出进报告；结论按 `[已验证]`/`[推断]`/`[存疑]` 标注。
+4. **零越界**：只新建 `tools/xx21b_t05_ui_drive_pcell.py`（+ 复用/新建 lab 部署目录与 vault 证据）；生产代码 `crates/` 一行不动；T017/T018 两套既有脚本不改；git 只读。
+5. **开跑前自查**：BootTime 连续无重启（对照 T018 记录 `10:05:53.549`，变了 → STOP 上报，C-4/B 未根治）；部署物三文件 sha 复核；防火墙 BLOCK 现状核实（未拦截 → STOP 请示，不许真联网）。
+6. 临时文件逐个删除；vault 证据先行；报告第一节回抄授权令牌（本行改写后）。
+
+## 红线（违反即整单作废）
+
+`NO_BYPASS=1`；不真联网、不改防火墙；样品/产物不外发、产物只在本机运行；不写 `C:\Windows`；不新增依赖；样品身份哈希不匹配即 STOP；同一验收标准连续 2 次不通过 → 停下写报告。
+
+## 交付物
+
+- `runs/20260830-TASK-019.md`（令牌回抄 + 脚本关键 diff + 三态判定 + 泵健康自证 + 全部原始输出 + 「我没做的事 / 我不确定的事」）
+- vault `D:/MidaVault/lab/evidence/xx21b_t05/`（新证据并入 + INDEX.md 更新）
+- 工作区留改动给总指挥，**不提交**。
