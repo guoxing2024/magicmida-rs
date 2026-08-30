@@ -118,6 +118,6 @@
 
 ## 下一步
 
-① **TASK-017（T0.5 续跑）已执行完毕（D-034，2026-08-30，实弹 1 格 XC-XXI-B 9/4 → 10/4），终态 = 工具性阻塞**：B1' 产物 Run 实调用**到达 GUI 业务层**（"授权验证"对话框、GUI 存活响应 3/3、无 AV、IAT 不变——行为面重大进展，旧基线连窗口都出不来）；但 RIP 判定证据不可得——本环境（PI Desktop 托管会话）对非附加式 GetThreadContext/EnumWindows **系统性垫零**（P-11，worker 六组探针 + 总指挥两条独立缝复核）；**调试端口路径实测可用**（总指挥 P2 探针真实 Rip）→ 等老板裁定：**A' 批 1 格 harness 改调试端口泵重跑三态（推荐）** / B 接受非 RIP 口径（不推荐） / C 挂起转其它战线（TASK-007 / clippy 基线门 D-031 F3 / §九 GTO-UI / 推送 21 提交 D-010）。TASK-014（路径 A'）/ TASK-015（路径 B1'，XX-11 端点恢复）已验收（D-027/D-029）；遗留小项 = mod.rs LifecycleError 归类补专属行为测试、load 探针 cdb 变体（worker 已标注）。
+① **TASK-018（T0.5 A' 路线）已授权在飞（D-035，2026-08-30，实弹 1 格 XC-XXI-B 10/4 → 11/4）**：老板批选项 A'——驱动脚本观测腿改调试端口泵（`DEBUG_ONLY_THIS_PROCESS` + 独立泵线程全量消费事件 + Run 线程句柄取自 CREATE_THREAD 调试事件 + EXCEPTION 全记录），重跑三态判定（语义与 T017 逐字一致）。前置：T017 终态 = 工具性阻塞（D-034）——B1' 产物 Run 已实调到 GUI 业务层（"授权验证"对话框、GUI 存活 3/3、无 AV、IAT 不变），RIP 证据因 P-11 环境垫零不可得；总指挥 P2 探针实测调试端口路径读得真实 Rip。其余暂缓：TASK-007 / clippy 基线门修复（D-031 F3）/ §九 GTO-UI / 推送（22 提交，D-010）。TASK-014（路径 A'）/ TASK-015（路径 B1'，XX-11 端点恢复）已验收（D-027/D-029）；遗留小项 = mod.rs LifecycleError 归类补专属行为测试、load 探针 cdb 变体（worker 已标注）。
 另有两个可另立的专项：ScyllaHide-NtContinue-hook 交互的微指令级定性（需实弹 trace）、C-5 缺陷 B（会话绑定，`/session-clean` 消费端）。
 推送时机由老板定；推送前建议补跑 `cargo deny check advisories`（本机离线跑不了）。
