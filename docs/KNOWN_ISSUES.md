@@ -157,7 +157,7 @@ WO-24 于 2026-08-27（提交 `607276d`）锁定 `_clippy_baseline`（TOTAL=349�
 - 每次运行内**恒同元组唯一**（`sort -u` 恰 1 条）× 1024 次，C-7 判据形状再次被证实。
 - 累计 **13/13 次跨 3 个 boot** 确定性撞同一故障环（006R 9 + 006R2 2 + 006R3 2）。**"重启后重试"这条路已经走到头了**——TASK-006R2 时我把它列为"近乎免费的探测"，探测做了，结果是阴性，这条路可以关掉了。
 - **总指挥读日志发现的抓手（TASK-013 的起点）**：`target/release/` 下**没有 `scylla_hide.ini`**，运行日志里也无任何读 ini/config 的痕迹，而 `scylla_hide.log` 显示 `Hooking KiUserExceptionDispatcher` 与 `Hooking NtContinue` **都装上了**；对照 vault 参考 ini（`D:/MidaVault/quarantine/20260722/workspace/magicmida-rs/scylla_hide.ini`）那里 `KiUserExceptionDispatcherHook=0`。→ **我们是在无配置状态下注入，ScyllaHide 默认把所有 hook 都装上**，包括跟壳打架的异常分发链。引擎里配置口子其实留着（`antidebug_controller.rs:507` 的 `OracleMode.ini_path`，挂着 `#[allow(dead_code)]`），**留了没接线**。[已验证]
-- **待办**：~~TASK-013~~ 已完成并验收；~~TASK-006R4~~ **已执行并验收（2026-08-30，终态 STOP：`C:\Windows` 落位方案结构性无效）** → ~~TASK-006R5~~ **已执行并验收（2026-08-30，终态路径 A）：受控 ini 生效后 0 次 AV、text-poll 首次收敛到 dump——C-6 故障环被干预实验定案（配置差异，D-020 证实）；缺陷 A fail-closed 门实弹生效（192 unresolved 槽拒绝产物）。新前沿 = IAT 启动路径重建（192 槽）。**
+- **待办**：~~TASK-013~~ 已完成并验收；~~TASK-006R4~~ **已执行并验收（2026-08-30，终态 STOP：`C:\Windows` 落位方案结构性无效）** → ~~TASK-006R5~~ **已执行并验收（2026-08-30，终态路径 A）：受控 ini 生效后 0 次 AV、text-poll 首次收敛到 dump——C-6 故障环被干预实验定案（配置差异，D-020 证实）；缺陷 A fail-closed 门实弹生效（192 unresolved 槽拒绝产物）。~~新前沿 = IAT 启动路径重建（192 槽）~~ **勘误（D-024/P-10）：IAT 重建能力 08-28 已实证（XX-11 186/186 + load 10/10 + S4 8/8）；当前 0/201 是回归，TASK-014 v2 = 回归定位与恢复。**
 
 **TASK-013 追加（2026-08-30）+ TASK-006R4 勘误（同日实弹实证推翻其中一条）：ini 查找规则的最终定论。**
 - ~~`InjectorCLIx64.exe` 用裸相对名读配置、只搜 Windows 目录、放 exe 旁没用~~ —— **这条 TASK-013 结论错误，已由 TASK-006R4 推翻（详见本块末尾"定案版"第 1 条）**。正确结论：InjectorCLI 用 `GetModuleFileNameW` 拿自身 exe 路径，读 **`<exe目录>/scylla_hide.ini`**；放 exe 同目录**有效**，放 `C:\Windows` **无效**。TASK-013 的探针测的是裸相对名的 API 语义（该语义本身正确），但 InjectorCLI 传的是绝对路径，故不适用。**教训（新 P-9）：探针必须打在被测程序的实际调用路径上；只验 API 语义就宣布"程序行为如何"，会把一个正确的 API 结论变成一个错误的程序结论，并据此烧掉一格实弹。**
@@ -258,6 +258,11 @@ CI 的 `on.push.branches` 已经把 `oreans/two-sample-mainline` 列为一等分
 
 TASK-013 落地代码里 "hook" 一词有 6+ 处写成了西里尔 `о`（U+043E）而非 ASCII `o`（`helpers.rs` 的显示串 `"无 ini（ScyllaHide 默认全 hооk）"` 与注释、`antidebug_controller.rs` 的测试断言与断言消息、报告标题同源）。测试内部自洽所以全绿，**但按 ASCII `hook` 去 grep 日志/sidecar 会漏**（`SCYLLAHIDE_HOOK_CONFIG_SOURCE=` 前缀和 `无 ini` 子串仍可 grep，实际影响面小）。
 **规矩**：① 下次任何 worker 获授权碰这三个文件时，顺手把西里尔 о 归一为 ASCII o（含对应测试断言，一处不漏）；② 我以后验收新增用户可见字符串时加一条"纯 ASCII/CJK 检查"。
+
+### P-10 同一样品开新工单/新战役前，必须先挖 vault 里的历史战役证据包 [已验证，2026-08-30 发现]
+
+xx 战役（08-27/28，xx1…xx11 共 11 次实弹）在 `D:/MidaVault/lab/evidence/xiongxiong_duokai/` 留有完整证据包与报告：**XX-11 已端到端跑通**（IAT 186/186 全解析 + 结构门 12/12 + load_no_crash 10/10 零 AV + S4 业务标记 8/8 对齐）。8-29 接管日无人读它 → 006R/R2/R3/R4 四格花在"回到已知位置"；总指挥 08-30 起草 TASK-014 时又没读，把问题定义写成"回溯从未咬合、需扩展"（错，实为回归）——被老板质询"以前能脱壳为什么现在不行"点醒后才直读证据包（D-024）。
+**规矩**：① 同一样品开任何新工单，第一步 = 通读 vault 证据目录下该样品全部历史 `*REPORT*`/manifest；② 问题定义里凡出现"从未/没能力/需要新建"字样，必须先有"历史做过没有"的证据；③ 产物类目标必须先对照历史最佳端点（本例 = XX-11 的 186/186 + 10/10 + S4 8/8）。
 
 ### P-9 探针打在 API 语义上而不是被测程序的实际调用路径上，烧掉一格实弹 [已验证，2026-08-30 TASK-006R4 实弹实证推翻 TASK-013]
 
