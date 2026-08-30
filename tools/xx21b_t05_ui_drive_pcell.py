@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""XC-XXI-B T0.5 终跑（TASK-019，完美候选路线）：B1' 宿主 + 脱壳 core 完美候选 + 调试端口泵，三态判定
-fork 自 tools/xx21b_t05_ui_drive_dbg.py (TASK-018 版); 原两套脚本 (T017 版 / T018 版) 不改, 本脚本为新增文件.
+"""XC-XXI-B T0.5 三态重跑·收官之战（TASK-021，清洗后候选路线）：B1' 宿主 + 清洗后候选 core + 调试端口泵，三态判定
+fork 自 tools/xx21b_t05_ui_drive_dbg.py (TASK-018 版); 原三套脚本 (T017 版 / T018 版 / T019 版) 不改.
 
-判定对象 = "B1' 宿主 (a852880a) + 脱壳 core 完美候选 (3650ea6c) + config.ini" 组合 (与 T0.4 Step1 基线同构).
-保留 T018 全部机制 (泵线程全量即时消费 / CREATE_THREAD 调试句柄 RIP 采样不 OpenThread / EXCEPTION 全记录 /
-泵健康自证 / attach_changed_behavior 上报 / sha fail-closed / 防火墙只读核实 / NO_BYPASS=1)。
+判定对象 = "B1' 宿主 (a852880a) + 清洗后候选 core (094f5401, T020+R1 会话指针清洗 8/8) + config.ini" 组合.
+保留 T019 全部机制 (泵线程全量即时消费 / CREATE_THREAD 调试句柄 RIP 采样不 OpenThread / EXCEPTION 全记录 /
+泵健康自证 / attach_changed_behavior 上报 / sha fail-closed / 导出动态解析 / 防火墙只读核实 / NO_BYPASS=1)。
 
-本版改动 (T019 票面):
-  1) sha 双门更新: CORE 期望 -> 3650ea6c (14,435,328 B); HOST 期望 -> a852880a (1,539,072 B);
-  2) Run/GetAppVersion 动态解析: 经 core.dll 导出表解析 (T0.4 报告实证: Run@0x1C120 / GetAppVersion@0xBB30
-     在候选中存在) — 不许硬编码 RVA (解析失败 -> fail-loud FAIL_RUN_EXPORT);
-  3) 基址一致性自证: 候选固定基址 (首选 0x7ffe1da10000, DYNAMIC_BASE 清除) — 动态解析结果与首选基址
-     分别记录、相互核对 (不一致 -> 记录事实并继续, 判定不依赖一致), 不回退到钉死;
-  4) urlmon IAT 槽解析同样动态化: 导出目录 + .idata 深度解析 URLDownloadToFileA 槽 RVA (不硬编码 0x16f300),
-     动态基址 + 槽 RVA 得 VA; 解析失败仅记录不阻断 (T0.4 报告静态证据已足)。
-三态判定语义与 T017/T018 票面逐字一致, 仅判定对象换为完美候选组合; 结论 = 路径级 (FULL = 路径级结论, 非完全行为等价).
+本版改动 (T021 票面, 最小 diff):
+  1) sha 门更新: CORE 期望 -> 094f5401 (14,435,328 B, 清洗后候选 R1, vault task020_cleanse/); HOST/CONFIG 不变
+     (a852880a / cde9be13);
+  2) 基址硬门 (新增, 本单核心保险丝): 候选首选基址从其 PE 头 ImageBase 动态读取 (不硬编码),
+     core.dll 实际加载基址从 LOAD_DLL 事件 / enum_modules 动态读取; 两者不等 -> FAIL_CORE_BASE_RELOCATED
+     fail-loud, 在触发 Run 之前终止 (候选 3549 个自引用 vs 仅 4 条重定位, 重定位即必败, T019 实测被重定位过;
+     防把实验烧在注定失败的配置上). 一致 -> base_agreement=true 继续;
+  3) run_head 明文预检: 触发 Run 前, 预期明文 prologue (非加密态 415741564155...) — 异常即 fail-loud;
+  4) AV 地址落在旧 ntdll 死区间 [0x7ffeeb320000, +0x300000) 或旧 urlmon 区间 -> 标注 ".winlice 残留命中" -> STOP.
+三态判定语义与 T017/T018/T019 票面逐字一致, 仅判定对象换为清洗后候选组合; 结论 = 路径级 (FULL = 路径级结论, 非完全行为等价).
 红线: NO_BYPASS=1; 不真联网; 不改防火墙; 样品/产物不外发; 不写 C:\\Windows; 不新增依赖 (仅 ctypes/subprocess/标准库).
 """
 import ctypes, ctypes.wintypes as wt
@@ -27,11 +28,18 @@ DEPLOY = r"D:\Claude project\magicmida-rs\lab\xx21b_run_pcell"
 HOST = os.path.join(DEPLOY, "rev2_unpacked.exe")
 CORE = os.path.join(DEPLOY, "core.dll")
 CONFIG = os.path.join(DEPLOY, "config.ini")
-CAND_SHA = "3650ea6c0a88c731d4b613eaa533ab1d48258ce782843a5661ca6c683fd9b64e"
+CAND_SHA = "094f5401b9c59db5512ec510ed1b13675013c414f98f78cde7ffa1fc31996457"  # T021: 清洗后候选 R1
 HOST_SHA = "a852880aabba215b16a2a96245322ca09d19ff148afaa30ff42b1a8ea438edac"
 CONFIG_SHA = "cde9be13a5da62f5805cbf3b359c56c27f020d12cd1ae838f6a4218492d1d610"
 # 候选固定基址首选 (T0.4 报告: keep_runtime_base 固定基址, DYNAMIC_BASE 清除, 0x7ffe1da10000 保留)
+# T021 基址硬门: 门判据必须用 read_candidate_preferred_base_disk() 从 PE 头 ImageBase 动态读取的值,
+# 本常量仅作文档对照 (两者应一致)。
 CAND_PREFERRED_BASE = 0x7FFE1DA10000
+# 旧 (dump 会话) 死区间, 用于 AV 地址 .winlice 残留命中标注 (T020 死区间恢复 / R1 加宽窗口):
+#   ntdll  [0x7ffeeb320000, +0x300000)  (T021 票面; 比 TASK-020 的 0x270000 加宽)
+#   urlmon [0x7ffec48f0000, +0x1dd000)  (T020 §4: IAT 槽值 0x7ffec49ee470 - 导出 RVA 0xfe470 推算)
+OLD_NTDLL_DEAD = (0x7FFEEB320000, 0x300000)
+OLD_URLMON_DEAD = (0x7FFEC48F0000, 0x1DD000)
 
 # 进程/线程权限
 PROCESS_QUERY_INFORMATION = 0x0400
@@ -393,6 +401,29 @@ class runtime:
             nm = image[noff2:noff2 + 64].split(b"\0")[0].decode('latin1', 'replace')
             res[nm] = frva
         return res
+
+    def read_candidate_preferred_base_disk(self):
+        """从磁盘 CORE 文件 PE 头动态读取候选首选基址 (ImageBase, 不硬编码; T021 基址硬门)。
+        返回 (image_base_or_None, err_or_None)。"""
+        try:
+            image = open(CORE, "rb").read()
+        except Exception as e:
+            return None, "open failed: %r" % (e,)
+        pe = self._pe_dirs(image)
+        if not pe:
+            return None, "PE parse failed"
+        return pe[0], None
+
+    def _dead_range_hit(self, addr):
+        """AV 地址是否落在旧 (dump 会话) 死区间: ntdll [0x7ffeeb320000,+0x300000) / urlmon [0x7ffec48f0000,+0x1dd000)。
+        T021: 落入 -> 返回命中详情 (标注 '.winlice 残留命中' -> STOP); 否则 None。"""
+        if addr is None:
+            return None
+        for base, size, name in ((OLD_NTDLL_DEAD[0], OLD_NTDLL_DEAD[1], "ntdll"),
+                                 (OLD_URLMON_DEAD[0], OLD_URLMON_DEAD[1], "urlmon")):
+            if base <= addr < base + size:
+                return {"dead_range": name, "base": hex(base), "size": hex(size), "addr": hex(addr)}
+        return None
 
     def resolve_urlmon_slot_disk(self):
         """从磁盘 CORE 文件解析 urlmon IAT 槽 (URLDownloadToFileA 导入槽 RVA)。
@@ -1052,7 +1083,7 @@ class runtime:
         sha_cfg = sha256_file(CONFIG)
         if sha_cfg != CONFIG_SHA:
             return {"redline": "FAIL_CONFIG_SHA", "sha": sha_cfg, "expect": CONFIG_SHA}
-        print("redline sha OK (core=3650ea6c perfect candidate, host=a852880a, config=cde9be13)")
+        print("redline sha OK (core=094f5401 cleansed candidate R1, host=a852880a, config=cde9be13)")
 
         # 0.25) 任务 1: 导出表动态解析 (Run/GetAppVersion — 不许硬编码 RVA)
         exports = self.resolve_exports_disk()
@@ -1144,8 +1175,26 @@ class runtime:
             self.terminate_host()
             self._cleanup_pump()
             self._cleanup_handles()
+            # T021: 即使 core 未能在 enum_modules 确认 (进程死于引导沉降期), 也尽量用泵 LOAD_DLL 事件流
+            # 记录 base_agreement。注意: _pump_core_candidate 是时间采样 (泵 LOAD_DLL 事件未名验证, T019 继承),
+            # 不作文档断言。权威证据 = 事件流中 base==PE 头首选基址 的 LOAD_DLL (固定基址 core 加载)。
+            ba = None
+            pump_cand = self._pump_core_candidate
+            pref, _ = self.read_candidate_preferred_base_disk()
+            # 扫泵事件流: 是否存在 base == 首选基址 的 LOAD_DLL (固定基址 core.dll 加载, 主线程)
+            fixed_base_load = False
+            with self.pump_lock:
+                for e in self.dbg_events:
+                    if e.get("name") == "LOAD_DLL_DEBUG_EVENT" and e.get("base") == pref:
+                        fixed_base_load = True
+                        break
+            ba = {"preferred_from_pe_header": hex(pref) if pref else None,
+                  "pump_timing_sample_actual_base": hex(pump_cand) if pump_cand else None,
+                  "pump_timing_sample_is_name_verified": False,  # 泵 LOAD_DLL 事件无模块名 (T019 继承)
+                  "load_dll_at_preferred_base_seen": fixed_base_load,
+                  "equal": fixed_base_load}
             return {"redline": "FAIL_CORE_NOT_LOADED", "wait": wcl,
-                    "pump": self.pump_summary()}
+                    "pump": self.pump_summary(), "base_agreement": ba}
 
         # 2) 基址动态解析 (MZ 双核 fail-closed) + 首选基址核对 (T019 票面语义边界条款)
         self.enum_modules()
@@ -1205,6 +1254,44 @@ class runtime:
             self._cleanup_handles()
             return {"redline": "FAIL_FIXED_BASE", "deploy_check": deploy_check,
                     "pump": self.pump_summary()}
+
+        # ============ T021 基址硬门 + run_head 明文预检 (触发 Run 前, fail-loud, 不许硬跑) ============
+        # ① 基址硬门: 候选首选基址从 PE 头 ImageBase 动态读取; 实际加载基址已由 enum_modules 动态读取 (core_base).
+        #    两者不等 -> FAIL_CORE_BASE_RELOCATED 终止于 Run 之前 (候选 3549 自引用 vs 仅 4 条 reloc, 重定位必败).
+        preferred_base, pe_err = self.read_candidate_preferred_base_disk()
+        if preferred_base is None:
+            self.terminate_host()
+            self._cleanup_pump()
+            self._cleanup_handles()
+            return {"redline": "FAIL_CANDIDATE_PE_IMAGEBASE", "err": pe_err,
+                    "base_agreement": self.base_agreement, "pump": self.pump_summary()}
+        self.base_agreement["preferred_from_pe_header"] = hex(preferred_base)
+        self.base_agreement["preferred_constant_doc"] = hex(CAND_PREFERRED_BASE)
+        base_equal = (core_base == preferred_base)
+        self.base_agreement["equal"] = base_equal
+        self.base_agreement["equal_vs_constant"] = (core_base == CAND_PREFERRED_BASE)
+        self.log_event("base_gate", json.dumps(self.base_agreement))
+        if not base_equal:
+            self.terminate_host()
+            self._cleanup_pump()
+            self._cleanup_handles()
+            return {"redline": "FAIL_CORE_BASE_RELOCATED",
+                    "detail": "实际加载基址 != 候选 PE 头首选基址 (重定位即必败: 3549 自引用 vs 4 reloc 条目); "
+                              "这是环境事实不是失败, 重跑策略由总指挥裁定",
+                    "base_agreement": self.base_agreement, "pump": self.pump_summary()}
+        # ② run_head 明文预检: 触发 Run 前, run_va 须为明文 prologue (非加密态; T018 附加下加密态 5/5 实证).
+        run_pre = self.rpm(RUN_VA, 6)
+        run_plain = (run_pre == bytes.fromhex("415741564155")) if run_pre else False
+        self.log_event("run_head_precheck", json.dumps({
+            "run_va": hex(RUN_VA), "run_head": run_pre.hex() if run_pre else None,
+            "plaintext_prologue": run_plain}))
+        if not run_plain:
+            self.terminate_host()
+            self._cleanup_pump()
+            self._cleanup_handles()
+            return {"redline": "FAIL_RUN_HEAD_ENCRYPTED",
+                    "detail": "Run 入口非明文 prologue (加密态, 附加改变行为 T018 5/5 实证) — fail-loud, 不硬跑",
+                    "run_head": run_pre.hex() if run_pre else None, "pump": self.pump_summary()}
 
         if dry:
             all_wnds = self.find_windows()
@@ -1364,12 +1451,23 @@ class runtime:
             self.pump_exit_code = exit_crash_code
             self.pump_process_exited = True
         non_boot_exceptions = real_avs
+        # T021: AV 地址死区间标注 (.winlice 残留命中 = 旧 ntdll/urlmon 死区间命中, 13 个入册残留之一)
+        winlice_residual_hits = []
+        for e in self.exceptions:
+            addr = e.get("address")
+            hit = self._dead_range_hit(addr)
+            if hit:
+                hit.update({"code": e.get("code"), "thread_rip": e.get("thread_rip")})
+                winlice_residual_hits.append(hit)
+        winlice_hit = bool(winlice_residual_hits)
         verdict = {
             "evidence_source": "debug_port_pump (DEBUG_ONLY_THIS_PROCESS)",
             "urlmon_hit_count": len(urlmon_hits),
             "urlmon_first_hit": urlmon_hits[0] if urlmon_hits else None,
             "exception_events_non_breakpoint": non_boot_exceptions,
             "exception_events_total": len(self.exceptions),
+            "winlice_residual_hits": winlice_residual_hits,
+            "winlice_residual_hit": winlice_hit,
             "process_alive_at_final": bool(fin["still_active"]),
             "process_exit_code": self.pump_exit_code,
             "process_exited_before_end": self.pump_process_exited,
@@ -1378,7 +1476,8 @@ class runtime:
             "attach_changed_behavior": self.attach_changed_behavior,
             "freeze_symptoms": self.freeze_symptoms,
             "pump": self.pump_summary(),
-            "state": self._classify(non_boot_exceptions, urlmon_hits, stable_rip, fin, result),
+            "state": self._classify(non_boot_exceptions, urlmon_hits, stable_rip, fin, result,
+                                     winlice_residual_hits),
         }
         self.log_event("verdict", json.dumps(verdict))
 
@@ -1454,7 +1553,8 @@ class runtime:
                 "stable": top[1] >= total * 0.7 and total >= 10,
                 "in_message_loop": top[0][1] in ("win32u.dll", "user32.dll") if top[0][1] else False}
 
-    def _classify(self, non_boot_exceptions, urlmon_hits, stable_rip, fin, out_result):
+    def _classify(self, non_boot_exceptions, urlmon_hits, stable_rip, fin, out_result,
+                  winlice_residual_hits=None):
         """三态判定 (语义与 T017/T018 票面逐字一致; 证据源 = 调试端口)。
         T017 票面语义:
           FULL: RIP 采样落入 urlmon.dll 模块区间 + 进程存活;
@@ -1462,13 +1562,21 @@ class runtime:
           AV: EXCEPTION 调试事件 (地址/码) 或进程异常退出 → 证据上报 → STOP。
         AV > 新阻塞 > FULL 顺序判定 (AV 证据优先); 0xc000008e 引导期良性浮点不计 AV。
         attach_changed_behavior 作为语境附注, 不压过 AV。
+        T021: AV 地址落在旧 ntdll 死区间 [0x7ffeeb320000,+0x300000) / 旧 urlmon 区间
+        -> 标注 ".winlice 残留命中" (13 个入册残留之一) -> STOP。
         FULL 语义边界 (T019 票面): 宿主+候选组合的路径级结论 (Run→urlmon 明文可达), 非完全行为等价。"""
         av_list = non_boot_exceptions
         if av_list:
-            return "AV_EVIDENCE (EXCEPTION 调试事件非引导断点: %s%s)" % (
+            wl = ""
+            if winlice_residual_hits:
+                wl = " | .winlice 残留命中: %s" % [
+                    {"dead_range": h.get("dead_range"), "addr": h.get("addr"),
+                     "code": h.get("code")} for h in winlice_residual_hits[:8]]
+            return "AV_EVIDENCE (EXCEPTION 调试事件非引导断点: %s%s%s)" % (
                 [{"code": e.get("code"), "addr": hex(e.get("address")) if e.get("address") else None,
                   "threadRip": e.get("thread_rip")} for e in av_list[:8]],
-                " + attach_changed_behavior" if self.attach_changed_behavior else "")
+                " + attach_changed_behavior" if self.attach_changed_behavior else "",
+                wl)
         if self.pump_process_exited:
             code = self.pump_exit_code
             if code:
