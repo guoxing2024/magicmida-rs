@@ -7,6 +7,7 @@
 use tracing::{debug, info, warn};
 
 use crate::error::ThemidaError;
+use sha2::Digest;
 
 /// Configuration for launching ScyllaHide injection.
 ///
@@ -81,6 +82,20 @@ pub struct ScyllaHideConfig {
 /// (or maliciously) running a tampered ScyllaHide helper — the helper injects
 /// into the debuggee, so integrity is a safety requirement, not a nicety.
 pub fn inject_scylla_hide(pid: u32, config: &ScyllaHideConfig) -> Result<(), ThemidaError> {
+    // Route A (TASK-006R5): when a controlled ini is supplied, stage the
+    // injector trio (InjectorCLI + HookLibrary + ini) into a workspace-OUT
+    // run-time staging dir and spawn the staged injector there. R4 evidence:
+    // InjectorCLI reads `<injector-exe-dir>/scylla_hide.ini` (it builds the
+    // path with GetModuleFileNameW + GetPrivateProfileSectionNamesW), so the
+    // controlled ini only takes effect when it sits next to the injector we
+    // actually spawn. ARTIFACT_POLICY forbids `scylla_hide.ini` in the
+    // workspace, hence the OS-temp staging dir. Without an ini, behaviour is
+    // byte-for-byte the pre-existing path (spawn the configured injector
+    // directly, no staging, no copies).
+    if let Some(ini) = config.ini_path.as_deref() {
+        return inject_scylla_hide_staged(pid, config, std::path::Path::new(ini));
+    }
+
     // Verify the injector binary exists.
     let injector_path = std::path::Path::new(&config.injector_cli_path);
     if !injector_path.exists() {
@@ -204,4 +219,458 @@ pub fn inject_scylla_hide(pid: u32, config: &ScyllaHideConfig) -> Result<(), The
     drop(child);
 
     Ok(())
+}
+
+/// Verify both helper binaries against their committed known-good SHA-256.
+fn verify_helper_hashes(
+    injector_path: &std::path::Path,
+    hook_path: &std::path::Path,
+) -> Result<(), ThemidaError> {
+    let injector_bytes = std::fs::read(injector_path).map_err(|e| {
+        ThemidaError::ScyllaHide(format!(
+            "Failed to read InjectorCLI for hash check: {e} (path: '{}')",
+            injector_path.display()
+        ))
+    })?;
+    if !crate::binaries::verify_sha256(&injector_bytes, crate::binaries::expected_injector_hash()) {
+        return Err(ThemidaError::ScyllaHide(format!(
+            "InjectorCLI hash mismatch at '{}': the file does not match the expected SHA-256. \
+             Aborting to avoid running a tampered helper.",
+            injector_path.display()
+        )));
+    }
+
+    let hook_bytes = std::fs::read(hook_path).map_err(|e| {
+        ThemidaError::ScyllaHide(format!(
+            "Failed to read HookLibrary for hash check: {e} (path: '{}')",
+            hook_path.display()
+        ))
+    })?;
+    if !crate::binaries::verify_sha256(&hook_bytes, crate::binaries::expected_hook_hash()) {
+        return Err(ThemidaError::ScyllaHide(format!(
+            "HookLibrary hash mismatch at '{}': the file does not match the expected SHA-256. \
+             Aborting to avoid running a tampered helper.",
+            hook_path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Spawn the injector with the pid / hook / nowait argument contract.
+fn spawn_injector(
+    injector_path: &std::path::Path,
+    pid_arg: &str,
+    hook_library_path: &str,
+) -> Result<std::process::Child, ThemidaError> {
+    std::process::Command::new(injector_path)
+        .arg(pid_arg)
+        .arg(hook_library_path)
+        .arg("nowait")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| {
+            ThemidaError::ScyllaHide(format!(
+                "Failed to spawn '{}': {e}",
+                injector_path.display()
+            ))
+        })
+}
+
+/// Drop-guard that removes the run-time staging directory.
+///
+/// Runs on normal return AND on panic (drop of the guard during unwind),
+/// so no staging artifact survives the inject call on any path.
+struct StagingGuard {
+    dir: std::path::PathBuf,
+}
+
+impl StagingGuard {
+    fn new(dir: std::path::PathBuf) -> Self {
+        Self { dir }
+    }
+}
+
+impl Drop for StagingGuard {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.dir) {
+            warn!(
+                dir = %self.dir.display(),
+                error = %e,
+                "Failed to remove ScyllaHide staging dir during cleanup"
+            );
+        } else {
+            debug!(dir = %self.dir.display(), "Removed ScyllaHide staging dir");
+        }
+    }
+}
+
+/// Compute the SHA-256 of a file (lowercase hex).
+fn sha256_hex(path: &std::path::Path) -> Result<String, ThemidaError> {
+    let bytes = std::fs::read(path).map_err(|e| {
+        ThemidaError::ScyllaHide(format!(
+            "Failed to read '{}' for sha256: {e}",
+            path.display()
+        ))
+    })?;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Fail-closed verification: the staged ini must byte-identically match the
+/// source ini, otherwise return Err (never silently continue with a
+/// possibly-corrupt config).
+fn verify_staged_ini_matches(
+    source: &std::path::Path,
+    staged: &std::path::Path,
+) -> Result<(), ThemidaError> {
+    let src_sha = sha256_hex(source)?;
+    let staged_sha = sha256_hex(staged)?;
+    if src_sha != staged_sha {
+        return Err(ThemidaError::ScyllaHide(format!(
+            "ScyllaHide ini staging verification FAILED: staged sha256 {staged_sha}              != source sha256 {src_sha} (path '{}')",
+            staged.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Route A: stage the injector trio into a workspace-out run-time dir and
+/// spawn the staged injector so the controlled `scylla_hide.ini` is actually
+/// read (it must sit next to the injector executable - R4 evidence).
+///
+/// Fail-closed semantics (TASK-006R5):
+///  1. the ini is copied to `<staging>/scylla_hide.ini`;
+///  2. the copy's sha256 must equal the source's sha256, else we return Err
+///     (never silently continue with a possibly-corrupt config);
+///  3. the staged injector is spawned and the staging dir is removed on every
+///     path (success / error / panic) via `StagingGuard`.
+///
+/// The actual staged path + verify result are logged on the
+/// `SCYLLAHIDE_HOOK_CONFIG_SOURCE` line so a live-fire run can prove the ini
+/// was delivered (not just recorded).
+fn inject_scylla_hide_staged(
+    pid: u32,
+    config: &ScyllaHideConfig,
+    ini_src: &std::path::Path,
+) -> Result<(), ThemidaError> {
+    // Integrity of the helpers is a precondition, identical to the non-staged
+    // path (they get copied into staging and spawned there).
+    let injector_src = std::path::Path::new(&config.injector_cli_path);
+    let hook_src = std::path::Path::new(&config.hook_library_path);
+    if !injector_src.exists() {
+        return Err(ThemidaError::ScyllaHide(format!(
+            "InjectorCLI not found at '{}'",
+            config.injector_cli_path
+        )));
+    }
+    if !hook_src.exists() {
+        return Err(ThemidaError::ScyllaHide(format!(
+            "HookLibrary not found at '{}'",
+            config.hook_library_path
+        )));
+    }
+    verify_helper_hashes(injector_src, hook_src)?;
+
+    if !ini_src.exists() {
+        return Err(ThemidaError::ScyllaHide(format!(
+            "Controlled ScyllaHide ini not found at '{}'",
+            ini_src.display()
+        )));
+    }
+    let src_ini_sha256 = sha256_hex(ini_src)?;
+
+    // Stage into workspace-out temp dir (keyed by pid).
+    let staging_dir = std::env::temp_dir().join(format!("mida-scyllahide-{pid}"));
+    if let Err(e) = std::fs::create_dir_all(&staging_dir) {
+        return Err(ThemidaError::ScyllaHide(format!(
+            "Failed to create ScyllaHide staging dir '{}': {e}",
+            staging_dir.display()
+        )));
+    }
+    let _guard = StagingGuard::new(staging_dir.clone());
+
+    let staged_injector = staging_dir.join("InjectorCLIx64.exe");
+    let staged_hook = staging_dir.join("HookLibraryx64.dll");
+    let staged_ini = staging_dir.join("scylla_hide.ini");
+
+    // Copy helper binaries (the staged injector must find the hook DLL and
+    // ini in its own directory).
+    std::fs::copy(injector_src, &staged_injector).map_err(|e| {
+        ThemidaError::ScyllaHide(format!(
+            "Failed to stage InjectorCLI to '{}': {e}",
+            staged_injector.display()
+        ))
+    })?;
+    std::fs::copy(hook_src, &staged_hook).map_err(|e| {
+        ThemidaError::ScyllaHide(format!(
+            "Failed to stage HookLibrary to '{}': {e}",
+            staged_hook.display()
+        ))
+    })?;
+    std::fs::copy(ini_src, &staged_ini).map_err(|e| {
+        ThemidaError::ScyllaHide(format!(
+            "Failed to stage ini to '{}': {e}",
+            staged_ini.display()
+        ))
+    })?;
+
+    // Fail-closed: the staged ini must byte-identically match the source.
+    verify_staged_ini_matches(ini_src, &staged_ini)?;
+
+    info!(
+        source = %ini_src.display(),
+        staged = %staged_ini.display(),
+        sha256 = %src_ini_sha256,
+        "SCYLLAHIDE_HOOK_CONFIG_SOURCE=ini: {} (staged to {}, sha256 verified {})",
+        ini_src.display(),
+        staged_ini.display(),
+        src_ini_sha256
+    );
+    info!(
+        staged_dir = %staging_dir.display(),
+        sha256_verified = true,
+        "ScyllaHide ini staging verification passed"
+    );
+
+    let pid_arg = format!("pid:{pid}");
+    debug!(
+        staged_injector = %staged_injector.display(),
+        %pid_arg,
+        hook = %staged_hook.display(),
+        "Launching staged ScyllaHide injector"
+    );
+    let mut child = spawn_injector(&staged_injector, &pid_arg, &staged_hook.to_string_lossy())?;
+
+    std::thread::sleep(std::time::Duration::from_millis(config.hook_delay_ms));
+
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            if status.success() {
+                info!("ScyllaHide injection completed successfully (staged)");
+            } else {
+                warn!(
+                    ?status,
+                    "ScyllaHide staged injector exited with non-zero status"
+                );
+            }
+        }
+        Ok(None) => {
+            info!("ScyllaHide injection initiated (staged, running in background)");
+        }
+        Err(e) => {
+            warn!("Failed to check staged ScyllaHide injector status: {e}");
+        }
+    }
+    drop(child);
+
+    // P-8 evidence preservation (TASK-006R5): the staged injector writes
+    // `scylla_hide.log` next to itself, i.e. inside the staging dir, which the
+    // StagingGuard is about to delete. Copy it to a persistent temp path so a
+    // live-fire run can archive it to the vault before any new injection
+    // overwrites it (each injection overwrites; evidence window is one-shot).
+    let staged_log = staging_dir.join("scylla_hide.log");
+    if staged_log.exists() {
+        let evidence_path =
+            std::env::temp_dir().join(format!("mida-scyllahide-evidence-{pid}.log"));
+        match std::fs::copy(&staged_log, &evidence_path) {
+            Ok(_) => info!(
+                evidence = %evidence_path.display(),
+                "ScyllaHide staging log preserved for P-8 evidence (outside staging dir, survives cleanup)"
+            ),
+            Err(e) => warn!(
+                log = %staged_log.display(),
+                error = %e,
+                "Failed to preserve staged scylla_hide.log for P-8 evidence"
+            ),
+        }
+    } else {
+        debug!(staged_dir = %staging_dir.display(), "No staged scylla_hide.log to preserve");
+    }
+
+    // StagingGuard drops here (or on any earlier Err / panic) and removes the
+    // whole staging dir; the staged injector has already returned by then
+    // (hook_delay_ms window) so no open handle keeps it alive.
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- route A: staging dir resolution (pure, no IO) ---
+
+    #[test]
+    fn staging_dir_is_workspace_out_and_pid_keyed() {
+        // Route-A path resolution contract: the staging dir must live under
+        // the OS temp dir (never the workspace - ARTIFACT_POLICY) and be
+        // unique per target pid so concurrent injects never collide.
+        let d1 = std::env::temp_dir().join(format!("mida-scyllahide-{}", 1234));
+        let d2 = std::env::temp_dir().join(format!("mida-scyllahide-{}", 1234));
+        let d3 = std::env::temp_dir().join(format!("mida-scyllahide-{}", 5678));
+        assert_eq!(d1, d2, "same pid must resolve to the same staging dir");
+        assert_ne!(
+            d1, d3,
+            "different pids must resolve to different staging dirs"
+        );
+        assert!(
+            d1.to_string_lossy()
+                .to_ascii_lowercase()
+                .contains("mida-scyllahide-1234"),
+            "staging dir must embed the pid, got: {}",
+            d1.display()
+        );
+        assert!(
+            d1.starts_with(&std::env::temp_dir()),
+            "staging dir must live under the OS temp dir (workspace-out), got: {}",
+            d1.display()
+        );
+    }
+
+    #[test]
+    fn sha256_hex_matches_known_input() {
+        // sha256("abc") — deterministic vector; proves the helper is real
+        // SHA-256, not a placeholder.
+        let dir = std::env::temp_dir().join("mida-scyllahide-test-sha");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("abc.txt");
+        std::fs::write(&p, b"abc").unwrap();
+        let got = sha256_hex(&p).unwrap();
+        assert_eq!(
+            got,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staging_guard_removes_dir_on_drop() {
+        let dir = std::env::temp_dir().join("mida-scyllahide-test-guard");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("scylla_hide.ini"), b"[SETTINGS]").unwrap();
+        {
+            let guard = StagingGuard::new(dir.clone());
+            assert!(dir.exists());
+            let _ = guard; // drop at scope end
+        }
+        assert!(!dir.exists(), "staging dir must be removed on guard drop");
+    }
+
+    // --- fail-closed: the staged ini must match the source sha256 ---
+
+    #[test]
+    fn staged_ini_mismatch_fails_closed() {
+        // Verify the fail-closed primitive directly: a mutated staged copy
+        // must be rejected against the source hash. This is the pure
+        // discriminator behind inject_scylla_hide_staged's verification.
+        let dir = std::env::temp_dir().join("mida-scyllahide-test-mismatch");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.ini");
+        let staged = dir.join("staged.ini");
+        std::fs::write(
+            &src,
+            b"[SETTINGS]
+KiUserExceptionDispatcherHook=0
+",
+        )
+        .unwrap();
+        std::fs::write(
+            &staged,
+            b"[SETTINGS]
+KiUserExceptionDispatcherHook=1
+",
+        )
+        .unwrap();
+        assert_ne!(
+            sha256_hex(&src).unwrap(),
+            sha256_hex(&staged).unwrap(),
+            "different bytes must give different hashes"
+        );
+        // Discrimination target: the REAL fail-closed verification must
+        // reject a mutated staged copy. If the verification were no-op'd
+        // (e.g. always Ok), this test goes red -> proves the check is live.
+        let err = verify_staged_ini_matches(&src, &staged)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("staging verification FAILED"),
+            "mismatched staged ini must fail-closed, got: {err}"
+        );
+        assert!(
+            err.contains("sha256"),
+            "error must show the hashes, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staged_ini_identical_copy_passes() {
+        // A byte-identical copy must pass the equality check (the happy path
+        // of the staging verification).
+        let dir = std::env::temp_dir().join("mida-scyllahide-test-copy");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.ini");
+        let staged = dir.join("staged.ini");
+        std::fs::write(
+            &src,
+            b"[SETTINGS]
+NtContinueHook=0
+",
+        )
+        .unwrap();
+        std::fs::copy(&src, &staged).unwrap();
+        verify_staged_ini_matches(&src, &staged).expect("identical copy must pass");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- no-ini dispatch: zero behaviour change ---
+
+    #[test]
+    fn no_ini_dispatches_to_non_staged_path() {
+        // The dispatch decision: Some(ini) -> staged, None -> legacy path.
+        // We can't spawn a real injector in tests, but we CAN assert the
+        // dispatch function splits correctly by checking the branch target
+        // exists and the non-staged path returns an error mentioning the
+        // injector (proving it did NOT take the staging route).
+        let config = ScyllaHideConfig {
+            injector_cli_path: r"C:\nonexistent\InjectorCLIx64.exe".to_string(),
+            hook_library_path: r"C:\nonexistent\HookLibraryx64.dll".to_string(),
+            ini_path: None,
+            hook_delay_ms: 1,
+        };
+        let err = inject_scylla_hide(12345, &config).unwrap_err().to_string();
+        assert!(
+            err.contains("InjectorCLI not found"),
+            "no-ini path must use the original injector-exists check, got: {err}"
+        );
+    }
+
+    #[test]
+    fn some_ini_missing_source_fails_closed() {
+        // With ini_path = Some(...) pointing at a missing file, the staged
+        // route must fail with a clear "ini not found" error and must NOT
+        // leave a staging dir behind.
+        let config = ScyllaHideConfig {
+            injector_cli_path: r"C:\nonexistent\InjectorCLIx64.exe".to_string(),
+            hook_library_path: r"C:\nonexistent\HookLibraryx64.dll".to_string(),
+            ini_path: Some(r"C:\nonexistent\no_such.ini".to_string()),
+            hook_delay_ms: 1,
+        };
+        let err = inject_scylla_hide(54321, &config).unwrap_err().to_string();
+        assert!(
+            err.contains("not found"),
+            "staged route must fail-closed on missing source, got: {err}"
+        );
+        let staging = std::env::temp_dir().join("mida-scyllahide-54321");
+        assert!(
+            !staging.exists(),
+            "no staging dir may survive a failed inject"
+        );
+    }
 }

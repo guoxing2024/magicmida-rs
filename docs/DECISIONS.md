@@ -162,3 +162,12 @@
 - **风险**：① 新增运行期复制/清理代码路径（panic 安全 + 删除证明已写入工单验收）；② 受控 ini 是整套 profile，走通后归因需最小差分变体另立单；③ 关 hook 后壳可能改走其它反调试路径（工单路径 D 承接）。
 - **前置（总指挥亲验，2026-08-30）**：BootTime = `2026-08-30 1:28:40`（与 R4 同 boot，无需重启）；起点 HEAD = `5c09e7a`；工作区 `target/release/` 与 `C:\Windows` 均无 ini 残留；vault ini sha `c88e94c3…` 与样品对象 sha `78009803…` 当场复核在位。
 - **落地**：`tickets/TASK-006R5.md` 首行已按 D-015 改写为授权令牌（worker 须原文回抄）。
+
+## D-022 TASK-006R5 验收通过（终态路径 A）；账本 6/4 → 7/4；换 boot 追认
+
+- **日期**：2026-08-30（总指挥验收）
+- **验收结论**：第一段八条 + 第二段强门全部通过。判别力由总指挥**换缝独立重做**（worker 打 `verify_staged_ini_matches` 恒 Ok 缝 → 1 红 exit 101；总指挥打断 `sha256_hex` 原语 → 已知向量 + 异同断言 2 红 exit 101）→ 字节级恢复（探针残留 0、diff 仍 +469/0 删）→ 7/7 复绿。强门证据 vault 直读：CONFIG_SOURCE 双行（ini + staged sha256 校验）、`staging verification passed` ×2、P-8 evidence-preserved ×2、`scylla_hide.log` NtContinue/KiUser hook 行双零 + NtSetInformationThread=1 等 15 键对照、AV=0 ×3、fail-closed 192 unresolved FATAL 行直读、image_base `0x7ff6eb6b0000` ×3 确定性。最终实弹 exe sha `3f055b8e…`（5825536 B），五字符串命中（SCYLLAHIDE ×3）。
+- **账本**：本格 3 次运行（attempt1 因 P-8 证据缺口判无效、attempt2/3 有效 2/2 即停）按 R2/R3 先例记 **1 格**，6/4 → **7/4**。
+- **换 boot 追认**：令牌载 BootTime 01:28:40，实测 10:05:51（令牌签发后机器重启）。追认理由：① 差异非 worker 责任、亦非其可检测项；② 本单变量（ini 生效）与 boot 无关（D-020）；③ 新 boot 全新 ASLR（ntdll `0x7ffd379e0000`）反而强化跨布局判定。**今后规则：授权令牌的 BootTime 前置只约束"签发时刻"，执行时 boot 已变不构成 STOP 事由，照实记录即可。**
+- **科学结论（干预实验定案）**：D-020 的"配置差异"解释升级为干预证实——唯一变量 = 受控 ini 生效（关闭 KiUserExceptionDispatcher + NtContinue hook），14/14 撞环 → 0 AV。C-6 故障环研究线关闭。TASK-013 待验风险（壳反检）实测阴性。
+- **新前沿**：IAT 启动路径重建（192 槽：`0x1123→0x1138d0 … 0x2c7c→0x113700`）是路径 B（可加载产物）的硬前置，另立新单。

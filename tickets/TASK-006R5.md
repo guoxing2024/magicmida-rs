@@ -4,7 +4,7 @@
 > `老板 · 2026-08-30 · 原话"批准 TASK-006R5： 授权"（回应总指挥列明的两件批准请求，按全案解释：两件同时批）· ① 授权 crates/ 改动：crates/packers/themida/src/antiantidebug/scyllahide.rs + crates/cli/src/unpacker/helpers.rs 及其测试模块（仅限本单授权文件清单）· ② 批 1 格实弹 · XC-XXI-B 6/4 → 7/4（超原配额，老板明确扩额）· 前置由总指挥亲验：BootTime = 2026-08-30 1:28:40（与 TASK-006R4 同 boot，无需重启）· 起点 HEAD = 5c09e7a（TASK-006R4 已验收入栈；worker 须核验 5c09e7a 为 HEAD 祖先、且 5c09e7a..HEAD 的 diff 仅 docs/tickets 文件）· vault 受控 ini sha256 c88e94c3… 与样品对象 sha256 78009803… 已当场复核在位`
 
 - **优先级**：P1（缺陷 A 实弹验证的硬前置；R4 已实证这是唯一路径）
-- **状态**：✅ 已授权（老板 2026-08-30 批准两件：crates/ 改动 + 一格实弹；记 D-021）
+- **状态**：✅ 已执行并验收（2026-08-30，终态 = 路径 A：受控 ini 经 staging 生效 → 0 次 AV、text-poll 首次收敛到 dump、`TASK-009 fail-closed` 192 槽拒绝产物；账本 7/4，验收记 D-022）
 - **岗位**：developer（第一段离线改代码，第二段实弹验证）
 - **账本**：XC-XXI-B **6/4 → 7/4**（老板 2026-08-30 明确扩额授权）
 
