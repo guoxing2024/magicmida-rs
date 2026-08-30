@@ -212,3 +212,12 @@
 - **核心知识资产（入 KNOWN_ISSUES C-6 块）**：74 个启动路径槽的运行时值 = Themida 段内 VM wrapper 地址（+0x1681d1…+0x3203d7；偏移与 XX 时代旧产物坏值 0x1401681d1 逐位一致，跨 boot 确定性互证）。**静态原导入表 9 项对 VM wrapper 结构性 0 命中 → XX-10-A 静态回填 0 覆盖是结构性必然，不是回归（修正 D-024 假设）**。shell trace 74 槽全败（主线程无单步事件）→ **186/186→0/201 的机制层主嫌疑 = shell trace 的执行线程/时机**；XX-11 时代 trace 能解 VM 槽的机制 = 复现钥匙。
 - **审计备注（不阻塞验收）**：① 报告 §1 写 +661 实际 +653（算术笔误）；② slot-scoped 行为改动的测试仅字符串断言（未压到"继续遍历"行为），下轮补真实行为测试；③ worker 留 2 个 evidence 临时文件在 /d/Temp（总指挥核对 sha256 与 vault 一致后删除）；④ 192 站点数与 FATAL 行核对一致。
 - **下一单参考（需老板批准后才派）**：TASK-015 = shell trace 在正确线程/时机单步 VM wrapper（恢复 XX-11 的 186/186 路径）+ 回归定位（`git diff 18e0349..be28951` trace 路径）+ acceptance crate `#[serde(default)]`（如需 sidecar 结构化证据，需扩授权）+ 一格实弹 8/4 → 9/4 冲 B1'（对照 XX-11 端点 186/186 + load 10/10 + S4 8/8）。
+
+## D-028 批 TASK-015 全案（crates/ 改动授权 + 再扩一格，XC-XXI-B 8/4 → 9/4）
+
+- **日期**：2026-08-30（老板裁定："批准"——回应总指挥列明的 TASK-015 范围与两件批准请求，按全案解释：两件同时批）
+- **决策**：① 授权 `crates/` 改动（工单清单：`trace_imports/mod.rs` + `slot.rs`（trace 线程/时机/起点修复）、pe dumper 五文件（适配/诊断延续）、`cli/unpacker/iat_evidence.rs`（sidecar）、`acceptance/src/oreans_gate.rs`（**仅限** `#[serde(default)]`/新增可选字段）及其测试模块；fail-closed 门语义零改动为硬约束）；② 批 1 格实弹冲 B1'。账本 8/4 → **9/4**。
+- **理由**：T014 诊断定案 74 启动槽 = Themida VM wrapper（静态结构性 0 命中，非回归）；shell trace 的线程/时机是恢复 XX-11 端点（186/186 + load 10/10 + S4 8/8）的唯一已知缺口，且 XX-11 时代机制存在 = 可复现性有据。
+- **保险丝（写入工单）**：① 第一段判别力未过或回归源未定位 → STOP 不烧格；② 不许改松门；③ A' 未改善不许第 3 次。
+- **前置（总指挥亲验，2026-08-30）**：BootTime = `10:05:51`（与 T014 实弹同 boot）；起点 HEAD = `291b239`；工作区净（仅已知 untracked）；vault ini sha `c88e94c3…` 与样品对象 sha `78009803…` 当场复核在位。
+- **落地**：`tickets/TASK-015.md` 首行已写授权令牌（worker 须原文回抄）。
