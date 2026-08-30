@@ -13,15 +13,14 @@ import json, os, sys, time, subprocess, hashlib, datetime, threading
 DEPLOY = r"D:\Claude project\magicmida-rs\lab\xx21b_run_ui"
 HOST = os.path.join(DEPLOY, "rev2_unpacked.exe")
 CORE = os.path.join(DEPLOY, "core.dll")
-CAND_SHA = "3650ea6c0a88c731d4b613eaa533ab1d48258ce782843a5661ca6c683fd9b64e"
-HOST_SHA = "36043cb4e82a500dbf94472d6219b0beac35823cebcd2d28fbdbaa4ab796c79b"
-BASE = 0x7FFE1DA10000        # core.dll 固定基址
+CAND_SHA = "09f3dd344215c6aa608bc6a8e8ae24486e3bf425c3f3541272d065a1d9999144"
+HOST_SHA = "a852880aabba215b16a2a96245322ca09d19ff148afaa30ff42b1a8ea438edac"
+# T016 反硬编码纪律 (TASK-017 适配): 不再钉死会话地址。
+# core.dll 基址/宿主 EXE 基址 一律经 enum_modules() 会话动态解析 (MZ 双核 fail-closed);
+# RUN_VA / URLMON_SLOT_VA = 动态基址 + 既有 RVA (0x1C120 / 0x16F300 — core.dll 结构相对量,
+# 09f3dd34 逐位一致故 RVA 稳定)。RUN_PARAM = 解析出的宿主 EXE 基址。
 RUN_RVA = 0x1C120
-RUN_VA = BASE + RUN_RVA
 URLMON_SLOT_RVA = 0x16F300
-URLMON_SLOT_VA = BASE + URLMON_SLOT_RVA
-HOST_EXE_BASE = 0x140000000  # 宿主 EXE 基址 (Step1 基线 0x2bbb0 校验通过)
-RUN_PARAM = HOST_EXE_BASE
 
 # 权限
 PROCESS_QUERY_INFORMATION = 0x0400
@@ -62,6 +61,10 @@ class Harness:
         self.sample_lock = threading.Lock()
         self.iat_pre = None
         self.iat_post = None
+        self.core_base = None       # core.dll 会话动态基址 (TASK-017 适配)
+        self.host_exe_base = None   # 宿主 EXE 会话动态基址 (TASK-017 适配)
+        self.urlmon_slot_va = None  # urlmon IAT 槽会话地址 (TASK-017)
+        self.gui_alive = False      # IsHungAppWindow 观测 (本环境 RIP 采样工具失效的替代证据)
 
     # ---------- 基础 API ----------
     def open_proc(self):
@@ -121,7 +124,10 @@ class Harness:
         return "unknown"
 
     def sample_rip(self):
-        """单次采样 Run 线程 RIP"""
+        """单次采样 Run 线程 RIP。
+        [TASK-017 工具性限制记录] 本环境 (PI Desktop 托管会话) 下 GetThreadContext 对任意进程线程
+        (含 notepad/cmd/自身) 均返回成功但 RIP/RSP/RAX 恒为 0 — 判定不可依赖 RIP; 窗口/线程/进程/事件证据可靠。
+        """
         ht = self.k32.OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, False, self.tid)
         if not ht: return None
         try:
@@ -131,7 +137,7 @@ class Harness:
             rip = ctx.Rip
             return {
                 "rip": hex(rip),
-                "owner": self.owner(rip),
+                "owner": self.owner(rip) if rip else "(tool-zeroed)",
                 "rsp": hex(ctx.Rsp),
                 "rax": hex(ctx.Rax),
             }
@@ -232,14 +238,59 @@ class Harness:
         self.user32.EnumChildWindows(wt.HWND(parent), _cb, 0)
         return out
 
+    # ---------- GUI 存活观测 (TASK-017: RIP 采样工具失效的替代证据) ----------
+    def gui_hung(self, hwnd):
+        """IsHungAppWindow: 0=响应中, 非0=未响应"""
+        return int(self.user32.IsHungAppWindow(ctypes.c_void_p(hwnd)))
+
+    def gui_snapshot(self, hwnds):
+        snap = []
+        for hwnd in hwnds:
+            alive = bool(self.user32.IsWindow(ctypes.c_void_p(hwnd)))
+            snap.append({"hwnd": hex(hwnd), "is_window": alive,
+                         "hung": self.gui_hung(hwnd) if alive else None})
+        return snap
+
+    def gui_pump(self, hwnd, n=3, interval=0.05):
+        """发送 WM_NULL 确认窗口消息循环仍在泵 (SendMessageW 直发, 返回成功次数)"""
+        ok = 0
+        for _ in range(n):
+            try:
+                self.send(hwnd, 0x0)  # WM_NULL
+                ok += 1
+            except Exception:
+                break
+            time.sleep(interval)
+        return ok
+
     # ---------- 事件驱动 ----------
+    def resolve_core_base(self):
+        """TASK-017: core.dll 基址动态解析 (enum_modules 会话态) — 反硬编码纪律"""
+        for base, size, name in self.modules:
+            if name.lower() == "core.dll":
+                h = self.rpm(base, 0x1000)
+                if h and h[:2] == b"MZ":
+                    return base, size
+        return None, None
+
+    def resolve_host_exe_base(self):
+        """TASK-017: 宿主 EXE 基址动态解析 (模块项 + MZ 双核 fail-closed)"""
+        host_name = os.path.basename(HOST)
+        for base, size, name in self.modules:
+            if name.lower() == host_name.lower():
+                h = self.rpm(base, 0x1000)
+                if h and h[:2] == b"MZ":
+                    return base, size
+        return None, None
+
     def wait_core_loaded(self, timeout=40):
-        """轮询等待 core.dll 固定基址就绪 (MZ at BASE) — 部署核实前置"""
+        """轮询等待 core.dll 会话基址就绪 (MZ 双核) — 部署核实前置"""
         t0 = time.time()
         while time.time() - t0 < timeout:
             self.enum_modules()
-            h = self.rpm(BASE, 0x1000)
-            if h and h[:2] == b"MZ":
+            cb, sz = self.resolve_core_base()
+            if cb:
+                self.core_base = cb
                 core_mod = [{"base": hex(b), "size": hex(s), "name": n} for b, s, n in self.modules if n.lower() == "core.dll"]
                 return {"loaded": True, "wait_s": round(time.time() - t0, 2), "core_module": core_mod}
             time.sleep(0.5)
@@ -401,7 +452,7 @@ class Harness:
         # 终态: 线程退出码 / IAT / 页级
         code = wt.DWORD(0)
         self.k32.GetExitCodeThread(self.hthread, ctypes.byref(code))
-        self.iat_post = self.read_qword(URLMON_SLOT_VA)
+        self.iat_post = self.read_qword(self.core_base + URLMON_SLOT_RVA)
         alive = self.k32.WaitForSingleObject(self.hthread, 0) == 0x102  # STILL_ACTIVE
         return {"exit_code": hex(code.value), "still_active": alive,
                 "iat_pre": hex(self.iat_pre) if self.iat_pre else None,
@@ -441,17 +492,30 @@ class Harness:
         if not wcl["loaded"]:
             return {"redline": "FAIL_CORE_NOT_LOADED", "wait": wcl}
 
-        # 2) 基址核实
-        core_head = self.rpm(BASE, 0x1000)
+        # 2) 基址动态解析 (T016 反硬编码纪律: enum_modules 会话态, MZ 双核 fail-closed)
+        self.enum_modules()
+        core_base, core_size = self.resolve_core_base()
+        if core_base is None:
+            return {"redline": "FAIL_CORE_NOT_FOUND", "modules": [n for _, _, n in self.modules]}
+        self.core_base = core_base
+        host_base, host_size = self.resolve_host_exe_base()
+        if host_base is None:
+            return {"redline": "FAIL_HOST_NOT_FOUND", "modules": [n for _, _, n in self.modules]}
+        self.host_exe_base = host_base
+        RUN_VA = self.core_base + RUN_RVA
+        URLMON_SLOT_VA = self.core_base + URLMON_SLOT_RVA
+        self.urlmon_slot_va = URLMON_SLOT_VA
+        RUN_PARAM = self.host_exe_base
+        core_head = self.rpm(self.core_base, 0x1000)
         core_ok = core_head and core_head[:2] == b"MZ"
-        host_head = self.rpm(HOST_EXE_BASE, 0x1000)
+        host_head = self.rpm(self.host_exe_base, 0x1000)
         host_ok = host_head and host_head[:2] == b"MZ"
         run_bytes = self.rpm(RUN_VA, 16)
         iat_val = self.read_qword(URLMON_SLOT_VA)
         self.iat_pre = iat_val
         deploy_check = {
-            "core_fixed_base": hex(BASE), "core_mz": core_ok,
-            "host_exe_base": hex(HOST_EXE_BASE), "host_mz": host_ok,
+            "core_base": hex(self.core_base), "core_size": hex(core_size), "core_mz": core_ok,
+            "host_exe_base": hex(self.host_exe_base), "host_size": hex(host_size), "host_mz": host_ok,
             "run_rva": hex(RUN_RVA), "run_va": hex(RUN_VA),
             "run_head": run_bytes.hex() if run_bytes else None,
             "run_head_plaintext": run_bytes[:6] == bytes.fromhex("415741564155") if run_bytes else False,
@@ -480,11 +544,11 @@ class Harness:
         # 3) 触发 Run
         tid = wt.DWORD(0)
         self.hthread = self.k32.CreateRemoteThread(
-            self.hproc, None, 0, ctypes.c_void_p(RUN_VA), ctypes.c_void_p(RUN_PARAM), 0, ctypes.byref(tid))
+            self.hproc, None, 0, ctypes.c_void_p(self.core_base + RUN_RVA), ctypes.c_void_p(RUN_PARAM), 0, ctypes.byref(tid))
         if not self.hthread:
             return {"redline": "FAIL_CREATEREMOTETHREAD", "err": ctypes.get_last_error()}
         self.tid = tid.value
-        self.log_event("run_trigger", f"CreateRemoteThread Run@{hex(RUN_VA)} param={hex(RUN_PARAM)} tid={self.tid}")
+        self.log_event("run_trigger", f"CreateRemoteThread Run@{hex(self.core_base + RUN_RVA)} param={hex(RUN_PARAM)} tid={self.tid}")
 
         # 4) RIP 采样线程 (0.03s 高密)
         self.sampling = True
@@ -547,6 +611,17 @@ class Harness:
         self.sampling = False
         sampler.join(timeout=3)
 
+        # 7.75) GUI 存活观测 (TASK-017 替代证据: IsHungAppWindow + WM_NULL 泵 + 窗口仍存在)
+        gui_obs = []
+        for w in (self.windows if self.windows else []):
+            snap = self.gui_snapshot([w["hwnd"]])
+            pumped = self.gui_pump(w["hwnd"], n=2, interval=0.03)
+            gui_obs.append({"window": w, "snapshot": snap, "wm_null_pumped": pumped})
+        self.gui_alive = any(g["snapshot"][0]["hung"] == 0 and g["snapshot"][0]["is_window"]
+                             for g in gui_obs) if gui_obs else False
+        self.gui_obs = gui_obs
+        self.log_event("gui_alive", json.dumps({"alive": self.gui_alive, "obs": gui_obs}))
+
         # 8) 终态
         fin = self.finish()
         self.log_event("final", json.dumps(fin))
@@ -583,8 +658,10 @@ class Harness:
                 "network_deny_all": "BLOCK_XX21B_RUNUI_HOST + BLOCK_XX21B_REV2_HOST (outbound block)",
             },
             "deploy_check": deploy_check,
-            "run_trigger": {"method": "CreateRemoteThread", "va": hex(RUN_VA), "param": hex(RUN_PARAM), "tid": self.tid},
+            "run_trigger": {"method": "CreateRemoteThread", "va": hex(self.core_base + RUN_RVA), "param": hex(RUN_PARAM), "tid": self.tid},
             "windows": self.windows,
+            "gui_alive": self.gui_alive,
+            "gui_obs": getattr(self, "gui_obs", []),
             "events": self.events,
             "rip_log": self.rip_log,
             "final": fin,

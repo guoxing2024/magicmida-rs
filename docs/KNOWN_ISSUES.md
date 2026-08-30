@@ -289,3 +289,9 @@ Windows 批处理里 `cargo test ... 2>&1 | findstr /C:"test result"` 之后取 
 2026-08-29 上午的 redump2 worker 在 `lab/xx21b_resume/run_ui_fixed/probe_run_out2.txt` 里**已经看到** `bb5ee568` 宿主 6 秒退出、`alive_final: false`、`core_seen: false`，却没有把"宿主不可用"当阻塞上报，照常固化候选、写 sidecar、继续后续流程——直到 TASK-006 实弹轮 10/10 崩溃才暴露，浪费了一格实弹。
 另：`probe_run_out.txt` 记录了一次 `NotADirectoryError` 部署失败（PowerShell `Out-File` 编码问题）也被静默绕过。
 **教训（对验收与派单都适用）**：涉及"产物固化/候选晋升"的工单，验收标准必须包含**当场存活探针**（产物写完立即跑一次，非 0/259 即阻塞上报），不能只看 sidecar 与静态结构通过。已在 TASK-009 及后续实弹工单的派单模板中加入此检查项。
+
+### P-11 PI Desktop 托管会话对非附加式观测系统性垫零：GetThreadContext 恒 0、EnumWindows 回调不触发；调试端口路径不受影响 [已验证，2026-08-30 TASK-017 + 总指挥独立探针]
+
+现象（TASK-017 worker 六组探针 + 总指挥两条独立缝复核）：本环境对**任意进程**（notepad/cmd/宿主/自身）的 `GetThreadContext`（kernel32 与 ntdll `NtGetContextThread` 双层）返回成功但 RIP/RSP/RAX 恒 0；`EnumWindows`/`EnumChildWindows` 回调不触发（窗口发现需改走 FindWindowW）；当前线程伪句柄路径直接拒绝（ok=0）。**调试端口附加的进程不受影响**：总指挥用 `DEBUG_ONLY_THIS_PROCESS` 拉起 cmd 实测 CREATE_PROCESS 挂起态读得真实 `Rip=0x22d9f9f8b8`、imageBase 真实非零。
+**影响面**：一切"外部观测型"harness（OpenThread+GetThreadContext、EnumWindows 回调）在本环境不可用作判定证据；**解包引擎不受影响**（调试端口路径实测可用，与 T015 同 boot 引擎 trace 74/74 互证）。
+**规矩**：① 本机上的判定类工具一律走**调试端口附加**或被测进程**进程内自证**路线；② 外部观测证据（RIP/RSP）在本机不再作为验收判据的必要条件，改用调试端口证据或进程内证据；③ 凡报告以 `GetThreadContext` 外部读取为关键证据的，总指挥验收时按本条复测。
