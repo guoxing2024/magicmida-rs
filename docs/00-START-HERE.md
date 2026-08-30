@@ -14,7 +14,7 @@ Windows PE 脱壳研究平台（Rust，221k 行，11 个 crate）。把受保护
 
 ## 现在在做什么（2026-08-31）
 
-**XX-21B core.dll 还原线战役已于 2026-08-31 收官关闭（D-055，老板裁定"先收官A"）**：账本冻结 XC-XXI-B 17/4；T0.5 Run verdict 终态 = PARTIAL 定档；快照重建路线判死（我方十票证据链 T017→T026 + 外部专家佐证 D-054）。收官总结 = `docs/XX21B_CORE_PERFECT_CLOSEOUT_20260831.md`。悬而未决的三件事全在老板侧：① 推送决策（分支 ahead 45，D-010）；② TASK-007（GVM-0 定向 dump，已批未开跑）；③ B 项目（CORE-REWRITE）若立项则另立授权。
+**XX-21B core.dll 还原线战役已于 2026-08-31 收官关闭（D-055，老板裁定"先收官A"）**：账本冻结 XC-XXI-B 17/4；T0.5 Run verdict 终态 = PARTIAL 定档；快照重建路线判死（我方十票证据链 T017→T026 + 外部专家佐证 D-054）。收官总结 = `docs/XX21B_CORE_PERFECT_CLOSEOUT_20260831.md`。悬而未决的三件事全在老板侧：① 推送决策（分支 ahead 45+，D-010）；② TASK-007（GVM-0 定向 dump，已批未开跑）；③ ~~B 项目另立~~ **已立项（D-056）**：根目录 `D:\Claude project\core-rewrite\`（独立 git/独立会话/G-0 权利门槛关闭中，交接物含本项目证据只读指针）——B 的事一律在新项目做，本项目不代跑。
 
 主攻线是 **GVM-0 反虚拟化战役**（`gto_launcher` 的 VM 语义还原 → lifter → 整镜像去虚拟化，账本 GVM 0/8，Phase 1 门 1 未过；老板已批一格定向 dump 实弹 → `tickets/TASK-007.md`）。
 `origin_macro` + `lunlun_software` 是必须一直绿的回归门。`xiongxiong_duokai` rev2 战役已于 2026-08-28 关闭。
