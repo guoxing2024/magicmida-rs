@@ -387,3 +387,12 @@
 - **纪律要点（写入票面）**：int3 仅内存驻留（磁盘零改动、部署 sha 前后双验）；诊断 only 不修宿主/候选/指针；**BootTime 存在性硬门**——候选重锚指针绑定本 boot，重启 = 现象不可复现 = 票作废。
 - **账本**：14/4 → **15/4**（1 格：验证趟 + 诊断趟含重试，T018 先例）。
 - **落地**：`tickets/TASK-023.md`（⛔ 首行令牌，D-015 格式）；前置亲验（2026-08-30）：HEAD `c787526`、BootTime `10:05:53.549` 连续、三件 sha 在位、EP RVA 动态读通（0x1027c0）、fork 基座在。
+
+## D-047 TASK-023 审计通过（C-9 根因大幅收窄：宿主侧 CRT exit(0) 发生在 core DllMain 返回后 2.4ms；加载器假设排除；账本 15/4 确认）
+
+- **日期**：2026-08-31（总指挥审计——worker 报告未送达聊天，全部从文件系统取证：runs 报告 + 脚本 + lab/vault 证据；BootTime 复核仍 = `2026-08-30 10:05:53.549`，worker 于 00:00-00:08 同 boot 内执行，候选有效前提成立）
+- **审计通过**：任务 1 工具（4 断点动态解析零硬编码——总指挥 grep 复跑 0 命中；int3 re-arm 全趟成功）；验证趟（host_loader 0 命中 + 存活 + EP 正控制）；诊断趟 3/3 逐位一致。磁盘 sha 前后不变（int3 内存驻留确认）；crates 零改动；vault 13 件 + INDEX。
+- **核心交付复算成立**：退出链 = ExitProcess（ret = msvcrt+0x3e2c9）→ RtlExitUserProcess（ret = kernel32 ExitProcess+0xb）→ NtTerminateProcess（ret = RtlExitUserProcess+0x47）→ [DllMain detach] → NtTerminateProcess（teardown 重入）。msvcrt+0x3e2c9 = `_exit+0x89`（离线精确验证）；链上所有 RVA 经 kernel32/ntdll 磁盘字节验证（`ff 15` IAT 间接调用 / `e8` 直调目标 0x1608f0 精确命中）。寄存器 Rcx=0 / R11=0xc0000135 / Rbp=0x140112058（宿主 .bss）3/3 一致。
+- **总指挥记档（自错自纠）**：审计中总指挥初版导表快速解析得出与 worker 不同的 ntdll RVA——根因 = 名字索引直读函数表、跳过 AddressOfNameOrdinals 序号间接寻址；正确重解析后与 worker 逐位一致。**教训（P 系补条）：解析 PE 导出表必须经序号表间接寻址，名字索引直读在 ntdll 级大导出表上必然出错；worker 工具与总指挥初判矛盾时，字节级（BP_ARM orig / call 目标）是最终裁决。**
+- **C-9 根因状态**：① 排除"加载器初始化失败"（EP 判别位：NOP stub DllMain 被 LdrpCallInitRoutine 正常调用 attach+detach 3/3）；② 退出 = 宿主侧代码经 CRT `exit(0)`（Rcx=0），发生在 core.dll 加载返回后 2.4ms；③ R11=STATUS_DLL_NOT_FOUND 强提示但 volatile 未定死；④ 剩余未知 = LoadLibrary(core) 返回 → exit(0) 之间宿主的判定逻辑（候选 VM 交互失败 / 宿主校验分支，未覆盖）→ **下一步：离线静态分析宿主退出调用点（零实弹不烧格，TASK-024 候选）**。
+- **账本**：XC-XXI-B 14/4 → **15/4** 确认（验证趟 + 诊断趟 3，1 格，票面口径）。
