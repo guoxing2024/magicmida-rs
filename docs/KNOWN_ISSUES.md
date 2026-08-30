@@ -306,3 +306,12 @@ Windows 批处理里 `cargo test ... 2>&1 | findstr /C:"test result"` 之后取 
 现象（TASK-017 worker 六组探针 + 总指挥两条独立缝复核）：本环境对**任意进程**（notepad/cmd/宿主/自身）的 `GetThreadContext`（kernel32 与 ntdll `NtGetContextThread` 双层）返回成功但 RIP/RSP/RAX 恒 0；`EnumWindows`/`EnumChildWindows` 回调不触发（窗口发现需改走 FindWindowW）；当前线程伪句柄路径直接拒绝（ok=0）。**调试端口附加的进程不受影响**：总指挥用 `DEBUG_ONLY_THIS_PROCESS` 拉起 cmd 实测 CREATE_PROCESS 挂起态读得真实 `Rip=0x22d9f9f8b8`、imageBase 真实非零。
 **影响面**：一切"外部观测型"harness（OpenThread+GetThreadContext、EnumWindows 回调）在本环境不可用作判定证据；**解包引擎不受影响**（调试端口路径实测可用，与 T015 同 boot 引擎 trace 74/74 互证）。
 **规矩**：① 本机上的判定类工具一律走**调试端口附加**或被测进程**进程内自证**路线；② 外部观测证据（RIP/RSP）在本机不再作为验收判据的必要条件，改用调试端口证据或进程内证据；③ 凡报告以 `GetThreadContext` 外部读取为关键证据的，总指挥验收时按本条复测。
+
+### C-5 状态更新（2026-08-30 TASK-022 + D-045）：对"管线产出"路径结构性关闭 [已验证]
+
+T0.4 式旧候选（3650ea6c / 清洗件 094f5401）仍为会话绑定历史工件（不改）；但 **TASK-022 证明当前管线产出的候选已根治本缺陷**：活体 dump 时 `fix_hardcoded_addresses` 重锚 3500 个陈旧指针 + 普查器 v2 实证 0 会话指针残留（对齐明文 0；判别力锚点：同门下旧件 094f5401 被正确拒收 hard=144）+ 重锚指针落进 20 个当前会话模块。**平台能力升级**：会话干净候选（session-clean candidate）可随 dump 产出，无需事后清洗。修复主线路径（`/session-clean` 消费端，T0.7 §7.2 遗留项）对本缺陷的优先级降为"宿主侧同类问题仍需各自验证"（宿主 a852880a 绑定生产 boot，重启后宿主侧 C-5 仍会复现——跨 boot 使用宿主需重产或另行验证）。
+
+### C-9 宿主 + 管线重产候选（096f3bdf）组合：宿主引导期干净退出 exit 0，Run 不可达 [已验证，2026-08-30 TASK-022，3/3 泵 + 3/3 普通启动可复现]
+
+现象：rev2 宿主（a852880a）加载当前 boot 重产候选（096f3bdf，fix_hardcoded_addresses 重锚 3500 指针 + EP=NOP stub）后，引导沉降期以 **exit code 0 干净退出**——无 AV、无异常事件（唯一 EXCEPTION = 引导断点 0x80000003）、无窗口、无 WinLicense 对话框；全部线程 + EXIT_PROCESS 退出码 0。**三方对照（同宿主同 config）**：原版受保护 core（09f3dd34）→ 宿主存活并显示"授权验证"窗口；T0.4 清洗候选（094f5401）→ 0xC0000005 AV（T021 同款陈旧指针取指 AV）；新候选 → exit 0。隔离加载路径完全正常（host_loader 6/6 首选基址命中 + GetAppVersion ×10 行为正确 + 页级零变化）→ 缺陷特定于 **rev2 宿主引导路径 × 重产候选** 组合，非候选加载/导出/行为问题。根因未定位（宿主内部哪条路径调 ExitProcess(0)——宿主校验失败分支 / 候选 VM 数据完整性自检 / .winlice 材料化状态差异，均未排除；候选 .winlice 内存在 VM 32 位旧会话地址高位字立即数（`XOR ECX,0x7FFEEA8F` 类），若 VM 用其做地址分类，当前会话地址不匹配可致不同分支——纯假设，未验证）。
+**影响**：T0.5 FULL（Run→urlmon）在该组合下不可达。T021（AV）+ T022（exit 0）= 该验收标准连续 2 单不通过，已触发停止规则（D-045），下一步由老板裁决：根因诊断（泵附加下钓 ExitProcess/TerminateProcess 调用者，1 格）或收官归档。

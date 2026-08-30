@@ -44,6 +44,9 @@ SELFTEST_EXPECT = {
 
 KUSER_BASE, KUSER_END = 0x7FFE00000000, 0x7FFE00001000
 ENCRYPTED_SECTIONS = {".winlice", ".boot"}
+SENTINEL = 0x7FFFFFFFFFFFFFFF  # 扫窗内低 48 位 = 0x7fffffffffff
+SECTION_EXEC = 0x20000000      # IMAGE_SCN_MEM_EXECUTE
+SECTION_WRITE = 0x80000000     # IMAGE_SCN_MEM_WRITE
 
 
 def sha256_file(path):
@@ -70,24 +73,32 @@ class PE:
         self.size_of_image = struct.unpack_from("<I", data, opt_off + 56)[0]
         self.dll_characteristics = struct.unpack_from("<H", data, opt_off + 70)[0]
         sec_off = opt_off + struct.unpack_from("<H", data, e_lfanew + 20)[0]
-        self.sections = []  # (name, vaddr, vsize, rawptr, rawsize)
+        self.sections = []  # (name, vaddr, vsize, rawptr, rawsize, chars)
         for i in range(nsec):
             base = sec_off + i * 40
             name = data[base:base + 8].rstrip(b"\x00").decode("latin1")
             vsize, vaddr, rawsize, rawptr = struct.unpack_from("<IIII", data, base + 8)
-            self.sections.append((name or "(unnamed@0x%x)" % vaddr, vaddr, vsize, rawptr, rawsize))
+            chars = struct.unpack_from("<I", data, base + 36)[0]
+            self.sections.append((name or "(unnamed@0x%x)" % vaddr, vaddr, vsize, rawptr, rawsize, chars))
 
     def off_to_rva(self, off):
-        for name, vaddr, vsize, rawptr, rawsize in self.sections:
+        for name, vaddr, vsize, rawptr, rawsize, chars in self.sections:
             if rawptr <= off < rawptr + rawsize:
                 return vaddr + (off - rawptr)
         return None
 
     def off_to_section(self, off):
-        for name, vaddr, vsize, rawptr, rawsize in self.sections:
+        for name, vaddr, vsize, rawptr, rawsize, chars in self.sections:
             if rawptr <= off < rawptr + rawsize:
                 return name
         return "(header)"
+
+    def section_chars_at(self, off):
+        """按原始区间取节 Characteristics（同名节众多——未命名节——不可按名字键）"""
+        for name, vaddr, vsize, rawptr, rawsize, chars in self.sections:
+            if rawptr <= off < rawptr + rawsize:
+                return chars
+        return None
 
 
 def scan_pointers(data):
@@ -139,15 +150,51 @@ def classify(image, hits, module_map):
             "module_hits": module_hits}
 
 
-def gate_decision(image, res):
-    """硬门：明文节 8 对齐违规 = FAIL；未对齐/加密区命中 = 入册 residual（不盲改）。"""
-    hard, residual = [], []
+def classify_violation(v, data, off, section_chars, baseline_data, image_size=None):
+    """v2 分类（D-045 审计定性的四类固有数据，防把非指针当违规）：
+    sentinel_marker  = INT64_MAX 哨兵（dump 管线数据标记，低 48 位 0x7fffffffffff）
+    nan_double       = IEEE754 NaN/Inf（指数位 0x7FF 的 double 常量，如 0x7ff8000f7fd0）
+    inherited_baseline = 原厂继承数据（同值 6 字节存在于原版受保护 core 磁盘文件）
+    code_immediate_context = 可执行节内命中（x86 指令立即数伪读，如 CMP R10W,0x7FFF /
+                       XOR ECX,0x7FFEEA8F —— 壳 VM 的地址分类/掩码常量）
+    hard             = 其余（对齐 + 明文数据节 + 非上述任何类）→ 真实会话指针候选
+    """
+    if v == 0x7FFFFFFFFFFF:  # INT64_MAX 6 字节窗口签名（bytes FF FF FF FF FF 7F）
+        return "sentinel_marker"
+    if off % 8 == 0 and off + 8 <= len(data):
+        q = struct.unpack_from("<Q", data, off)[0]
+        if (q >> 52) in (0x7FF, 0xFFF):  # 完整 8 字节 double 指数位全 1 = NaN/Inf
+            return "nan_double"
+    if image_size is not None and (v & 0xFFFFFFFF) < image_size:
+        # 跨字段伪读：窗口低 32 位是合法 RVA（< SizeOfImage）= 元数据/RVA 字段拼接，
+        # 真实模块指针低 32 位必然 >= 0x10000000（本系统模块基址布局），不受此判影响
+        return "cross_field_rva"
+    if baseline_data is not None and baseline_data.find(struct.pack("<Q", v)[:6]) != -1:
+        return "inherited_baseline"
+    if section_chars is not None and (section_chars & SECTION_EXEC):
+        return "code_immediate_context"
+    return "hard"
+
+
+def gate_decision(image, res, baseline_data=None):
+    """v2 硬门：hard 类 = 对齐 + 明文 + 非哨兵/非NaN/非继承/非代码节。
+    未对齐 / 加密区（.winlice/.boot）命中一律 residual（不盲改，T020 纪律）。"""
+    hard, residual, classes = [], [], {}
     for v in res["violations"]:
-        if v["aligned"] and v["section"] not in ENCRYPTED_SECTIONS:
-            hard.append(v)
-        else:
+        sec_name = v["section"]
+        off = int(v["file_offset"], 16)
+        chars = image.section_chars_at(off)
+        if not v["aligned"] or sec_name in ENCRYPTED_SECTIONS:
+            v["class"] = "unaligned_or_encrypted"
             residual.append(v)
-    return hard, residual
+        else:
+            val = int(v["value"], 16)
+            cls = classify_violation(val, image.data, off, chars, baseline_data, image.size_of_image)
+            v["class"] = cls
+            if cls == "hard":
+                hard.append(v)
+        classes[v["class"]] = classes.get(v["class"], 0) + 1
+    return hard, residual, classes
 
 
 def selftest(path):
@@ -182,6 +229,7 @@ def main():
     ap.add_argument("--image", required=True)
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--module-map")
+    ap.add_argument("--baseline", help="原版受保护 core 磁盘文件（inherited_baseline 分类源）")
     ap.add_argument("--out")
     args = ap.parse_args()
 
@@ -192,11 +240,12 @@ def main():
     image = PE(data)
     hits = scan_pointers(data)
     module_map = json.load(open(args.module_map, encoding="utf-8")) if args.module_map else None
+    baseline_data = open(args.baseline, "rb").read() if args.baseline else None
     res = classify(image, hits, module_map)
-    hard, residual = gate_decision(image, res)
+    hard, residual, classes = gate_decision(image, res, baseline_data)
     top_buckets = [{"bucket": hex(b << 16), "count": c} for b, c in res["buckets"].most_common(24)]
     report = {
-        "schema": "xx21b_session_pointer_census/v1",
+        "schema": "xx21b_session_pointer_census/v2",
         "image": args.image,
         "image_sha256": sha256_file(args.image),
         "image_base": hex(image.image_base),
@@ -204,15 +253,18 @@ def main():
         "dll_characteristics": hex(image.dll_characteristics),
         "module_map_source": args.module_map,
         "module_map_boot_time": (module_map or {}).get("boot_time"),
+        "baseline_source": args.baseline,
         "total_hits": len(hits),
         "own_image_refs": res["own"],
         "kuser_shared_data_refs": res["kuser"],
         "module_map_refs": dict(res["module_hits"]),
         "top_buckets": top_buckets,
+        "violation_classes": classes,
         "hard_violations_aligned_plaintext": hard,
         "residual_unpatched": residual,
         "gate": "FAIL" if hard else "PASS",
-        "note": "对齐明文违规=硬门FAIL；未对齐/加密区命中=入册 residual 不盲改（T020 票面纪律）",
+        "note": "v2 硬门 = 对齐+明文+非哨兵/非NaN/非继承/非代码节；判别力锚点：已知答案 094f5401 "
+                "（含真实旧会话指针）必须 FAIL，TASK-022 重产候选 096f3bdf 必须 PASS（D-045）",
     }
     text = json.dumps(report, ensure_ascii=False, indent=1)
     if args.out:

@@ -3,12 +3,12 @@
 """XC-XXI-B T0.5 三态重跑·收官之战（TASK-021，清洗后候选路线）：B1' 宿主 + 清洗后候选 core + 调试端口泵，三态判定
 fork 自 tools/xx21b_t05_ui_drive_dbg.py (TASK-018 版); 原三套脚本 (T017 版 / T018 版 / T019 版) 不改.
 
-判定对象 = "B1' 宿主 (a852880a) + 清洗后候选 core (094f5401, T020+R1 会话指针清洗 8/8) + config.ini" 组合.
+判定对象 = "B1' 宿主 (a852880a) + 当前 boot 重产候选 core (core_perfect_candidate_r2, 本票 dump 活体重产 + 固化, 会话指针已重锚当前 boot) + config.ini" 组合.
 保留 T019 全部机制 (泵线程全量即时消费 / CREATE_THREAD 调试句柄 RIP 采样不 OpenThread / EXCEPTION 全记录 /
 泵健康自证 / attach_changed_behavior 上报 / sha fail-closed / 导出动态解析 / 防火墙只读核实 / NO_BYPASS=1)。
 
-本版改动 (T021 票面, 最小 diff):
-  1) sha 门更新: CORE 期望 -> 094f5401 (14,435,328 B, 清洗后候选 R1, vault task020_cleanse/); HOST/CONFIG 不变
+本版改动 (T022 票面, 最小 diff):
+  1) sha 门更新: CORE 期望 -> 096f3bdf... (14,424,064 B, 当前 boot 重产候选 R2, lab/xx21b_repro/); HOST/CONFIG 不变
      (a852880a / cde9be13);
   2) 基址硬门 (新增, 本单核心保险丝): 候选首选基址从其 PE 头 ImageBase 动态读取 (不硬编码),
      core.dll 实际加载基址从 LOAD_DLL 事件 / enum_modules 动态读取; 两者不等 -> FAIL_CORE_BASE_RELOCATED
@@ -24,11 +24,11 @@ import json, os, sys, time, subprocess, hashlib, datetime, threading
 import struct
 
 # ---------------- 常量 ----------------
-DEPLOY = r"D:\Claude project\magicmida-rs\lab\xx21b_run_pcell"
+DEPLOY = r"D:\Claude project\magicmida-rs\lab\xx21b_run_pcell2"
 HOST = os.path.join(DEPLOY, "rev2_unpacked.exe")
 CORE = os.path.join(DEPLOY, "core.dll")
 CONFIG = os.path.join(DEPLOY, "config.ini")
-CAND_SHA = "094f5401b9c59db5512ec510ed1b13675013c414f98f78cde7ffa1fc31996457"  # T021: 清洗后候选 R1
+CAND_SHA = "096f3bdfd30e71b7217e602da29a304981c06138c2c768e59cbc23799695923d"  # T022: 当前 boot 重产候选 R2
 HOST_SHA = "a852880aabba215b16a2a96245322ca09d19ff148afaa30ff42b1a8ea438edac"
 CONFIG_SHA = "cde9be13a5da62f5805cbf3b359c56c27f020d12cd1ae838f6a4218492d1d610"
 # 候选固定基址首选 (T0.4 报告: keep_runtime_base 固定基址, DYNAMIC_BASE 清除, 0x7ffe1da10000 保留)
@@ -1083,7 +1083,7 @@ class runtime:
         sha_cfg = sha256_file(CONFIG)
         if sha_cfg != CONFIG_SHA:
             return {"redline": "FAIL_CONFIG_SHA", "sha": sha_cfg, "expect": CONFIG_SHA}
-        print("redline sha OK (core=094f5401 cleansed candidate R1, host=a852880a, config=cde9be13)")
+        print("redline sha OK (core=096f3bdf current-boot candidate R2, host=a852880a, config=cde9be13)")
 
         # 0.25) 任务 1: 导出表动态解析 (Run/GetAppVersion — 不许硬编码 RVA)
         exports = self.resolve_exports_disk()
