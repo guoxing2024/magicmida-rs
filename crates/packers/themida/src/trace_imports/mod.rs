@@ -725,7 +725,21 @@ fn run_slot_trace(
         // records it as a failed slot and keeps walking); it does not abort
         // the whole pass. The `?` above only propagates genuinely terminal
         // OS-level errors, which are rare and must still fail-fast.
-        _ => {}
+        slot::SlotTraceEnd::Api | slot::SlotTraceEnd::Vm | slot::SlotTraceEnd::NoResult => {}
+        // TASK-015: a slot whose trace could not even start (lifecycle error,
+        // e.g. a stale pending event that could not be cleared) must be
+        // reported as such — never mislabeled as a "completed" trace with no
+        // API. This keeps the fail-closed accounting (the slot is failed) but
+        // records an honest root-cause reason for the per-slot diagnostics.
+        slot::SlotTraceEnd::LifecycleError => {
+            log(
+                LogMsgType::Fatal,
+                "trace lifecycle error — slot could not start (TASK-015)",
+            );
+            return Ok(SlotTraceRaw::Failed(
+                "trace lifecycle error (slot could not start)",
+            ));
+        }
     }
 
     if state.trace_in_vm {

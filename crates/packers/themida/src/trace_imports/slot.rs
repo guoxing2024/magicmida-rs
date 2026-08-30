@@ -132,9 +132,21 @@ pub(crate) fn trace_one_slot(
     // Resume from the event that brought us here — OR bootstrap from a
     // no-pending-event state (XX-8-A).
     //
-    // Two entry states exist:
-    // - event entry: the caller (debug loop) still holds a pending debug event;
-    //   `continue_event` resumes it so the RIP+TF context write takes effect.
+    // Three entry states exist:
+    // - event entry: the caller (debug loop) still holds a pending debug event
+    //   for THIS thread; `continue_event` resumes it so the RIP+TF context
+    //   write takes effect.
+    // - stale-pending entry (TASK-015): the caller (debug loop) broke while a
+    //   pending debug event belonged to a DIFFERENT (usually already-exited
+    //   spurious) thread — e.g. the T0.5-R2 HW-anchor-failure grace window
+    //   leaves the loop on a spurious thread's `ExitThread` event. That event
+    //   was never continued, so the lifecycle still holds it. We must continue
+    //   the pending event on ITS OWN thread id first (exactly what the debug
+    //   loop's ExitThread arm would have done) to clear the lifecycle, then
+    //   bootstrap via the first wait — the trace thread already has RIP+TF set
+    //   and is free-running, so the first single-step event arrives when it
+    //   executes the wrapper. Continuing the TRACE thread here would reject
+    //   with a TID mismatch and the slot would fail before any step event.
     // - frozen entry: the caller left the loop via a timeout freeze (e.g. the
     //   IAT-materialization wait's `FreezeAndDump` after 30s) with NO pending
     //   event; the trace thread is already free-running and the RIP+TF context
@@ -144,18 +156,40 @@ pub(crate) fn trace_one_slot(
     //   single-step event.
     //
     // Fail-fast is reserved for genuinely abnormal sequences (debugger errors,
-    // unexpected exceptions on the traced thread), never for a legal frozen
-    // entry that simply lacks a pending event.
-    let had_pending_event = debugger.pending_event_thread_id().is_some();
-    if had_pending_event {
-        debugger
-            .continue_event(thread_id, ContinueStatus::Continue)
-            .map_err(|e| ThemidaError::Debugger(format!("trace_one_slot continue: {e}")))?;
-    } else {
-        log(
-            LogMsgType::Info,
-            "trace_one_slot: no pending event — bootstrapping via first wait (frozen entry)",
-        );
+    // unexpected exceptions on the traced thread), never for a legal frozen/
+    // stale-pending entry that simply needs its pending lifecycle cleared.
+    match debugger.pending_event_thread_id() {
+        Some(pending_tid) if pending_tid == thread_id => {
+            // Event entry: resume the pending event for the trace thread.
+            debugger
+                .continue_event(thread_id, ContinueStatus::Continue)
+                .map_err(|e| ThemidaError::Debugger(format!("trace_one_slot continue: {e}")))?;
+        }
+        Some(pending_tid) => {
+            // Stale-pending entry: the pending event belongs to another
+            // (usually already-exited) thread. Continue it on its own id to
+            // clear the debug lifecycle, then bootstrap via the first wait.
+            log(
+                LogMsgType::Info,
+                &format!(
+                    "trace_one_slot: clearing stale pending event from thread \
+                     {pending_tid} — bootstrapping via first wait (TASK-015)"
+                ),
+            );
+            debugger
+                .continue_event(pending_tid, ContinueStatus::Continue)
+                .map_err(|e| {
+                    ThemidaError::Debugger(format!(
+                        "trace_one_slot clear stale pending ({pending_tid}): {e}"
+                    ))
+                })?;
+        }
+        None => {
+            log(
+                LogMsgType::Info,
+                "trace_one_slot: no pending event — bootstrapping via first wait (frozen entry)",
+            );
+        }
     }
 
     // ---- Event loop --------------------------------------------------------
@@ -375,6 +409,10 @@ mod tests {
         events: Vec<DebugEvent>,
         context: RefCell<CONTEXT>,
         continue_calls: u32,
+        /// Thread ids passed to `continue_event` (TASK-015: pins that a stale
+        /// pending event is continued on ITS OWN thread, never on the trace
+        /// thread).
+        continued_tids: Vec<u32>,
     }
 
     impl ScriptedDebugger {
@@ -395,6 +433,7 @@ mod tests {
                 events: Vec::new(),
                 context: RefCell::new(ctx),
                 continue_calls: 0,
+                continued_tids: Vec::new(),
             }
         }
 
@@ -425,10 +464,11 @@ mod tests {
         }
         fn continue_event(
             &mut self,
-            _thread_id: u32,
+            thread_id: u32,
             _status: ContinueStatus,
         ) -> Result<(), CoreError> {
             self.continue_calls += 1;
+            self.continued_tids.push(thread_id);
             Ok(())
         }
         fn read_memory(&self, _address: usize, _buf: &mut [u8]) -> Result<usize, CoreError> {
@@ -528,5 +568,58 @@ mod tests {
         assert!(result.is_ok(), "event entry must trace: {result:?}");
         assert_eq!(dbg.continue_calls, 1, "exactly one continue on event entry");
         assert_eq!(state.traced_api, REAL_API);
+    }
+
+    #[test]
+    fn stale_pending_event_from_other_thread_is_cleared_then_bootstraps() {
+        // TASK-015 real behavior: the debug loop can break while a pending
+        // debug event belongs to a DIFFERENT (spurious, already-exited) thread
+        // — e.g. the T0.5-R2 HW-anchor-failure grace window leaves the loop on
+        // a spurious thread's ExitThread. `trace_one_slot` must continue that
+        // pending event on ITS OWN thread id (clearing the debug lifecycle),
+        // then bootstrap via the first wait and resolve the single-step that
+        // the trace thread produces when it executes the wrapper.
+        //
+        // Regression: the old code called `continue_event(THREAD)` whenever
+        // ANY pending event existed, which rejected with a TID mismatch
+        // (provided_tid=THREAD, pending_tid=OTHER_THREAD) and the slot failed
+        // before any step event — every VM slot reported "tracing completed
+        // but no API resolved" and the IAT trace could never start.
+        const OTHER_THREAD: u32 = THREAD + 1;
+        let mut dbg =
+            ScriptedDebugger::new(Some(OTHER_THREAD)).with_event(DebugEvent::SingleStep {
+                thread_id: THREAD,
+                address: REAL_API as u64,
+            });
+        let mut state = ThemidaState::new(pe_info(), false);
+        let noop = |_: LogMsgType, _: &str| {};
+
+        let result = trace_one_slot(
+            &mut dbg,
+            &mut state,
+            REAL_API as u64,
+            THREAD,
+            0x7ff7_0000_3000,
+            0x7ff7_0000_5000,
+            0x7ff7_0000_0000,
+            0x7ff7_0000_6000,
+            TRACE_LIMIT,
+            &noop,
+        );
+
+        assert!(result.is_ok(), "stale pending must bootstrap: {result:?}");
+        assert_eq!(
+            state.traced_api, REAL_API,
+            "single-step on the trace thread must resolve the API"
+        );
+        assert!(!state.trace_in_vm);
+        // The stale pending event was continued on its OWN thread (clearing
+        // the lifecycle) — never on the trace thread (which would reject with
+        // a TID mismatch).
+        assert_eq!(
+            dbg.continued_tids,
+            vec![OTHER_THREAD],
+            "stale pending must be continued on its own thread id"
+        );
     }
 }

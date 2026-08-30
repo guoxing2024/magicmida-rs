@@ -4,7 +4,7 @@
 > `老板 · 2026-08-30 · 原话"批准"（回应总指挥列明的 TASK-015 范围与两件批准请求，按全案解释：两件同时批）· ① 授权 crates/ 改动：crates/packers/themida/src/trace_imports/mod.rs + slot.rs、crates/pe/src/dumper/iat_partial_accept.rs + iat_gap_retarget.rs + dump_process.rs + import_rebuild.rs + iat_completeness.rs、crates/cli/src/unpacker/iat_evidence.rs、crates/acceptance/src/oreans_gate.rs（仅限 #[serde(default)]/新增可选字段）及其测试模块（仅限本单授权文件清单；fail-closed 门语义零改动为硬约束）· ② 批 1 格实弹 · XC-XXI-B 8/4 → 9/4（超原配额，老板明确扩额）· 前置由总指挥亲验：BootTime（令牌签发时刻）= 2026-08-30 10:05:51（执行时 boot 已变不构成 STOP 事由，照实记录即可——D-022 新规）· 起点 HEAD = 291b239（TASK-014 已验收入栈；worker 须核验 291b239 为 HEAD 祖先、且 291b239..HEAD 的 diff 仅 docs/tickets 文件）· vault 受控 ini sha256 c88e94c3… 与样品对象 sha256 78009803… 已当场复核在位`
 
 - **优先级**：P1（XX-11 端点恢复的最短路径；路径 B 的硬前置）
-- **状态**：✅ 已授权（老板 2026-08-30 批准两件；记 D-028）
+- **状态**：✅ 已执行并验收（2026-08-30，终态 = 路径 B1'：XX-11 端点恢复——74/74 trace 全解析、186 imports、结构门 12/12、load 10/10、S4 字节级对齐、产物 1,539,072 B ×2；账本 9/4，验收记 D-029）
 - **岗位**：developer（第一段离线定位+修复，第二段实弹验证）
 - **账本**：XC-XXI-B **8/4 → 9/4**（老板 2026-08-30 明确扩额授权）
 

@@ -3655,4 +3655,129 @@ mod tests {
         assert!(!failures.is_empty(), "tampered disk must fail");
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    // -- TASK-015: serde-default backward compatibility for IAT evidence ----
+
+    /// A minimal full-shape `OreansIatEvidence` JSON WITHOUT the newer
+    /// diagnostic fields (`resolution_source`, `iat_partial_accepted`,
+    /// `iat_partial_accept`, `static_corroborations`). This is the shape an
+    /// older sidecar (pre-XX-9/XX-10-A) would have serialized. The
+    /// `#[serde(default)]` attributes must let it deserialize.
+    fn legacy_iat_evidence_json() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": "mida.oreans-iat-evidence/v1",
+            "protected_input": {
+                "path": "protected.exe",
+                "sha256": "a".repeat(64),
+                "size_bytes": 100
+            },
+            "candidate": {
+                "path": "candidate.exe",
+                "sha256": "b".repeat(64),
+                "size_bytes": 200
+            },
+            "fix_imports_requested": true,
+            "iat_evidence_present": true,
+            "iat_evidence_complete": true,
+            "iat_report": {
+                "requested_bytes": 16,
+                "bytes_read": 16,
+                "slot_size": 8,
+                "slots": [{
+                    "slot_index": 0,
+                    "slot_address": 1234,
+                    "slot_rva": 4096,
+                    "observed_value": 7777,
+                    "rebuilt_value": 7777,
+                    "slot_value": 7777,
+                    "status": "Resolved",
+                    "unresolved_reason": null,
+                    "module_name": "kernel32.dll",
+                    "function_name": "ExitProcess",
+                    "ordinal": null
+                }],
+                "unresolved_reason_counts": {
+                    "by_reason": {},
+                    "pending_live_confirmation": 0
+                }
+            },
+            "final_imports": [{
+                "slot_rva": 4096,
+                "module_name": "kernel32.dll",
+                "function_name": "ExitProcess",
+                "ordinal": null
+            }],
+            "prerequisite_passes": true,
+            "blocker": null
+        })
+    }
+
+    #[test]
+    fn legacy_iat_sidecar_without_new_diagnostic_fields_still_deserializes() {
+        // TASK-015: `#[serde(default)]` on the newer diagnostic fields
+        // (`resolution_source`, `iat_partial_accepted`, `iat_partial_accept`,
+        // `static_corroborations`) must let a pre-XX-9/XX-10-A sidecar
+        // deserialize with the defaults filled in — the acceptance gate must
+        // consume older evidence without failing on missing fields.
+        let value = legacy_iat_evidence_json();
+        let evidence: OreansIatEvidence =
+            serde_json::from_value(value).expect("legacy sidecar must deserialize");
+        assert!(!evidence.iat_partial_accepted, "default must be false");
+        assert!(
+            evidence.iat_partial_accept.is_none(),
+            "default must be None"
+        );
+        assert!(evidence.blocker.is_none());
+        assert!(evidence.prerequisite_passes);
+        let report = evidence.iat_report.expect("report must be present");
+        assert_eq!(report.slots.len(), 1);
+        assert_eq!(
+            report.slots[0].resolution_source, None,
+            "default resolution_source must be None"
+        );
+        assert_eq!(report.slots[0].status, "Resolved");
+    }
+
+    #[test]
+    fn iat_sidecar_still_rejects_unknown_fields() {
+        // TASK-015: the `#[serde(default)]` additions must NOT weaken
+        // `deny_unknown_fields` — an unknown top-level field must still fail
+        // closed, so future schema drift is caught at parse time.
+        let mut value = legacy_iat_evidence_json();
+        value["unexpected_field"] = serde_json::json!(123);
+        let result: Result<OreansIatEvidence, _> = serde_json::from_value(value);
+        assert!(
+            result.is_err(),
+            "unknown field must still be rejected (deny_unknown_fields preserved)"
+        );
+    }
+
+    #[test]
+    fn iat_sidecar_round_trips_new_diagnostic_fields() {
+        // TASK-015: a sidecar produced with the newer diagnostic fields must
+        // serialize AND deserialize without loss (round-trip), so a modern
+        // producer's output is fully preserved by the gate.
+        let value = legacy_iat_evidence_json();
+        let mut evidence: OreansIatEvidence =
+            serde_json::from_value(value).expect("legacy sidecar must deserialize");
+        evidence.iat_partial_accepted = true;
+        evidence.iat_partial_accept = Some(OreansIatPartialAcceptEvidence {
+            partial_accepted: true,
+            resolved_fraction_num: 74,
+            resolved_fraction_den: 201,
+            fraction_ok: false,
+            rejected_within_budget: false,
+            structural_failures: vec![],
+            rejected_slots: vec![],
+            stale_slots: vec![],
+            accepted_resolved_slots: vec![],
+            static_corroborations: vec![],
+        });
+        let bytes = serde_json::to_vec(&evidence).expect("serialize");
+        let decoded: OreansIatEvidence =
+            serde_json::from_slice(&bytes).expect("round-trip deserialize");
+        assert!(decoded.iat_partial_accepted);
+        assert!(decoded.iat_partial_accept.is_some());
+        assert_eq!(decoded.iat_report.unwrap().slots.len(), 1);
+    }
 }

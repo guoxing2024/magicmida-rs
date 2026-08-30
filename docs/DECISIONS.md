@@ -221,3 +221,12 @@
 - **保险丝（写入工单）**：① 第一段判别力未过或回归源未定位 → STOP 不烧格；② 不许改松门；③ A' 未改善不许第 3 次。
 - **前置（总指挥亲验，2026-08-30）**：BootTime = `10:05:51`（与 T014 实弹同 boot）；起点 HEAD = `291b239`；工作区净（仅已知 untracked）；vault ini sha `c88e94c3…` 与样品对象 sha `78009803…` 当场复核在位。
 - **落地**：`tickets/TASK-015.md` 首行已写授权令牌（worker 须原文回抄）。
+
+## D-029 TASK-015 验收通过（终态路径 B1'，XX-11 端点受治理复现；账本 8/4 → 9/4）
+
+- **日期**：2026-08-30（总指挥审计）
+- **验收结论**：v1 八条 + 强门四件套全部通过。总指挥独立复核：① 差异范围 3 文件全授权（+249/-17；`oreans_gate.rs` 仅新增 3 个 serde-default 行为测试；**门语义零改动亲验**）；② 六套件真退出码全 0（pe **1054** / themida **176**=175+1 / cli **580** / acceptance lib **256**=253+3 / clippy / fmt，零 FAILED）；③ **换缝独立判别力探针**（stale-pending 分支改用错误 tid continue → 1 红 exit 101 → 字节级恢复 exit 0；worker 的探针 = 整支退回旧行为，另有记录）；④ vault 直读 B1' 全链条：EXIT=0 ×2、**[GOOD] Candidate written ×2**（行内含 ANSI 色码，总指挥初查误报 0，ANSI 核实后在案）、AV=0 ×2、**trace resolved=74/74 failed=0**（clearing stale pending=1、Suspending spurious thread=7/6、OK IAT[=75）、**imports 186 整**（逐项计数 kernel32 69/msvcrt 76/user32 23/wininet 9/version 3/advapi32 3/shell32 1/comctl32 1/gdi32 1，两趟逐位一致）、结构门 **12/12 ×2**、**load_no_crash 10/10 ×2**（pass_rate 1.0）、产物 **1,539,072 B ×2**（attempt1 `fd96ed38…` / attempt2 `a852880a…`——与 XX-11 `36043cb4…` 不同 = session 级差异，语义端点一致，worker 已如实披露）、scylla 日志双零 + 15 键、P-8 13:56<14:00、staging 全清、构建 sha `bc1feebf…` 五字符串命中。
+- **主根因定案 [已验证]**：T0.5-R2（`a9aced4`）HW-anchor ERROR_NOACCESS → 12s grace window → debug loop 断在 spurious 线程 ExitThread 且未 continue → post-loop trace `continue_event(trace线程)` 被 TID 校验拒绝 → **trace 从未单步**。三日志互证：R5 日志 TID mismatch ×3（fail-fast 可见）、T014 日志 0 处（被 slot-scoped 包装吞成误导文案）、XX-11 日志 frozen-entry bootstrap 行（无 pending 路径）。`trace_imports` 自 `3b5862b`（XX-8-A）起结构未变——缺口在 break 路径不在 trace_imports；`--oep=captured` 本就是默认值（flag 假设关闭，D-024 假设①作废）。
+- **账本**：2 次有效尝试 = 1 格，8/4 → **9/4**。
+- **里程碑**：**同一样品第二次端到端跑通（08-28 XX-11 之后首次），且全程有治理证据链**——强门四件套、P-8、结构门 12/12、load 探针 10/10、S4 对照（窗口标题/config.ini 26B/core.dll sha `09f3dd34…` 与 XX-10 vault 逐位一致）。老板的"以前能脱壳"从记忆变成可复算的事实。
+- **审计备注（不阻塞验收）**：① 两趟产物 sha 互异且 ≠ XX-11（session 级确定性差异，尺寸/imports/结构/load/S4 全对齐，worker 已披露）；② S4 提取物（core.dll/config.ini）随 s4_probe 目录删除——sha 已记录且对照对象在 vault 可复算，建议后续此类提取物**先入 vault 再清理**（P-8 精神延伸）；③ `mod.rs` 的 LifecycleError 归类无专属行为测试（T015 唯一新测试压在 slot.rs stale-pending 上）；④ load 探针用 `tools/_behavior_probe.py` 非 cdb sxe-av（语义等价，worker 已披露，可选补跑）。

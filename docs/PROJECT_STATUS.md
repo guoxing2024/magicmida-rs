@@ -7,7 +7,7 @@
 
 这项目是**活的**（654 次提交，2801 个测试全绿），
 本次接管已把最要紧的风险解掉：**两天的在飞成果已分 8 个提交落到本地 git，`cargo fmt` 从红 216 处变为 0。推送按老板裁定停在本地，等他逐次确认。**
-下一件最要紧的事是 **TASK-015（待批准后起草派单）**：TASK-014（08-30，终态路径 A'，账本 **8/4**）实弹诊断定案——201 槽 = 112 Resolved + 74 Unresolved（全部是 Themida 段内 VM wrapper 地址，偏移 0x1681d1 与 XX 时代旧产物坏值逐位一致）+ 15 零终止符；**静态原导入表 9 项对 VM wrapper 结构性 0 命中 → XX-10-A 静态回填 0 覆盖是结构性必然（修正 D-024"回归"定性）**；真缺口 = shell trace 的执行线程/时机（74 槽 trace 全败：主线程无单步事件）。XX-11 端点（186/186 + load 10/10 + S4 8/8）仍是最短路径目标。
+下一件最要紧的事 = **等老板裁定下一步**（xiongxiong 线战役目标已达成）。**TASK-015（08-30，终态路径 B1'，账本 **9/4**）= XX-11 端点受治理复现**：主根因定案（T0.5-R2 grace window 断点遗留其它线程 pending → TID mismatch → trace 从未单步；R5/T014/XX-11 三日志互证）并修复（stale pending 按归属线程 continue 清生命周期再 bootstrap）；实弹 2/2——trace 74/74、imports 186 整、结构门 12/12、load_no_crash 10/10 ×2、S4 标记字节级对齐（窗口标题/config.ini 26B/core.dll sha 09f3dd34）、产物 1,539,072 B 与 XX-11 同尺寸。TASK-014（同日，路径 A'，8/4）先采回 201 槽逐槽诊断（74 启动槽 = Themida VM wrapper，静态回填结构性 0 命中）。
 **为什么**：TASK-006R3 换 boot 后再跑，13/13 次跨 3 个 boot 全部撞同一个 ScyllaHide NtContinue-hook 故障环（风暴 RIP 恒 = hook 地址 +8，两套完全不同的 ASLR 布局下都成立）。**这不是 ASLR 运气，是确定性的工具交互故障**，"重启后重试"这条路已探测过、阴性、关闭。抓手是：我们现在**在无 ini 配置的状态下注入 ScyllaHide，它默认把所有 hook 都装上**（含跟壳打架的异常分发链），而引擎里的配置口子留了没接线。
 老板 2026-08-30 三条裁定已落账：追认 TASK-006R2 那一格（D-015，4/4 成立）、扩额批 TASK-006R3 一格（D-016，→ **5/4**）、授权迁移工作区大文件证据（D-017，G-6 已关）。
 三个 fail-open/无终止缺陷都已在**离线级**修完：缺陷 A（C-4，dump 重建把不可解析运行时指针固化进只读节 → 兜底清零 + fail-closed 门，TASK-009）、C-7（text-poll 阶段无 AV 风暴终止 → 恒同元组计数 + fail-closed 中止，TASK-011）、C-7 加固（阈值 32→1024 + host 腿补测试，TASK-012）。三者的**实弹验证都还没做**，而且只能在同一次重脱壳里一起验：TASK-006R 首跑用掉 1 格但 9/9 陷在 text-poll 风暴里，dump 从未到达（正是 C-7 造成的），所以缺陷 A 的实弹替换验证既未证实也未证伪。
@@ -118,6 +118,6 @@
 
 ## 下一步
 
-① **TASK-015**（已授权 D-028：shell trace 线程/时机修复（74 VM 槽 → ≥186 imports）+ 回归定位 `18e0349..291b239` + acceptance serde default 限窄扩授权 + 一格实弹 8/4→9/4 冲 B1'，对照 XX-11 端点；工单 `tickets/TASK-015.md`）→ ② T0.5 续跑 → ③ TASK-007。TASK-014 已完成并验收（终态路径 A'，核心诊断 = 74 启动槽是 Themida VM wrapper，D-027）。→ ② T0.5 续跑 → ③ TASK-007。TASK-006R5 已完成并验收（终态路径 A，账本 7/4，D-022）：受控 ini 经 staging 生效后 0 次 AV、text-poll 首次收敛、fail-closed 192 槽拒绝产物；TASK-013 待验风险（壳反检）实测阴性。
+① **等老板裁定**：推送（本地积压 18 个提交，D-010 逐次确认制）→ ② T0.5 续跑 → ③ TASK-007。TASK-014（路径 A'）/ TASK-015（路径 B1'，XX-11 端点恢复）已验收（D-027/D-029）；遗留小项 = mod.rs LifecycleError 归类补专属行为测试、load 探针 cdb 变体（worker 已标注）。→ ② T0.5 续跑 → ③ TASK-007。TASK-014 已完成并验收（终态路径 A'，核心诊断 = 74 启动槽是 Themida VM wrapper，D-027）。→ ② T0.5 续跑 → ③ TASK-007。TASK-006R5 已完成并验收（终态路径 A，账本 7/4，D-022）：受控 ini 经 staging 生效后 0 次 AV、text-poll 首次收敛、fail-closed 192 槽拒绝产物；TASK-013 待验风险（壳反检）实测阴性。
 另有两个可另立的专项：ScyllaHide-NtContinue-hook 交互的微指令级定性（需实弹 trace）、C-5 缺陷 B（会话绑定，`/session-clean` 消费端）。
 推送时机由老板定；推送前建议补跑 `cargo deny check advisories`（本机离线跑不了）。

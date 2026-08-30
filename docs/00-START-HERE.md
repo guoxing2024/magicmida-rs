@@ -33,7 +33,7 @@ Windows PE 脱壳研究平台（Rust，221k 行，11 个 crate）。把受保护
 **连带修正**：此前 **14/14** 次实弹全部处于"全默认 hook、异常分发链开启"状态；xx 线当年成功是因为跑在 scratch 目录（注入器旁就有受控 ini → 异常分发链关闭）。**e8bda46 的"ASLR 布局依赖"假说撤回**——不是布局运气，是配置差异。
 **TASK-006R5 已执行并验收（2026-08-30，1 格，终态 = 路径 A）：14 次实弹以来首次到达 dump 阶段——受控 ini 解锁 text-poll 收敛，缺陷 A fail-closed 门首次实弹验证。**
 路线 A 落地：`scyllahide.rs` +469——有 ini 时把 InjectorCLI+HookLibrary+受控 ini 复制到 `%TEMP%\mida-scyllahide-<pid>\`（工作区外，绕开 ARTIFACT_POLICY 第 11 条）、sha256 fail-closed 校验、RAII 清理 + P-8 证据保留；无 ini 字节级走原路径。实弹 attempt2/3 有效 2/2 次确定性复现：**0 次 AV**（对照此前 14/14 次 1024 风暴环）、text-poll 首次收敛到 dump、`TASK-009 fail-closed`（192 个启动路径 call/jmp 指向 unresolved IAT 槽 → 拒绝写产物）、`[GOOD]` 不出现、无产物。**D-020 的"配置差异"解释被干预实验证实**；TASK-013 留的待验风险（关 hook 后壳反检调试器）实测未发生。验收全套（五连真退出码 + 总指挥换缝独立判别力探针）全过，账本 **7/4**（D-022）。见 `runs/20260830-TASK-006R5.md`。
-**下一战线（08-30 第二次勘误，D-027）**：TASK-014 实弹诊断定案——201 槽 = **112 Resolved**（live 直接匹配）+ **74 Unresolved**（全部是 Themida 段内 VM wrapper 地址：image_base+0x1681d1…+0x3203d7，偏移与 XX 时代旧产物坏值 0x1401681d1 逐位一致）+ 15 零终止符；192 启动路径站点 → 74 唯一槽。**静态原导入表 9 项对 VM wrapper 结构性 0 命中 → XX-10-A 静态回填 0 覆盖是结构性必然，不是回归**（修正 D-024 假设）；真缺口 = **shell trace 的执行线程/时机**（74 槽 trace 全败：主线程无单步事件；XX-11 时代能解 VM 槽的机制 = 复现钥匙）。下一单 TASK-015（待批准）= trace 线程/时机修复 + 回归定位（`18e0349..be28951`）+ 一格实弹 8/4→9/4 冲 B1'（对照 XX-11 端点 186/186 + load 10/10 + S4 8/8）。**教训 P-10：同一样品开新工单前必读 vault 历史战役报告。**
+**下一战线（08-30 第二次勘误 D-027 → T015 收官 D-029）**：TASK-014 实弹诊断定案——201 槽 = **112 Resolved**（live 直接匹配）+ **74 Unresolved**（全部是 Themida 段内 VM wrapper 地址：image_base+0x1681d1…+0x3203d7，偏移与 XX 时代旧产物坏值 0x1401681d1 逐位一致）+ 15 零终止符；**静态原导入表 9 项对 VM wrapper 结构性 0 命中 → XX-10-A 静态回填 0 覆盖是结构性必然，不是回归**。**TASK-015 主根因定案并修复**：T0.5-R2 grace window 断点遗留其它线程 pending → TID mismatch → trace 从未单步（R5 日志 ×3 / T014 被吞 / XX-11 frozen-entry 三日志互证；trace_imports 自 XX-8-A 起结构未变——缺口在 break 路径不在 trace_imports）；修复 = stale pending 按归属线程 continue 清生命周期再 bootstrap。实弹 2/2：**trace 74/74、imports 186 整、结构门 12/12、load 10/10、S4 字节级对齐、产物 1,539,072 B 与 XX-11 同尺寸——XX-11 端点受治理复现达成（账本 9/4）**。**教训 P-10：同一样品开新工单前必读 vault 历史战役报告。**
 
 
 **TASK-010 已完成（只读调查，定性 (c)）**：C-6 的基址差异与 AV 风暴**无因果**（同基址成败并存），两时段风暴不同型（04:0x = VM 取指环；21:1x = ScyllaHide NtContinue-hook 区故障环）；真正的放大器是引擎缺口 **C-7**——text-poll 阶段无风暴终止（guardless 无条件 Continue + `text_poll_start` 每事件重置致 30s idle 结构上永不触发）。见 `runs/20260829-TASK-010.md`。
@@ -42,7 +42,7 @@ Windows PE 脱壳研究平台（Rust，221k 行，11 个 crate）。把受保护
 **流程新规（P-4）**：产物固化类工单必须含"当场存活探针"——产物写完立即跑一次，非 0/259 即阻塞上报。
 （推送按老板裁定停在本地，等他逐次确认；推送前建议补跑 `cargo deny check advisories`。）
 
-工单顺序（**串行派发，同一时间只派一单**——D-014；worker 在飞期间禁止派新单——D-026）：**TASK-015（已授权 D-028：shell trace 线程/时机修复 + 回归定位 + 一格实弹 8/4→9/4，令牌已入工单首行）→ T0.5 续跑 → TASK-007**。TASK-005/009/010/011/012/013/006R5/014 已完成；TASK-006R/R2/R3 终态路径 C、R4 终态 STOP、R5 终态路径 A、T014 终态路径 A'（实弹累计 **8/4**，记 D-022/D-027）。
+工单顺序（**串行派发，同一时间只派一单**——D-014；worker 在飞期间禁止派新单——D-026）：**等老板裁定（xiongxiong 线 B1' 已达成：推送 18 个本地提交？T0.5 续跑？TASK-007？）**。TASK-005/009/010/011/012/013/006R5/014/015 已完成；TASK-006R/R2/R3 终态路径 C、R4 终态 STOP、R5 终态路径 A、T014 终态路径 A'、T015 终态路径 B1'（实弹累计 **9/4**，记 D-022/D-027/D-029）。
 
 ## 30 秒把它跑起来
 
