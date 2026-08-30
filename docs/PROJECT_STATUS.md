@@ -118,6 +118,6 @@
 
 ## 下一步
 
-① **TASK-020(+R1) 候选清洗已验收（D-040/D-041，2026-08-30，纯离线不烧格）——T0.5 三态重跑就绪，等老板批最后 1 格（12/4 → 13/4）**：清洗件 094f5401（8 槽会话指针全部指向当前会话，总指挥逐槽独立验证 8/8，含 T019 命中槽 0x13f810 → 0x7ffd37ae6390）+ pointer_map.json（13 个 .winlice 非对齐残留入册不盲改）已入 vault。**重跑票面将写入**：基址硬门（候选 3549 自引用指针基址锁死、`.reloc` 仅 4 条——实际加载 ≠ 首选 0x7ffe1da10000 → 触发 Run 前 fail-loud 弃判）、`.winlice` 残留风险注记、BootTime 自查。过程记录：T020 初版两缺陷（7 槽基址 +0x100000 = 总指挥 D-038 错误分解被采信；非对齐漏扫）经 R1 全部消除；总指挥两次算术失误（D-038/D-041）记档。背景链：T017（P-11 垫零）→ T018（C-8 原版 core，P-10 失误）→ T019（C-5 候选陈旧指针，worker 归因被法证纠正）→ T020+R1（清洗）。其余暂缓：TASK-007 / clippy 基线门（D-031 F3）/ §九 GTO-UI / 推送（33 提交，D-010）。TASK-014（路径 A'）/ TASK-015（路径 B1'）已验收（D-027/D-029）；遗留小项 = mod.rs LifecycleError 归类补专属行为测试、load 探针 cdb 变体（worker 已标注）。
+① **TASK-021（T0.5 三态重跑·收官之战）已授权在飞（D-042，2026-08-30，实弹 1 格 XC-XXI-B 12/4 → 13/4）**：B1' 宿主 a852880a + 清洗后候选 core 094f5401（T020+R1 清洗 8/8 验收，D-041）+ 调试端口泵 harness（sha 门更新 + 基址硬门 + run_head 明文预检）→ 三态判定（FULL/新阻塞/AV/附加改变行为，语义逐字沿用）。**基址硬门**：候选 3549 自引用指针基址锁死——实际加载 ≠ 首选 0x7ffe1da10000 → 触发 Run 前 fail-loud 弃判。`.winlice` 13 残留命中 → 标注 STOP。收官 = FULL（Run verdict PARTIAL → FULL，路径级结论）。其余暂缓：TASK-007 / clippy 基线门（D-031 F3）/ §九 GTO-UI / 推送（34 提交，D-010）。TASK-014（路径 A'）/ TASK-015（路径 B1'）已验收（D-027/D-029）；遗留小项 = mod.rs LifecycleError 归类补专属行为测试、load 探针 cdb 变体（worker 已标注）。
 另有两个可另立的专项：ScyllaHide-NtContinue-hook 交互的微指令级定性（需实弹 trace）、C-5 缺陷 B（会话绑定，`/session-clean` 消费端）。
 推送时机由老板定；推送前建议补跑 `cargo deny check advisories`（本机离线跑不了）。
