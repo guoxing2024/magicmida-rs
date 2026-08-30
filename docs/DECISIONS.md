@@ -230,3 +230,12 @@
 - **账本**：2 次有效尝试 = 1 格，8/4 → **9/4**。
 - **里程碑**：**同一样品第二次端到端跑通（08-28 XX-11 之后首次），且全程有治理证据链**——强门四件套、P-8、结构门 12/12、load 探针 10/10、S4 对照（窗口标题/config.ini 26B/core.dll sha `09f3dd34…` 与 XX-10 vault 逐位一致）。老板的"以前能脱壳"从记忆变成可复算的事实。
 - **审计备注（不阻塞验收）**：① 两趟产物 sha 互异且 ≠ XX-11（session 级确定性差异，尺寸/imports/结构/load/S4 全对齐，worker 已披露）；② S4 提取物（core.dll/config.ini）随 s4_probe 目录删除——sha 已记录且对照对象在 vault 可复算，建议后续此类提取物**先入 vault 再清理**（P-8 精神延伸）；③ `mod.rs` 的 LifecycleError 归类无专属行为测试（T015 唯一新测试压在 slot.rs stale-pending 上）；④ load 探针用 `tools/_behavior_probe.py` 非 cdb sxe-av（语义等价，worker 已披露，可选补跑）。
+
+## D-030 批 TASK-016 阶段收尾（crates/ 改动授权按清单；纯离线零实弹，账本不变 9/4）
+
+- **日期**：2026-08-30（老板令："现在你派个单做个阶段收尾，别以后用不能用了。还有要注意通用性，不要有硬编码"——并已亲验 B1' 产物"达到要求了"）
+- **决策**：① 授权 `crates/` 改动**仅限**工单清单（B1' 路径 8 文件行为中性硬编码清除 + `acceptance/src/preflight.rs` 能力预检 + 各自测试模块）；② **纯离线零实弹**，账本不变 9/4；③ 交付 = 硬编码审计报告（含只读文件发现清单）+ runbook（`docs/RUNBOOK_REV2_B1.md`）+ vault 索引 + 全仓 workspace 回归快照。
+- **理由**：B1' 能力当前靠 env 变量 + 隐性知识支撑（无 ini 静默撞环、无启动前检查、复现配方散落 runs 报告）；T014/T015 快速修复可能引入样品级硬编码（RVA/魔法数/路径/线程假设）——换样品/环境即断。老板点名的"通用性/无硬编码"与"别以后用不能用"正是这三个风险面。
+- **硬约束**：① **行为中性**——清除只许更通用，不得改变 B1' 行为（全仓测试全绿 + 计数不减为证据）；必须行为性改动才修的 → STOP 请示（属下一战役需实弹）；② preflight 查 ini 结构（三 =0 键）不查内容指纹；③ 报告-only 文件（mod.rs text-poll/C-7 段、args.rs、oep/、data_reinit.rs、windows_debugger.rs、av_*）只报不改。
+- **前置（总指挥亲验，2026-08-30）**：起点 HEAD = `3de2ade`；工作区净（仅已知 untracked）；vault ini sha `c88e94c3…` 与样品对象 sha `78009803…` 在位（preflight 目标物）。
+- **落地**：`tickets/TASK-016.md` 首行已写授权令牌（worker 须原文回抄）。
