@@ -249,3 +249,11 @@
 - **F2（补正：审计完整性）**：审计文档"授权文件生产代码无样品级硬编码进入控制流"全称命题为假——`dump_process.rs` 存在整片**既有** GTO-UI 样品锚区未盘点（裸 `0x147868`/`0x147888` :2298-2299/2362；具名补丁常量 `0x5c5d`/`0x35520`/`0x364e0`/`0x34dbb`/`0x34ed4`/`0x34f66`/`0x34f59` 及注释内 0x63f4/0x6757/0x1b10 等，全部 `stage_plan`/`capture_policy` AhkGto 门控、对 B1'/xx21b 死代码）。按工单判据必须进报告（处置 = STOP 级留待下一战役）；R1 只增补文档，GTO-UI 生产代码一行不动。
 - **F3（既有基线门失败，不阻塞 T016，需老板另授权）**：`tools/check_clippy_baseline.ps1`（WO-23 lint 锁，08-29 18:17 基线）现 FAIL：`too_many_arguments` 基线 61 → 实测 62。总指挥逐文件分组核对：62 条命中 0 条由 T016 引入（T016 diff 无任何函数签名改动、新函数参数 ≤2；slot.rs 的 1 条命中是既有 `trace_one_slot` 签名告警，diff 中 "fn trace_one_slot" 两处均为 hunk 头注记）→ **HEAD 上同样 62，漂移来自基线生成后的已验收提交窗口（T006R5/T014/T015），确切函数未溯源（非决策依赖）**。修门 = 改门文件（基线再生）或重构 8 参函数，均属门变更 → 需老板授权另立工单，本审计不动。
 - **审计备注（不阻塞）**：① 审计文档 §八 "+482/-66" vs 实际 +487/-66（笔误，R1 顺带勘误）；② 授权清单误写 `dumper/iat_completeness.rs`（实为 `crates/pe/src/iat_completeness.rs`，总指挥起草笔误；已核 `201/192` 仅在其 :281-282 doc 注释，原结论对该文件成立）；③ preflight 键匹配用 `.ends_with(".{key}")` 理论上可被同后缀更长键误命中（现实 ScyllaHide 键集无此形状，留作未来加固观察）；④ 总指挥误删已跟踪文件 `_clippy_baseline` → 当场 `git checkout` 字节级恢复（2822 B）；教训：rm 前先 `git ls-files`；⑤ worker 新注释/文档沿用仓库既有 "hооk" 同形字惯例（HEAD 5 文件先例），非新问题。
+
+## D-032 TASK-016 + R1 终验收通过（阶段收尾入栈；账本不变 9/4；零实弹）
+
+- **日期**：2026-08-30（总指挥终审）
+- **R1 终审（五条全亲验 PASS）**：① R1 增量仅落 2 个授权文件（其余 5 个 crates 文件 diff 统计与审计时逐项相同、preflight.rs sha `49b7134e…` 未动、`_clippy_baseline`/`check_clippy_baseline.ps1` 零触碰）；② **F1 还原逐位核对**：`GAP_NAME_NEIGHBOR_MAX_DELTA=63` + `1..=` ≡ pre-T016 `1..64u32`（probed deltas 1..=63），doc 注释如实写明还原语义；③ 我的重跑 pe **1054** / acc **263** 真退出码 0、clippy（-D 三 lint）/fmt 0；④ `HARDCODING_AUDIT_T016.md` §九 GTO-UI 锚区清单与总指挥审计发现逐项吻合（含 `CALL_RVA=0x6757/0x63f4` 具名常量——总指挥此前扫描截断漏看，已核实在位），全称命题改限定 + 2 行勘误到位；⑤ runs 增补段诚实（连 R1 注释扩写 +487→+490 的 3 行差异都主动披露）、D-030 令牌回抄、零实弹自证。
+- **TASK-016 整单结论**：8 条验收标准在补正后**全部 PASS**（标准 3 经 §九 增补后成立）。T016 交付物入栈：6 个授权文件硬编码处置（行为中性）+ preflight ScyllaHide readiness（三零键 fail-loud，7 用例；未接进 `run_offline_preflight` 为已披露限制）+ `docs/RUNBOOK_REV2_B1.md`（七项判据经 vault 实证逐条核对）+ `docs/HARDCODING_AUDIT_T016.md`（含 §九）+ vault `INDEX.md`（git 外）+ runs 报告。
+- **账本**：XC-XXI-B **9/4 不变**（T016+R1 全程零实弹）。
+- **留给老板的三个裁定（都不阻塞入栈）**：① F3 clippy 基线门既有失败（61→62，T016 贡献 0）——重生成基线或重构 8 参函数，需另立工单授权；② §九 GTO-UI 锚区（裸 0x147868/0x147888 + 具名补丁常量）的清除属下一战役（需实弹再验证）；③ 18 个本地提交未推送（D-010），推送前建议 `cargo deny check advisories`（本机离线跑不了）。

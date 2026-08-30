@@ -1110,6 +1110,161 @@ fn atomic_replace(temp: &Path, destination: &Path) -> io::Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// ScyllaHide readiness (TASK-016)
+// ---------------------------------------------------------------------------
+
+/// INI keys that must be present with value 0 in the controlled ScyllaHide
+/// ini. TASK-006R/006R2/006R3 evidence: the exception-dispatch chain
+/// (`KiUserExceptionDispatcherHook` and `NtContinueHook`) and `NtCloseHook`
+/// fight the shell's exception dispatch / HW breakpoint path — any of them
+/// left at the default (hооk on) produces the AV-storm ring the C-7 guard
+/// has to abort. `NtCloseHook=0` keeps HW breakpoints triggerable.
+///
+/// **Structure-only**: we never pin the ini's sha256 (the content may
+/// legitimately evolve — e.g. more hооk keys or a profile rename). The check
+/// only requires that the three switches be explicitly present and zero, so
+/// a future ini revision stays compatible without re-approval.
+pub const SCYLLA_HIDE_REQUIRED_ZERO_KEYS: [&str; 3] = [
+    "KiUserExceptionDispatcherHook",
+    "NtContinueHook",
+    "NtCloseHook",
+];
+
+/// Default file name of the hооk configuration InjectorCLI reads (must sit
+/// next to the injector binary — TASK-013 evidence: GetModuleFileNameW +
+/// GetPrivateProfileSectionNamesW).
+pub const SCYLLA_HIDE_INI_FILE_NAME: &str = "scylla_hide.ini";
+
+/// File name of the 64-bit ScyllaHide injector CLI (staged next to the ini).
+pub const SCYLLA_INJECTOR_X64_FILE_NAME: &str = "InjectorCLIx64.exe";
+
+/// File name of the 64-bit ScyllaHide hооk library DLL (staged next to the
+/// ini).
+pub const SCYLLA_HOOK_X64_FILE_NAME: &str = "HookLibraryx64.dll";
+
+/// Verdict of the ScyllaHide readiness check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScyllaHideReadiness {
+    pub ok: bool,
+    /// One reason per failure (empty when `ok`). Fail-loud: each reason names
+    /// the exact missing/malformed item so the operator knows what to fix.
+    pub reasons: Vec<String>,
+}
+
+/// Parse a ScyllaHide INI file (pure, line-based) into a map of
+/// `section.key -> raw value`. ScyllaHide ini syntax is a Windows INI:
+/// `[Section]` headers and `Key=Value` lines; values are trimmed. Comments
+/// start with `;`. Keys without a section are ignored (they carry no
+/// semantics for the hook switches).
+pub fn parse_ini_sections(content: &str) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut section = String::new();
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line[1..line.len() - 1].trim().to_string();
+            continue;
+        }
+        let Some(eq) = line.find('=') else {
+            continue;
+        };
+        let key = line[..eq].trim();
+        let value = line[eq + 1..].trim();
+        if key.is_empty() {
+            continue;
+        }
+        out.insert(format!("{section}.{key}"), value.to_string());
+    }
+    out
+}
+
+/// Check that a ScyllaHide ini *content* carries the three required zero
+/// switches (pure, no IO). Returns fail-loud reasons otherwise.
+pub fn check_scylla_hide_ini_content(content: &str) -> ScyllaHideReadiness {
+    let parsed = parse_ini_sections(content);
+    let mut reasons = Vec::new();
+    for key in SCYLLA_HIDE_REQUIRED_ZERO_KEYS {
+        // The key may appear in any section (the UncoverEngine profile is the
+        // working baseline); search every section.
+        let hits: Vec<(&String, &String)> = parsed
+            .iter()
+            .filter(|(k, _)| k.ends_with(&format!(".{key}")))
+            .collect();
+        match hits.as_slice() {
+            [] => reasons.push(format!(
+                "controlled ini is missing {key} — default hооk will be used and the exception-dispatch chain will fight the shell (AV-storm ring)"
+            )),
+            [(_, value)] if value.trim() == "0" => {}
+            [(k, value)] => reasons.push(format!(
+                "controlled ini {k} = {value:?} (expected 0) — the exception-dispatch chain must be OFF"
+            )),
+            _ => reasons.push(format!(
+                "controlled ini has {key} in more than one section (ambiguous)"
+            )),
+        }
+    }
+    ScyllaHideReadiness {
+        ok: reasons.is_empty(),
+        reasons,
+    }
+}
+
+/// Check the ScyllaHide helper files are present next to the controlled ini:
+/// InjectorCLIx64.exe and HookLibraryx64.dll (the pair that must sit in the
+/// same directory as `scylla_hide.ini` for the staged injector to pick it
+/// up). Structure-only (existence), never content.
+pub fn check_scylla_hide_helpers(ini_dir: &Path) -> ScyllaHideReadiness {
+    let mut reasons = Vec::new();
+    for (name, what) in [
+        (SCYLLA_HIDE_INI_FILE_NAME, "controlled ini"),
+        (SCYLLA_INJECTOR_X64_FILE_NAME, "ScyllaHide injector (x64)"),
+        (SCYLLA_HOOK_X64_FILE_NAME, "ScyllaHide hook library (x64)"),
+    ] {
+        if !ini_dir.join(name).is_file() {
+            reasons.push(format!(
+                "{what} '{name}' not found next to the ini at '{}'",
+                ini_dir.display()
+            ));
+        }
+    }
+    ScyllaHideReadiness {
+        ok: reasons.is_empty(),
+        reasons,
+    }
+}
+
+/// Full ScyllaHide readiness check: ini exists, parses, has the three zero
+/// switches, and the injector/hook/ini trio sits in the same directory.
+/// Fail-loud with one reason per missing/malformed item.
+pub fn check_scylla_hide_readiness(
+    ini_path: &Path,
+    helper_dir: Option<&Path>,
+) -> ScyllaHideReadiness {
+    let mut reasons = Vec::new();
+    match fs::read_to_string(ini_path) {
+        Ok(content) => {
+            let content_check = check_scylla_hide_ini_content(&content);
+            reasons.extend(content_check.reasons);
+        }
+        Err(e) => reasons.push(format!(
+            "cannot read controlled ScyllaHide ini '{}': {e}",
+            ini_path.display()
+        )),
+    }
+    if let Some(dir) = helper_dir {
+        let helpers = check_scylla_hide_helpers(dir);
+        reasons.extend(helpers.reasons);
+    }
+    ScyllaHideReadiness {
+        ok: reasons.is_empty(),
+        reasons,
+    }
+}
+
 /// Run every offline check and return the deterministic report.
 ///
 /// `status == Ready` only when every case passes identity, the case set is
@@ -1563,6 +1718,178 @@ pub fn write_preflight_report(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    // ------------------------------------------------------------------
+    // TASK-016: ScyllaHide readiness — discrimination tests
+    // ------------------------------------------------------------------
+
+    const GOOD_INI: &str = "[SETTINGS]
+CurrentProfile=UncoverEngine
+[UncoverEngine]
+NtQueryObjectHook=1
+NtCloseHook=0
+KiUserExceptionDispatcherHook=0
+NtContinueHook=0
+NtSetInformationThreadHook=1
+";
+
+    #[test]
+    fn scylla_hide_good_ini_passes() {
+        let verdict = check_scylla_hide_ini_content(GOOD_INI);
+        assert!(
+            verdict.ok,
+            "well-formed ini must pass: {:?}",
+            verdict.reasons
+        );
+        assert!(verdict.reasons.is_empty());
+    }
+
+    #[test]
+    fn scylla_hide_missing_key_fails_loud() {
+        // Drop NtContinueHook — the exception-dispatch chain would fight the
+        // shell; the check must fail with a reason naming the exact key.
+        let content = "[UncoverEngine]
+NtCloseHook=0
+KiUserExceptionDispatcherHook=0
+";
+        let verdict = check_scylla_hide_ini_content(content);
+        assert!(!verdict.ok);
+        assert!(
+            verdict
+                .reasons
+                .iter()
+                .any(|r| r.contains("NtContinueHook") && r.contains("missing")),
+            "must name the missing key: {:?}",
+            verdict.reasons
+        );
+        assert!(
+            verdict.reasons.iter().any(|r| r.contains("AV-storm")),
+            "must warn about the AV-storm ring: {:?}",
+            verdict.reasons
+        );
+    }
+
+    #[test]
+    fn scylla_hide_key_set_to_one_fails_loud() {
+        // KiUserExceptionDispatcherHook=1 (default hооk) must be rejected.
+        let content = "[UncoverEngine]
+NtCloseHook=0
+KiUserExceptionDispatcherHook=1
+NtContinueHook=0
+";
+        let verdict = check_scylla_hide_ini_content(content);
+        assert!(!verdict.ok);
+        assert!(
+            verdict
+                .reasons
+                .iter()
+                .any(|r| r.contains("KiUserExceptionDispatcherHook") && r.contains("expected 0")),
+            "{:?}",
+            verdict.reasons
+        );
+    }
+
+    #[test]
+    fn scylla_hide_duplicate_key_is_ambiguous_fail() {
+        let content = "[A]
+NtCloseHook=0
+[B]
+NtCloseHook=0
+KiUserExceptionDispatcherHook=0
+NtContinueHook=0
+";
+        let verdict = check_scylla_hide_ini_content(content);
+        assert!(!verdict.ok);
+        assert!(
+            verdict
+                .reasons
+                .iter()
+                .any(|r| r.contains("NtCloseHook") && r.contains("more than one section")),
+            "{:?}",
+            verdict.reasons
+        );
+    }
+
+    #[test]
+    fn scylla_hide_parser_ignores_comments_and_empty_lines() {
+        let content = "; comment
+
+[UncoverEngine]
+; another
+NtCloseHook=0
+";
+        let parsed = parse_ini_sections(content);
+        assert_eq!(
+            parsed.get("UncoverEngine.NtCloseHook").map(String::as_str),
+            Some("0")
+        );
+        assert!(!parsed.contains_key("comment"));
+    }
+
+    #[test]
+    fn scylla_hide_helper_missing_files_fail_loud() {
+        // Discrimination: the trio (ini + injector + hook) must all be present.
+        let dir = std::env::temp_dir().join(format!(
+            "mida_preflight_scylla_helpers_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // Only the ini exists — injector + hook missing.
+        fs::write(dir.join("scylla_hide.ini"), GOOD_INI).unwrap();
+        let verdict = check_scylla_hide_helpers(&dir);
+        assert!(!verdict.ok);
+        assert!(
+            verdict
+                .reasons
+                .iter()
+                .any(|r| r.contains("InjectorCLIx64.exe")),
+            "{:?}",
+            verdict.reasons
+        );
+        assert!(
+            verdict
+                .reasons
+                .iter()
+                .any(|r| r.contains("HookLibraryx64.dll")),
+            "{:?}",
+            verdict.reasons
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scylla_hide_readiness_full_check_ok_and_fail() {
+        // Full check: ini readable + three switches + trio present => ok.
+        let dir =
+            std::env::temp_dir().join(format!("mida_preflight_scylla_full_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let ini = dir.join("scylla_hide.ini");
+        fs::write(&ini, GOOD_INI).unwrap();
+        // Touching placeholder files proves presence without content checks.
+        fs::write(dir.join("InjectorCLIx64.exe"), b"x").unwrap();
+        fs::write(dir.join("HookLibraryx64.dll"), b"x").unwrap();
+        let ok = check_scylla_hide_readiness(&ini, Some(&dir));
+        assert!(
+            ok.ok,
+            "complete trio + good ini must pass: {:?}",
+            ok.reasons
+        );
+
+        // Missing ini file => fail-loud with read error.
+        let missing = dir.join("no_such.ini");
+        let bad = check_scylla_hide_readiness(&missing, Some(&dir));
+        assert!(!bad.ok);
+        assert!(
+            bad.reasons
+                .iter()
+                .any(|r| r.contains("cannot read controlled ScyllaHide ini")),
+            "{:?}",
+            bad.reasons
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn identity_check_rejects_digest_mismatch_and_alias() {

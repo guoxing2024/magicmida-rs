@@ -93,9 +93,15 @@ pub(crate) fn set_stack_ptr(
     ctx.Rsp = val as u64;
 }
 
+/// Trap flag bit of the x86/x64 EFlags register (single-step TF, bit 8).
+/// The x86 architecture defines this bit; it is not a sample-specific magic
+/// value. Setting it makes the CPU raise a single-step debug exception after
+/// the next instruction — the mechanism the Themida VM tracer relies on.
+pub(crate) const X86_EFLAGS_TRAP_FLAG: u32 = 0x100;
+
 /// Set the trap flag (TF, bit 8 of EFlags) in a `CONTEXT`.
 pub(crate) fn set_trap_flag(ctx: &mut windows::Win32::System::Diagnostics::Debug::CONTEXT) {
-    ctx.EFlags |= 0x100;
+    ctx.EFlags |= X86_EFLAGS_TRAP_FLAG;
 }
 
 // ---------------------------------------------------------------------------
@@ -114,6 +120,13 @@ pub fn is_at_themida_vm(debugger: &dyn DebuggerCore, ip: usize) -> bool {
         _ => false,
     }
 }
+
+/// Minimum user-mode address (the 64KiB floor below which no real API or
+/// module mapping lives on Windows). Used as the "already resolved" boundary
+/// for IAT slot values: anything above this and outside the image is a real
+/// system API, not an in-image pointer. This is a Windows user/kernel address
+/// convention, not a sample-specific constant.
+pub const MIN_USER_MODE_ADDRESS: usize = 0x1_0000;
 
 /// Maximum consecutive *unknown/invalid* IAT slot values before we stop.
 ///
@@ -157,7 +170,7 @@ pub(crate) fn classify_iat_slot_for_trace(
 
     // Outside image (and above low-address floor) → already a real API.
     let in_image = current >= image_base && current < image_boundary;
-    if current >= 0x10000 && !in_image {
+    if current >= MIN_USER_MODE_ADDRESS && !in_image {
         return IatSlotClass::Skip;
     }
 
@@ -596,7 +609,7 @@ fn trace_slot(
             ))
         }
         SlotTraceRaw::Resolved(api) => {
-            if api < 0x10000 || (api >= image_base && api < image_boundary) {
+            if api < MIN_USER_MODE_ADDRESS || (api >= image_base && api < image_boundary) {
                 // Partial deobfuscation (in-image or too low). Retry deepened.
                 log(
                     LogMsgType::Info,
@@ -799,7 +812,7 @@ fn retry_or_fail(
             }
         }
         SlotTraceRaw::Resolved(api) => {
-            if api < 0x10000 || (api >= image_base && api < image_boundary) {
+            if api < MIN_USER_MODE_ADDRESS || (api >= image_base && api < image_boundary) {
                 Ok(TraceSlotOutcome::Failed(
                     "deepened trace still in image range or too low",
                 ))

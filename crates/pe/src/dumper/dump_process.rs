@@ -354,6 +354,32 @@ use super::output_writer::write_output_file;
 use super::sections::{create_pdata_section, create_reloc_section};
 use super::types::{DumpOptions, DumpProcessReport, EarlySectionSnapshot};
 
+// ---------------------------------------------------------------------------
+// Named constants (general-purpose engine policy — no bare magic literals)
+// ---------------------------------------------------------------------------
+
+/// Bytes read for the PE header (DOS header + PE signature + Optional Header +
+/// section table start). 0x1000 is the standard PE header read size; the
+/// header may span more for huge section tables, but the first 4 KiB always
+/// covers the DOS/COFF/optional headers and the first section entries.
+const PE_HEADER_READ_BYTES: usize = 0x1000;
+
+/// Cap for a single live `.text` read used for call-site verification
+/// (evidence leg 3 of static corroboration). Real code sections are far
+/// smaller; a huge value is a hostile/unusual image, capped to bound the
+/// read.
+const LIVE_TEXT_READ_CAP_BYTES: usize = 0x100_000;
+
+/// Log-only threshold: sections with `virtual_size` above this are printed
+/// in the POST-SANITIZE / POST-TRIM diagnostics. Purely informational; does
+/// not gate any behaviour.
+const HUGE_SECTION_LOG_THRESHOLD: u32 = 0x100_000;
+
+/// Ceiling for a plausible AHK cmd-table count dword (preserved live before
+/// overlay / data_reinit zeros `.data`). Values at or above this are treated
+/// as garbage (not a real count) and not preserved.
+const CMD_TABLE_COUNT_MAX: u32 = 0x10000;
+
 /// Apply static back-fills to `ModuleNotFound` rejected slots
 /// (XX-10-A direction 2).
 ///
@@ -695,13 +721,14 @@ pub fn dump_process_with_report(
     opts: &DumpOptions,
 ) -> Result<DumpProcessReport, PeError> {
     // 1. Read PE headers
-    let mut header_buf = vec![0u8; 0x1000];
+    let mut header_buf = vec![0u8; PE_HEADER_READ_BYTES];
     let read = debugger
         .read_memory(opts.image_base as usize, &mut header_buf)
         .map_err(|e| PeError::Parse(format!("Failed to read PE headers: {e}")))?;
-    if read < 0x1000 {
+    if read < PE_HEADER_READ_BYTES {
         return Err(PeError::Parse(format!(
-            "Short read on PE headers: got {read} bytes, expected 4096"
+            "Short read on PE headers: got {read} bytes, expected {}",
+            PE_HEADER_READ_BYTES
         )));
     }
 
@@ -1031,7 +1058,7 @@ pub fn dump_process_with_report(
                 Some(section) => {
                     let va = opts.image_base as usize + section.virtual_address as usize;
                     let size = section.virtual_size as usize;
-                    let mut buf = vec![0u8; size.min(0x100_000)];
+                    let mut buf = vec![0u8; size.min(LIVE_TEXT_READ_CAP_BYTES)];
                     let read = debugger.read_memory(va, &mut buf).unwrap_or(0);
                     buf.truncate(read);
                     (buf, section.virtual_address)
@@ -1362,7 +1389,7 @@ pub fn dump_process_with_report(
     // 3. Sanitize PE header
     pe.sanitize();
     for s in &pe.sections {
-        if s.virtual_size > 0x100000 {
+        if s.virtual_size > HUGE_SECTION_LOG_THRESHOLD {
             info!(
                 "POST-SANITIZE: {} va={:#x} vsz={:#x} raw={:#x} ptr={:#x}",
                 s.name,
@@ -2272,7 +2299,7 @@ pub fn dump_process_with_report(
         let off = 0x147888usize;
         if off + 4 <= dump_buf.len() {
             let n = u32::from_le_bytes(dump_buf[off..off + 4].try_into().unwrap_or([0; 4]));
-            if n > 0 && n < 0x10000 {
+            if n > 0 && n < CMD_TABLE_COUNT_MAX {
                 Some(n)
             } else {
                 None
@@ -2775,7 +2802,7 @@ pub fn dump_process_with_report(
     let mut iat_raw_addr = 0u32;
     let _delta = pe.trim_huge_sections(&dump_buf, &mut iat_raw_addr);
     for s in &pe.sections {
-        if s.virtual_size > 0x100000 {
+        if s.virtual_size > HUGE_SECTION_LOG_THRESHOLD {
             info!(
                 "POST-TRIM: {} va={:#x} vsz={:#x} raw={:#x} ptr={:#x}",
                 s.name,
@@ -4745,11 +4772,11 @@ pub fn dump_dotnet_with_source(
     source_path: &Path,
 ) -> Result<(), PeError> {
     // Read PE headers
-    let mut header = vec![0u8; 0x1000];
+    let mut header = vec![0u8; PE_HEADER_READ_BYTES];
     let read = debugger
         .read_memory(image_base as usize, &mut header)
         .map_err(|e| PeError::Parse(format!("Failed to read header: {e}")))?;
-    if read < 0x1000 {
+    if read < PE_HEADER_READ_BYTES {
         return Err(PeError::Parse("Short read on .NET PE header".into()));
     }
 

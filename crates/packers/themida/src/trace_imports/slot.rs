@@ -14,7 +14,7 @@ use crate::error::ThemidaError;
 use super::decision::{trace_is_at_api, TraceStepDecision};
 use super::{
     instr_ptr, is_at_themida_vm, set_instr_ptr, set_stack_ptr, set_trap_flag, stack_ptr,
-    thread_id_of, PTR_SIZE,
+    thread_id_of, PTR_SIZE, X86_EFLAGS_TRAP_FLAG,
 };
 
 /// TASK-014: diagnostic back-fill path marker for one slot trace attempt.
@@ -283,7 +283,7 @@ pub(crate) fn trace_one_slot(
                                 set_stack_ptr(&mut ctx, sp + PTR_SIZE);
                             }
                             set_instr_ptr(&mut ctx, target_ip);
-                            ctx.EFlags |= 0x100;
+                            ctx.EFlags |= X86_EFLAGS_TRAP_FLAG;
                             debugger.set_thread_context(thread_id, &ctx).map_err(|e| {
                                 ThemidaError::Debugger(format!(
                                     "skip_anti_trace_api set_context: {e}"
@@ -322,7 +322,7 @@ pub(crate) fn trace_one_slot(
                     }
 
                     // Re-set TF so the next instruction also single-steps.
-                    ctx.EFlags |= 0x100;
+                    ctx.EFlags |= X86_EFLAGS_TRAP_FLAG;
                     debugger.set_thread_context(thread_id, &ctx).map_err(|e| {
                         ThemidaError::Debugger(format!("trace_one_slot set_tf: {e}"))
                     })?;

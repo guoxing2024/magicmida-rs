@@ -34,6 +34,32 @@ use crate::import_table::ImportTableBuilder;
 
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 
+/// Max search delta (in IAT slots) left/right of an interior-zero slot when
+/// guessing the API name from the original continuous import order. The loop
+/// is `1..=GAP_NAME_NEIGHBOR_MAX_DELTA`, so the max probed delta equals this
+/// value; 63 reproduces the original `1..64u32` search window exactly.
+/// Bounded heuristic: the gap is between two named neighbors; searching far
+/// wider than the real IAT module boundary adds cost without accuracy
+/// (observed gaps are 1–2 slots).
+const GAP_NAME_NEIGHBOR_MAX_DELTA: u32 = 63;
+
+/// Max function-table distance when matching a (prev, next) neighbor pair in
+/// the original continuous import order. Bounded scan so a pathological
+/// import list cannot walk unboundedly; real gaps sit within ~24 functions.
+const GAP_NAME_NEIGHBOR_FUNC_WINDOW: usize = 24;
+
+/// MessageBoxW uType immediates that distinguish an MB_OK-style call site:
+/// 0xA = MB_ICONWARNING, 0xE = MB_ICONERROR. These are Win32 API flag
+/// constants (not sample-specific); the call-site scanner treats a site with
+/// either as a MessageBoxW candidate.
+const MSGBOX_UTYPE_IMMEDIATES: [u8; 2] = [0x0A, 0x0E];
+
+/// SendMessageW `mov edx, imm` immediate values the call-site scanner treats
+/// as SendMessageW candidates: 0x10 = WM_CLOSE, 0x02 = WM_DESTROY,
+/// 0x0C/0x0D = WM_QUERYENDSESSION/END session, 0x0E = WM_QUERYOPEN.
+/// Win32 message constants (not sample-specific).
+const SENDMESSAGE_WM_IMMEDIATES: [u8; 5] = [0x0Eu8, 0x0C, 0x0D, 0x02, 0x10];
+
 /// Scan executable sections of a dumped image for direct `call/jmp [rip+disp32]`
 /// sites whose target RVA is one of `target_slot_rvas`. Returns `(site_rva,
 /// target_rva)` pairs in scan order.
@@ -293,7 +319,7 @@ fn guess_gap_api(
 ) -> Option<String> {
     let mut prev_name: Option<&str> = None;
     let mut next_name: Option<&str> = None;
-    for delta in 1..64u32 {
+    for delta in 1..=GAP_NAME_NEIGHBOR_MAX_DELTA {
         let p = zero_rva.saturating_sub(delta * 8);
         if prev_name.is_none() {
             if let Some(n) = name_by_slot.get(&p) {
@@ -315,7 +341,7 @@ fn guess_gap_api(
     for funcs in original.values() {
         for i in 0..funcs.len() {
             if funcs[i].eq_ignore_ascii_case(prev_name) {
-                for j in (i + 1)..funcs.len().min(i + 24) {
+                for j in (i + 1)..funcs.len().min(i + GAP_NAME_NEIGHBOR_FUNC_WINDOW) {
                     if funcs[j].eq_ignore_ascii_case(next_name) {
                         let gap = &funcs[i + 1..j];
                         if gap.len() == 1 {
@@ -349,8 +375,9 @@ fn classify_gap_call(
 
 fn window_has_msgbox_utype(pre: &[u8]) -> bool {
     // mov r8d, 0xA / 0xE
-    if find_bytes(pre, &[0x41, 0xB8, 0x0A, 0x00, 0x00, 0x00]).is_some()
-        || find_bytes(pre, &[0x41, 0xB8, 0x0E, 0x00, 0x00, 0x00]).is_some()
+    if MSGBOX_UTYPE_IMMEDIATES
+        .iter()
+        .any(|&ut| find_bytes(pre, &[0x41, 0xB8, ut, 0x00, 0x00, 0x00]).is_some())
     {
         return true;
     }
@@ -359,7 +386,7 @@ fn window_has_msgbox_utype(pre: &[u8]) -> bool {
     while i + 3 < pre.len() {
         let b0 = pre[i];
         if (b0 == 0x41 || b0 == 0x44 || b0 == 0x45) && pre[i + 1] == 0x8D {
-            if pre[i + 3] == 0x0A || pre[i + 3] == 0x0E {
+            if MSGBOX_UTYPE_IMMEDIATES.contains(&pre[i + 3]) {
                 return true;
             }
         }
@@ -379,7 +406,7 @@ fn window_has_localfree_shape(pre: &[u8]) -> bool {
 }
 
 fn window_has_sendmessage_shape(pre: &[u8]) -> bool {
-    for imm in [0x0Eu8, 0x0C, 0x0D, 0x02, 0x10] {
+    for imm in SENDMESSAGE_WM_IMMEDIATES {
         if find_bytes(pre, &[0xBA, imm, 0x00, 0x00, 0x00]).is_some() {
             return true;
         }
