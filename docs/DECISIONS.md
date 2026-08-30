@@ -257,3 +257,13 @@
 - **TASK-016 整单结论**：8 条验收标准在补正后**全部 PASS**（标准 3 经 §九 增补后成立）。T016 交付物入栈：6 个授权文件硬编码处置（行为中性）+ preflight ScyllaHide readiness（三零键 fail-loud，7 用例；未接进 `run_offline_preflight` 为已披露限制）+ `docs/RUNBOOK_REV2_B1.md`（七项判据经 vault 实证逐条核对）+ `docs/HARDCODING_AUDIT_T016.md`（含 §九）+ vault `INDEX.md`（git 外）+ runs 报告。
 - **账本**：XC-XXI-B **9/4 不变**（T016+R1 全程零实弹）。
 - **留给老板的三个裁定（都不阻塞入栈）**：① F3 clippy 基线门既有失败（61→62，T016 贡献 0）——重生成基线或重构 8 参函数，需另立工单授权；② §九 GTO-UI 锚区（裸 0x147868/0x147888 + 具名补丁常量）的清除属下一战役（需实弹再验证）；③ 18 个本地提交未推送（D-010），推送前建议 `cargo deny check advisories`（本机离线跑不了）。
+
+## D-033 批 TASK-017（T0.5 续跑：熊熊 B1' 产物 Run UI 事件驱动实弹 1 格，XC-XXI-B 9/4 → 10/4）
+
+- **日期**：2026-08-30（老板令："先解决1，其他的再等等吧"——按全案解释：批准 T0.5 续跑 = 熊熊收尾最后一格；TASK-007 / clippy 基线门修复 / §九 GTO-UI 锚区 / 推送 全部暂缓）
+- **决策**：① 批 1 格实弹（T0.5 = 启动 B1' 产物 a852880a + UI 事件驱动，验 Run 按钮 RIP 是否落 urlmon.dll = 事件级行为等价，Run verdict PARTIAL → FULL）；② 本单内多次 UI drive 尝试记 1 格（T015 先例），**中途若需重新 `/unpack` → 另立单另批格**。
+- **为什么现在能跑（双重阻塞解除）**：① 缺陷 A 已修并实弹验证（TASK-009/T015）；② 旧宿主跨 boot 崩（C-4/B）——总指挥亲验 **BootTime = 2026-08-30 10:05:51 与 T015 产物生产同 boot**，风险暂不适用。
+- **关键适配（写入工单）**：旧驱动脚本按 XX-11 产物 36043cb4 写死（HOST_SHA、core.dll 固定基址 0x7FFE1DA10000、宿主基址 0x140000000——全是旧会话绑定期产物）→ 本单换治理产物 a852880a（T015 attempt2）+ **基址全部动态解析**（enum_modules，解析不到 fail-loud；T016 反硬编码纪律沿用）；core.dll 期望 sha 换 S4 验证过的 09f3dd34；RVA 0x1C120/0x16F300 保留（core.dll 跨战役逐位一致）。
+- **保险丝（写入工单）**：开跑前自查 BootTime（变了 → STOP，跨 boot 必崩是已知 C-4/B，不是本单要验证的）；防火墙拦截现状核实（未拦截 → STOP 请示，不许自行改）；新阻塞/AV → STOP 不烧第 2 格；证据先入 vault 再清理（P-8，D-029 备注②教训）。
+- **前置（总指挥亲验，2026-08-30）**：BootTime = 10:05:51 同产产 boot；vault 产物 a852880a（1,539,072 B）与 core.dll 09f3dd34 在位（sha 现算核对）；`lab/xx21b_run_ui/` 不存在（全新部署）；脚本机制就绪（`wait_core_loaded`/sha fail-closed/redline FAIL_FIXED_BASE 结构在）。
+- **落地**：`tickets/TASK-017.md` 首行已写授权令牌（worker 须原文回抄）。

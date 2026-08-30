@@ -118,6 +118,6 @@
 
 ## 下一步
 
-① **TASK-016 阶段收尾 + R1 补正已终验收入栈（D-032，2026-08-30）**：B1' 能力固化完成——硬编码处置（行为中性）+ preflight ScyllaHide readiness（三零键 fail-loud，7 用例；未接 `run_offline_preflight` = 已披露限制）+ 复现 runbook `docs/RUNBOOK_REV2_B1.md`（判据经 vault 实证逐条核对）+ vault INDEX（34 件）+ 全仓快照 pe 1054/themida 176/cli 580/acc 263；零实弹，账本 **9/4 不变**。→ ② 等老板裁定：**T0.5 续跑 / TASK-007**；clippy 基线门既有失败修复授权（D-031 F3）；§九 GTO-UI 锚区清除（下一战役需实弹）；推送时机（18 个本地提交，D-010，推送前建议 `cargo deny check advisories`）。TASK-014（路径 A'）/ TASK-015（路径 B1'，XX-11 端点恢复）已验收（D-027/D-029）；遗留小项 = mod.rs LifecycleError 归类补专属行为测试、load 探针 cdb 变体（worker 已标注）。TASK-006R5 已完成并验收（终态路径 A，账本 7/4，D-022）：受控 ini 经 staging 生效后 0 次 AV、text-poll 首次收敛、fail-closed 192 槽拒绝产物；TASK-013 待验风险（壳反检）实测阴性。
+① **TASK-017（T0.5 续跑）已授权在飞（D-033，2026-08-30，实弹 1 格 XC-XXI-B 9/4 → 10/4）**：熊熊收尾最后一格——启动 B1' 产物 a852880a + UI 事件驱动，验 Run 按钮 RIP 落 urlmon.dll（Run verdict PARTIAL → FULL）；脚本 `tools/xx21b_t05_ui_drive.py` 按票面动态化适配（旧脚本按 36043cb4 写死会话基址）。老板令"先解决1，其他的再等等吧"：TASK-016 阶段收尾已入栈（D-032），TASK-007 / clippy 基线门修复（D-031 F3）/ §九 GTO-UI 锚区 / 推送（19 提交，D-010）全部暂缓。TASK-014（路径 A'）/ TASK-015（路径 B1'，XX-11 端点恢复）已验收（D-027/D-029）；遗留小项 = mod.rs LifecycleError 归类补专属行为测试、load 探针 cdb 变体（worker 已标注）。
 另有两个可另立的专项：ScyllaHide-NtContinue-hook 交互的微指令级定性（需实弹 trace）、C-5 缺陷 B（会话绑定，`/session-clean` 消费端）。
 推送时机由老板定；推送前建议补跑 `cargo deny check advisories`（本机离线跑不了）。
