@@ -118,6 +118,6 @@
 
 ## 下一步
 
-① **起草 IAT 启动路径重建工单**（192 槽清零 → 路径 B，TASK-006R5 实弹指认的最前沿）→ ② T0.5 续跑 → ③ TASK-007。TASK-006R5 已完成并验收（终态路径 A，账本 7/4，D-022）：受控 ini 经 staging 生效后 0 次 AV、text-poll 首次收敛、fail-closed 192 槽拒绝产物；TASK-013 待验风险（壳反检）实测阴性。
+① **TASK-014**（已起草待授权：IAT 启动路径重建——192 站点可解析 + 完整站点清单外发 + 逐槽诊断，一格实弹冲路径 B 7/4→8/4；工单 `tickets/TASK-014.md`）→ ② T0.5 续跑 → ③ TASK-007。TASK-006R5 已完成并验收（终态路径 A，账本 7/4，D-022）：受控 ini 经 staging 生效后 0 次 AV、text-poll 首次收敛、fail-closed 192 槽拒绝产物；TASK-013 待验风险（壳反检）实测阴性。
 另有两个可另立的专项：ScyllaHide-NtContinue-hook 交互的微指令级定性（需实弹 trace）、C-5 缺陷 B（会话绑定，`/session-clean` 消费端）。
 推送时机由老板定；推送前建议补跑 `cargo deny check advisories`（本机离线跑不了）。
