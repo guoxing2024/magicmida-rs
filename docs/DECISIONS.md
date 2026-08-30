@@ -430,3 +430,12 @@
 - **更正（微）**：vault 计数 10+INDEX（报告写 12+INDEX）；泵健康 continues=54 未独立复核（JSON 字段 None，ndjson 在档，采信）。
 - **下一步选项（待老板裁决）**：A. TASK-026（1 格 16/4→17/4）变体组合深观测 + T0.5 三态尝试（分钟级观测 + RIP 采样 + Run 触发，语义逐字）；B. 收官归档（C-9 破解 + 4 字节修复方案 = "EP 指回原壳入口"入册，C-10 缺口定档）。
 - **账本**：15/4 → **16/4** 确认（非附加对照 3 + 泵 2，1 格，票面口径）。
+
+## D-052 批 TASK-026（D-051 选项 A：变体组合深观测 + T0.5 三态尝试；XC-XXI-B 16/4 → 17/4）
+
+- **日期**：2026-08-31（老板令："A. TASK-026（1 格，16/4 → 17/4）"）
+- **决策**：① 深观测趟 ≥2（C-10：180s 窗口枚举 + 全线程 RIP 采样 + 线程数——窗口是否迟到、宿主存活态在做什么）；② Run 触发趟 ≥2（CreateRemoteThread Run + 三态判定语义逐字沿用 T017-T021：FULL = RIP 入 urlmon + 存活 + ≥2 可复现；urlmon IAT 槽 0x16f300 动态解析前后值 + 页级变化全记录）；③ 工具 = pcell harness 常量改动（CAND_SHA → 7b470117 / DEPLOY → lab/xx21b_boot）+ 最小观测扩展（Run 前深观测段，diff 披露）；④ 基址硬门/run_head 明文预检/`.winlice` 残留标注零改动（变体 ImageBase 0x7ffc57e30000 动态读、Run prologue 明文已预验 415741564155）。
+- **前提（D-051 旁证）**：泵与自举变体兼容（attach_changed_behavior=False、无 WinLicense）→ T0.5 方法论可用。结局开放：消息循环 = PARTIAL 重演（T0.4 Step1 同型）/ urlmon = FULL / 新阻塞 = C-10 定性 / AV = STOP。
+- **纪律**：BootTime 存在性硬门（变体重锚指针绑定本 boot）；观测+触发 only 不改任何字节；授权红线重申（不输入真实注册码、不绕过授权，只观测窗口与消息泵）。
+- **账本**：16/4 → **17/4**（1 格：深观测趟 + Run 触发趟含重试，T018 先例）。
+- **落地**：`tickets/TASK-026.md`（⛔ 首行令牌，D-015 格式）；前置亲验（2026-08-31）：HEAD `eb91329`、BootTime 连续、变体 7b470117 在位（EP=0x8a0108、ImageBase=0x7ffc57e30000、Run prologue 明文）、pcell 基座在。
