@@ -14,7 +14,11 @@ Windows PE 脱壳研究平台（Rust，221k 行，11 个 crate）。把受保护
 
 ## 现在在做什么（2026-08-31）
 
-**XX-21B core.dll 还原线战役已于 2026-08-31 收官关闭（D-055，老板裁定"先收官A"）**：账本冻结 XC-XXI-B 17/4；T0.5 Run verdict 终态 = PARTIAL 定档；快照重建路线判死（我方十票证据链 T017→T026 + 外部专家佐证 D-054）。收官总结 = `docs/XX21B_CORE_PERFECT_CLOSEOUT_20260831.md`。悬而未决的三件事全在老板侧：① 推送决策（分支 ahead 45+，D-010）；② TASK-007（GVM-0 定向 dump，已批未开跑）；③ ~~B 项目另立~~ **已立项（D-056）**：根目录 `D:\Claude project\core-rewrite\`（独立 git/独立会话/G-0 权利门槛关闭中，交接物含本项目证据只读指针）——B 的事一律在新项目做，本项目不代跑。
+**主攻线 = DEVIRT-CORE 反虚拟化战役（core.dll .winlice，D-061，老板授权"我们自己搞吧"）**：按 Pushan 论文（arXiv 2603.18355，trace-free）自实现反虚拟化，目标 = 还原 .winlice VM 语义 → 回答 C-10 → 语义规格交付 B 项目。账本 **DEVIRT-CORE 0/8**。章程 `docs/DEVIRT_CORE_CHARTER.md`；首票 TASK-028（Phase 0：VPC 顺序演化验证 + 单 handler CFG 恢复，离线为主）已拟待开。前置 TASK-027 已过（VPC 假设 SUPPORTED，r13@0x85daaa 最强锚点）。工具基座 = `crates/disasm/`（iced-x86）+ `tools/xx21b_vpc_probe.py`（零新增依赖）。
+
+**XX-21B core.dll 还原线已于 2026-08-31 收官关闭（D-055）**：账本冻结 XC-XXI-B **18/4**（含 D-059 老板质证实弹 1 格）；快照重建判死（D-054/D-058）。收官总结 = `docs/XX21B_CORE_PERFECT_CLOSEOUT_20260831.md`。**B 项目已另立（D-056）**：根目录 `D:\Claude project\core-rewrite\`（独立 git/独立会话/G-0 权利门槛关闭中）；DEVIRT-CORE 的 Phase 3 规格将单向交付 B。
+
+悬置：① 推送决策（分支 ahead 56+，D-010）；② TASK-007（GVM-0 定向 dump，已批未开跑，与 DEVIRT-CORE 并行立项未开跑）；③ G-0 材料（B 项目权利依据，老板侧）。
 
 主攻线是 **GVM-0 反虚拟化战役**（`gto_launcher` 的 VM 语义还原 → lifter → 整镜像去虚拟化，账本 GVM 0/8，Phase 1 门 1 未过；老板已批一格定向 dump 实弹 → `tickets/TASK-007.md`）。
 `origin_macro` + `lunlun_software` 是必须一直绿的回归门。`xiongxiong_duokai` rev2 战役已于 2026-08-28 关闭。
