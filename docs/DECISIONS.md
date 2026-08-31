@@ -534,3 +534,14 @@
 - **意义**：路线 A（按 Pushan 论文自实现反虚拟化）前置通过——Themida 稳定 VPC 假设在我们样本成立，r13/r5 可作 VPC 锚点；下一前置 = VPC 顺序演化验证（离线扩展或泵下动态）。
 - **账本**：XC-XXI-B 维持 **18/4**（本票 0 格，离线零实弹）。
 - **证据**：`runs/20260831-TASK-027.md`；工具 `tools/xx21b_vpc_probe.py`；证据库 `D:/MidaVault/lab/evidence/xx21b_vpc/`。
+
+## D-061 DEVIRT-CORE 战役立项（老板授权"我们自己搞吧"，B 路关闭）：按 Pushan 自实现反虚拟化，账本 DEVIRT-CORE 0/8，Phase 0 首票 TASK-028 已拟
+
+- **日期**：2026-08-31（老板："作者联系不上，我们自己搞吧。我授权。需要新开会话吗？"）
+- **背景**：B 路（联系 Pushan 作者索取 artifact）关闭——联系不上；A 路（自实现）经老板授权启动。TASK-027 已证前置（Pushan §5.1 Themida 稳定 VPC 假设 SUPPORTED，r13@0x85daaa 最强锚点 1438 次间接读取）。
+- **章程**：`docs/DEVIRT_CORE_CHARTER.md`（目标 = .winlice 语义还原 → 回答 C-10 → 语义规格交付 B 项目；非目标 = 不击穿授权、不产可运行 core；四阶段：Phase 0 工具链 / 1 目标函数 CFG+简化 / 2 C 伪代码+LLM / 3 规格交付）。
+- **工具基座发现**：`crates/disasm/`（iced-x86 1.21 workspace 依赖，完整 x64 解码 REX/VEX/ModRM）+ `crates/pe/` 现成 → Phase 0 解码能力零新增依赖；`tools/xx21b_vpc_probe.py` 已验。
+- **首票**：`tickets/TASK-028.md`（Phase 0 = VPC 顺序演化验证 + 单 handler CFG 恢复，离线为主不烧格；动态验证 VPC 演化需另票实弹 1 格）。
+- **账本**：**DEVIRT-CORE 0/8**（独立于 XC-XXI-B 冻结 18/4）；预算 8 格老板已授"最大支持"。
+- **会话安排（答老板问）**：**需要新开会话，根目录不变**（`D:\Claude project\magicmida-rs`）——本战役月级长战役，当前会话上下文已膨胀（T021→T027+质证+调研）；新会话读章程+START-HERE+TASK-028 无缝接手；公司记忆在文件系统。
+- **红线沿袭**：NO_BYPASS=1；不击穿授权（还原出"需注册码"如实报告）；样品/VM 语义不外发；不新增依赖；crates/ 既有代码不动（战役工具在 tools/ 或新建 crates/devirt-core/）。
