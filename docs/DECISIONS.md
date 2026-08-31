@@ -495,3 +495,20 @@
 - **老板判断的合理内核**：三件中 `core_structural_rebased.dll`(1.7MB, 剥离壳区) + `core_text_decrypted.bin`(1MB 明文 .text) 才是更接近"能跑"的方向，值得解剖验证；`core_equivalence.dll` 是病灶态非出路。
 - **P 教训补条**：AI 不得因"这是以前脱壳的"口头断言即改判战役结论；任何质证文件必须走 ① sha 定位原始工件 ② 原始 manifest/report 定义 ③ 与已知缺陷态逐字节对齐 三步考证，落 D-057 类记录。
 - **下一步（老板可选，按章程需授权）**：解剖三件（equivalence/structural_rebased/text_decrypted）产报告，判定结构重建件能否独立加载——属旧项目还原研究正业（离线零实弹，或实弹一格按账本）或新项目 B 证据补采（G-0 门槛）。
+
+## D-058 老板出示五件物证全解剖（equivalence / structural_rebased ×3 / text_decrypted）——明文资产真实存在；structural 系剥离壳节半成品、停于 GVM-0 墙；"直接跑通"仍判死，"明文还原"部分可行
+
+- **日期**：2026-08-31（老板："现在有思考了，重新梳理最新证据"；总指挥五件全解剖，全字节级证据）
+- **解剖结果（全部实测）**：
+  1. `core_text_decrypted.bin`（1,054,720 B = 0x101800 = .text 节整）——**纯 .text 明文**（无 MZ 头、无文件头），Run/GetAppVersion 完整 prologue 与 equivalence .text 逐字节同（Run pro 上下文 32B 一致：`0f 1f 84 00 00 00 00 00 41 57 41 56 41 55 41 54 55 57 56 53 48 83 ec 38 48 89 8c 24 80 00 00 00`）。= XX 报告 Step3.2 `dump-process --module=core.dll` 产物（1,054,720 B、熵 6.166 对上，实测 6.073 同量级）。
+  2. `core_equivalence.dll`（41ec52e0）——D-057 已证 = `core_candidate_nep.dll` 副本（XX 时代 dump 候选，EP=NOP stub 病灶态）；含明文 .winlice（熵 6.018，109 指令/512B）、明文 URL（101.132.143.14 / download_url / http:// 大量）。
+  3. `core_structural_rebased.dll`（1.7MB，19 节）——**剥离 .winlice/.boot 壳节**（与 equivalence 21/23 节不同）；ImageBase 重建为 0x1d00000000（非 dump 基址）；DllChar=0x20（DYNAMIC_BASE 清）；EP=0x8a0108 但 **0x8a0108 不在任何节内（EP 悬空）**；全文件 147 个 qword 指向旧 VM 区范围（0x198000..0xdb2000，集中在 0x13c280+ .bss 一带）= **VM 指针残留**；.text 与 equivalence .text 257/257 页全不同但 Run pro 上下文逐字节一致 → 同源、整体重排。
+  4. `core_structural_rebased_fixed.dll`——ImageBase 误改为 0x1d0000000（少一位 0），EP 改 0x1000（.text 开头），DllChar=0x0；**内部 3241 个指针仍按 0x1d00000000 编址 = 改基址没改指针，反而全部错位**。
+  5. `.bak` = 与 structural 一致（仅备份）。
+- **重大发现**：structural 系（时间 2026-08-28 18:07–19:36，与 attempt3 同段）**在 vault 零登记、零报告、零收官**——XX 时代存在一条未归档的"剥离壳节独立重建"实验支线，被遗弃在三件文件里。
+- **裁定（对老板"路应该能走通"的最终回应）**：
+  1. **明文资产真实存在**——.text 全明文（1MB）+ VM 代码明文 + URL 明文。修正我此前"全密文"表述的过度概括：**磁盘态密文 ✓ 与 dump 态明文 ✓ 两者都成立**，dump 态明文资产可解剖、可作 B 项目规格、可作重写参考。
+  2. **但"直接跑通"仍判死**——三件各自缺口 = C-5（147 VM 指针残留）/ C-9（equivalence EP=NOP stub；structural EP 悬空）/ C-10（快照不自洽）+ GVM-0：structural 剥离壳节后 thunk 指向已删的 VM handler（XX 报告 Step1.1：GetAppVersion IAT thunk 指向 .winlice 内部），继续 = 必须反虚拟化 = GVM-0 墙。**剥离壳节 ≠ 绕开 C-10，只是把墙从 C-10 换成 GVM-0**。
+  3. **"明文还原"部分可行**——作为"明文代码还原/重写参考"路线有真实价值（尤其 text_decrypted.bin），这是老板直觉的正确内核；作为"让原 core 直接跑通"路线仍死。
+- **P 教训补条（自省）**：我此前对 `structural_rebased` 说"更接近能跑"系**未解剖即下判断**（只看文件名/大小）；D-058 起，任何工件论断必须先过字节级解剖。此条同时回应老板"你没思考"的质疑——本轮已全程实弹解剖。
+- **待老板授权**：解剖五件落档报告（旧项目还原研究，离线零实弹起步：把 147 VM 指针定位、IAT 重建评估、EP 悬空修复路径、text_decrypted 与 .text 对齐全部写成判定；若判定"剥离壳节重建可修"则评估是否重启该支线，成本 = GVM-0 量级）或归档为 XX 遗留物证。
