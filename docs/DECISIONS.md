@@ -482,3 +482,16 @@
 - **G-0 硬门（沿 D-054/D-055）**：权利依据（源码/构建/SDK 合同/服务器凭据任一）+ 总指挥验讫落档前，新项目**禁止派发任何工单**（含零实弹票）。
 - **clean-room 双史**：本项目 = spec/观测史（供体，只读）；新项目 = 实现史。规格补采需回本项目按章程立票，产出只读入新项目 spec/。
 - **本项目义务**：不再代跑 B 的任何工单；本决策为新旧两项目的唯一交链。
+
+## D-057 老板出示 `D:\xiongxiong\core_analysis\core_equivalence.dll`（sha 41ec52e0）质证结论——系 XX 时代候选 `core_candidate_nep.dll` 副本，非"已脱壳走通"件；不推翻战役结论
+
+- **日期**：2026-08-31（老板："这个是项目以前脱壳的，你的结论很可能是错的，路应该能走通"；总指挥据原始文档考证）
+- **身份考证（原档对齐，无臆测）**：`41ec52e0` = 本项目 vault `D:/MidaVault/lab/evidence/xiongxiong_core/xx3_attempt_3/core_candidate_nep.dll`（sha 精确一致），为老板复制到新目录改名。原始定义见 `docs/XX21_CORE_PERFECT_REPORT_20260829.md` + `attempt3_manifest.json`：XX 时代 XC-XXI 战役 Step3（2026-08-29）dump 产物，EP 改为 **NOP stub**（`31 c0 ff c0 c3`，manifest 明写"候选 EP 改为 NOP stub 跳壳初始化"），保留 .boot/.winlice 壳节。
+- **为何不推翻战役结论（四证齐）**：
+  1. **该候选行为门只验证了 GetAppVersion**（×10 = 0x1DB4C4C0 与原件一致）；**Run 从未验证**（manifest notes 明写"Run() 未调用（网络 deny 风险 urlmon）"）——所以它从未被判定为"走通"，判定 = 路径 A 打通 + S1-S4 可达 + Run 红线未触发。
+  2. **EP=NOP stub 正是 T025 破解的病灶**：T025 证明该 stub 让宿主 VM 区查询失败 → exit(0)；修复 = EP 改回原壳入口 0x8a0108（变体 7b470117）。此文件 EP 仍停在 0x1027c0（NOP stub）→ 是"跑不通"状态，非出路。
+  3. **T026/专家(D-054) 判死的快照重建死路，此文件正属快照重建产物**：image_base 0x7ffe1da10000（运行时 dump 基址）、固定基址约束、含 .boot 加密区——正是快照重建路线，且 EP 未修复。
+  4. **明文 URL 是 dump 态红利，不构成"可走通"证据**：磁盘原版(09f3dd34)密文、dump 态明文（`101.132.143.14`/`download_url` 在位）——说明明文资产真实存在，可作**证据**用（新项目 B 的规格输入），但不等于重建件能独立走完授权状态机。
+- **老板判断的合理内核**：三件中 `core_structural_rebased.dll`(1.7MB, 剥离壳区) + `core_text_decrypted.bin`(1MB 明文 .text) 才是更接近"能跑"的方向，值得解剖验证；`core_equivalence.dll` 是病灶态非出路。
+- **P 教训补条**：AI 不得因"这是以前脱壳的"口头断言即改判战役结论；任何质证文件必须走 ① sha 定位原始工件 ② 原始 manifest/report 定义 ③ 与已知缺陷态逐字节对齐 三步考证，落 D-057 类记录。
+- **下一步（老板可选，按章程需授权）**：解剖三件（equivalence/structural_rebased/text_decrypted）产报告，判定结构重建件能否独立加载——属旧项目还原研究正业（离线零实弹，或实弹一格按账本）或新项目 B 证据补采（G-0 门槛）。
