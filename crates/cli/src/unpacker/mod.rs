@@ -77,6 +77,9 @@ struct LoopState {
     /// Set once the post-OEP IAT decryption window has run.  Guards against
     /// re-entering the 5-second monitoring loop on a later access violation.
     iat_monitoring_done: bool,
+    /// Watchdog for identical-access-violation storms.  See
+    /// [`AvStorm`](av_handler::AvStorm).
+    av_storm: av_handler::AvStorm,
 }
 
 // ---------------------------------------------------------------------------
@@ -128,7 +131,10 @@ pub fn unpack(
     let mut pe = PeHeader::from_file(input)
         .map_err(|e| anyhow!("Failed to parse PE header: {e}"))?;
 
-    if looks_like_dll && pe.nt_headers.optional_header.data_directory[14].virtual_address == 0 {
+    if looks_like_dll
+        && pe.nt_headers.optional_header.data_directory[14].virtual_address == 0
+        && std::env::var("MIDA_ALLOW_DLL").is_err()
+    {
         return Err(anyhow!(
             "Refusing to unpack a native DLL target: {}.\n\
              Themida's DLL stub calls ExitProcess instead of DllMain, so no usable \
@@ -242,6 +248,7 @@ pub fn unpack(
         virtualized_oep_retries: 0,
         last_possible_oep: None,
         iat_monitoring_done: false,
+        av_storm: av_handler::AvStorm::default(),
     };
     let guard_protection = PAGE_NOACCESS.0;
     // Image boundary from PE header (pre-ASLR value). Will be rebased after

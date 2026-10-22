@@ -110,42 +110,94 @@ const IMAGE_NT_SIGNATURE: u32 = 0x0000_4550;
 // DLL → stub EXE: entry-point shims
 // ---------------------------------------------------------------------------
 
+/// x86 stub — same shape and same two fixes as [`STUB_X64`], except that the
+/// 32-bit base is still pushed as an absolute immediate (there is no
+/// RIP-relative addressing on x86).  A 32-bit Themida DLL is bootstrapped at its
+/// preferred base in practice, so the immediate is adequate; if that ever stops
+/// being true this needs a `call $+5; pop ebx` prologue.
+///
+/// Layout (20 bytes):
+/// ```text
+/// 55                push ebp
+/// 89 E5             mov  ebp, esp
+/// 6A 00             push 0
+/// 6A 01             push 1
+/// 68 <imm32>        push <ImageBase>   (patched)
+/// E8 <disp32>       call <DllMain>     (patched)
+/// CC                int3
+/// EB FE             jmp  $
+/// ```
 #[cfg(target_arch = "x86")]
-const STUB_X86: [u8; 23] = [
-    0x55,                                     // push ebp
-    0x89, 0xE5,                               // mov  ebp, esp
-    0x6A, 0x00,                               // push 0
-    0x6A, 0x01,                               // push 1
-    0x68, 0x00, 0x00, 0x00, 0x00,            // push <ImageBase> (patched)
-    0xE8, 0x00, 0x00, 0x00, 0x00,            // call <DllMain>    (patched)
-    0x50,                                     // push eax
-    0xE8, 0x00, 0x00, 0x00, 0x00,            // call <ExitProcess> (patched)
+const STUB_X86: [u8; 20] = [
+    0x55,                          // push ebp
+    0x89, 0xE5,                    // mov  ebp, esp
+    0x6A, 0x00,                    // push 0
+    0x6A, 0x01,                    // push 1
+    0x68, 0x00, 0x00, 0x00, 0x00,  // push <ImageBase> (patched)
+    0xE8, 0x00, 0x00, 0x00, 0x00,  // call <DllMain>    (patched)
+    0xCC,                          // int3
+    0xEB, 0xFE,                    // jmp  $
 ];
 #[cfg(target_arch = "x86")]
 const X86_PUSH_IMM_OFFSET: usize = 6;
 #[cfg(target_arch = "x86")]
 const X86_CALL_DLLMAIN_OFFSET: usize = 12;
-#[cfg(target_arch = "x86")]
-const X86_CALL_EXITPROC_OFFSET: usize = 18;
 
 /// x64 stub that calls `DllMain(hinstDLL, DLL_PROCESS_ATTACH, 0)` and then
-/// `ExitProcess(return_value)`.
+/// hands control back to the debugger.
+///
+/// # Why this shape
+///
+/// 1. **`hinstDLL` must be the runtime base, not the file ImageBase.**  The
+///    original stub patched an absolute immediate carrying the *file*
+///    ImageBase; the reference `core.dll` declares `0x3205C0000` but the loader
+///    placed it at `0x7ff785020000`.  Themida's `DllMain` uses `hinstDLL` for
+///    its base arithmetic, so the mismatch sent it dereferencing a null pointer.
+///
+/// 2. **`lea rcx, [rip+disp]` cannot express "stub_va - new_ep_rva".**  A RIP
+///    relative `lea` yields `stub_va + k`, and subtracting `new_ep_rva` from
+///    that would require the immediate anyway.  The `call $+5 / pop rcx`
+///    prologue is the standard way to obtain the current RIP, and the
+///    subsequent `sub rcx, imm32` turns it into the runtime base:
+///    `rcx = (stub_va + 5) - (new_ep_rva + 5) = stub_va - new_ep_rva`.
+///
+/// 3. **No `ExitProcess`.**  The old stub patched the "exit" call to point at
+///    `DllMain` as a placeholder, which meant a *second* entry into the packer's
+///    entry point with garbage arguments — exactly where the reference DLL
+///    crashed.  A packed DLL's `DllMain` does not return until it has
+///    bootstrapped, so the only correct post-call behaviour is to yield to
+///    whoever is watching.  This stub only ever runs under our debugger.
+///
+/// Layout (33 bytes):
+/// ```text
+/// 48 83 EC 28                sub   rsp, 28h
+/// E8 00 00 00 00             call  $+5
+/// 59                         pop   rcx
+/// 48 81 E9 <imm32>           sub   rcx, new_ep_rva + 5   ; rcx = runtime base
+/// BA 01 00 00 00             mov   edx, 1
+/// 45 31 C0                   xor   r8d, r8d
+/// E8 <disp32>                call  <DllMain>
+/// CC                         int3
+/// EB FE                      jmp   $
+/// ```
 #[cfg(target_arch = "x86_64")]
-const STUB_X64: [u8; 34] = [
-    0x48, 0x83, 0xEC, 0x28,                                     // sub  rsp, 28h
-    0x48, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov  rcx, <ImageBase>
-    0xBA, 0x01, 0x00, 0x00, 0x00,                               // mov  edx, 1
-    0x45, 0x31, 0xC0,                                           // xor  r8d, r8d
-    0xE8, 0x00, 0x00, 0x00, 0x00,                               // call <DllMain>
-    0x89, 0xC1,                                                 // mov  ecx, eax
-    0xE8, 0x00, 0x00, 0x00, 0x00,                               // call <ExitProcess>
+const STUB_X64: [u8; 33] = [
+    0x48, 0x83, 0xEC, 0x28, // sub  rsp, 28h
+    0xE8, 0x00, 0x00, 0x00, 0x00, // call $+5
+    0x59, // pop  rcx
+    0x48, 0x81, 0xE9, 0x00, 0x00, 0x00, 0x00, // sub rcx, imm32 (patched)
+    0xBA, 0x01, 0x00, 0x00, 0x00, // mov  edx, 1
+    0x45, 0x31, 0xC0,             // xor  r8d, r8d
+    0xE8, 0x00, 0x00, 0x00, 0x00, // call <DllMain> (patched)
+    0xCC,                         // int3
+    0xEB, 0xFE,                   // jmp  $
 ];
+/// Offset of the `imm32` inside `sub rcx, imm32`.
 #[cfg(target_arch = "x86_64")]
-const X64_MOV_RCX_IMM_OFFSET: usize = 6;
+const X64_SUB_RCX_IMM_OFFSET: usize = 13;
+/// Offset of the `call <DllMain>` opcode.
 #[cfg(target_arch = "x86_64")]
-const X64_CALL_DLLMAIN_OFFSET: usize = 23;
-#[cfg(target_arch = "x86_64")]
-const X64_CALL_EXITPROC_OFFSET: usize = 29;
+const X64_CALL_DLLMAIN_OFFSET: usize = 25;
 
 /// Suffix appended to the DLL filename to form the stub EXE path.
 const STUB_EXE_SUFFIX: &str = "MM.exe";
@@ -529,6 +581,7 @@ fn make_dll_executable(
     }
 
     // Get entry point, image base, and section headers location.
+    #[allow(unused_variables)]
     let (entry_point_rva, image_base, sections_offset) = if magic == 0x10B {
         // SAFETY: calling a Windows FFI function with validated, properly-lifetime arguments.
         let opt = unsafe {
@@ -576,19 +629,9 @@ fn make_dll_executable(
 
     // Select stub based on architecture.
     #[cfg(target_arch = "x86")]
-    let (stub, imm_offset, call_main_offset, call_exit_offset) = (
-        &STUB_X86[..],
-        X86_PUSH_IMM_OFFSET,
-        X86_CALL_DLLMAIN_OFFSET,
-        X86_CALL_EXITPROC_OFFSET,
-    );
+    let (stub, call_main_offset) = (&STUB_X86[..], X86_CALL_DLLMAIN_OFFSET);
     #[cfg(target_arch = "x86_64")]
-    let (stub, imm_offset, call_main_offset, call_exit_offset) = (
-        &STUB_X64[..],
-        X64_MOV_RCX_IMM_OFFSET,
-        X64_CALL_DLLMAIN_OFFSET,
-        X64_CALL_EXITPROC_OFFSET,
-    );
+    let (stub, call_main_offset) = (&STUB_X64[..], X64_CALL_DLLMAIN_OFFSET);
 
     // Calculate where the stub goes: end of raw section data.
     let raw_data_offset = ep_section.1.PointerToRawData as usize;
@@ -599,6 +642,10 @@ fn make_dll_executable(
         ));
     }
     let stub_file_offset = raw_data_offset + raw_data_size - stub.len();
+
+    // The new entry-point RVA, needed before patching so the x64 stub can
+    // compute the runtime base from its own RIP.
+    let new_ep_rva = ep_section.1.VirtualAddress as u64 + raw_data_size as u64 - stub.len() as u64;
 
     // Verify the space for the stub is all zeros (unused padding).
     let trailing = &data[stub_file_offset..stub_file_offset + stub.len()];
@@ -612,45 +659,51 @@ fn make_dll_executable(
     // Copy and patch the stub.
     let mut stub_bytes = stub.to_vec();
 
-    // Patch the image base immediate.
+    // Patch `hinstDLL`.
+    //
+    // x86 keeps the absolute push immediate: the stub is only ever used to
+    // bootstrap a 32-bit image at its preferred base in practice, and the
+    // immediate is what the original code did.
     #[cfg(target_arch = "x86")]
     {
-        stub_bytes[imm_offset..imm_offset + 4]
+        stub_bytes[X86_PUSH_IMM_OFFSET..X86_PUSH_IMM_OFFSET + 4]
             .copy_from_slice(&(image_base as u32).to_le_bytes());
     }
+    // x64 computes the runtime base from its own RIP:
+    //   call $+5      -> pushes stub_va + 5
+    //   pop  rcx      -> rcx = stub_va + 5
+    //   sub  rcx, imm -> rcx = stub_va + 5 - (new_ep_rva + 5)
+    //                        = stub_va - new_ep_rva
+    //                        = runtime base
+    //
+    // Patching an absolute immediate here would bake in the file ImageBase and
+    // break under ASLR (see the STUB_X64 docs).  Note that a RIP-relative `lea`
+    // cannot express this: `lea rcx,[rip+k]` is `stub_va + k`, and turning that
+    // into `stub_va - new_ep_rva` still needs an immediate subtraction.
     #[cfg(target_arch = "x86_64")]
     {
-        stub_bytes[imm_offset..imm_offset + 8]
-            .copy_from_slice(&image_base.to_le_bytes());
+        // `pop rcx` yields stub_va + 5, so subtract new_ep_rva + 5.
+        let imm = new_ep_rva as u32 + 5;
+        stub_bytes[X64_SUB_RCX_IMM_OFFSET..X64_SUB_RCX_IMM_OFFSET + 4]
+            .copy_from_slice(&imm.to_le_bytes());
     }
 
-    // The new entry-point RVA:
-    //   EP_section.VirtualAddress + EP_section.SizeOfRawData - stub.len()
-    let new_ep_rva = ep_section.1.VirtualAddress as u64 + raw_data_size as u64 - stub.len() as u64;
+    // The new entry-point RVA was computed above (needed to patch the x64
+    // stub's RIP-relative base load).
 
     // Patch `call <DllMain>` displacement.
-    // RIP after the call instruction = new_ep_rva + call_main_offset + 4
-    let dllmain_disp: i32 = (entry_point_rva as i64)
-        .wrapping_sub((new_ep_rva + call_main_offset as u64 + 4) as i64)
-        as i32;
-    stub_bytes[call_main_offset..call_main_offset + 4]
-        .copy_from_slice(&dllmain_disp.to_le_bytes());
-
-    // Patch `call <ExitProcess>` displacement.
-    // For ExitProcess, we also point to the original entry point (DllMain).
-    // DllMain will be called twice: once explicitly and once as the "exit"
-    // path. This is intentional — DllMain(DLL_PROCESS_DETACH, ...) is not
-    // invoked here; the call acts as a tail-call placeholder. In a
-    // production stub, the ExitProcess call would target the IAT-resolved
-    // `kernel32!ExitProcess`. Since we don't know the IAT layout at file
-    // generation time, we use the DllMain address as a safe fallback.
     //
-    // TODO: resolve ExitProcess through the import table for a proper stub.
-    let exit_disp: i32 = (entry_point_rva as i64)
-        .wrapping_sub((new_ep_rva + call_exit_offset as u64 + 4) as i64)
+    // `call rel32` is a FIVE byte instruction (opcode + 4-byte displacement), so
+    // the RIP used for the relative calculation is the address *after* those
+    // five bytes, and the displacement starts at `call_main_offset + 1`.  Using
+    // `+4` / writing at `call_main_offset` lands the call inside the stub
+    // itself, which is exactly where the reference DLL crashed
+    // (stub + 0x1B).
+    let dllmain_disp: i32 = (entry_point_rva as i64)
+        .wrapping_sub((new_ep_rva + call_main_offset as u64 + 5) as i64)
         as i32;
-    stub_bytes[call_exit_offset..call_exit_offset + 4]
-        .copy_from_slice(&exit_disp.to_le_bytes());
+    stub_bytes[call_main_offset + 1..call_main_offset + 5]
+        .copy_from_slice(&dllmain_disp.to_le_bytes());
 
     // Write the stub into the file buffer.
     data[stub_file_offset..stub_file_offset + stub_bytes.len()]
