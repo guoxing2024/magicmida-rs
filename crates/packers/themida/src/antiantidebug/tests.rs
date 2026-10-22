@@ -26,12 +26,11 @@ fn ptr_from_bytes_partial() {
 
 #[test]
 fn constants_are_correct() {
+    // Only the constants that survive on the live path are asserted here.
+    // PROCESS_DEBUG_PORT / _OBJECT_HANDLE / _FLAGS / STATUS_PORT_NOT_SET were
+    // removed with NtQueryInformationProcess handling (no call sites).
     assert_eq!(THREAD_HIDE_FROM_DEBUGGER, 0x11);
-    assert_eq!(PROCESS_DEBUG_PORT, 7);
-    assert_eq!(PROCESS_DEBUG_OBJECT_HANDLE, 30);
-    assert_eq!(PROCESS_DEBUG_FLAGS, 31);
     assert_eq!(STATUS_SUCCESS, 0);
-    assert_eq!(STATUS_PORT_NOT_SET, 0xC000_0353);
 }
 
 #[test]

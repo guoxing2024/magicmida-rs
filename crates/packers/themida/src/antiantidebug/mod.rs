@@ -33,18 +33,14 @@
 //!   manual anti-anti-debug).
 
 mod handlers;
-mod kifast;
 mod scyllahide;
 
 #[cfg(test)]
 mod tests;
 
 // Re-export the public API so `crate::antiantidebug::*` works unchanged.
-pub use handlers::{handle_nt_query_information_process, handle_nt_set_information_thread};
+pub use handlers::handle_nt_set_information_thread;
 pub use scyllahide::{inject_scylla_hide, ScyllaHideConfig};
-
-#[cfg(target_arch = "x86")]
-pub use kifast::{get_nt_qip_syscall_number, handle_kifast_syscall, install_kifast_syscall_hook};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -54,14 +50,9 @@ pub use kifast::{get_nt_qip_syscall_number, handle_kifast_syscall, install_kifas
 /// debugger, effectively preventing any further debug events for it.
 pub(crate) const THREAD_HIDE_FROM_DEBUGGER: u32 = 0x11; // = 17 decimal
 
-/// NT kernel class IDs for `NtQueryInformationProcess`.
-pub(crate) const PROCESS_DEBUG_PORT: u32 = 7;
-pub(crate) const PROCESS_DEBUG_OBJECT_HANDLE: u32 = 30;
-pub(crate) const PROCESS_DEBUG_FLAGS: u32 = 31;
 
 /// NT status codes used when faking returns.
 pub(crate) const STATUS_SUCCESS: u32 = 0x0000_0000;
-pub(crate) const STATUS_PORT_NOT_SET: u32 = 0xC000_0353;
 
 /// Syscall number for `NtQueryInformationProcess` on x86 (used by the
 /// `KiFastSystemCall` hook).

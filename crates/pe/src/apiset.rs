@@ -25,7 +25,6 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use crate::error::PeError;
 
 // ---------------------------------------------------------------------------
 // ApiSetMapping
@@ -95,25 +94,6 @@ fn build_apiset_lookup() -> HashMap<&'static str, &'static str> {
 // empty mapping — the compile-time lookup table above handles the common
 // case.
 
-/// Parse the ApiSet schema from the target process's PEB.
-///
-/// **Status: stub.** The full implementation requires reading and parsing the
-/// undocumented `API_SET_NAMESPACE` structure from the PEB's `ApiSetMap`
-/// field. This is complex reverse-engineering work; the compile-time lookup
-/// table in `APISET_APIS` covers the common cases.
-///
-/// Returns an empty `Vec` as a safe fallback (the dumper will not use
-/// api-set names for module remapping when this returns empty, but it
-/// won't block the dump).
-pub fn parse_apiset_schema(
-    _debugger: &dyn mida_core::DebuggerCore,
-    _peb_address: u64,
-) -> Result<Vec<ApiSetMapping>, PeError> {
-    // Stub: return empty mapping.
-    // The compile-time APISET_APIS table provides the mapping for
-    // `get_apiset_module_by_api` without needing the runtime schema.
-    Ok(Vec::new())
-}
 
 /// Resolve an api-set DLL name to its real host DLL name.
 ///

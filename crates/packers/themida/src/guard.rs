@@ -97,48 +97,7 @@ pub fn install_iat_guard(
     Ok(())
 }
 
-/// Temporarily restore read/write access to the IAT region so a write can complete.
-pub fn temporary_un_guard_iat(
-    h_process: HANDLE,
-    iat_start: usize,
-    iat_size: usize,
-) -> Result<PAGE_PROTECTION_FLAGS, ThemidaError> {
-    let mut old_protect = PAGE_PROTECTION_FLAGS::default();
-    // SAFETY: h_process is a valid process handle; iat_start/text_section_start is a valid virtual address; old_protect is a valid out-pointer.
-    unsafe {
-        VirtualProtectEx(
-            h_process,
-            iat_start as *const std::ffi::c_void,
-            iat_size,
-            PAGE_EXECUTE_READWRITE,
-            &mut old_protect,
-        )
-    }
-    .map_err(|e| ThemidaError::Debugger(format!("VirtualProtectEx temporary unguard IAT: {e}")))?;
-    Ok(old_protect)
-}
 
-/// Re-install the IAT guard after a write has completed.
-pub fn re_guard_iat(
-    h_process: HANDLE,
-    iat_start: usize,
-    iat_size: usize,
-) -> Result<(), ThemidaError> {
-    let mut old_protect = PAGE_PROTECTION_FLAGS::default();
-    // SAFETY: h_process is a valid process handle; iat_start/text_section_start is a valid virtual address; old_protect is a valid out-pointer.
-    unsafe {
-        VirtualProtectEx(
-            h_process,
-            iat_start as *const std::ffi::c_void,
-            iat_size,
-            PAGE_NOACCESS,
-            &mut old_protect,
-        )
-    }
-    .map_err(|e| ThemidaError::Debugger(format!("VirtualProtectEx re-guard IAT: {e}")))?;
-    debug!("IAT guard re-installed: {:#x} – {:#x}", iat_start, iat_start + iat_size);
-    Ok(())
-}
 
 /// Install the code-section guard on the target process.
 pub fn install_code_section_guard(
@@ -433,110 +392,8 @@ pub fn remove_code_section_guard(
 /// Check whether an address falls within the guarded code section.
 #[inline]
 #[must_use]
-pub fn is_guarded_address(address: usize, guard_start: usize, guard_end: usize) -> bool {
-    guard_start != 0 && address >= guard_start && address < guard_end
-}
 
-/// Switch to IAT monitoring mode.
-///
-/// After finding OEP, this function:
-/// 1. Computes IAT and Themida section bounds.
-/// 2. Sets up state for IAT write monitoring.
-/// 3. Installs the IAT guard.
-///
-/// Returns the IAT bounds for the caller to use.
-pub fn switch_to_iat_monitoring(
-    h_process: HANDLE,
-    state: &mut ThemidaState,
-) -> Result<(usize, usize), ThemidaError> {
-    // Compute IAT bounds from the IAT address stored in state.
-    // The IAT address is determined by the caller and stored in guard_start/guard_end
-    // or we can use the IAT location from the unpacker.
-    let iat_addr = state.guard_start;
-    let iat_size = state.guard_end - state.guard_start;
 
-    if iat_size == 0 {
-        return Err(ThemidaError::Debugger("IAT monitoring: IAT size is zero".into()));
-    }
-
-    // Install the IAT guard.
-    install_iat_guard(h_process, iat_addr, iat_size)?;
-
-    // Update state.
-    state.iat_monitoring = true;
-
-    info!(
-        "IAT monitoring enabled: guard {:#x}–{:#x} ({} bytes)",
-        iat_addr, iat_addr + iat_size, iat_size
-    );
-
-    Ok((iat_addr, iat_size))
-}
-
-/// Process an access violation while in IAT monitoring mode.
-///
-/// This is triggered when the Themida VM writes to the guarded IAT region.
-/// We:
-/// 1. Temporarily un-guard the IAT so the write can complete.
-/// 2. Single-step to let the write instruction execute.
-/// 3. Read the new value from the IAT slot.
-/// 4. Record it if it looks like a valid API address.
-/// 5. Re-guard the IAT for the next write.
-///
-/// Returns `Some(GuardAccessResult::IatReady)` when enough writes have been
-/// detected to consider the IAT fully decrypted.
-pub fn process_iat_monitoring_access(
-    h_process: HANDLE,
-    state: &mut ThemidaState,
-    fault_address: usize,
-    exception_address: usize,
-    debugger: &dyn DebuggerCore,
-    thread_id: u32,
-) -> Result<Option<GuardAccessResult>, ThemidaError> {
-    let iat_addr = state.guard_start;
-    let iat_size = state.guard_end - state.guard_start;
-
-    // Temporarily un-guard the IAT so the write can complete.
-    let _old_protect = temporary_un_guard_iat(h_process, iat_addr, iat_size)?;
-
-    // Set trap flag to single-step.
-    enable_trap_flag(debugger, thread_id)?;
-
-    // Continue execution - the write instruction will execute.
-    // We'll get a single-step exception after the write.
-
-    // For now, just record the fault and continue.
-    // The actual IAT value will be read after the single-step.
-
-    debug!(
-        "IAT monitoring: write to {:#x} from {:#x}",
-        fault_address, exception_address
-    );
-
-    // Check if we've seen enough writes to consider IAT ready.
-    state.iat_total_writes += 1;
-    state.iat_write_addresses.insert(fault_address);
-
-    // Simple heuristic: if we've seen enough unique writes, consider ready.
-    // A better approach would be to check if all non-zero slots have been written.
-    if state.iat_write_addresses.len() as u32 >= state.iat_write_threshold
-        || state.iat_total_writes >= state.iat_timeout_threshold
-    {
-        info!(
-            "IAT monitoring: {} unique writes ({} total), considering IAT ready",
-            state.iat_write_addresses.len(),
-            state.iat_total_writes
-        );
-        state.iat_monitoring = false;
-        return Ok(Some(GuardAccessResult::IatReady {
-            address: fault_address,
-        }));
-    }
-
-    // Not ready yet - continue monitoring.
-    // The IAT will be re-guarded after the single-step.
-    Ok(None)
-}
 ///
 /// After the OEP is reached, some Themida v3 binaries delay IAT decryption
 /// until the program executes for a while.  This function switches the guard

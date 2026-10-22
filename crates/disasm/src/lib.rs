@@ -8,11 +8,9 @@
 
 pub mod decoder;
 pub mod error;
-mod iat_scanner;
 pub mod pattern;
 
 // Re-export commonly used types.
 pub use decoder::{is_indirect_call, is_indirect_jmp, Disassembler};
 pub use error::DisasmError;
-pub use iat_scanner::find_all_iat_references;
 pub use pattern::{find_dynamic, find_static, BytePattern};

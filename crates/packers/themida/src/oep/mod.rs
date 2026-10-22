@@ -15,7 +15,7 @@ mod restore;
 
 // Re-export the restoration functions from the `restore` submodule.
 pub use restore::{
-    restore_stolen_oep_msvc6, restore_stolen_oep_msvc9_dll, write_msvc_oep_x64,
+    write_msvc_oep_x64,
 };
 
 use tracing::{debug, info, warn};
@@ -269,58 +269,6 @@ pub fn find_real_oep_in_bytes(text_buf: &[u8], oep_rva: u32) -> Option<u32> {
     None
 }
 
-/// Attempt to find the correct OEP with a search range around the current OEP.
-pub fn try_find_correct_oep_by_range(
-    debugger: &dyn DebuggerCore,
-    oep: usize,
-    search_range: usize,
-    text_base: usize,
-    text_len: usize,
-    major_linker_version: u8,
-) -> Result<Option<usize>, ThemidaError> {
-    if !KNOWN_MSVC_VERSIONS.contains(&major_linker_version) {
-        warn!(
-            major_linker_version,
-            "Don't know what to do about OEP for this compiler — target likely won't run"
-        );
-        return Ok(None);
-    }
-
-    let scan_start = text_base.max(oep.saturating_sub(search_range));
-    let scan_end = (text_base + text_len).min(oep.saturating_add(search_range));
-    let scan_size = scan_end.saturating_sub(scan_start);
-
-    if scan_size < 10 {
-        warn!(oep = format_args!("{oep:#x}"), "OEP search window too small");
-        return Ok(None);
-    }
-
-    let mut buf = vec![0u8; scan_size];
-    let bytes_read = debugger
-        .read_memory(scan_start, &mut buf)
-        .map_err(|e| ThemidaError::Debugger(format!("read memory for OEP range scan: {e}")))?;
-
-    let effective_len = bytes_read.min(scan_size);
-
-    let end = effective_len.saturating_sub(10);
-    for i in 0..end {
-        if buf[i] == 0xE8 && buf[i + 5] == 0xE9 {
-            let disp = {
-                let mut d = [0u8; 4];
-                d.copy_from_slice(&buf[i + 1..i + 5]);
-                i32::from_le_bytes(d)
-            };
-            let call_target = (scan_start + i + 5).wrapping_add_signed(disp as isize);
-            if call_target == oep {
-                let real_oep = scan_start + i;
-                info!("Found likely real OEP at {real_oep:#x} (was {oep:#x})");
-                return Ok(Some(real_oep));
-            }
-        }
-    }
-
-    Ok(None)
-}
 
 // ---------------------------------------------------------------------------
 // Public API — TLS callback handling

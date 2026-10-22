@@ -31,7 +31,6 @@ mod fix;
 use tracing::{info, warn};
 
 use mida_core::DebuggerCore;
-use mida_pe::PeHeader;
 
 use crate::common::ThemidaState;
 use crate::error::ThemidaError;
@@ -494,26 +493,4 @@ pub fn fixup_api_call_sites(
 
     info!("Fixed up {fixup_count} API call sites");
     Ok(fixup_count)
-}
-
-// ===========================================================================
-// Compiler detection
-// ===========================================================================
-
-/// Auto-detect the compiler used to build the target, based on PE header and
-/// `.text` section characteristics.
-///
-/// Detection signals:
-///
-/// | Compiler | Signal                                |
-/// |----------|---------------------------------------|
-/// | Go       | `.text` starts with `FF 20 47 6F`     |
-/// |          | (identifiable by "Go build ID")        |
-/// | Delphi   | `MajorLinkerVersion` >= 6 **and**       |
-/// |          | `.text` bytes at offset 6 spell        |
-/// |          | `"Boole"` or `"ByteT"`                 |
-/// | MSVC     | Everything else.                       |
-#[must_use]
-pub fn detect_compiler(_pe: &PeHeader, text_section: &[u8]) -> CompilerHint {
-    discovery::detect_compiler_from_text(text_section)
 }

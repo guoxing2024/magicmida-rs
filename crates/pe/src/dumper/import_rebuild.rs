@@ -21,29 +21,6 @@ use super::types::{IatSlot, RemoteModule, ResolutionCandidate};
 // rebuild_import_table (public API)
 // -----------------------------------------------------------------------
 
-/// Rebuild the import table from the live IAT in the target process.
-///
-/// Returns an [`ImportTableBuilder`] with the resolved modules and thunks.
-///
-/// This is the Rust equivalent of `TDumper.Process` (Pass 1 and Pass 2).
-pub fn rebuild_import_table(
-    debugger: &mut dyn mida_core::DebuggerCore,
-    iat_address: u64,
-    iat_size: usize,
-    image_base: u64,
-    is_64bit: bool,
-) -> Result<ImportTableBuilder, PeError> {
-    let (_, _, builder) = rebuild_import_table_inner(
-        debugger,
-        iat_address,
-        iat_size,
-        image_base,
-        is_64bit,
-        None, // no original imports for ApiSet decisions
-    )?;
-
-    builder.ok_or_else(|| PeError::Parse("Import table reconstruction produced no output".into()))
-}
 
 // -----------------------------------------------------------------------
 // rebuild_import_table_complete
