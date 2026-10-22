@@ -5,6 +5,7 @@ members = [
     "crates/disasm",
     "crates/packers/themida",
     "crates/cli",
+    "crates/gui",
 ]
 resolver = "2"
 

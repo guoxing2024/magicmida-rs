@@ -1,0 +1,19 @@
+[package]
+name = "mida-gui"
+version.workspace = true
+edition.workspace = true
+description = "Graphical front-end for Magicmida-RS"
+repository.workspace = true
+license.workspace = true
+readme.workspace = true
+
+[dependencies]
+mida-pe = { path = "../pe" }
+eframe = { version = "0.32", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+rfd = "0.15"
+sha2 = "0.10"
