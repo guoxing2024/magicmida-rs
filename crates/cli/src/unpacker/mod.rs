@@ -54,7 +54,7 @@ use session::ProcessSession;
 use oep_scan::scan_live_memory_for_real_oep;
 use helpers::{
     scylla_injector_path, scylla_hook_path, resolve_output_path, resolve_api_addrs,
-    resolve_host_api, compute_data_section_bounds, pe_section_name_remote_rva,
+    resolve_host_api, compute_data_section_bounds, detect_packed_dll, pe_section_name_remote_rva,
     dotnet_dump_and_dump_output, handle_hw_breakpoint,
 };
 use av_handler::{AvAction, handle_access_violation};
@@ -70,6 +70,9 @@ pub use dump::dump_process_code;
 struct LoopState {
     guard_installed: bool,
     close_handle_bp_set: bool,
+    /// Set once the packed DLL has been located in `LOAD_DLL` and `image_base`
+    /// has been retargeted from the loader host onto the DLL.
+    dll_base_found: bool,
     oep: Option<usize>,
     oep_found_via_scanning: bool,
     virtualized_oep_retries: u32,
@@ -243,6 +246,7 @@ pub fn unpack(
     let mut ls = LoopState {
         guard_installed: false,
         close_handle_bp_set: false,
+        dll_base_found: false,
         oep: None,
         oep_found_via_scanning: false,
         virtualized_oep_retries: 0,
@@ -398,6 +402,52 @@ pub fn unpack(
                     let _ = windows::Win32::Foundation::CloseHandle(h_file);
                 }
 
+                // ---- DLL targets: retarget onto the packed DLL and arm .text --
+                //
+                // The debuggee is our loader host, so `CREATE_PROCESS` reported
+                // the *host* EXE's base.  Every downstream computation is
+                // `image_base + rva`, so the base has to move to the packed DLL
+                // before any guard or OEP logic runs.
+                //
+                // The DLL is recognised by its `.winlice` section, which the
+                // host EXE does not have.  The `.text` guard is armed here —
+                // during `LOAD_DLL`, i.e. before `DllMain` executes — so the
+                // first execute fault into `.text` is the real entry point.
+                if looks_like_dll && !ls.dll_base_found {
+                    if let Some(dll_base) =
+                        detect_packed_dll(&dbg, base_address as usize, state.pe_info.pe_sections[0].virtual_address)
+                    {
+                        ls.dll_base_found = true;
+                        dbg.set_image_base(dll_base as u64);
+                        info!(
+                            dll_base = %format!("{dll_base:#x}"),
+                            "Packed DLL located — image_base retargeted from the loader host"
+                        );
+
+                        let text_sec = &state.pe_info.pe_sections[0];
+                        let text_start = dll_base + text_sec.virtual_address as usize;
+                        let text_size = text_sec.virtual_size as usize;
+                        if text_size > 0 {
+                            match mida_packers_themida::install_code_section_guard(
+                                h_process,
+                                text_start,
+                                text_size,
+                                guard_protection,
+                            ) {
+                                Ok(()) => {
+                                    ls.guard_installed = true;
+                                    info!(
+                                        text = %format!("{text_start:#x}"),
+                                        size = %format!("{text_size:#x}"),
+                                        "Code section guard armed on the packed DLL before DllMain"
+                                    );
+                                }
+                                Err(e) => warn!("Cannot arm DLL .text guard: {e}"),
+                            }
+                        }
+                    }
+                }
+
                 if !ls.close_handle_bp_set {
                     let close_handle_addr = dbg.apis.as_ref().map(|a| a.close_handle);
                     if let Some(addr) = close_handle_addr {
@@ -547,7 +597,7 @@ pub fn unpack(
                     &mut ls, &mut dbg, &mut state, &pe,
                     h_process, guard_protection,
                     image_base_usize, image_boundary,
-                    thread_id, exception_addr, target_address, exc_type,
+                    thread_id, exception_addr, target_address, exc_type, looks_like_dll,
                 )? {
                     AvAction::Continue => {}
                     AvAction::Break => break,

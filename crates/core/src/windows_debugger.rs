@@ -1,4 +1,4 @@
-﻿//! Concrete [`DebuggerCore`] implementation backed by the Windows debug API.
+//! Concrete [`DebuggerCore`] implementation backed by the Windows debug API.
 //!
 //! `WindowsDebugger` holds the target process, breakpoint tables, and thread
 //! registrations and translates raw `DEBUG_EVENT` structs into the
@@ -100,6 +100,17 @@ impl WindowsDebugger {
     /// Return the image base discovered during `CREATE_PROCESS_DEBUG_EVENT`.
     pub fn image_base(&self) -> u64 {
         self.process.image_base
+    }
+
+    /// Override the image base.
+    ///
+    /// Used for DLL targets: `CREATE_PROCESS` reports the *loader host* EXE, so
+    /// the caller must retarget this to the packed DLL once `LOAD_DLL` reveals
+    /// it.  Every downstream address computation (guard bounds, OEP, dump) is
+    /// expressed as `image_base + rva`, so retargeting here is what makes the
+    /// rest of the pipeline operate on the DLL rather than the host.
+    pub fn set_image_base(&mut self, base: u64) {
+        self.process.image_base = base;
     }
 
     // ------------------------------------------------------------------

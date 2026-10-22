@@ -324,6 +324,7 @@ fn compute_max_iat_rva(builder: &ImportTableBuilder, original_iat_rva: u32, ptr_
 pub(crate) fn write_iat_to_output(
     out_data: &mut Vec<u8>,
     pe: &PeHeader,
+    builder: Option<&crate::import_table::ImportTableBuilder>,
     import_thunks: &[u64],
     original_iat_rva: u32,
     is_64bit: bool,
@@ -332,8 +333,61 @@ pub(crate) fn write_iat_to_output(
         return;
     }
 
-    let iat_file_off = section_rva_to_file_offset(&pe.sections, original_iat_rva);
     let ptr_size = if is_64bit { 8 } else { 4 };
+
+    // Sparse path: write each Hint/Name RVA to the slot the thunk actually came
+    // from.
+    //
+    // The dense path below assumes entry `i` belongs at
+    // `original_iat_rva + i * ptr_size`.  That holds only when the source IAT was
+    // a single contiguous run.  A Themida DLL's runtime IAT is not: its slots are
+    // scattered across `.rdata` with shell trampolines interleaved, and the
+    // rebuilt table is bucketed per module rather than by address order.  Writing
+    // densely shifted every entry — on the reference DLL 143 thunks landed at rva
+    // 0x141a78..0x141d00 while the code called 0x1421a0, 0x142220, 0x142280, so
+    // `Run()` jumped into the `.import` Hint/Name table and crashed.
+    //
+    // When the builder is available, trust its per-thunk `iat_address`; the
+    // loader only needs the FirstThunk slot to hold a Hint/Name RVA (or an
+    // ordinal flag) and will overwrite it with the resolved address.
+    if let Some(b) = builder {
+        // `import_thunks` is flat and ordered exactly like the builder's modules
+        // and thunks, with one null terminator appended per module.  Walk both in
+        // lockstep with a single cursor.
+        let mut cursor = 0usize;
+        let mut written = 0usize;
+        for module in &b.modules {
+            for thunk in &module.thunks {
+                let val = match import_thunks.get(cursor) {
+                    Some(&v) => v,
+                    None => break,
+                };
+                cursor += 1;
+                if val == 0 {
+                    continue;
+                }
+                let file_off = section_rva_to_file_offset(&pe.sections, thunk.iat_address);
+                let end = file_off + ptr_size;
+                if end > out_data.len() {
+                    out_data.resize(end, 0);
+                }
+                if ptr_size == 8 {
+                    out_data[file_off..end].copy_from_slice(&val.to_le_bytes());
+                } else {
+                    out_data[file_off..end].copy_from_slice(&(val as u32).to_le_bytes());
+                }
+                written += 1;
+            }
+            cursor += 1; // per-module null terminator
+        }
+        info!(
+            count = written,
+            "Wrote Hint/Name RVAs to their original IAT slots (sparse)"
+        );
+        return;
+    }
+
+    let iat_file_off = section_rva_to_file_offset(&pe.sections, original_iat_rva);
     let copy_size = import_thunks.len() * ptr_size;
     let end = iat_file_off + copy_size;
     if end > out_data.len() {

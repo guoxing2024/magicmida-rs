@@ -76,7 +76,7 @@ pub(crate) fn write_output_file(
     write_section_data(&mut out_data, pe, dump_buf);
 
     // 6f. Write Hint/Name RVAs to the IAT location
-    write_iat_to_output(&mut out_data, pe, import_thunks, original_iat_rva, is_64bit);
+    write_iat_to_output(&mut out_data, pe, _import_builder, import_thunks, original_iat_rva, is_64bit);
 
     // 6g. Fill additional IAT locations
     fill_additional_iat_locations(&mut out_data, pe, opts, import_thunks, is_64bit);

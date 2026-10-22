@@ -14,7 +14,8 @@ use windows::Win32::Foundation::{
 use windows::Win32::Storage::FileSystem::CopyFileW;
 use windows::Win32::System::Diagnostics::Debug::{
     ReadProcessMemory, WriteProcessMemory,
-    IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY, IMAGE_FILE_CHARACTERISTICS,
+    IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE, IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY,
+    IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA, IMAGE_FILE_CHARACTERISTICS,
     IMAGE_FILE_DLL, IMAGE_FILE_HEADER, IMAGE_NT_HEADERS32,
     IMAGE_NT_HEADERS64, IMAGE_OPTIONAL_HEADER32, IMAGE_OPTIONAL_HEADER64,
     IMAGE_SECTION_HEADER,
@@ -202,6 +203,72 @@ const X64_CALL_DLLMAIN_OFFSET: usize = 25;
 /// Suffix appended to the DLL filename to form the stub EXE path.
 const STUB_EXE_SUFFIX: &str = "MM.exe";
 
+/// Suffix appended to the DLL filename to form the **loader-host** EXE path.
+///
+/// The loader host is a purpose-built executable that calls `LoadLibraryW` on
+/// the packed DLL and then parks.  Unlike the stub EXE it does **not** touch the
+/// DLL's headers: the real Windows loader maps the image, runs its TLS
+/// callbacks, and calls `DllMain(hinstDLL, DLL_PROCESS_ATTACH, NULL)` through
+/// the normal `LdrpLoadDll` path.
+const HOST_EXE_SUFFIX: &str = "MMHost.exe";
+
+// ---------------------------------------------------------------------------
+// Loader host source
+// ---------------------------------------------------------------------------
+
+/// Minimal C source for the loader host.
+///
+/// It takes the DLL path as `argv[1]`, loads it with `LoadLibraryW`, prints the
+/// result to `<dll>.host.log`, resolves two exports as a liveness check, and
+/// then sleeps so an external debugger keeps the fully-bootstrapped image
+/// mapped while it dumps it.
+///
+/// Compiled on demand by [`ensure_loader_host`] with whatever C compiler is on
+/// `PATH` (`gcc` from the bundled MinGW is the expected one).
+const HOST_SOURCE: &str = r#"/* Auto-generated loader host. Do not edit; see mida-core/src/process.rs. */
+#include <windows.h>
+#include <stdio.h>
+
+int main(int argc, char **argv) {
+    if (argc < 2) return 2;
+
+    /* argv[1] is an ANSI path; widen it so non-ASCII paths survive. */
+    wchar_t wide[32768];
+    if (MultiByteToWideChar(CP_ACP, 0, argv[1], -1, wide,
+                            (int)(sizeof wide / sizeof wide[0])) == 0)
+        return 2;
+
+    /* Log next to the DLL so the debugger's CWD does not matter. */
+    char log[MAX_PATH * 2];
+    snprintf(log, sizeof log, "%s.host.log", argv[1]);
+    FILE *lf = fopen(log, "w");
+
+    HMODULE h = LoadLibraryW(wide);
+    if (lf) {
+        fprintf(lf, "pid=%lu base=%p ok=%d\n", (unsigned long)GetCurrentProcessId(),
+                (void *)h, h != NULL);
+        if (h) {
+            fprintf(lf, "GetAppVersion=%p Run=%p\n",
+                    (void *)GetProcAddress(h, "GetAppVersion"),
+                    (void *)GetProcAddress(h, "Run"));
+        }
+        fflush(lf);
+    }
+
+    if (h == NULL) {
+        if (lf) fclose(lf);
+        return 1;
+    }
+
+    /* Keep the module mapped so the debugger can dump the bootstrapped image. */
+    for (;;) Sleep(1000);
+}
+"#;
+
+/// Name of the C compiler used to build the loader host.
+const HOST_COMPILER: &str = "gcc";
+
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -231,22 +298,36 @@ pub fn create_debug_process(
 
     let is_dll = opts.is_dll || pe_info.is_dll;
     let executable_path: PathBuf;
+    let mut host_arguments: Option<String> = None;
 
-    // Step 2: if DLL, generate stub EXE
+    // Step 2: if DLL, build a loader host and pass the DLL as its argument.
+    //
+    // The previous approach rewrote the DLL into a stub EXE (clear
+    // IMAGE_FILE_DLL, point the entry point at a hand-written `call DllMain`
+    // shim).  That does not work for a Themida-packed DLL: the loader's
+    // `DLL_PROCESS_ATTACH` sequencing never runs, and the shell dies at
+    // `.winlice+0x33E22E` dereferencing a null pointer.  Handing the DLL to the
+    // real loader instead lets the shell bootstrap exactly as it does when the
+    // host application loads it normally.
     let stub_exe = if is_dll {
-        let stub_path = make_dll_executable(&opts.executable, pe_info.has_force_integrity)?;
-        info!("Created DLL stub executable: {}", stub_path.display());
-        executable_path = stub_path.clone();
-        Some(stub_path)
+        let host_path = ensure_loader_host(&opts.executable)?;
+        info!("Created DLL loader host: {}", host_path.display());
+        host_arguments = Some(format!("\"{}\"", opts.executable.display()));
+        executable_path = host_path.clone();
+        Some(host_path)
     } else {
         executable_path = opts.executable.clone();
         None
     };
 
     // Step 3: build command line
-    let cmd_line = match &opts.command_line {
-        Some(args) => format!("\"{}\" {}", executable_path.display(), args),
-        None => format!("\"{}\"", executable_path.display()),
+    let cmd_line = match (&host_arguments, &opts.command_line) {
+        (Some(dll_arg), Some(extra)) => {
+            format!("\"{}\" {} {}", executable_path.display(), dll_arg, extra)
+        }
+        (Some(dll_arg), None) => format!("\"{}\" {}", executable_path.display(), dll_arg),
+        (None, Some(extra)) => format!("\"{}\" {}", executable_path.display(), extra),
+        (None, None) => format!("\"{}\"", executable_path.display()),
     };
     debug!(%cmd_line, "Launching debuggee");
 
@@ -327,6 +408,53 @@ pub fn create_debug_process(
     );
 
     Ok(target)
+}
+
+// ---------------------------------------------------------------------------
+// Optional-header field locations
+// ---------------------------------------------------------------------------
+
+/// Offset of `DllCharacteristics` **within** the optional header.
+///
+/// This is `0x46` for both PE32 and PE32+ — the two layouts diverge only after
+/// the fields that precede it, and `DllCharacteristics` is one of the fields
+/// they share verbatim (`Magic`, `MajorLinkerVersion` … `SizeOfImage`,
+/// `SizeOfHeaders`, `CheckSum`, `Subsystem`, `DllCharacteristics`).
+///
+/// The previous code used `0x44` for PE32 and `0x48` for PE32+, which landed on
+/// `SizeOfStackReserve` and `SizeOfStackCommit` respectively.  The practical
+/// consequence was that `FORCE_INTEGRITY` was never detected on any target, and
+/// an ASLR patch written through that offset corrupted the stack-reserve fields
+/// instead of the header flags it meant to clear.
+const DLL_CHARACTERISTICS_IN_OPTIONAL_HEADER: usize = 0x46;
+
+/// Validate the optional-header magic at `opt_header_offset` and return the file
+/// offset of `DllCharacteristics`.
+///
+/// Returns `None` when the magic is neither `PE32` (`0x10B`) nor `PE32+`
+/// (`0x20B`), or when the header would extend past the end of `data`.
+fn dll_characteristics_offset(data: &[u8], opt_header_offset: usize) -> Option<usize> {
+    let magic = u16::from_le_bytes(
+        data.get(opt_header_offset..opt_header_offset + 2)?
+            .try_into()
+            .ok()?,
+    );
+    if magic != 0x10B && magic != 0x20B {
+        return None;
+    }
+    let off = opt_header_offset + DLL_CHARACTERISTICS_IN_OPTIONAL_HEADER;
+    if data.len() < off + 2 {
+        return None;
+    }
+    Some(off)
+}
+
+/// Read the `DllCharacteristics` word, if the header is well-formed.
+fn dll_characteristics_at(data: &[u8], opt_header_offset: usize) -> Option<u16> {
+    let off = dll_characteristics_offset(data, opt_header_offset)?;
+    Some(u16::from_le_bytes(
+        data.get(off..off + 2)?.try_into().ok()?,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -425,36 +553,9 @@ fn pe_inspect(path: &Path) -> Result<PeInfo, CoreError> {
     // Read optional header magic to determine if we need to check
     // DllCharacteristics for FORCE_INTEGRITY.
     let opt_header_offset = file_header_offset + size_of::<IMAGE_FILE_HEADER>();
-    let has_force_integrity = if data.len() >= opt_header_offset + 2 {
-        let magic_bytes = data.get(opt_header_offset..opt_header_offset + 2)
-            .and_then(|s| s.try_into().ok());
-
-        if let Some(bytes) = magic_bytes {
-            let magic = u16::from_le_bytes(bytes);
-
-            let dll_char_off = match magic {
-                0x10B => opt_header_offset + 0x44, // PE32
-                0x20B => opt_header_offset + 0x48, // PE32+
-                _ => 0,                            // unknown magic
-            };
-
-            if dll_char_off > 0 && data.len() >= dll_char_off + 2 {
-                if let Some(bytes) = data.get(dll_char_off..dll_char_off + 2)
-                    .and_then(|s| s.try_into().ok()) {
-                    let dll_chars = u16::from_le_bytes(bytes);
-                    (dll_chars & IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY.0) != 0
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        } else {
-            false
-        }
-    } else {
-        false
-    };
+    let has_force_integrity = dll_characteristics_at(&data, opt_header_offset)
+        .map(|c| (c & IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY.0) != 0)
+        .unwrap_or(false);
 
     Ok(PeInfo {
         is_dll,
@@ -561,22 +662,34 @@ fn make_dll_executable(
         u16::from_le_bytes(bytes)
     };
 
-    // Step 3: disable FORCE_INTEGRITY if set
-    if has_force_integrity {
-        let dll_char_off = match magic {
-            0x10B => Some(opt_header_offset + 0x44),
-            0x20B => Some(opt_header_offset + 0x48),
-            _ => None,
-        };
-        if let Some(off) = dll_char_off {
-            if data.len() >= off + 2 {
-                if let Some(bytes) = data.get(off..off + 2).and_then(|s| s.try_into().ok()) {
-                    let dll_chars = u16::from_le_bytes(bytes);
-                    let new_chars = dll_chars & !IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY.0;
-                    data[off..off + 2].copy_from_slice(&new_chars.to_le_bytes());
-                    debug!("Cleared FORCE_INTEGRITY DllCharacteristic");
-                }
+    // Step 3: disable FORCE_INTEGRITY if set, and ALWAYS disable ASLR.
+    //
+    // ASLR must go: a Themida-packed image is built for one fixed base and its
+    // relocation directory is empty (the reference `core.dll` declares a 0x10
+    // byte `.reloc` holding four entries that all live in `.tls` — i.e. nothing
+    // that covers the shell).  Leaving `DYNAMIC_BASE` set makes the loader
+    // relocate the image to a random base, and every absolute address the shell
+    // baked in at build time then points at the wrong place.  Observed on
+    // `core.dll`: declared base `0x3205C0000`, actual base `0x7ff63e560000`,
+    // and the shell dies dereferencing a null pointer at `.winlice+0x33E22E`.
+    //
+    // Clearing `DYNAMIC_BASE` forces the loader to honour `ImageBase`, which is
+    // exactly what the packer assumes.  Clearing `HIGH_ENTROPY_VA` alongside it
+    // keeps the two ASLR switches consistent.
+    if let Some(off) = dll_characteristics_offset(&data, opt_header_offset) {
+        if let Some(bytes) = data.get(off..off + 2).and_then(|s| s.try_into().ok()) {
+            let mut dll_chars = u16::from_le_bytes(bytes);
+            if has_force_integrity {
+                dll_chars &= !IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY.0;
+                debug!("Cleared FORCE_INTEGRITY DllCharacteristic");
             }
+            dll_chars &= !IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE.0;
+            dll_chars &= !IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA.0;
+            data[off..off + 2].copy_from_slice(&dll_chars.to_le_bytes());
+            debug!(
+                dll_chars = format_args!("{dll_chars:#06x}"),
+                "Cleared DYNAMIC_BASE and HIGH_ENTROPY_VA so the shell keeps its build-time base"
+            );
         }
     }
 
@@ -729,6 +842,78 @@ fn make_dll_executable(
     );
 
     Ok(stub_exe_path)
+}
+
+// ---------------------------------------------------------------------------
+// Loader host generation
+// ---------------------------------------------------------------------------
+
+/// Build (or reuse) the loader host executable for `dll_path` and return its
+/// path.
+///
+/// The host is a small native EXE that calls `LoadLibraryW` on the DLL.  This is
+/// the only correct way to bootstrap a Themida-packed DLL: the packer's
+/// `DllMain` depends on the loader having run `DLL_PROCESS_ATTACH` sequencing
+/// (TLS callbacks, heap, CRT init).  Bypassing that — which is what clearing
+/// `IMAGE_FILE_DLL` and jumping straight to `DllMain` does — sends the shell
+/// dereferencing a null pointer at `.winlice+0x33E22E`.
+///
+/// The source is written to `<dll>.host.c` and compiled with [`HOST_COMPILER`].
+/// The result is cached: if the EXE is newer than the source it is reused, so a
+/// repeated unpack does not pay the compile cost.
+pub fn ensure_loader_host(dll_path: &Path) -> Result<PathBuf, CoreError> {
+    let dll_str = dll_path
+        .as_os_str()
+        .to_str()
+        .ok_or_else(|| CoreError::ProcessCreation("DLL path is not valid UTF-8".into()))?;
+
+    let src_path = PathBuf::from(format!("{dll_str}.host.c"));
+    let exe_path = PathBuf::from(format!("{dll_str}{HOST_EXE_SUFFIX}"));
+
+    // Write the source every time — it is tiny, and keeping it in sync with the
+    // Rust constant matters more than saving a few hundred bytes of I/O.
+    std::fs::write(&src_path, HOST_SOURCE).map_err(|e| {
+        CoreError::ProcessCreation(format!(
+            "Cannot write loader-host source '{}': {e}",
+            src_path.display()
+        ))
+    })?;
+
+    // Reuse a current build.
+    if let (Ok(exe_meta), Ok(src_meta)) =
+        (std::fs::metadata(&exe_path), std::fs::metadata(&src_path))
+    {
+        if let (Ok(exe_t), Ok(src_t)) = (exe_meta.modified(), src_meta.modified()) {
+            if exe_t >= src_t {
+                debug!(host = %exe_path.display(), "Reusing existing loader host");
+                return Ok(exe_path);
+            }
+        }
+    }
+
+    let output = std::process::Command::new(HOST_COMPILER)
+        .arg("-O2")
+        .arg("-o")
+        .arg(&exe_path)
+        .arg(&src_path)
+        .output()
+        .map_err(|e| {
+            CoreError::ProcessCreation(format!(
+                "Cannot run '{HOST_COMPILER}' to build the loader host: {e}. \
+                 A C compiler on PATH is required to unpack DLL targets."
+            ))
+        })?;
+
+    if !output.status.success() {
+        return Err(CoreError::ProcessCreation(format!(
+            "Building the loader host failed (status {}):\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    info!(host = %exe_path.display(), "Built loader host");
+    Ok(exe_path)
 }
 
 // ---------------------------------------------------------------------------

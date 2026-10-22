@@ -17,8 +17,8 @@ pub use breakpoint::{HwBreakpoint, HwbpType, SoftBpAction};
 pub use debugger::{ContinueStatus, DebugEvent, DebuggerCore};
 pub use error::CoreError;
 pub use process::{
-    cleanup_stub_exe, close_process_handles, create_debug_process, patch_peb_anti_debug,
-    CreateProcessOptions, TargetProcess,
+    cleanup_stub_exe, close_process_handles, create_debug_process, ensure_loader_host,
+    patch_peb_anti_debug, CreateProcessOptions, TargetProcess,
 };
 pub use windows_debugger::WindowsDebugger;
 

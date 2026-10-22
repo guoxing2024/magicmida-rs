@@ -218,6 +218,96 @@ pub(super) fn dotnet_dump_and_dump_output(
 }
 
 // ---------------------------------------------------------------------------
+// Packed-DLL detection
+// ---------------------------------------------------------------------------
+
+/// Themida v3 x64 section that only exists in a packed image, never in a
+/// normal host EXE.  Eight bytes, space-padded, exactly as it appears in the
+/// section table.
+const WINLICE_SECTION: &[u8; 8] = b".winlice";
+
+/// Return the base address of `candidate` if it is the packed DLL.
+///
+/// Called for every `LOAD_DLL` event.  The debuggee is our loader host, so the
+/// first thing the loader reports is the host EXE and then the system DLLs; the
+/// packed DLL is identified by its `.winlice` section rather than by path,
+/// because the path in `LOAD_DLL` is ANSI and may be non-ASCII.
+///
+/// `expected_text_rva` is the `.text` RVA parsed from the file on disk.  A
+/// matching `.winlice` is enough on its own, but requiring the section table to
+/// agree with the file rules out a stray `ntdll` copy that happens to contain
+/// the string.
+pub(super) fn detect_packed_dll(
+    dbg: &ProcessSession,
+    candidate: usize,
+    expected_text_rva: u32,
+) -> Option<usize> {
+    let sections = read_remote_sections(dbg, candidate)?;
+
+    let has_winlice = sections.iter().any(|s| &s.name == WINLICE_SECTION);
+    if !has_winlice {
+        return None;
+    }
+
+    // The image we care about must agree with the on-disk section 0 RVA.
+    let text_rva = sections.first()?.virtual_address;
+    if text_rva != expected_text_rva {
+        return None;
+    }
+
+    Some(candidate)
+}
+
+/// A section header read out of a remote process.
+struct RemoteSection {
+    name: [u8; 8],
+    virtual_address: u32,
+    virtual_size: u32,
+}
+
+/// Parse the section table of the PE mapped at `base` in the debuggee.
+fn read_remote_sections(dbg: &ProcessSession, base: usize) -> Option<Vec<RemoteSection>> {
+    let mut dos = [0u8; 0x40];
+    dbg.read_memory(base, &mut dos).ok()?;
+    if &dos[0..2] != b"MZ" {
+        return None;
+    }
+    let e_lfanew = u32::from_le_bytes(dos[0x3C..0x40].try_into().ok()?) as usize;
+    let nt = base.checked_add(e_lfanew)?;
+
+    let mut sig = [0u8; 4];
+    dbg.read_memory(nt, &mut sig).ok()?;
+    if &sig != b"PE\0\0" {
+        return None;
+    }
+
+    let mut fh = [0u8; 20];
+    dbg.read_memory(nt + 4, &mut fh).ok()?;
+    let num_sections = u16::from_le_bytes(fh[2..4].try_into().ok()?) as usize;
+    let opt_size = u16::from_le_bytes(fh[16..18].try_into().ok()?) as usize;
+    // A sane PE has a handful of sections; bail on a corrupt header rather than
+    // trying to read a million headers out of the target.
+    if num_sections == 0 || num_sections > 96 {
+        return None;
+    }
+
+    let sec_start = nt + 4 + 20 + opt_size;
+    let mut out = Vec::with_capacity(num_sections);
+    for i in 0..num_sections {
+        let mut sh = [0u8; 40];
+        dbg.read_memory(sec_start + i * 40, &mut sh).ok()?;
+        let mut name = [0u8; 8];
+        name.copy_from_slice(&sh[0..8]);
+        out.push(RemoteSection {
+            name,
+            virtual_size: u32::from_le_bytes(sh[8..12].try_into().ok()?),
+            virtual_address: u32::from_le_bytes(sh[12..16].try_into().ok()?),
+        });
+    }
+    Some(out)
+}
+
+// ---------------------------------------------------------------------------
 // Hardware breakpoint handler
 // ---------------------------------------------------------------------------
 

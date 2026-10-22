@@ -363,32 +363,56 @@ fn pass2_vote(
             }
         };
 
-        // Pin each slot to the winner module's candidate
+        // Choose a candidate for every slot in the group.
+        //
+        // The original implementation forced the whole group onto the winning
+        // module's candidate, falling back to candidate 0 for slots that had no
+        // candidate from that module.  That is wrong for a Themida DLL whose IAT
+        // interleaves real API pointers with shell trampolines and contains no
+        // zero separators at all — observed layout on the reference sample:
+        //
+        //   0x1421a0  0x7fffe43dd280   user32 API
+        //   0x1421a8  0x7fff2d181f8b   shell trampoline
+        //   0x1421b0  0x7fff2d042c4f   shell trampoline
+        //   0x1421c0  0x7fffe4401ea0   user32 API
+        //
+        // With no zeros to split on, that whole run forms one group, the vote
+        // picks a single module, and the slots belonging to other modules get
+        // either a wrong name or are dropped.  Result: `CreateWindowExA`,
+        // `GetSystemMetrics` and `LoadIconA` were missing from the rebuilt table
+        // and the dumped DLL crashed inside `.import` when `Run()` called them.
+        //
+        // Prefer the winner module when it has a candidate (keeps the common
+        // case identical), otherwise take that slot's own best candidate.
         for j in group_start..=group_end {
-            let mut found_winner = false;
+            if slots[j].candidates.is_empty() {
+                continue;
+            }
+            let mut chosen_idx = 0usize;
             for (k, c) in slots[j].candidates.iter().enumerate() {
                 if c.module_index == winner_mi {
-                    slots[j].chosen = Some(k);
-                    found_winner = true;
+                    chosen_idx = k;
                     break;
                 }
             }
-            if !found_winner && !slots[j].candidates.is_empty() {
-                slots[j].chosen = Some(0);
-            }
+            slots[j].chosen = Some(chosen_idx);
         }
 
-        // Build thunks
-        let module_name = modules[winner_mi].name.clone();
-        let mut thunks: Vec<ImportThunk> = Vec::new();
+        // Build thunks, bucketed by the module each slot actually resolved to.
+        //
+        // The group no longer implies a single module (see the selection comment
+        // above), so a group can contribute thunks to several import descriptors.
+        // Bucket by module index and emit one `ImportModule` per bucket.
+        let mut by_module: std::collections::BTreeMap<usize, Vec<ImportThunk>> =
+            std::collections::BTreeMap::new();
 
         for j in group_start..=group_end {
             let chosen = match slots[j].chosen {
                 Some(c) => &slots[j].candidates[c],
                 None => {
-                    warn!(
+                    debug!(
                         iat_va = format!("{:#x}", iat_address + (j * ptr_size) as u64),
-                        "IAT slot has no candidate for winning module, skipping"
+                        "IAT slot has no candidate, skipping"
                     );
                     continue;
                 }
@@ -419,7 +443,7 @@ fn pass2_vote(
                 (Some(placeholder), None)
             };
 
-            thunks.push(ImportThunk {
+            by_module.entry(actual_module_index).or_default().push(ImportThunk {
                 iat_address: (iat_address - image_base) as u32 + (j * ptr_size) as u32,
                 function_name,
                 ordinal,
@@ -427,8 +451,11 @@ fn pass2_vote(
             });
         }
 
-        if !thunks.is_empty() {
-            builder.modules.push(ImportModule { name: module_name, thunks });
+        for (mi, thunks) in by_module {
+            builder.modules.push(ImportModule {
+                name: modules[mi].name.clone(),
+                thunks,
+            });
         }
 
         i = group_end + 1;

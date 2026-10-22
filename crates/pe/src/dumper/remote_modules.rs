@@ -83,6 +83,27 @@ pub fn take_module_snapshot(
     image_base: u64,
     is_64bit: bool,
 ) -> Result<Vec<RemoteModule>, PeError> {
+    // Fall back to the *current* process when the target is not a live process
+    // (`pid == 0`).  This is the file-backed case: `dump_process` is being run
+    // against a saved memory image, so there is no target to query, but the
+    // image's IAT slots hold the very same system-DLL addresses that this
+    // process sees — module bases are randomised once per boot, not per process.
+    // Without this the snapshot is empty, `is_api_address` never matches, and
+    // `determine_iat_size` collapses the IAT to a single slot.
+    let (process_handle, pid) = if pid == 0 {
+        // SAFETY: no arguments; both calls always succeed for the current
+        // process and the returned pseudo-handle needs no cleanup.
+        let (self_pid, self_handle) = unsafe {
+            (
+                windows::Win32::System::Threading::GetCurrentProcessId(),
+                windows::Win32::System::Threading::GetCurrentProcess(),
+            )
+        };
+        (self_handle, self_pid)
+    } else {
+        (process_handle, pid)
+    };
+
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, MODULEENTRY32W, TH32CS_SNAPMODULE,
     };

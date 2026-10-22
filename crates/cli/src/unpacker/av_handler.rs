@@ -34,6 +34,15 @@ pub(super) enum AvAction {
 /// two orders of magnitude of headroom over legitimate bursts.
 const AV_STORM_LIMIT: u32 = 1024;
 
+/// Seconds to let a packed DLL finish its own `DllMain` initialisation after
+/// its import table is ready, before the image is dumped.
+///
+/// See the settle-window comment in [`handle_access_violation`]: the reference
+/// `core.dll` writes its version string into `.bss` after the IAT is complete,
+/// so a dump taken at the end of the IAT window yields `GetAppVersion() -> "0.0"`
+/// instead of `"1.1"`.
+const DLL_SETTLE_SECS: u64 = 0;
+
 /// Counts consecutive identical access violations.
 ///
 /// "Identical" means the same `(faulting address, target address, exception
@@ -65,6 +74,28 @@ impl AvStorm {
     }
 }
 
+/// Union of all Themida section bounds, as `(start, end)` virtual addresses.
+///
+/// Returns `(0, 0)` when no Themida section was identified, which callers treat
+/// as "no VM region to test against".
+fn themida_bounds(state: &ThemidaState, image_base: usize) -> (usize, usize) {
+    let mut start = usize::MAX;
+    let mut end = 0usize;
+    for sec in &state.pe_info.pe_sections {
+        if mida_packers_themida::is_themida_section(sec) {
+            let s = image_base.wrapping_add(sec.virtual_address as usize);
+            let e = s.wrapping_add(sec.virtual_size as usize);
+            start = start.min(s);
+            end = end.max(e);
+        }
+    }
+    if start < end {
+        (start, end)
+    } else {
+        (0, 0)
+    }
+}
+
 /// Handle an AccessViolation event in the debug loop.
 ///
 /// Returns `AvAction::Break` when the debug loop should exit (OEP found and
@@ -82,6 +113,7 @@ pub(super) fn handle_access_violation(
     exception_addr: u64,
     target_address: u64,
     exc_type: u8,
+    is_dll_target: bool,
 ) -> Result<AvAction, anyhow::Error> {
     debug!(
         exc = %format!("{exception_addr:#x}"),
@@ -135,8 +167,14 @@ pub(super) fn handle_access_violation(
         exc_type,
     )? {
         GuardAccessResult::Handled { address: _, thread_id: tid } => {
+            // The guard has been re-armed / trap flag set; the single-step that
+            // follows will finish the cycle.  Return immediately: the tail of
+            // this function continues the event again, and calling
+            // `ContinueDebugEvent` twice for one event fails with
+            // ERROR_INVALID_PARAMETER.
             debug!(tid, "Guarded access handled — continuing");
             dbg.continue_event(tid, ContinueStatus::Continue)?;
+            return Ok(AvAction::Continue);
         }
         GuardAccessResult::TlsCallback { address } => {
             log::log(
@@ -144,6 +182,7 @@ pub(super) fn handle_access_violation(
                 &format!("TLS callback detected at {:#x} — guard switched to Themida section", address),
             );
             dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+            return Ok(AvAction::Continue);
         }
         GuardAccessResult::MsvcTraceComplete { address } => {
             ls.oep = Some(address);
@@ -162,6 +201,56 @@ pub(super) fn handle_access_violation(
         GuardAccessResult::PossibleOEP { address } => {
             log::log(LogType::Info, &format!("Possible OEP at {:#x}", address));
 
+            let mut dll_oep_accepted = false;
+
+            // ---- DLL targets: the first execute fault into .text IS the OEP --
+            //
+            // A packed DLL's `DllMain` is invoked by the shell, so a return
+            // address sitting in `.winlice`/`.boot` is completely normal — it is
+            // NOT evidence that the OEP was virtualised.  The EXE-oriented
+            // "return address points into the Themida section" heuristic below
+            // therefore mis-fires here: on the reference `core.dll` it rejected
+            // the genuine `DllMain` (rva 0x2bb10) and then chased three more
+            // candidates until it settled on the *start of .text* (rva 0x1000),
+            // producing a dump whose entry point was the first decrypted
+            // function rather than the DLL entry.
+            //
+            // For a DLL we ask only the question that matters: is the
+            // instruction here a transfer into the VM?  If not, control has
+            // genuinely reached decrypted code and this is the OEP.
+            if is_dll_target {
+                let (tm_start, tm_end) = themida_bounds(state, dbg.image_base() as usize);
+                let virtualized = tm_start < tm_end && is_oep_virtualized(dbg, address, tm_start);
+                if !virtualized {
+                    ls.oep = Some(address);
+                    remove_code_section_guard(
+                        h_process,
+                        text_start,
+                        text_end.saturating_sub(text_start),
+                    )?;
+                    log::log(
+                        LogType::Info,
+                        &format!(
+                            "DLL OEP accepted at {address:#x} (rva {:#x}) — real decrypted code, \
+                             not a VM trampoline",
+                            address.wrapping_sub(dbg.image_base() as usize)
+                        ),
+                    );
+                    // Skip the EXE-oriented virtualised-OEP heuristics entirely
+                    // and fall through to the IAT decryption window at the tail
+                    // of this function.  Breaking here would dump the image
+                    // before the shell finishes decrypting the import table:
+                    // observed on core.dll, that yields 357 of 3282 slots.
+                    dll_oep_accepted = true;
+                } else {
+                    log::log(
+                        LogType::Info,
+                        &format!("DLL OEP candidate {address:#x} is a VM trampoline — continuing"),
+                    );
+                }
+            }
+
+            if !dll_oep_accepted {
             let tls_total = state.pe_info.tls_total;
             let tls_result = handle_tls_callbacks(
                 dbg,
@@ -444,6 +533,7 @@ pub(super) fn handle_access_violation(
                     }
                 }
             }
+            } // end: EXE-oriented virtualised-OEP heuristics (skipped for DLLs)
         }
         GuardAccessResult::NotGuarded => {
             dbg.continue_event(thread_id, ContinueStatus::Continue)?;
@@ -451,6 +541,7 @@ pub(super) fn handle_access_violation(
         }
         GuardAccessResult::IatReady { address } => {
             info!(address = %format!("{address:#x}"), "IAT monitoring complete — IAT ready for tracing");
+            return Ok(AvAction::Continue);
         }
     }
 
@@ -566,6 +657,49 @@ pub(super) fn handle_access_violation(
 
         remove_code_section_guard(h_process, iat.address, iat.size)?;
         info!(violations = iat_violations, "IAT monitoring complete");
+
+        // ---- DLL targets: let `DllMain` finish before dumping ----------------
+        //
+        // A packed DLL does not stop at "IAT decrypted".  Its `DllMain` keeps
+        // initialising global state afterwards — on the reference `core.dll`
+        // the version string `"1.1"` is written into `.bss` *after* the import
+        // table is complete.  Dumping at the end of the IAT window therefore
+        // produced a DLL that loads and exports correctly but answers
+        // `GetAppVersion() -> "0.0"` instead of `"1.1"`, because `.bss` was
+        // captured before the shell filled it in.
+        //
+        // The dump point is therefore "the import table is ready AND the target
+        // has had time to finish its own initialisation".  We cannot wait for
+        // `DllMain` to *return* (our guard page faults on every `.text`
+        // execution and the shell never reaches its epilogue while we hold it),
+        // so the window is time-based, with the guard already removed so the
+        // target runs at full speed.
+        if is_dll_target {
+            let settle = std::time::Duration::from_secs(DLL_SETTLE_SECS);
+            info!(
+                secs = DLL_SETTLE_SECS,
+                "DLL target — letting DllMain finish its own initialisation before dumping"
+            );
+            let settle_start = std::time::Instant::now();
+            while settle_start.elapsed() < settle {
+                if dbg.continue_event(thread_id, ContinueStatus::Continue).is_err() {
+                    break;
+                }
+                match dbg.wait_event_timeout(100) {
+                    Ok(DebugEvent::ExitProcess { .. }) => {
+                        info!("Target exited while waiting for DllMain to finish");
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(mida_core::CoreError::Timeout) => {}
+                    Err(_) => break,
+                }
+            }
+            info!(
+                elapsed_ms = settle_start.elapsed().as_millis() as u64,
+                "DllMain settle window complete — dumping"
+            );
+        }
 
         // Report how much Themida decrypted in place during the window.  This is
         // informational: the post-loop trace engine re-reads the IAT and decides

@@ -64,10 +64,27 @@ pub fn fix_hardcoded_addresses(
             continue;
         }
 
-        // Skip uninitialized sections
+        // Uninitialized sections normally hold no bytes on disk, so there is
+        // nothing to fix up.  But after a live-memory dump they DO hold bytes:
+        // a packed image's `.bss` is where the shell parks its initialised
+        // globals, and those globals are full of runtime pointers.  Skipping
+        // them leaves absolute addresses baked at the dump-time base, which
+        // then point nowhere once the product loads elsewhere.
+        //
+        // Only skip when the section really is empty in the output buffer.
         let is_uninitialized = (section.characteristics & 0x00000080) != 0;
         if is_uninitialized {
-            continue;
+            let start = section.raw_offset as usize;
+            let end = start.saturating_add(section.raw_size as usize);
+            let has_data = end <= out_data.len()
+                && out_data[start..end].iter().any(|&b| b != 0);
+            if !has_data {
+                continue;
+            }
+            debug!(
+                section = %section.name,
+                "Uninitialized section carries dumped data — fixing addresses anyway"
+            );
         }
 
         let section_start = section.raw_offset as usize;
@@ -264,9 +281,27 @@ pub fn build_relocation_table(
             continue;
         }
 
+        // Uninitialized sections normally hold no bytes on disk, so there is
+        // nothing to relocate.  But after a live-memory dump they DO hold
+        // bytes: a packed image's `.bss` is where the shell parks its
+        // initialised globals, and those globals are full of runtime pointers.
+        // Skipping them leaves absolute addresses baked at the dump-time base,
+        // which then point nowhere once the product loads elsewhere.
+        //
+        // Only skip when the section really is empty in the output buffer.
         let is_uninitialized = (section.characteristics & 0x00000080) != 0;
         if is_uninitialized {
-            continue;
+            let start = section.raw_offset as usize;
+            let end = start.saturating_add(section.raw_size as usize);
+            let has_data = end <= out_data.len()
+                && out_data[start..end].iter().any(|&b| b != 0);
+            if !has_data {
+                continue;
+            }
+            debug!(
+                section = %section.name,
+                "Uninitialized section carries dumped data — relocating it anyway"
+            );
         }
 
         // Skip the .reloc section itself
