@@ -478,8 +478,7 @@ pub(super) fn get_themida_section_bounds(state: &ThemidaState) -> (usize, usize)
 /// - Outside the image boundaries (for most DLLs; can be inside the image
 ///   for forwarded exports, but that's rare).
 /// - Not obviously a kernel address (for user-mode targets).
-pub(super) fn is_likely_api_address(addr: usize) -> bool {
-    // Must be above the low-memory region.
+pub(super) fn is_likely_api_address(addr: usize) -> bool {    // Must be above the low-memory region.
     if addr < 0x10000 {
         return false;
     }

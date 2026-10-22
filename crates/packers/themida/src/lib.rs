@@ -71,7 +71,8 @@ pub use text_tracer::{
     decide_text_trace_step, is_valid_x64_prologue_at, trace_until_real_oep, TextTraceDecision, is_oep_already_decrypted,
 };
 pub use trace_imports::{
-    is_at_themida_vm, trace_imports, trace_is_at_api, TraceImportResult, TraceStepDecision,
+    classify_iat_slot, is_at_themida_vm, trace_imports, trace_is_at_api, IatSlotDecision,
+    TraceImportResult, TraceStepDecision,
     // Instruction limit per trace step (used by text decrypt walk + IAT trace).
     TRACE_LIMIT,
 };

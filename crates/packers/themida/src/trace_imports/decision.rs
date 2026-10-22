@@ -2,7 +2,8 @@
 //! [`super::trace_one_slot`] and the external `handle_trace_step` in the CLI
 //! unpacker.
 //!
-//! Contains: [`TraceStepDecision`], [`trace_is_at_api`], [`is_real_api_address`].
+//! Contains: [`TraceStepDecision`], [`trace_is_at_api`], [`is_real_api_address`],
+//! [`IatSlotDecision`], [`classify_iat_slot`].
 
 use super::PTR_SIZE;
 
@@ -142,6 +143,96 @@ pub(crate) fn is_real_api_address(
 
 // Keep PTR_SIZE referenced so the import stays consistent with the module.
 const _: usize = PTR_SIZE;
+
+// ===========================================================================
+// IAT slot classification (v3 fragmented-IAT scan)
+// ===========================================================================
+
+/// Classification of one IAT slot value during the v3 trace scan.
+///
+/// Extracted from `trace_imports` so the taxonomy is unit-testable against
+/// real-world observed values (see `tests/regression_guoxing_shiguang.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IatSlotDecision {
+    /// Zero-valued block separator inside a fragmented v3 IAT.  Skip the slot
+    /// and reset the trash counter — zeros are NOT trash.
+    Separator,
+    /// Already-resolved API address (fully-relocated `0x7FFx_xxxx_xxxx`,
+    /// outside both the image and the Themida section).  Adopt as-is.
+    ///
+    /// **Regression guard:** the original scan counted these toward the trash
+    /// threshold and aborted at slot 142 of 1063 on the guoxing/时光 sample,
+    /// leaving ~900 slots — including the one behind `call [rip+disp]` at
+    /// `.text+0x3b63` — still holding Themida VM trampolines.  The dumped
+    /// image then crashed with 0xC0000005 on first launch.
+    Resolved { api: usize },
+    /// Obfuscated pointer inside the Themida VM — single-step trace from
+    /// `start` (the value as-is, already relocated).
+    Trace { start: usize },
+    /// Bare in-image RVA stored unrelocated (Themida v3 x64 occasionally
+    /// leaves slots as file-base-relative values).  Trace from
+    /// `image_base + rva`.
+    TraceRva { start: usize },
+    /// Non-zero value that is neither an API, nor in the image, nor in the
+    /// Themida section — data garbage.  Counts toward the trash threshold.
+    Trash,
+}
+
+/// Pure computation: classify one IAT slot value before the trace scan acts
+/// on it.
+///
+/// Ordering matters and mirrors the fixed `trace_imports` loop:
+///
+/// 1. `0` → [`IatSlotDecision::Separator`] (never trash — fragmented v3 IATs
+///    separate their blocks with zero runs).
+/// 2. In Themida section → [`IatSlotDecision::Trace`] (obfuscated import).
+/// 3. Outside image + plausible API range → [`IatSlotDecision::Resolved`]
+///    (Themida decrypts IAT blocks progressively; by trace time whole blocks
+///    may already be resolved).
+/// 4. In image but outside Themida section → [`IatSlotDecision::Trace`] if
+///    stored relocated, [`IatSlotDecision::TraceRva`] if stored as a bare RVA.
+/// 5. Everything else → [`IatSlotDecision::Trash`].
+#[must_use]
+pub fn classify_iat_slot(
+    value: usize,
+    themida_start: usize,
+    themida_end: usize,
+    image_base: usize,
+    image_boundary: usize,
+) -> IatSlotDecision {
+    if value == 0 {
+        return IatSlotDecision::Separator;
+    }
+
+    if value >= themida_start && value < themida_end {
+        return IatSlotDecision::Trace { start: value };
+    }
+
+    // Already-resolved API: same heuristic as `iat::fix::is_likely_api_address`
+    // (user-mode DLL range on x64/x86), inlined here so the classifier stays a
+    // dependency-free pure function.
+    let plausible_api = if cfg!(target_arch = "x86_64") {
+        (0x7ff0_0000_0000..0x0000_7FFF_FFFF_0000).contains(&value)
+    } else {
+        (0x6000_0000..0x7FFF_0000).contains(&value)
+    };
+    if plausible_api {
+        return IatSlotDecision::Resolved { api: value };
+    }
+
+    let in_image_ptr = value >= image_base && value < image_boundary;
+    let relocated = image_base.wrapping_add(value);
+    let in_image_rva = relocated >= image_base && relocated < image_boundary;
+
+    if in_image_ptr {
+        return IatSlotDecision::Trace { start: value };
+    }
+    if in_image_rva {
+        return IatSlotDecision::TraceRva { start: relocated };
+    }
+
+    IatSlotDecision::Trash
+}
 
 // ===========================================================================
 // Tests
@@ -330,5 +421,119 @@ mod tests {
             ),
             TraceStepDecision::Continue,
         );
+    }
+
+    // -- classify_iat_slot: regression fixtures from the guoxing/时光 V3 x64
+    //    case (2026-10-22).  Live runtime context of that sample:
+    //      image        0x7ff6f5d40000 .. 0x7ff6f6a68000
+    //      themida sect 0x7ff6f5ea8000 .. 0x7ff6f6a66800
+    //    These constants reproduce that run; the assertions freeze the
+    //    taxonomy that fixed the slot-142 trash-abort bug.
+
+    /// (image_base, image_boundary, themida_start, themida_end)
+    const SHIGUANG: (usize, usize, usize, usize) = (
+        0x0000_7FF6_F5D4_0000,
+        0x0000_7FF6_F6A6_8000,
+        0x0000_7FF6_F5EA_8000,
+        0x0000_7FF6_F6A6_6800,
+    );
+
+    #[test]
+    fn shiguang_zero_separator_is_not_trash() {
+        // Live slot 3 held 0 — under the old code it incremented trash_counter.
+        let d = classify_iat_slot(0, SHIGUANG.2, SHIGUANG.3, SHIGUANG.0, SHIGUANG.1);
+        assert_eq!(d, IatSlotDecision::Separator);
+    }
+
+    #[test]
+    fn shiguang_resolved_api_block_is_not_trash() {
+        // Live slots 130-142 held already-resolved API addresses like these
+        // (ntdll/KERNELBASE range) — the old code abort the scan here.
+        let samples = [
+            0x0000_7FFF_E3FC_B050usize,
+            0x0000_7FFF_E3FC_B180,
+            0x0000_7FFF_E3F6_D720,
+            0x0000_7FFF_E3FB_4FD0,
+        ];
+        for v in samples {
+            let d = classify_iat_slot(v, SHIGUANG.2, SHIGUANG.3, SHIGUANG.0, SHIGUANG.1);
+            assert_eq!(d, IatSlotDecision::Resolved { api: v }, "value {v:#x}");
+        }
+    }
+
+    #[test]
+    fn shiguang_vm_pointer_is_traced() {
+        // Live slot 0: 0x7ff6f6026454 — inside the Themida section.
+        let v = 0x0000_7FF6_F602_6454usize;
+        assert!(v >= SHIGUANG.2 && v < SHIGUANG.3);
+        let d = classify_iat_slot(v, SHIGUANG.2, SHIGUANG.3, SHIGUANG.0, SHIGUANG.1);
+        assert_eq!(d, IatSlotDecision::Trace { start: v });
+    }
+
+    #[test]
+    fn shiguang_data_garbage_is_trash() {
+        // Observed unresolvable pairs: 0x11303c0011303c / 0x11305000113050 —
+        // two packed 32-bit data offsets, neither API nor image pointer.
+        for v in [0x0000_0113_03C0_0113_03C0usize, 0x0000_0113_0500_0113_0500] {
+            let d = classify_iat_slot(v, SHIGUANG.2, SHIGUANG.3, SHIGUANG.0, SHIGUANG.1);
+            assert_eq!(d, IatSlotDecision::Trash, "value {v:#x}");
+        }
+    }
+
+    #[test]
+    fn shiguang_image_internal_pointer_resolved_on_x64() {
+        // On x64 the ASLR image base (0x7FF6_....) itself sits inside the
+        // plausible-API range, so a relocated in-image non-Themida pointer
+        // classifies as Resolved BEFORE the in-image Trace branch.  This is
+        // the exact ordering the successful 186-thunk run used — freeze it.
+        // (The Trace branch for raw in-image pointers only fires on x86-style
+        // bases, see `x86_style_image_pointer_is_traced` below.)
+        let v = SHIGUANG.0 + 0x5000; // inside .text, relocated
+        let d = classify_iat_slot(v, SHIGUANG.2, SHIGUANG.3, SHIGUANG.0, SHIGUANG.1);
+        assert_eq!(d, IatSlotDecision::Resolved { api: v });
+    }
+
+    #[test]
+    fn x86_style_image_pointer_is_traced() {
+        // x86-style base (0x400000) lies below the plausible-API range, so a
+        // relocated in-image pointer there must reach the Trace branch.
+        let d = classify_iat_slot(
+            0x0040_5000, // image 0x400000..0x500000, themida 0x410000..0x420000
+            0x0041_0000,
+            0x0042_0000,
+            0x0040_0000,
+            0x0050_0000,
+        );
+        assert_eq!(d, IatSlotDecision::Trace { start: 0x0040_5000 });
+    }
+
+    #[test]
+    fn bare_rva_gets_rebased_for_tracing() {
+        // Synthetic: file-base-relative value stored unrelocated.
+        // image 0x140000000..0x140D28000; rva 0x500000 → trace at 0x140500000.
+        let d = classify_iat_slot(
+            0x0050_0000,
+            0x1401_68000, // themida start (.winlice)
+            0x140D_28000, // themida end
+            0x1_4000_0000,
+            0x1_40D2_8000,
+        );
+        assert_eq!(d, IatSlotDecision::TraceRva { start: 0x1_4050_0000 });
+    }
+
+    #[test]
+    fn one_hundred_consecutive_resolved_slots_never_trash() {
+        // The core regression: a long run of already-resolved API addresses
+        // must classify as Resolved (never Trash), so the scan cannot abort
+        // mid-table the way it did at slot 142/1063.
+        for i in 0..100 {
+            let v = 0x0000_7FFF_E3F0_0000usize + i * 0x10;
+            let d = classify_iat_slot(v, SHIGUANG.2, SHIGUANG.3, SHIGUANG.0, SHIGUANG.1);
+            assert_eq!(
+                d,
+                IatSlotDecision::Resolved { api: v },
+                "slot offset {i} — a resolved run must never feed the trash counter"
+            );
+        }
     }
 }

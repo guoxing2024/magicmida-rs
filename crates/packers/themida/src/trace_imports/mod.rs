@@ -13,7 +13,8 @@
 //!
 //! ## Modules
 //!
-//! - [`decision`] — pure decision logic (`TraceStepDecision`, `trace_is_at_api`).
+//! - [`decision`] — pure decision logic (`TraceStepDecision`, `trace_is_at_api`,
+//!   `classify_iat_slot` / `IatSlotDecision` for the fragmented-IAT scan).
 //! - [`slot`] — the core single-slot trace loop (`trace_one_slot`).
 
 mod decision;
@@ -21,7 +22,9 @@ mod slot;
 
 // Re-export public API items used by external callers (lib.rs re-exports these
 // further).
-pub use decision::{trace_is_at_api, TraceStepDecision};
+pub use decision::{
+    classify_iat_slot, trace_is_at_api, IatSlotDecision, TraceStepDecision,
+};
 // is_real_api_address is only used internally by tests but keep it accessible.
 #[cfg(test)]
 pub(crate) use decision::is_real_api_address;
@@ -105,8 +108,18 @@ pub fn is_at_themida_vm(debugger: &dyn DebuggerCore, ip: usize) -> bool {
     }
 }
 
-/// Maximum number of consecutive invalid/zero IAT slots before we give up
-/// and assume we've reached the end of the table.
+/// Maximum number of consecutive non-API / non-Themida-stub slots before
+/// we give up and assume we've reached the end of the table.
+///
+/// **Zero-valued slots are NOT counted** — a Themida v3 IAT is frequently
+/// fragmented into multiple blocks separated by runs of zeros (this target
+/// had 14 blocks / 1063 slots, with slot 3 and every block boundary being 0).
+/// Treating zeros as "trash" aborted the trace at slot 141 and left ~900
+/// slots — including the one behind `call [rip+disp]` at `.text+0x3b63` —
+/// still holding Themida VM trampolines, which crashes the dumped image.
+///
+/// Only consecutive **non-zero, non-Themida** values end the scan: those are
+/// the marker of "we walked past the table into unrelated data".
 const TRASH_THRESHOLD: usize = 64;
 
 /// Default single-step limit per IAT slot.  The Pascal reference uses 500 000.
@@ -224,103 +237,126 @@ pub fn trace_imports(
             );
         }
 
-        let in_themida = current >= tm_start && current < tm_end;
-
-        if !in_themida || current == 0 {
-            trash_counter += 1;
-            if trash_counter > TRASH_THRESHOLD {
+        // Classify the slot (pure function — see decision::classify_iat_slot
+        // and tests/regression_guoxing_shiguang.rs for the frozen taxonomy).
+        match decision::classify_iat_slot(current, tm_start, tm_end, image_base, image_boundary) {
+            IatSlotDecision::Separator => {
+                // Block separator inside a fragmented v3 IAT — reset the trash
+                // counter and keep scanning the remaining blocks.
+                trash_counter = 0;
+                continue;
+            }
+            IatSlotDecision::Resolved { api } => {
+                // Themida decrypts IAT blocks progressively; by trace time
+                // whole blocks may already be resolved.  Adopt as-is — these
+                // are NOT trash (regression: slot-142 abort, see tests).
+                iat_data[i] = api;
+                resolved_count += 1;
+                trash_counter = 0;
+                log(
+                    LogMsgType::Good,
+                    &format!("IAT[{i}] {slot_va:#x}: already resolved → {api:#x}"),
+                );
+                continue;
+            }
+            IatSlotDecision::Trash => {
+                trash_counter += 1;
+                if trash_counter > TRASH_THRESHOLD {
+                    log(
+                        LogMsgType::Info,
+                        &format!("Trash threshold ({TRASH_THRESHOLD}) exceeded at slot {i} — stopping IAT trace"),
+                    );
+                    break;
+                }
+                continue;
+            }
+            IatSlotDecision::Trace { start } | IatSlotDecision::TraceRva { start } => {
+                let trace_start = start as u64;
                 log(
                     LogMsgType::Info,
-                    &format!("Trash threshold ({TRASH_THRESHOLD}) exceeded at slot {i} — stopping IAT trace"),
+                    &format!("Tracing IAT slot {i} ({slot_va:#x}) from {current:#x} (trace_start={trace_start:#x})"),
                 );
-                break;
-            }
-            continue;
-        }
+                trash_counter = 0;
 
-        log(
-            LogMsgType::Info,
-            &format!("Tracing IAT slot {i} ({slot_va:#x}) from {current:#x}"),
-        );
-        trash_counter = 0;
+                if debugger.get_thread_context(main_thread_id).is_err() {
+                    log(
+                        LogMsgType::Info,
+                        &"Debug session ended — skipping remaining IAT slots".to_string(),
+                    );
+                    break;
+                }
 
-        if debugger.get_thread_context(main_thread_id).is_err() {
-            log(
-                LogMsgType::Info,
-                &"Debug session ended — skipping remaining IAT slots".to_string(),
-            );
-            break;
-        }
+                state.traced_api = 0;
+                state.trace_in_vm = false;
 
-        state.traced_api = 0;
-        state.trace_in_vm = false;
+                match slot::trace_one_slot(
+                    debugger,
+                    state,
+                    trace_start,
+                    main_thread_id,
+                    tm_start,
+                    tm_end,
+                    image_base,
+                    image_boundary,
+                    log,
+                ) {
+                    Ok(()) => {
+                        if state.trace_in_vm {
+                            if !did_set_exit_process {
+                                did_set_exit_process = true;
+                                let real_exit_process = resolve_exit_process();
+                                iat_data[i] = real_exit_process;
+                                resolved_count += 1;
+                                log(
+                                    LogMsgType::Info,
+                                    &format!("IAT[{i}] {slot_va:#x}: VM entry → ExitProcess ({real_exit_process:#x})"),
+                                );
+                            } else {
+                                failed_count += 1;
+                                failed_slots.push(i);
+                                log(
+                                    LogMsgType::Fatal,
+                                    &format!("IAT[{i}] {slot_va:#x}: trace entered VM — giving up"),
+                                );
+                            }
+                        } else if state.traced_api != 0 {
+                            let api = state.traced_api;
 
-        match slot::trace_one_slot(
-            debugger,
-            state,
-            current as u64,
-            main_thread_id,
-            tm_start,
-            tm_end,
-            image_base,
-            image_boundary,
-            log,
-        ) {
-            Ok(()) => {
-                if state.trace_in_vm {
-                    if !did_set_exit_process {
-                        did_set_exit_process = true;
-                        let real_exit_process = resolve_exit_process();
-                        iat_data[i] = real_exit_process;
-                        resolved_count += 1;
-                        log(
-                            LogMsgType::Info,
-                            &format!("IAT[{i}] {slot_va:#x}: VM entry → ExitProcess ({real_exit_process:#x})"),
-                        );
-                    } else {
+                            if api < 0x10000 || (api >= image_base && api < image_boundary) {
+                                log(
+                                    LogMsgType::Info,
+                                    &format!(
+                                        "IAT[{i}] {slot_va:#x}: discarding result {api:#x} \
+                                         (in image range or too low), aborting IAT tracing"
+                                    ),
+                                );
+                                break;
+                            }
+
+                            iat_data[i] = api;
+                            resolved_count += 1;
+                            log(
+                                LogMsgType::Good,
+                                &format!("IAT[{i}] {slot_va:#x}: {current:#x} → {api:#x}"),
+                            );
+                        } else {
+                            failed_count += 1;
+                            failed_slots.push(i);
+                            log(
+                                LogMsgType::Fatal,
+                                &format!("IAT[{i}] {slot_va:#x}: tracing completed but no API resolved"),
+                            );
+                        }
+                    }
+                    Err(e) => {
                         failed_count += 1;
                         failed_slots.push(i);
                         log(
                             LogMsgType::Fatal,
-                            &format!("IAT[{i}] {slot_va:#x}: trace entered VM — giving up"),
+                            &format!("IAT[{i}] {slot_va:#x}: tracer error: {e}"),
                         );
                     }
-                } else if state.traced_api != 0 {
-                    let api = state.traced_api;
-
-                    if api < 0x10000 || (api >= image_base && api < image_boundary) {
-                        log(
-                            LogMsgType::Info,
-                            &format!(
-                                "IAT[{i}] {slot_va:#x}: discarding result {api:#x} \
-                                 (in image range or too low), aborting IAT tracing"
-                            ),
-                        );
-                        break;
-                    }
-
-                    iat_data[i] = api;
-                    resolved_count += 1;
-                    log(
-                        LogMsgType::Good,
-                        &format!("IAT[{i}] {slot_va:#x}: {current:#x} → {api:#x}"),
-                    );
-                } else {
-                    failed_count += 1;
-                    failed_slots.push(i);
-                    log(
-                        LogMsgType::Fatal,
-                        &format!("IAT[{i}] {slot_va:#x}: tracing completed but no API resolved"),
-                    );
                 }
-            }
-            Err(e) => {
-                failed_count += 1;
-                failed_slots.push(i);
-                log(
-                    LogMsgType::Fatal,
-                    &format!("IAT[{i}] {slot_va:#x}: tracer error: {e}"),
-                );
             }
         }
     }

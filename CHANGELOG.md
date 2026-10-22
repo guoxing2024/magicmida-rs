@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **IAT trace aborted early on fragmented v3 IATs** (`trace_imports`): the
+  trash-threshold counter treated already-resolved API addresses
+  (`0x7FFx_xxxx_xxxx`, whole blocks decrypted by Themida before the trace ran)
+  as garbage, aborting the scan at slot 142 of 1063 on a real-world V3 x64
+  target.  ~900 slots — including the slot behind `call [rip+disp]` at
+  `.text+0x3b63` — kept VM trampolines and the dumped image crashed with
+  0xC0000005 on launch.  Slot classification is now a pure function
+  (`classify_iat_slot` / `IatSlotDecision`): zero runs are separators (not
+  trash), resolved blocks are adopted, VM pointers are traced, bare in-image
+  RVAs are rebased before tracing.  On the reference sample: 50→186 resolved
+  imports, 8→9 modules (shell32 restored), unpacked binary launches.
 - Replaced x86 ScyllaHide SHA-256 placeholder hashes with all-zero placeholders
   that will fail verification until real hashes are configured (P0-3).
 - Fixed UTF-8 mojibake (`鈥` → `—`, `鈫` → `→`) in source comments across
@@ -29,6 +40,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and added it to `.gitignore` (P1-5).
 
 ### Added
+- **Regression fixtures for the first fully-successful real-world case**
+  (`crates/packers/themida/tests/regression_guoxing_shiguang.rs` + unit tests
+  in `trace_imports::decision`): the packed sample's 16-section Themida v3 x64
+  fingerprint (blank 8-space section names, `.winlice`/`.boot` memory-only
+  stubs, OEP entering the VM via `call rel32`), the runtime Themida/IAT bounds,
+  the observed slot-value taxonomy (zero separators, decrypted API blocks,
+  VM trampolines, packed-32-bit data garbage), and the golden before/after
+  metrics (50→186 resolved, 8→9 modules, crash slot `0x113C48` →
+  `SetProcessDPIAware`).  11 integration tests + 8 classifier tests, all
+  sample-free.
 - Created `CHANGELOG.md` documenting project history (P2-12).
 - Added DLL target limitation to README Known limitations section (P1-7).
 
