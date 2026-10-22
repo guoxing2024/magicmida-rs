@@ -21,3 +21,21 @@ pub use process::{
     CreateProcessOptions, TargetProcess,
 };
 pub use windows_debugger::WindowsDebugger;
+
+/// Log-message severity levels used by the trace loops.
+///
+/// Corresponds to `TLogMsgType` in the Pascal reference (`Utils.pas`).
+///
+/// This lives here rather than in `mida-tracer` because every consumer
+/// (`packers/themida`, `cli`) needs only this enum — not the `Tracer` engine,
+/// which has no production call sites.  Keeping the enum in `core` removes a
+/// whole crate dependency edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogMsgType {
+    /// General informational message.
+    Info,
+    /// Positive / success message.
+    Good,
+    /// Fatal error — execution cannot continue.
+    Fatal,
+}

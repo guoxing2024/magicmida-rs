@@ -134,10 +134,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "mida-core",
- "mida-disasm",
  "mida-packers-themida",
  "mida-pe",
- "mida-tracer",
  "tracing",
  "tracing-subscriber",
  "windows",
@@ -170,7 +168,6 @@ dependencies = [
  "mida-core",
  "mida-disasm",
  "mida-pe",
- "mida-tracer",
  "sha2",
  "thiserror",
  "tracing",
@@ -182,19 +179,7 @@ name = "mida-pe"
 version = "0.1.0"
 dependencies = [
  "mida-core",
- "mida-disasm",
  "pelite",
- "thiserror",
- "tracing",
- "windows",
-]
-
-[[package]]
-name = "mida-tracer"
-version = "0.1.0"
-dependencies = [
- "mida-core",
- "mida-disasm",
  "thiserror",
  "tracing",
  "windows",

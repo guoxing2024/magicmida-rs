@@ -164,6 +164,21 @@ pub fn take_module_snapshot(
     // SAFETY: h_snap is a valid snapshot handle.
     unsafe { let _ = CloseHandle(h_snap); }
 
+    // 4. Sort by module base address.
+    //
+    // `TH32CS_SNAPMODULE` enumeration order is the loader's load order, which is
+    // NOT stable across runs: the OS resolves some DLL dependencies
+    // asynchronously, so the same target can produce different orderings.  The
+    // ordering leaks into the output because import thunks are emitted per
+    // module in snapshot order.  Sorting by base makes the snapshot (and hence
+    // the dumped import table) reproducible for a given target state.
+    //
+    // Note: the *content* of a live-memory dump is still not bit-reproducible
+    // in general -- see the TLS `EndRawData` field, which Themida updates
+    // lazily.  Use a semantic fingerprint (see `fingerprint` module) rather
+    // than a whole-file hash as a regression criterion.
+    modules.sort_by_key(|m| m.base);
+
     debug!(
         module_count = modules.len(),
         "Module snapshot complete"

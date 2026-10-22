@@ -6,7 +6,7 @@
 use tracing::debug;
 
 use mida_core::debugger::{ContinueStatus, DebugEvent, DebuggerCore};
-use mida_tracer::LogMsgType;
+use mida_core::LogMsgType;
 
 use crate::common::ThemidaState;
 use crate::error::ThemidaError;

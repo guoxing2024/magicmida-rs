@@ -30,7 +30,7 @@ pub use decision::{
 pub(crate) use decision::is_real_api_address;
 
 use mida_core::debugger::{DebugEvent, DebuggerCore};
-use mida_tracer::LogMsgType;
+use mida_core::LogMsgType;
 
 use crate::common::ThemidaState;
 use crate::error::ThemidaError;
@@ -166,7 +166,7 @@ pub struct TraceImportResult {
 /// * `state` — mutable unpacker state (`traced_api`, `trace_start_sp`, etc.).
 /// * `iat` — location of the Import Address Table in the target.
 /// * `main_thread_id` — ID of the main (only) thread in the debuggee.
-/// * `log` — log callback (same signature as `mida_tracer::LogMsgType`).
+/// * `log` — log callback (same signature as `mida_core::LogMsgType`).
 ///
 /// # Errors
 ///

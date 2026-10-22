@@ -363,7 +363,7 @@ pub fn fix_iat_v3(
     main_thread_id: u32,
 ) -> Result<(), ThemidaError> {
     use crate::trace_imports::trace_imports;
-    use mida_tracer::LogMsgType;
+    use mida_core::LogMsgType;
 
     // Resolve anti-trace API addresses in the host process (valid in the
     // target because kernel32 is loaded at a per-system ASLR base).

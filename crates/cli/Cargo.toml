@@ -10,8 +10,6 @@ readme.workspace = true
 [dependencies]
 mida-core = { path = "../core" }
 mida-pe = { path = "../pe" }
-mida-disasm = { path = "../disasm" }
-mida-tracer = { path = "../tracer" }
 mida-packers-themida = { path = "../packers/themida" }
 anyhow = { workspace = true }
 tracing = { workspace = true }

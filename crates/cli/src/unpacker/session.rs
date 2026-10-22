@@ -137,41 +137,16 @@ impl DebuggerCore for ProcessSession {
 }
 
 // ---------------------------------------------------------------------------
-// CONTEXT_CONTROL fast-path helpers
+// CONTEXT_CONTROL fast-path helper
 // ---------------------------------------------------------------------------
 
-/// Fast `GetThreadContext` with `CONTEXT_CONTROL` only.
-///
-/// Avoids `ERROR_PARTIAL_COPY` on protector-packaged targets where
-/// `CONTEXT_ALL` triggers a partial-copy error even though the kernel has
-/// successfully filled the control registers.
-pub(super) fn get_thread_context_control(
-    dbg: &ProcessSession,
-    thread_id: u32,
-) -> Result<windows::Win32::System::Diagnostics::Debug::CONTEXT, anyhow::Error> {
-    use windows::Win32::System::Diagnostics::Debug::{CONTEXT_CONTROL_AMD64, GetThreadContext};
-
-    let h = dbg.thread_handle(thread_id).map_err(|e| anyhow!("{e}"))?;
-    let mut ctx: windows::Win32::System::Diagnostics::Debug::CONTEXT =
-        // SAFETY: CONTEXT is repr(C); zeroing produces a valid all-zero struct that GetThreadContext will populate.
-        unsafe { std::mem::zeroed() };
-    #[cfg(target_arch = "x86_64")]
-    {
-        ctx.ContextFlags = CONTEXT_CONTROL_AMD64;
-    }
-    #[cfg(target_arch = "x86")]
-    {
-        ctx.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_X86;
-    }
-    // SAFETY: h is a valid thread handle with THREAD_GET_CONTEXT rights; ctx is a writable CONTEXT initialised with the right flags.
-    unsafe {
-        GetThreadContext(h, &mut ctx)
-            .map_err(|e| anyhow!("GetThreadContext failed: {e}"))?;
-    }
-    Ok(ctx)
-}
-
 /// Fast `SetThreadContext` with pre-filled `CONTEXT_CONTROL` flags.
+///
+/// The matching read path goes through
+/// [`DebuggerCore::get_thread_context_control`](mida_core::DebuggerCore), which
+/// is already the narrow `CONTEXT_CONTROL`-only read that avoids
+/// `ERROR_PARTIAL_COPY` on protector-packaged targets.  There used to be a
+/// free-function duplicate here with no call sites; it was removed.
 pub(super) fn set_thread_context_control(
     dbg: &ProcessSession,
     thread_id: u32,

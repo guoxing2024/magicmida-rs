@@ -3,7 +3,6 @@ members = [
     "crates/core",
     "crates/pe",
     "crates/disasm",
-    "crates/tracer",
     "crates/packers/themida",
     "crates/cli",
 ]

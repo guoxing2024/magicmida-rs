@@ -13,4 +13,3 @@ pelite = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 windows = { workspace = true }
-mida-disasm = { path = "../disasm" }

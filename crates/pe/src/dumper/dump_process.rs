@@ -9,7 +9,6 @@ use tracing::{debug, info, warn};
 
 use crate::error::PeError;
 use crate::header::PeHeader;
-use crate::import_table::ImportTableBuilder;
 use crate::original_imports::{read_original_import_table, resolve_imports_via_getprocaddress};
 
 use super::header_patch::{shrink_sections, validate_and_patch_pe_header};
@@ -147,6 +146,18 @@ pub fn dump_process(
         warn!(expected = dump_size, actual = read, "Short read on dump image");
     }
 
+    // 4a. Normalise the TLS directory before anything reads it.
+    //
+    // Themida updates `EndRawData` lazily during startup, so a live-memory dump
+    // can capture an intermediate value.  Observed on the reference v3 x64
+    // target: the same binary produced `EndRawData = StartRawData + 0x8` on some
+    // runs and `+ 0x8008` on others -- a 0x8000 (one allocation granularity)
+    // overshoot.  That made the whole-file SHA-256 non-reproducible and is a
+    // genuine semantic defect: a TLS template 32 KB long instead of 8 bytes.
+    //
+    // The template length is fixed by the protected input, so clamp it there.
+    normalize_tls_directory(&mut pe, &mut dump_buf, opts.executable_path.as_deref(), is_64bit);
+
     // 4b. Create .pdata and .reloc sections
     if opts.shrink {
         if let Some((exc_rva, exc_size)) = saved_exception_rva {
@@ -202,6 +213,148 @@ pub fn dump_process(
     );
 
     Ok(())
+}
+
+// -----------------------------------------------------------------------
+// normalize_tls_directory
+// -----------------------------------------------------------------------
+
+/// Clamp the dumped TLS template length to the value the protected input
+/// declares, neutralising Themida's lazily-updated `EndRawData`.
+///
+/// # Why this is needed
+///
+/// `IMAGE_TLS_DIRECTORY.EndRawData` bounds the TLS template that the loader
+/// copies per thread.  Themida rewrites it during startup, and the rewrite is
+/// not atomic with respect to a live-memory dump: on the reference target the
+/// same binary yielded `StartRawData + 0x8` on some runs and
+/// `StartRawData + 0x8008` on others.  Both products launch, but the second is
+/// semantically wrong (a 32 KB TLS template instead of 8 bytes) and it made the
+/// output SHA-256 non-reproducible, which broke the whole "compare the golden
+/// hash" regression approach.
+///
+/// # Strategy
+///
+/// The template length is a property of the original binary, so read it from
+/// `executable_path` when available.  Fall back to clamping against the dumped
+/// `.tls` section extent when the input cannot be read.  Either way we only
+/// ever *shrink* an out-of-range `EndRawData`; a plausible value is left alone.
+fn normalize_tls_directory(
+    pe: &mut PeHeader,
+    dump_buf: &mut [u8],
+    executable_path: Option<&Path>,
+    is_64bit: bool,
+) {
+    const IMAGE_DIRECTORY_ENTRY_TLS: usize = 9;
+
+    let tls_dir = pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_TLS];
+    if tls_dir.virtual_address == 0 {
+        return;
+    }
+
+    let Some(dir_off) = pe.rva_to_offset(tls_dir.virtual_address).map(|o| o as usize) else {
+        debug!("TLS directory RVA {:#x} is not file-backed, skipping normalisation", tls_dir.virtual_address);
+        return;
+    };
+
+    let ptr_size = if is_64bit { 8 } else { 4 };
+    // StartRawData, EndRawData, AddressOfIndex, AddressOfCallbacks.
+    let end_off = dir_off + ptr_size;
+    if end_off + ptr_size > dump_buf.len() {
+        return;
+    }
+
+    let read_ptr = |buf: &[u8], off: usize| -> u64 {
+        if ptr_size == 8 {
+            u64::from_le_bytes(buf[off..off + 8].try_into().unwrap_or([0u8; 8]))
+        } else {
+            u32::from_le_bytes(buf[off..off + 4].try_into().unwrap_or([0u8; 4])) as u64
+        }
+    };
+
+    let start = read_ptr(dump_buf, dir_off);
+    let end = read_ptr(dump_buf, end_off);
+    if start == 0 || end <= start {
+        return;
+    }
+
+    // Authoritative template length: whatever the protected input declares.
+    // The input's own TLS directory is often obfuscated, so treat "cannot read"
+    // as "unknown" rather than failing.
+    let declared_len = executable_path.and_then(|p| read_declared_tls_template_len(p, is_64bit));
+
+    // Fallback bound: the dumped .tls section must contain the template.
+    let section_bound = pe
+        .get_section_by_rva(start as u32)
+        .map(|s| (s.virtual_address as u64) + (s.virtual_size as u64))
+        .unwrap_or(u64::MAX);
+
+    let limit = match declared_len {
+        Some(len) => start.saturating_add(len),
+        None => section_bound,
+    };
+
+    if end <= limit {
+        return; // plausible; leave as-is
+    }
+
+    let new_end = limit;
+    let bytes = if ptr_size == 8 {
+        new_end.to_le_bytes().to_vec()
+    } else {
+        (new_end as u32).to_le_bytes().to_vec()
+    };
+    dump_buf[end_off..end_off + ptr_size].copy_from_slice(&bytes);
+
+    info!(
+        old_end = format_args!("{end:#x}"),
+        new_end = format_args!("{new_end:#x}"),
+        start = format_args!("{start:#x}"),
+        declared = ?declared_len,
+        "Normalised TLS EndRawData (Themida lazy update overshoot)"
+    );
+}
+
+/// Read the TLS template length declared by the protected input file.
+///
+/// Returns `None` when the input has no TLS directory, the directory is not
+/// file-backed, or the values look obfuscated (Themida sometimes leaves
+/// `0x20202020` filler in the data directory).
+fn read_declared_tls_template_len(path: &Path, is_64bit: bool) -> Option<u64> {
+    const IMAGE_DIRECTORY_ENTRY_TLS: usize = 9;
+
+    let data = std::fs::read(path).ok()?;
+    let pe = PeHeader::from_bytes(&data).ok()?;
+    let tls_dir = pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_TLS];
+    if tls_dir.virtual_address == 0 {
+        return None;
+    }
+    let dir_off = pe.rva_to_offset(tls_dir.virtual_address)? as usize;
+    let ptr_size = if is_64bit { 8 } else { 4 };
+    let end_off = dir_off + ptr_size;
+    if end_off + ptr_size > data.len() {
+        return None;
+    }
+
+    let read_ptr = |off: usize| -> u64 {
+        if ptr_size == 8 {
+            u64::from_le_bytes(data[off..off + 8].try_into().unwrap_or([0u8; 8]))
+        } else {
+            u32::from_le_bytes(data[off..off + 4].try_into().unwrap_or([0u8; 4])) as u64
+        }
+    };
+
+    let start = read_ptr(dir_off);
+    let end = read_ptr(end_off);
+    if start == 0 || end <= start {
+        return None;
+    }
+    let len = end - start;
+    // Reject obviously bogus values (obfuscated filler, or absurdly large).
+    if len > 0x100_000 {
+        return None;
+    }
+    Some(len)
 }
 
 /// Debug helper: verify section 1 characteristics in the output buffer.

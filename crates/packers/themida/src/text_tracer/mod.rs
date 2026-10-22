@@ -16,7 +16,7 @@
 //!
 //! ## Reference
 //!
-//! - `Tracer.pas`                     → generic single-step loop (`mida-tracer`).
+//! - `Tracer.pas`                     → generic single-step loop (inlined per-slot; see `trace_imports/slot.rs`).
 //! - `Themida.pas` / `Themida64.pas` → `TraceIsAtAPI` anti-trace / VM logic;
 //!                                      this module borrows the same shape but
 //!                                      with a different *stop* condition.
@@ -44,7 +44,7 @@ use mida_disasm::Disassembler;
 use tracing::debug;
 use windows::Win32::System::Diagnostics::Debug::CONTEXT;
 
-use mida_tracer::LogMsgType;
+use mida_core::LogMsgType;
 
 use crate::error::ThemidaError;
 use crate::trace_imports::{is_at_themida_vm, set_trap_flag, TRACE_LIMIT};
