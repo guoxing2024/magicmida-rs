@@ -108,7 +108,14 @@ pub fn shrink_pe(pe: &mut PeHeader) -> Result<usize, ThemidaError> {
 
     helpers::recalc_size_of_image(pe);
 
-    info!(removed, "Shrink complete");
+    // This counts sections dropped from the *in-memory* PE model before dumping.
+    // The dump stage runs its own shrink over the header it read from the live
+    // process and reports a separate count; the two are not expected to match.
+    // Label them distinctly so a log reader does not see a contradiction.
+    info!(
+        removed_from_pe_model = removed,
+        "shrink_pe: dropped sections from the PE model"
+    );
     Ok(removed)
 }
 

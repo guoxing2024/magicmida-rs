@@ -171,5 +171,5 @@ fn compact_section_vas(pe: &mut PeHeader, removed_ranges: &[(u32, u32)], removed
             }
         }
     }
-    info!("Shrink complete: removed {} sections, VAs compacted, SizeOfImage: {:#x}", removed, max_end);
+    info!("Dump-stage shrink: removed {} section(s) from the live header, VAs compacted, SizeOfImage: {:#x}", removed, max_end);
 }

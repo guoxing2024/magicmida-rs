@@ -1,0 +1,36 @@
+# Case manifest — reference Themida v3 x64 case
+#
+# This file is the single source of truth for the sample identity and the
+# frozen metrics of the only fully-successful end-to-end unpack.
+#
+# Why a manifest instead of constants in the test:
+#   Rotating a sample, or recording a new golden record after a deliberate
+#   behaviour change, must be a manifest edit — reviewable in isolation — not a
+#   silent edit to a test file.  The upstream project enforces "no sample hashes
+#   in production code"; this keeps the same spirit for test code.
+#
+# Format: `key: value`, one per line, `#` starts a comment.
+# The gate refuses to run when `sample_sha256` does not match the file on disk.
+
+case_id: guoxing_shiguang
+
+# --- protected input -------------------------------------------------------
+sample_path: D:\Projects\shiguang\时光一键宏.exe
+sample_sha256: 7800980301207bf2f851d00a50f7f18e0dcd61a0f2b1581ca609ddcc0f2f1ea7
+sample_size: 5793808
+
+# --- frozen pipeline metrics (log lines: `IAT trace complete`,
+#     `Import table reconstructed`, `IAT boundaries`) ------------------------
+expect_resolved: 186
+expect_failed: 8
+expect_module_count: 9
+expect_thunk_count: 186
+expect_iat_slots: 1063
+
+# --- product ---------------------------------------------------------------
+expect_output_size: 1539584
+#
+# Set to `none` to disable the byte-level check for a case that is legitimately
+# non-reproducible (e.g. one whose dump picks up a lazily-updated field).  The
+# structural checks still run.  Leave a real hash here for cases that are.
+expect_output_sha256: 75c1af1b2c539c35f10e368858bca394bc8ebd6fb3cc964dc7cf9d77ada4810a

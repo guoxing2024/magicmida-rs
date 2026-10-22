@@ -1,4 +1,4 @@
-﻿# Magicmida-RS
+# Magicmida-RS
 
 Themida automatic unpacker, Rust reimplementation.
 
@@ -6,9 +6,31 @@ Based on the reverse engineering of [Hendi48/Magicmida](https://github.com/Hendi
 the entire unpacking pipeline is rewritten in Rust for safer memory management,
 better error handling, and a modular architecture.
 
+> ## ⚠️ Scope of this branch
+>
+> **This branch is an experimental sandbox forked from the upstream project on
+> 2026-07-09, not the project's mainline.** It does not track upstream and does
+> not represent the project's capability. See
+> [`BRANCH_DECISION.md`](../BRANCH_DECISION.md) for the rationale and for the
+> list of assets worth porting back upstream.
+>
+> Everything below describes **what has actually been measured on this branch**.
+> Anything not verified is marked as such rather than advertised.
+
+## Verified capability
+
+| Target | Status | Evidence |
+|---|---|---|
+| **Themida v3, x64, EXE** | ✅ Works | 186 imports / 9 modules / product launches to its auth window. Frozen as a gate: `crates/packers/themida/tests/e2e_gate.rs` |
+| Themida v3, **x86** | ❓ **Unverified** | The x86 code path has never been compiled on the dev machine (`rustup` only has `x86_64-pc-windows-gnu`), and the x86 ScyllaHide hashes in `binaries.rs` are all-zero placeholders, so `verify_sha256` would reject them |
+| Themida **v1 / v2** | ❓ **No evidence** | No sample, no test |
+| **DLL** targets | ❌ Not supported | The CLI now rejects `.dll` input explicitly; the DLL stub calls `ExitProcess` instead of `DllMain` |
+
+Only the first row has an automated end-to-end gate. Treat the rest as
+untested.
+
 ## Features
 
-- **Themida v1/v2/v3** detection and unpacking (x86 & x64)
 - **Runtime IAT reconstruction** — resolves imports via live memory tracing
 - **OEP discovery** — MSVC CRT startup pattern matching, Go/Delphi heuristics
 - **ScyllaHide integration** — bypasses anti-debugging on newer Themida builds
@@ -152,21 +174,27 @@ user-downloaded and verified at runtime via SHA-256 checksums (see
 
 ## Supported Targets
 
+**Only one combination is verified.** The table below separates "the code path
+exists" from "somebody ran it and checked the result".
+
 | Themida Version | x86 | x64 | Notes |
 |---|---|---|---|
-| **V1** (Ancient) | ✅ | — | Legacy Themida. |
-| **V2** | ✅ | — | Detected by dual `0x1000`-sized stub sections. |
-| **V3** | ✅ | ✅ | Current generation. x64 is always V3. Requires ScyllaHide. |
+| **V1** (Ancient) | ❓ unverified | — | Detection code exists; never run on a real sample. |
+| **V2** | ❓ unverified | — | Detected by dual `0x1000`-sized stub sections; never run on a real sample. |
+| **V3** | ❓ unverified | ✅ **verified** | x64 is always V3. Requires ScyllaHide. This is the only gated case. |
 
 **Known limitations:**
 
+- **x86 is untested.** The x86 build has never been compiled on the dev machine,
+  and the x86 ScyllaHide SHA-256 values in `binaries.rs` are all-zero
+  placeholders that `verify_sha256` rejects by design. Populate them before
+  claiming x86 support.
 - Themida v3 x86 with heavy VM obfuscation may require runtime heuristics that
   static analysis alone cannot resolve (`ThemidaVersion::Unknown`).
 - Import resolution for fully virtualized IAT (v3 VM-strong) may produce
   incomplete results; the original PE's import table is used as a fallback.
-- **DLL (.dll) targets**: not fully supported. The DLL stub calls
-  `ExitProcess` instead of `DllMain`, so the unpacked DLL won't load correctly
-  as a proper DLL. Use the unpacker primarily for `.exe` targets.
+- **DLL (.dll) targets**: rejected up front. The DLL stub calls `ExitProcess`
+  instead of `DllMain`, so an unpacked DLL would not load as a proper DLL.
 - **Relocation table generation** — scans non-executable sections for absolute
   addresses, builds a complete `.reloc` table, and enables ASLR (`DYNAMIC_BASE`).
   The table is clamped to fit the available VA space between `.reloc` and the

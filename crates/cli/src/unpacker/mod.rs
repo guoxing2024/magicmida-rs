@@ -109,11 +109,34 @@ pub fn unpack(
     // ---- step 1: resolve output path ----
     let output_path = resolve_output_path(input, output);
 
+    // ---- step 1b: reject DLL targets up front ----
+    //
+    // A Themida-packed DLL's stub calls `ExitProcess` instead of `DllMain`, so
+    // the debug loop never reaches a usable OEP and the pipeline either hangs or
+    // emits a DLL that cannot be loaded.  Refuse instead of burning minutes.
+    // (Observed: a 6 MB `core.dll` sat for >10 minutes before being killed by
+    // hand.)  The `is_dll` flag is still propagated to CreateProcessOptions for
+    // the .NET path, which does handle DLLs.
+    let looks_like_dll = input
+        .extension()
+        .map(|e| e.eq_ignore_ascii_case("dll"))
+        .unwrap_or(false);
+
     // ---- step 2: parse PE header ----
     log::log(LogType::Info, &format!("Loading: {}", input.display()));
 
     let mut pe = PeHeader::from_file(input)
         .map_err(|e| anyhow!("Failed to parse PE header: {e}"))?;
+
+    if looks_like_dll && pe.nt_headers.optional_header.data_directory[14].virtual_address == 0 {
+        return Err(anyhow!(
+            "Refusing to unpack a native DLL target: {}.\n\
+             Themida's DLL stub calls ExitProcess instead of DllMain, so no usable \
+             OEP is reached and the result cannot be loaded. Only EXE targets are \
+             supported (see README \"Verified capability\").",
+            input.display()
+        ));
+    }
 
     let is_64bit = pe.is_64bit;
     debug!(is_64bit, "PE architecture");
@@ -756,7 +779,7 @@ fn run_post_loop_phases(
 
     if shrink {
         match shrink_pe(pe) {
-            Ok(removed) => log::log(LogType::Info, &format!("Removed {removed} Themida sections")),
+            Ok(removed) => log::log(LogType::Info, &format!("PE model shrink: dropped {removed} Themida section(s)")),
             Err(e) => warn!("shrink_pe failed (non-fatal): {e}"),
         }
     }
