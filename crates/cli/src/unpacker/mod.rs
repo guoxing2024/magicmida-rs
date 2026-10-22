@@ -1,4 +1,4 @@
-﻿//! Themida unpacker main flow — ties together all modules.
+//! Themida unpacker main flow — ties together all modules.
 //!
 //! ## Reference
 //!
@@ -25,7 +25,6 @@
 //! ```
 
 mod session;
-mod iat_trace;
 mod oep_scan;
 mod verify;
 mod dump;
@@ -52,7 +51,6 @@ use mida_packers_themida::{
 use crate::log::{self, LogType};
 
 use session::ProcessSession;
-use iat_trace::{IatTraceState, TracePhase, handle_trace_step};
 use oep_scan::scan_live_memory_for_real_oep;
 use helpers::{
     scylla_injector_path, scylla_hook_path, resolve_output_path, resolve_api_addrs,
@@ -76,7 +74,9 @@ struct LoopState {
     oep_found_via_scanning: bool,
     virtualized_oep_retries: u32,
     last_possible_oep: Option<usize>,
-    iat_trace: Option<IatTraceState>,
+    /// Set once the post-OEP IAT decryption window has run.  Guards against
+    /// re-entering the 5-second monitoring loop on a later access violation.
+    iat_monitoring_done: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -218,7 +218,7 @@ pub fn unpack(
         oep_found_via_scanning: false,
         virtualized_oep_retries: 0,
         last_possible_oep: None,
-        iat_trace: None,
+        iat_monitoring_done: false,
     };
     let guard_protection = PAGE_NOACCESS.0;
     // Image boundary from PE header (pre-ASLR value). Will be rebased after
@@ -524,32 +524,9 @@ pub fn unpack(
                 }
             }
             // ---------------------------------------------------------------
-            // SINGLE_STEP — may be real single-step or hardware breakpoint
-            // Also handles IAT tracing for v3 targets.
+            // SINGLE_STEP — re-arm the code section guard after a guarded access
             // ---------------------------------------------------------------
             DebugEvent::SingleStep { thread_id, address } => {
-                // Check if we're in IAT tracing mode.
-                let is_tracing = ls.iat_trace.as_ref().is_some_and(|t| {
-                    t.trace_phase == TracePhase::Tracing && t.trace_thread_id == thread_id
-                });
-
-                if is_tracing {
-                    // Handle IAT trace step.
-                    if let Some(ref mut trace) = ls.iat_trace {
-                        handle_trace_step(&mut dbg, trace, address, image_base_usize, image_boundary)?;
-                    }
-
-                    // After handling the trace step, check if tracing is complete.
-                    // If so, break immediately to avoid the target process exiting.
-                    if let Some(ref t) = ls.iat_trace {
-                        if t.current_slot >= t.total_slots {
-                            info!("IAT tracing complete — exiting debug loop");
-                            break;
-                        }
-                    }
-                    continue;
-                }
-
                 // Re-arm the guard after a guard-related single-step
                 // (Pascal: FGuardStepping in OnSinglestep).
                 // When a library reads .text or Themida writes a call target,

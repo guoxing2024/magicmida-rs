@@ -11,7 +11,6 @@ use mida_packers_themida::{
 };
 use crate::log::{self, LogType};
 use super::session::ProcessSession;
-use super::iat_trace::{IatTraceState, advance_to_next_slot};
 use super::helpers::compute_data_section_bounds;
 use super::LoopState;
 
@@ -389,7 +388,19 @@ pub(super) fn handle_access_violation(
     }
 
     // After OEP is found, set up IAT decryption monitoring.
-    if ls.oep.is_some() && ls.iat_trace.is_none() {
+    //
+    // This is a *passive* window: install a PAGE_NOACCESS guard over the IAT,
+    // let the target run, and record which instructions touch it (they land in
+    // `state.guard_addrs`, which `determine_iat_address` consumes downstream).
+    // Themida v3 progressively decrypts whole IAT blocks during this window.
+    //
+    // The actual slot resolution happens later, in the post-loop phase via
+    // `fix_iat` -> `fix_iat_v3` -> `trace_imports` (the single production trace
+    // engine).  There used to be a second, in-loop trace state machine here
+    // (`iat_trace.rs`) that duplicated the slot classifier, resolved 0 slots,
+    // wrote its partial results back into the target, and then threw them away.
+    // It was removed — see ARCHITECTURE_REVIEW.md §3.
+    if ls.oep.is_some() && !ls.iat_monitoring_done {
         let oep_addr = ls.oep.ok_or_else(|| anyhow!("OEP not found: cannot start IAT decryption wait"))?;
         info!(oep = %format!("{oep_addr:#x}"), "OEP found — letting program execute for .text + IAT decryption");
 
@@ -464,10 +475,11 @@ pub(super) fn handle_access_violation(
                                 && target_address < (iat.address + iat.size) as u64
                             {
                                 iat_violations += 1;
-                                // Record the faulting instruction address for later fixup
+                                // Record the faulting instruction address for later fixup.
                                 state.guard_addrs.push(address as usize);
-                                debug!("IAT access #{} at target={:#x} from={:#x}",
-                                       iat_violations, target_address, address);
+                                // Do NOT log per-access: this window sees 150k+ IAT
+                                // touches on a real v3 target, which turned a -v run
+                                // into a 16 MB log.  Report the aggregate below.
                             }
                         }
                         DebugEvent::ExitProcess { .. } => {
@@ -488,6 +500,10 @@ pub(super) fn handle_access_violation(
         remove_code_section_guard(h_process, iat.address, iat.size)?;
         info!(violations = iat_violations, "IAT monitoring complete");
 
+        // Report how much Themida decrypted in place during the window.  This is
+        // informational: the post-loop trace engine re-reads the IAT and decides
+        // per slot.  Blocks already resolved here are adopted by the classifier
+        // as `IatSlotDecision::Resolved`.
         let ptr_size = std::mem::size_of::<usize>();
         let slot_count = iat.size / ptr_size;
         let mut slot_values = vec![0usize; slot_count];
@@ -506,51 +522,8 @@ pub(super) fn handle_access_violation(
             .count();
         info!(api_like = api_like_count, total = actual_slots, "IAT analysis after execution");
 
-        let mut tm_start = usize::MAX;
-        let mut tm_end = 0;
-        let mut found_themida = false;
-        for section in &state.pe_info.pe_sections {
-            if mida_packers_themida::is_themida_section(section) {
-                let start = image_base_usize + section.virtual_address as usize;
-                let end = start + section.virtual_size as usize;
-                tm_start = tm_start.min(start);
-                tm_end = tm_end.max(end);
-                found_themida = true;
-            }
-        }
-        if !found_themida {
-            tm_start = image_base_usize;
-            tm_end = image_boundary;
-        }
-
-        let trace_thread_id = thread_id;
-        let trace_ctx = dbg.get_thread_context_control(trace_thread_id)
-            .map_err(|e| anyhow!("get_thread_context_control for trace_start_sp: {e}"))?;
-        let trace_start_sp = trace_ctx.Rsp as usize;
-
-        let mut trace = IatTraceState::new(
-            iat.address,
-            iat.size,
-            slot_values,
-            tm_start,
-            tm_end,
-            image_base_usize,
-            image_boundary,
-            trace_thread_id,
-            trace_start_sp,
-        );
-        log::log(LogType::Info, &format!("IAT trace state created: {} slots", trace.total_slots));
-
-        advance_to_next_slot(dbg, &mut trace)?;
-        ls.iat_trace = Some(trace);
-
-        if let Some(ref t) = ls.iat_trace {
-            if t.current_slot >= t.total_slots {
-                info!("IAT tracing complete — exiting debug loop immediately");
-                return Ok(AvAction::Break);
-            }
-        }
-        return Ok(AvAction::Continue);
+        ls.iat_monitoring_done = true;
+        return Ok(AvAction::Break);
     }
 
     dbg.continue_event(thread_id, ContinueStatus::Continue)?;
