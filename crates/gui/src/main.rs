@@ -5,6 +5,12 @@
 //! log.  The pipeline itself is untouched — see `parse.rs` for why the process
 //! boundary matters.
 
+// A GUI must not open a console window.  Without this the binary is built as a
+// console subsystem program and Windows attaches a CMD box behind the main
+// window for the whole session.  Only in release: a debug build keeps the
+// console so `dbg!` output and panics stay visible.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod fonts;
 mod job;
 mod parse;
@@ -29,11 +35,17 @@ fn main() -> eframe::Result<()> {
         .map(PathBuf::from);
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([1180.0, 780.0])
-            .with_min_inner_size([900.0, 600.0])
+            // Deliberately smaller than the old 1180x780: that filled a
+            // 1600x900 desktop edge to edge and overflowed once the window
+            // frame and a scaled DPI were taken into account.  `ui.rs` also
+            // clamps the first frame to the actual monitor, so this is only the
+            // preferred size on a roomy screen.
+            .with_inner_size([1060.0, 660.0])
+            .with_min_inner_size([820.0, 520.0])
             .with_title("Magicmida-RS · Themida 脱壳"),
         ..Default::default()
     };
+
 
     eframe::run_native(
         "Magicmida-RS",

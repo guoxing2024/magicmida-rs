@@ -159,20 +159,27 @@ pub fn inject_scylla_hide(pid: u32, config: &ScyllaHideConfig) -> Result<(), The
     //                             Themida VM dispatcher session, and
     //                             WaitForDebugEvent fails with
     //                             `ERROR_PARTIAL_COPY`.
-    let mut child = std::process::Command::new(injector_path)
-        .arg(&pid_arg)
-        .arg(&config.hook_library_path)
-        .arg("nowait")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| {
-            ThemidaError::ScyllaHide(format!(
-                "Failed to spawn '{}': {e}",
-                injector_path.display()
-            ))
-        })?;
+    let mut child = {
+        use std::os::windows::process::CommandExt;
+        // InjectorCLI is a console program and we discard all of its output, so
+        // it must not get a console window of its own.  Without this flag every
+        // unpack run flashed a CMD box while the injector started.
+        std::process::Command::new(injector_path)
+            .arg(&pid_arg)
+            .arg(&config.hook_library_path)
+            .arg("nowait")
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| {
+                ThemidaError::ScyllaHide(format!(
+                    "Failed to spawn '{}': {e}",
+                    injector_path.display()
+                ))
+            })?
+    };
 
     // Wait a tunable window for the injector to finish.
     std::thread::sleep(std::time::Duration::from_millis(config.hook_delay_ms));

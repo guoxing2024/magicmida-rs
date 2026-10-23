@@ -13,10 +13,10 @@ use eframe::egui::{
 };
 
 use crate::job::Job;
-use crate::parse::{Level, LogLine, Metrics, Phase, RunState};
+use crate::parse::{Level, LogLine, Metrics, Phase, RunState, TargetKind};
 use crate::theme;
 
-const RAIL_W: f32 = 340.0;
+const RAIL_W: f32 = 300.0;
 
 pub struct App {
     cli: Option<PathBuf>,
@@ -31,6 +31,21 @@ pub struct App {
     show_debug: bool,
     auto_scroll: bool,
     elapsed: f32,
+    /// Target kind of the file currently in `input`.
+    ///
+    /// Tracked separately from `RunState.kind` because the rail has to show the
+    /// right labels *before* a run starts — the file picker is the first place
+    /// a user learns that DLLs are supported at all.
+    kind: TargetKind,
+    /// Whether the one-shot "fit the window to the monitor" pass has run.
+    ///
+    /// The preferred size in `main.rs` is a guess.  On a 1600x900 desktop a
+    /// 1060x660 window plus its frame is comfortable, but on a smaller or
+    /// heavily scaled screen the same numbers overflow.  Rather than pick a
+    /// number that is wrong somewhere, the first frame measures the actual
+    /// monitor and shrinks the viewport to fit if needed.  Doing it once keeps
+    /// the user free to resize afterwards.
+    fitted: bool,
 }
 
 #[derive(Clone)]
@@ -62,6 +77,8 @@ impl App {
             show_debug: false,
             auto_scroll: true,
             elapsed: 0.0,
+            kind: TargetKind::Exe,
+            fitted: false,
         };
         if let Some(p) = preset {
             if p.is_file() {
@@ -86,6 +103,7 @@ impl App {
     }
 
     fn pick_input(&mut self, p: PathBuf) {
+        self.kind = TargetKind::of_path(&p);
         self.output = default_output(&p).display().to_string();
         self.input = p.display().to_string();
     }
@@ -100,6 +118,10 @@ impl App {
             self.status = Status::Failed(format!("输入不存在：{}", short_name(&input)));
             return;
         }
+        // Re-derive from the path actually being unpacked: the user may have
+        // typed it rather than picked it, and the rail label has to agree with
+        // what the CLI will do.
+        self.kind = TargetKind::of_path(&input);
         let output = if self.output.trim().is_empty() {
             default_output(&input)
         } else {
@@ -131,7 +153,7 @@ impl App {
         // `Done.` is logged to stderr while the final `[GOOD] Unpacked:` line may
         // race on stdout, so the parser flag alone is not authoritative.  Trust
         // the exit code, and corroborate with a product on disk.
-        let (parsed_ok, product) = st
+        let (parsed_ok, product, kind) = st
             .lock()
             .map(|s| {
                 (
@@ -140,15 +162,26 @@ impl App {
                         .as_ref()
                         .map(|p| Path::new(p).is_file())
                         .unwrap_or(false),
+                    s.kind,
                 )
             })
-            .unwrap_or((false, false));
+            .unwrap_or((false, false, TargetKind::Exe));
 
         let ok = code == 0 && (parsed_ok || product);
-        self.status = if ok {
-            Status::Ok(format!("完成 · {secs:.1}s"))
-        } else {
-            Status::Failed(format!("失败 · 退出码 {code} · {secs:.1}s"))
+        self.status = match (ok, kind) {
+            // An EXE product is accepted by launching it: still alive after a
+            // few seconds means the dump is usable.
+            (true, TargetKind::Exe) => Status::Ok(format!("完成 · {secs:.1}s")),
+            // A DLL product is *not* accepted by its existence.  The failure
+            // this project spent a whole round on was a DLL that loaded, had
+            // resolvable exports, and still answered "0.0" because the shell
+            // had not finished writing `.bss` when the dump was taken.  So the
+            // GUI says what is actually known and points at the gate that
+            // proves the rest.
+            (true, TargetKind::Dll) => Status::Ok(format!(
+                "产物已写出 · {secs:.1}s · 行为需 gate 验证"
+            )),
+            (false, _) => Status::Failed(format!("失败 · 退出码 {code} · {secs:.1}s")),
         };
         self.last = Some(st);
     }
@@ -156,6 +189,8 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.fit_to_screen(ctx);
+
         if let Some(job) = &mut self.job {
             let (dirty, exit) = job.pump();
             if dirty {
@@ -170,13 +205,13 @@ impl eframe::App for App {
             }
         }
 
-        // Accept EXE files dragged anywhere onto the window.
+        // Accept EXE and DLL files dragged anywhere onto the window.
         let dropped = ctx.input(|i| {
             i.raw
                 .dropped_files
                 .iter()
                 .filter_map(|f| f.path.clone())
-                .find(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")))
+                .find(|p| is_supported(p))
         });
         if let Some(p) = dropped {
             if !self.running() {
@@ -191,7 +226,7 @@ impl eframe::App for App {
             .frame(
                 egui::Frame::NONE
                     .fill(theme::BG)
-                    .inner_margin(Margin::same(20)),
+                    .inner_margin(Margin::symmetric(14, 12)),
             )
             .show(ctx, |ui| {
                 let snap = self
@@ -205,9 +240,53 @@ impl eframe::App for App {
     }
 }
 
+impl App {
+    /// Shrink the window to fit the monitor, once, on the first frame.
+    ///
+    /// `main.rs` asks for 1060x660, which is a guess.  The actual usable area
+    /// depends on the monitor and the DPI scale, and on a small or scaled
+    /// desktop that guess pushes the window off screen — the symptom being a
+    /// log panel and the 开始 button that cannot be reached at all.
+    ///
+    /// This runs before any panel is laid out, so the very first frame is
+    /// already correct; there is no visible resize on startup in the normal
+    /// case because the target size only changes when it has to.
+    fn fit_to_screen(&mut self, ctx: &egui::Context) {
+        if self.fitted {
+            return;
+        }
+        self.fitted = true;
+
+        // `available_rect` is the viewport minus the title bar / taskbar, in
+        // points.  Reading it needs a screen rect first, so use the monitor
+        // size egui reports for the current viewport.
+        let Some(screen) = ctx.input(|i| i.viewport().monitor_size) else {
+            return;
+        };
+        if screen.x <= 0.0 || screen.y <= 0.0 {
+            return;
+        }
+
+        // Leave room for the OS window frame and the taskbar.  These margins are
+        // deliberately generous: a window that is slightly smaller than the
+        // screen is a mild waste of space, a window that is larger is unusable.
+        let max_w = (screen.x - 48.0).max(720.0);
+        let max_h = (screen.y - 96.0).max(480.0);
+
+        let cur = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size()));
+        let Some(cur) = cur else { return };
+
+        if cur.x > max_w || cur.y > max_h {
+            let target = Vec2::new(cur.x.min(max_w), cur.y.min(max_h));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target));
+        }
+    }
+}
+
 /// Rendering snapshot — cloned so the lock is released immediately.
 struct Snapshot {
     phase: Option<Phase>,
+    kind: TargetKind,
     metrics: Metrics,
     finished: Option<bool>,
     error: Option<String>,
@@ -219,6 +298,7 @@ impl From<&RunState> for Snapshot {
     fn from(s: &RunState) -> Self {
         Self {
             phase: s.phase,
+            kind: s.kind,
             metrics: s.metrics.clone(),
             finished: s.finished,
             error: s.error.clone(),
@@ -235,28 +315,30 @@ impl From<&RunState> for Snapshot {
 impl App {
     fn title_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("title")
-            .exact_height(58.0)
+            .exact_height(46.0)
             .frame(
                 egui::Frame::NONE
                     .fill(theme::PANEL)
-                    .inner_margin(Margin::symmetric(20, 0)),
+                    .inner_margin(Margin::symmetric(14, 0)),
             )
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
-                    ui.label(RichText::new("Magicmida").size(21.0).strong().color(theme::ACCENT));
-                    ui.label(RichText::new("RS").size(21.0).strong().color(theme::TEXT));
-                    ui.add_space(14.0);
+                    ui.label(RichText::new("Magicmida").size(17.0).strong().color(theme::ACCENT));
+                    ui.label(RichText::new("RS").size(17.0).strong().color(theme::TEXT));
+                    ui.add_space(10.0);
                     pill(ui, "Themida v3 · x64", theme::MUTED);
-                    ui.add_space(6.0);
-                    pill(ui, "已实测", theme::GOOD);
+                    ui.add_space(5.0);
+                    // The kind of the file in the picker, not of the last run:
+                    // the badge has to answer "what will happen if I press 开始".
+                    pill(ui, self.kind.label(), theme::ACCENT);
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if self.running() {
-                            ui.add(egui::Spinner::new().size(15.0).color(theme::ACCENT));
+                            ui.add(egui::Spinner::new().size(13.0).color(theme::ACCENT));
                             ui.label(
                                 RichText::new(format!("{:.1}s", self.elapsed))
-                                    .size(13.0)
-                                    .font(theme::mono(13.0))
+                                    .size(12.0)
+                                    .font(theme::mono(12.0))
                                     .color(theme::MUTED),
                             );
                         }
@@ -278,19 +360,19 @@ impl App {
             .frame(
                 egui::Frame::NONE
                     .fill(theme::PANEL)
-                    .inner_margin(Margin::same(20)),
+                    .inner_margin(Margin::symmetric(14, 12)),
             )
             .show(ctx, |ui| {
-                ui.add_space(6.0);
+                ui.add_space(2.0);
                 section(ui, "目标");
-                ui.add_space(8.0);
+                ui.add_space(6.0);
 
                 let busy = self.running();
                 ui.add_enabled(
                     !busy,
                     egui::TextEdit::singleline(&mut self.input)
                         .desired_width(f32::INFINITY)
-                        .hint_text("受 Themida 保护的 .exe")
+                        .hint_text("受 Themida 保护的 .exe / .dll")
                         .font(theme::mono(12.5)),
                 );
                 ui.add_space(6.0);
@@ -300,7 +382,7 @@ impl App {
                         .clicked()
                     {
                         if let Some(p) = rfd::FileDialog::new()
-                            .add_filter("可执行文件", &["exe"])
+                            .add_filter("可执行文件 / 动态库", &["exe", "dll"])
                             .pick_file()
                         {
                             self.pick_input(p);
@@ -318,14 +400,18 @@ impl App {
                     }
                 });
 
-                ui.add_space(18.0);
+                ui.add_space(12.0);
                 section(ui, "输出");
-                ui.add_space(8.0);
+                ui.add_space(6.0);
                 ui.add_enabled(
                     !busy,
                     egui::TextEdit::singleline(&mut self.output)
                         .desired_width(f32::INFINITY)
-                        .hint_text("<输入名>U.exe")
+                        .hint_text(if self.kind == TargetKind::Dll {
+                            "<输入名>U.dll"
+                        } else {
+                            "<输入名>U.exe"
+                        })
                         .font(theme::mono(12.5)),
                 );
                 ui.add_space(6.0);
@@ -333,22 +419,28 @@ impl App {
                     .add_enabled(!busy, egui::Button::new("另存为…").min_size(Vec2::new(0.0, 26.0)))
                     .clicked()
                 {
+                    // Match the extension to the target: a DLL dumped to `.exe`
+                    // still loads, but the name would mislead every later tool.
+                    let (filter_name, filter_ext, default_name) = match self.kind {
+                        TargetKind::Dll => ("动态库", "dll", "unpacked.dll"),
+                        TargetKind::Exe => ("可执行文件", "exe", "unpacked.exe"),
+                    };
                     if let Some(p) = rfd::FileDialog::new()
-                        .add_filter("可执行文件", &["exe"])
-                        .set_file_name("unpacked.exe")
+                        .add_filter(filter_name, &[filter_ext])
+                        .set_file_name(default_name)
                         .save_file()
                     {
                         self.output = p.display().to_string();
                     }
                 }
 
-                ui.add_space(18.0);
+                ui.add_space(12.0);
                 section(ui, "选项");
-                ui.add_space(6.0);
+                ui.add_space(4.0);
                 ui.checkbox(&mut self.verbose, "详细日志");
                 hint(ui, "记录每个调试事件，排查用");
 
-                ui.add_space(24.0);
+                ui.add_space(16.0);
                 let can = self.cli.is_some() && !self.input.trim().is_empty();
                 if busy {
                     if big_button(ui, "取消", theme::FATAL).clicked() {
@@ -363,7 +455,7 @@ impl App {
                     hint(ui, "未找到 mida-cli.exe，请先 cargo build --release");
                 }
 
-                ui.add_space(18.0);
+                ui.add_space(10.0);
                 match &self.status {
                     Status::Idle => {}
                     Status::Running => status_box(ui, theme::ACCENT, "运行中…"),
@@ -373,7 +465,7 @@ impl App {
 
                 ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
                     ui.add_space(2.0);
-                    hint(ui, "只支持 EXE；DLL 会被拒绝");
+                    hint(ui, "支持 EXE 与 DLL（Themida v3 · x64）");
                     ui.add_space(2.0);
                     if !self.cjk_ok {
                         hint(ui, "未找到中文字体，部分文字可能显示为方块");
@@ -391,9 +483,9 @@ impl App {
     fn canvas_empty(&mut self, ui: &mut Ui) {
         let avail = ui.available_rect_before_wrap();
         ui.allocate_ui_with_layout(avail.size(), Layout::top_down(Align::Center), |ui| {
-            ui.add_space((avail.height() * 0.18).max(40.0));
+            ui.add_space((avail.height() * 0.12).max(24.0));
 
-            let size = Vec2::new(avail.width().min(540.0), 160.0);
+            let size = Vec2::new(avail.width().min(520.0), 132.0);
             let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
             let hot = resp.hovered();
             let stroke_col = if hot { theme::ACCENT } else { theme::BORDER };
@@ -404,18 +496,18 @@ impl App {
                 StrokeKind::Inside,
             );
 
-            ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink(20.0)), |ui| {
+            ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink(18.0)), |ui| {
                 ui.vertical_centered(|ui| {
-                    ui.add_space(38.0);
+                    ui.add_space(28.0);
                     ui.label(
-                        RichText::new("把 EXE 拖到这里")
-                            .size(19.0)
+                        RichText::new("把 EXE 或 DLL 拖到这里")
+                            .size(17.0)
                             .color(if hot { theme::ACCENT } else { theme::TEXT }),
                     );
-                    ui.add_space(8.0);
+                    ui.add_space(6.0);
                     ui.label(
                         RichText::new("或使用左侧「浏览…」选择文件")
-                            .size(13.0)
+                            .size(12.0)
                             .color(theme::MUTED),
                     );
                 });
@@ -423,18 +515,18 @@ impl App {
 
             // Give the drop target room before the capability strip; the
             // previous spacing let the strip collide with the dashed box.
-            ui.add_space(52.0);
+            ui.add_space(30.0);
             ui.vertical_centered(|ui| {
-                ui.label(RichText::new("已验证能力").size(11.0).color(theme::MUTED));
-                ui.add_space(10.0);
+                ui.label(RichText::new("已验证能力").size(10.5).color(theme::MUTED));
+                ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    let total = 3.0 * 152.0 + 2.0 * 10.0;
+                    let total = 3.0 * 146.0 + 2.0 * 8.0;
                     ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
-                    cap(ui, "Themida v3 · x64", "实测通过", theme::GOOD);
-                    ui.add_space(10.0);
-                    cap(ui, "Themida x86", "未编译验证", theme::WARN);
-                    ui.add_space(10.0);
-                    cap(ui, "v1 / v2", "无样本", theme::DIM);
+                    cap(ui, "Themida v3 · x64 EXE", "实测通过", theme::GOOD);
+                    ui.add_space(8.0);
+                    cap(ui, "Themida v3 · x64 DLL", "实测通过", theme::GOOD);
+                    ui.add_space(8.0);
+                    cap(ui, "x86 / v1 / v2", "无样本", theme::DIM);
                 });
             });
         });
@@ -442,11 +534,11 @@ impl App {
 
     fn canvas_run(&mut self, ui: &mut Ui, snap: &Snapshot) {
         self.phase_rail(ui, snap);
-        ui.add_space(14.0);
+        ui.add_space(10.0);
         self.metric_grid(ui, snap);
-        ui.add_space(12.0);
+        ui.add_space(8.0);
         self.trace_strip(ui, snap);
-        ui.add_space(12.0);
+        ui.add_space(8.0);
         self.log_panel(ui, snap);
     }
 
@@ -484,45 +576,67 @@ impl App {
                 m.themida_version.clone().unwrap_or_else(|| "—".into()),
                 theme::ACCENT,
             );
-            metric(&mut c[1], "OEP", hex(m.oep), theme::TEXT);
+            metric(&mut c[1], "目标类型", snap.kind.label().to_string(), theme::ACCENT);
+            metric(&mut c[2], "OEP", hex(m.oep), theme::TEXT);
             metric(
-                &mut c[2],
+                &mut c[3],
                 "IAT 槽位",
                 m.iat_slots.map(|v| v.to_string()).unwrap_or_else(|| "—".into()),
                 theme::TEXT,
             );
+        });
+        ui.add_space(6.0);
+        ui.columns(4, |c| {
             metric(
-                &mut c[3],
+                &mut c[0],
                 "导入模块",
                 m.module_count.map(|v| v.to_string()).unwrap_or_else(|| "—".into()),
                 if m.module_count.is_some() { theme::GOOD } else { theme::TEXT },
             );
-        });
-        ui.add_space(10.0);
-        ui.columns(4, |c| {
             metric(
-                &mut c[0],
+                &mut c[1],
                 "已解析",
                 m.resolved.map(|v| v.to_string()).unwrap_or_else(|| "—".into()),
                 theme::GOOD,
             );
             metric(
-                &mut c[1],
+                &mut c[2],
                 "失败槽",
                 m.failed.map(|v| v.to_string()).unwrap_or_else(|| "—".into()),
                 if m.failed.unwrap_or(0) > 0 { theme::WARN } else { theme::TEXT },
             );
             metric(
-                &mut c[2],
+                &mut c[3],
+                "数据槽",
+                m.not_import.map(|v| v.to_string()).unwrap_or_else(|| "—".into()),
+                theme::MUTED,
+            );
+        });
+        ui.add_space(6.0);
+        ui.columns(4, |c| {
+            metric(
+                &mut c[0],
                 "地址重锚",
                 m.fixed_addresses.map(|v| v.to_string()).unwrap_or_else(|| "—".into()),
                 theme::TEXT,
             );
             metric(
-                &mut c[3],
+                &mut c[1],
+                "重定位",
+                m.relocations.map(|v| v.to_string()).unwrap_or_else(|| "—".into()),
+                theme::TEXT,
+            );
+            metric(
+                &mut c[2],
                 "产物",
                 m.output_size.map(human_size).unwrap_or_else(|| "—".into()),
                 theme::TEXT,
+            );
+            metric(
+                &mut c[3],
+                "验收方式",
+                snap.kind.acceptance().to_string(),
+                theme::MUTED,
             );
         });
     }
@@ -533,16 +647,11 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("IAT 追踪").size(12.0).color(theme::MUTED));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let text = match (m.current_slot, m.iat_slots) {
-                        (Some(c), Some(t)) => format!("{c} / {t}"),
-                        (None, Some(t)) => format!("— / {t}"),
-                        _ => "—".into(),
-                    };
                     ui.label(
-                        RichText::new(text)
+                        RichText::new(m.trace_label())
                             .size(12.5)
                             .font(theme::mono(12.5))
-                            .color(theme::TEXT),
+                            .color(if m.trace_done { theme::GOOD } else { theme::TEXT }),
                     );
                 });
             });
@@ -558,7 +667,11 @@ impl App {
                     track.min,
                     Vec2::new((bar_w * f).max(2.0), 6.0),
                 );
-                p.rect_filled(filled, CornerRadius::same(3), theme::ACCENT);
+                p.rect_filled(
+                    filled,
+                    CornerRadius::same(3),
+                    if m.trace_done { theme::GOOD } else { theme::ACCENT },
+                );
             }
             // Live counters under the bar, so the strip is informative even
             // before the first slot reports in.
@@ -567,6 +680,8 @@ impl App {
                 counter(ui, "已解析", m.resolved, theme::GOOD);
                 ui.add_space(14.0);
                 counter(ui, "失败", m.failed, theme::WARN);
+                ui.add_space(14.0);
+                counter(ui, "数据槽", m.not_import, theme::MUTED);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if let Some(b) = m.iat_blocks {
                         ui.label(
@@ -630,14 +745,14 @@ impl App {
         });
         ui.add_space(6.0);
 
-        let h = ui.available_height().max(140.0);
+        let h = ui.available_height().max(120.0);
         egui::Frame::NONE
             .fill(theme::PANEL)
-            .inner_margin(Margin::same(10))
+            .inner_margin(Margin::symmetric(9, 8))
             .corner_radius(CornerRadius::same(8))
             .stroke(Stroke::new(1.0_f32, theme::BORDER))
             .show(ui, |ui| {
-                ui.set_min_height(h - 24.0);
+                ui.set_min_height((h - 20.0).max(80.0));
                 let needle = self.log_filter.to_lowercase();
                 ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -670,7 +785,7 @@ impl App {
 fn card_frame() -> egui::Frame {
     egui::Frame::NONE
         .fill(theme::PANEL)
-        .inner_margin(Margin::same(14))
+        .inner_margin(Margin::symmetric(12, 9))
         .corner_radius(CornerRadius::same(8))
         .stroke(Stroke::new(1.0_f32, theme::BORDER))
 }
@@ -771,17 +886,17 @@ fn phase_chip(ui: &mut Ui, p: Phase, state: ChipState) {
 fn metric(ui: &mut Ui, label: &str, value: String, color: Color32) {
     egui::Frame::NONE
         .fill(theme::PANEL)
-        .inner_margin(Margin::symmetric(13, 11))
-        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(11, 8))
+        .corner_radius(CornerRadius::same(7))
         .stroke(Stroke::new(1.0_f32, theme::BORDER))
         .show(ui, |ui| {
             ui.vertical(|ui| {
-                ui.label(RichText::new(label).size(11.0).color(theme::MUTED));
-                ui.add_space(3.0);
+                ui.label(RichText::new(label).size(10.5).color(theme::MUTED));
+                ui.add_space(2.0);
                 ui.label(
                     RichText::new(value)
-                        .size(17.0)
-                        .font(theme::mono(17.0))
+                        .size(15.0)
+                        .font(theme::mono(15.0))
                         .color(color),
                 );
             });
@@ -791,15 +906,15 @@ fn metric(ui: &mut Ui, label: &str, value: String, color: Color32) {
 fn cap(ui: &mut Ui, title: &str, note: &str, color: Color32) {
     egui::Frame::NONE
         .fill(theme::PANEL)
-        .inner_margin(Margin::symmetric(12, 10))
-        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(10, 8))
+        .corner_radius(CornerRadius::same(7))
         .stroke(Stroke::new(1.0_f32, theme::BORDER))
         .show(ui, |ui| {
-            ui.set_width(152.0);
+            ui.set_width(146.0);
             ui.vertical(|ui| {
-                ui.label(RichText::new(title).size(12.5).color(theme::TEXT));
+                ui.label(RichText::new(title).size(11.5).color(theme::TEXT));
                 ui.add_space(2.0);
-                ui.label(RichText::new(note).size(11.0).color(color));
+                ui.label(RichText::new(note).size(10.5).color(color));
             });
         });
 }
@@ -918,4 +1033,14 @@ fn default_output(input: &Path) -> PathBuf {
     let ext = input.extension().and_then(|s| s.to_str()).unwrap_or("exe");
     let parent = input.parent().unwrap_or_else(|| Path::new("."));
     parent.join(format!("{stem}U.{ext}"))
+}
+
+/// Extensions the CLI accepts as unpack targets.
+///
+/// The pipeline dispatches on the PE header, not the extension, but the GUI
+/// needs a cheap filter for drag-and-drop and the file picker.
+fn is_supported(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("exe") || e.eq_ignore_ascii_case("dll"))
 }

@@ -12,7 +12,7 @@ use std::os::windows::process::CommandExt;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 
-use crate::parse::RunState;
+use crate::parse::{RunState, TargetKind};
 
 /// A message sent from the reader thread to the UI thread.
 pub enum Event {
@@ -27,6 +27,13 @@ pub struct Job {
     rx: Receiver<Event>,
     pub state: Arc<Mutex<RunState>>,
     pub started_at: std::time::Instant,
+    /// PID of the `mida-cli` process itself.
+    ///
+    /// Kept separate from `state.metrics.pid`: that one is the *debuggee*, and
+    /// killing it leaves the CLI running with its debug loop waiting on a dead
+    /// process.  Cancellation has to target this one, with `/T` to take the
+    /// debuggee and the loader host with it.
+    cli_pid: u32,
 }
 
 impl Job {
@@ -52,7 +59,7 @@ impl Job {
         let stderr = child.stderr.take().expect("piped stderr");
 
         let (tx, rx) = mpsc::channel::<Event>();
-        let state = Arc::new(Mutex::new(RunState::new()));
+        let state = Arc::new(Mutex::new(RunState::with_kind(TargetKind::of_path(input))));
 
         // Two reader threads: the CLI logs to stderr (tracing) but may also
         // print to stdout (usage text, panics).
@@ -71,13 +78,13 @@ impl Job {
                 .map(|s| s.code().unwrap_or(-1))
                 .unwrap_or(-1);
             let _ = tx.send(Event::Exited(code));
-            let _ = pid;
         });
 
         Ok(Job {
             rx,
             state,
             started_at: std::time::Instant::now(),
+            cli_pid: pid,
         })
     }
 
@@ -112,31 +119,22 @@ impl Job {
     ///
     /// The process handle lives on the waiter thread, so cancellation goes
     /// through `taskkill` rather than `Child::kill`.
+    ///
+    /// Target the **CLI**, not the debuggee.  An earlier version used
+    /// `metrics.pid` (the debuggee) — that kills the thing being unpacked and
+    /// leaves `mida-cli` spinning in `WaitForDebugEvent` on a dead process, so
+    /// the run never ends and the Cancel button looks inert.  `/T` takes the
+    /// debuggee and, on the DLL path, the generated loader host with it.
     pub fn cancel(&mut self) {
         if let Ok(state) = self.state.lock() {
             if state.finished.is_some() {
                 return;
             }
         }
-        // The debuggee is a child of the CLI; killing the tree keeps orphans
-        // from holding the sample file open.
         let _ = Command::new("taskkill")
-            .args(["/PID"])
-            .arg(self.pid_string())
-            .args(["/T", "/F"])
-            .creation_flags(0x0800_0000)
+            .args(["/PID", &self.cli_pid.to_string(), "/T", "/F"])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
             .output();
-    }
-
-    fn pid_string(&self) -> String {
-        // The CLI records its own PID in the log; fall back to the debuggee PID
-        // we parsed if the CLI's own is unknown.
-        self.state
-            .lock()
-            .ok()
-            .and_then(|s| s.metrics.pid)
-            .map(|p| p.to_string())
-            .unwrap_or_default()
     }
 }
 
