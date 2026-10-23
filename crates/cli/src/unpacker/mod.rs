@@ -327,21 +327,31 @@ pub fn unpack(
                 // process — valid in the target on x64).
                 let apis = resolve_api_addrs()?;
 
-                // Apply ScyllaHide.  Capture hook_delay_ms BEFORE the move
-                // into inject_scylla_hide so we can reuse it for the post-
-                // injection settle sleep below.
+                // Apply ScyllaHide — asynchronously, and *without* blocking.
+                //
+                // `InjectorCLIx86.exe` injects by suspending and hijacking the
+                // target's main thread, and it only returns once that thread
+                // actually runs the hijacked `LoadLibraryW`.  A debuggee's
+                // threads are frozen by the kernel while it has a pending debug
+                // event, and they stay frozen until the debugger calls
+                // `ContinueDebugEvent`.  So blocking here would deadlock: the
+                // injector waits for a thread that only the (blocked) debug
+                // loop can release.  That is exactly how the x86 run died —
+                // >15 s with no exit, main thread left at `Suspended`, loop
+                // stuck in `WaitForDebugEvent` after logging "ScyllaHide
+                // injected".
+                //
+                // `inject_scylla_hide` therefore spawns and returns.  The loop
+                // continues the event right below, which unfreezes the target
+                // and lets the injector finish in ~47 ms.
                 let injector_path = scylla_injector_path();
-                let hook_delay_ms: u64 = 500;
                 let scylla_config = ScyllaHideConfig {
                     injector_cli_path: injector_path.display().to_string(),
                     hook_library_path: scylla_hook_path().display().to_string(),
                     ini_path: None,
-                    hook_delay_ms,
                 };
                 if let Err(e) = inject_scylla_hide(pid, &scylla_config) {
                     warn!("ScyllaHide injection failed (non-fatal): {e}");
-                } else {
-                    info!("ScyllaHide injected");
                 }
 
                 // Store resolved APIs for later breakpoint comparisons.

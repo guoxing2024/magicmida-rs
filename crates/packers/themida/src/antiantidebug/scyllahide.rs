@@ -53,13 +53,6 @@ pub struct ScyllaHideConfig {
     /// Path to `scylla_hide.ini` (optional — if absent, the injector uses
     /// its own defaults).
     pub ini_path: Option<String>,
-    /// Delay in milliseconds to wait after spawning the injector, before
-    /// returning control to the debug loop.  Empirically 500 is a good
-    /// trade-off for Themida-protected samples, but pathological targets
-    /// may need to raise or lower this to avoid either a "Target process
-    /// exited before unpack completed" (too short) or a deadlock reported
-    /// as `ERROR_PARTIAL_COPY` (too long).  Defaults to 500 ms.
-    pub hook_delay_ms: u64,
 }
 
 /// Launch the ScyllaHide injector as a detached child process.
@@ -181,31 +174,72 @@ pub fn inject_scylla_hide(pid: u32, config: &ScyllaHideConfig) -> Result<(), The
             })?
     };
 
-    // Wait a tunable window for the injector to finish.
-    std::thread::sleep(std::time::Duration::from_millis(config.hook_delay_ms));
-
-    match child.try_wait() {
-        Ok(Some(status)) => {
-            if status.success() {
-                info!("ScyllaHide injection completed successfully");
-            } else {
-                warn!(
-                    ?status,
-                    "ScyllaHide injector exited with non-zero status"
-                );
-            }
-        }
-        Ok(None) => {
-            // Still running — injection is in progress, that's fine.
-            info!("ScyllaHide injection initiated (running in background)");
-        }
-        Err(e) => {
-            warn!("Failed to check ScyllaHide injector status: {e}");
-        }
-    }
-
-    // Drop the child handle without killing the process.
+    // Detach and let the injector run asynchronously.
+    //
+    // Measured behaviour of `InjectorCLIx86.exe` (2026-10-24): it injects by
+    // suspending and hijacking the target's **main thread**, so it only returns
+    // once that thread actually runs the hijacked `LoadLibraryW`.
+    //
+    // The catch is that a debuggee's threads are frozen by the kernel whenever
+    // it has a pending debug event, and they stay frozen until the debugger
+    // calls `ContinueDebugEvent`.  So if the debug loop blocks *inside* this
+    // function waiting for the injector, nobody drains the event queue, the
+    // hijacked thread never runs, and the injector hangs forever.  Measured:
+    // >15 s with no exit, main thread left at `Suspended`, and the debug loop
+    // then blocked in `WaitForDebugEvent` right after logging "ScyllaHide
+    // injected" — exactly how the x86 run died.
+    //
+    // Spawned against a target that is genuinely running (no pending debug
+    // event) the same injector finishes in ~47 ms.
+    //
+    // Therefore this function must never wait for the injector.  It spawns it,
+    // optionally nudges it, and returns immediately so the caller can get back
+    // into `WaitForDebugEvent`.  The caller is responsible for calling
+    // [`reap_hung_injector`] once the session ends.
+    let _ = &child;
+    debug!("ScyllaHide injector spawned; running asynchronously");
     std::mem::forget(child);
 
     Ok(())
+}
+
+/// Kill an injector that never returned, so it does not outlive the unpack run.
+///
+/// Kept separate from [`inject_scylla_hide`] because the caller must not block
+/// on the injector — see the measurement in that function's comments.  Call
+/// this after the debug session finishes; a healthy injector has already exited
+/// and this becomes a no-op.
+pub fn reap_hung_injector() {
+    use std::os::windows::process::CommandExt;
+    let mut sys = sysinfo_injector_procs();
+    for pid in sys.drain(..) {
+        debug!(pid, "reaping leftover ScyllaHide injector");
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
+#[cfg(windows)]
+fn sysinfo_injector_procs() -> Vec<u32> {
+    use std::os::windows::process::CommandExt;
+    // Best-effort: enumerate via `tasklist` rather than pulling in a dependency.
+    let out = std::process::Command::new("tasklist")
+        .args(["/FO", "CSV", "/NH", "/FI", "IMAGENAME eq InjectorCLIx86.exe"])
+        .creation_flags(0x0800_0000)
+        .output();
+    let Ok(out) = out else { return Vec::new() };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split("\",\"");
+            f.next()?;
+            let pid = f.next()?.trim_matches('"').trim();
+            pid.parse::<u32>().ok()
+        })
+        .collect()
 }

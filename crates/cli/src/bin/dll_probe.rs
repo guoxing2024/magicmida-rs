@@ -140,6 +140,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Themida probes for a debugger immediately.  Without ScyllaHide
                 // it trips STATUS_FLOAT_DIVIDE_BY_ZERO and stalls.
+                //
+                // Order matters: the injector hijacks the target's main thread,
+                // so it must be spawned only after this event has been answered
+                // and the thread is running.  See `scyllahide.rs` for the
+                // measurement.
                 let exe_dir = std::env::current_exe()
                     .ok()
                     .and_then(|p| p.parent().map(|d| d.to_path_buf()))
@@ -154,10 +159,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .display()
                         .to_string(),
                     ini_path: None,
-                    hook_delay_ms: 500,
                 };
+                // Spawn the injector and get straight back to WaitForDebugEvent:
+                // blocking here would freeze the target (pending debug event)
+                // and the injector would wait on it forever.
                 match mida_packers_themida::inject_scylla_hide(ev.dwProcessId, &cfg) {
-                    Ok(()) => println!("ScyllaHide injected"),
+                    Ok(()) => println!("ScyllaHide injector spawned"),
                     Err(e) => println!("ScyllaHide injection FAILED: {e}"),
                 }
             }
