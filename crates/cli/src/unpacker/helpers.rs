@@ -163,6 +163,26 @@ pub(super) fn compute_data_section_bounds(
     (0, 0)
 }
 
+/// Flatten the PE section table into `(rva, virtual_size, is_executable)`
+/// triples, the shape the IAT locator consumes.
+///
+/// The locator needs this to tell a real data section from the unmapped-looking
+/// gap between two sections: gaps are mapped and readable at run time, so
+/// `read_memory` on one succeeds and returns zeroes.  Memory content cannot
+/// distinguish them; the section table can.
+pub(super) fn section_table(sections: &[mida_pe::PeSection]) -> Vec<(u32, u32, bool)> {
+    sections
+        .iter()
+        .map(|s| {
+            (
+                s.virtual_address,
+                s.virtual_size,
+                s.characteristics & 0x2000_0000 != 0,
+            )
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // PE header helper
 // ---------------------------------------------------------------------------

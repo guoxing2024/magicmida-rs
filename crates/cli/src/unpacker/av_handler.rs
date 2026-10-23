@@ -744,6 +744,7 @@ pub(super) fn handle_access_violation(
             state.pe_info.is_vm_oep,
             mida_packers_themida::CompilerHint::Auto,
             &state.guard_addrs,
+            &super::helpers::section_table(&state.pe_info.pe_sections),
         ) {
             Ok(Some(iat)) => iat,
             Ok(None) => {

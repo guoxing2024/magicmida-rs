@@ -57,7 +57,7 @@ use helpers::{
     read_tls_callback_oep,
     scylla_injector_path, scylla_hook_path, resolve_output_path, resolve_api_addrs,
     resolve_host_api, compute_data_section_bounds, detect_packed_dll, pe_section_name_remote_rva,
-    dotnet_dump_and_dump_output, handle_hw_breakpoint,
+    dotnet_dump_and_dump_output, handle_hw_breakpoint, section_table,
 };
 use av_handler::{AvAction, handle_access_violation};
 // Re-export public functions for commands.rs
@@ -638,6 +638,7 @@ pub fn unpack(
                                 state.pe_info.is_vm_oep,
                                 CompilerHint::Auto,
                                 &state.guard_addrs,
+                                &section_table(&state.pe_info.pe_sections),
                             ) {
                                 match iat {
                                     Some(i) => {
@@ -1059,6 +1060,7 @@ fn run_post_loop_phases(
         state.pe_info.is_vm_oep,
         CompilerHint::Auto,
         &state.guard_addrs,
+        &section_table(&state.pe_info.pe_sections),
     )?
     .ok_or_else(|| anyhow!("IAT not found"))?;
 
@@ -1207,5 +1209,4 @@ fn run_post_loop_phases(
     log::log(LogType::Good, &format!("Unpacked: {}", output_path.display()));
     Ok(())
 }
-
 

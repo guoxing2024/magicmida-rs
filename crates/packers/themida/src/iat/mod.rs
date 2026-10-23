@@ -55,6 +55,28 @@ pub(super) const CONSECUTIVE_ZERO_THRESHOLD: usize = 64;
 /// we give up during backward IAT-boundary scanning.
 pub(super) const MAX_TRASH_SLOTS: usize = 64;
 
+/// How far *earlier* than an already-confirmed IAT reference a full-`.text`
+/// rescan may move the IAT start.
+///
+/// The OEP scan produces a reference that is known to be inside the table (its
+/// slot was read and held a code address).  A rescan of `.text` can produce a
+/// numerically smaller reference that belongs to a *different* table, so
+/// adoption is gated on the candidate sitting in the same section and being
+/// this close.  Measured: the EXE's rescan result is 0x328 before the
+/// reference and *is* the golden IAT start, so this threshold must admit it.
+pub(super) const MAX_EARLIER_REF_GAP: usize = 0x800;
+
+/// Which section an RVA belongs to, or `None` in the gap between sections.
+///
+/// Section gaps are mapped and readable at run time, so `read_memory` on one
+/// succeeds and returns zeroes — memory content cannot tell a gap from a real
+/// data section, but the section table can.
+pub(super) fn section_index_of_rva(rva: u32, sections: &[(u32, u32, bool)]) -> Option<usize> {
+    sections
+        .iter()
+        .position(|&(va, size, _)| rva >= va && (rva as u64) < va as u64 + size as u64)
+}
+
 // ---------------------------------------------------------------------------
 // IatLocation
 // ---------------------------------------------------------------------------
@@ -163,8 +185,22 @@ pub fn determine_iat_address(
     is_vm_oep: bool,
     compiler_hint: CompilerHint,
     guard_addrs: &[usize],
+    sections: &[(u32, u32, bool)],
 ) -> Result<Option<IatLocation>, ThemidaError> {
     let code_size = text_section.len();
+
+    // `.text` is section 0 in every Themida target measured so far, so the
+    // image base follows from `text_base` and the section table.
+    let image_base = match sections.first() {
+        Some(&(va, _, _)) => text_base.wrapping_sub(va as usize),
+        None => 0,
+    };
+    let section_of = |va: usize| -> Option<usize> {
+        if sections.is_empty() {
+            return None;
+        }
+        section_index_of_rva(va.wrapping_sub(image_base) as u32, sections)
+    };
 
     // Resolve the compiler hint.
     let compiler = match compiler_hint {
@@ -277,7 +313,22 @@ pub fn determine_iat_address(
             code_size,
         )?;
         if earliest != 0 {
-            earliest
+            // Nothing to compare against, but the rescan still has to name a
+            // real section: a gap address reads back as zeroes, so an
+            // unchecked result here is how the DLL case landed on `.text`'s
+            // end boundary.
+            match section_of(earliest) {
+                Some(_) => earliest,
+                None if sections.is_empty() => earliest,
+                None => {
+                    warn!(
+                        earliest = format_args!("{earliest:#x}"),
+                        "Discarding full-scan IAT ref: it belongs to no section \
+                         (section gap) — falling through to guard fallback"
+                    );
+                    0
+                }
+            }
         } else if !guard_addrs.is_empty() {
             // Pascal fallback (ThemidaCommon.pas lines 307-318):
             // Read the first guard addr, extract the call target, then
@@ -295,21 +346,42 @@ pub fn determine_iat_address(
             0
         }
     } else {
-        // Found via OEP scan, but try to find an earlier ref
+        // Found via OEP scan, but try to find an earlier ref.
+        //
+        // The OEP-scan reference is *confirmed* — its slot was read back and
+        // held a code address — while a whole-`.text` rescan can return a
+        // numerically smaller reference belonging to a different table.  So
+        // adoption is gated on same-section and proximity.
         let earliest = discovery::find_earliest_iat_ref(
             debugger,
             text_section,
             text_base,
             code_size,
         )?;
-        if earliest != 0 && earliest < iat_ref {
+        let gap = iat_ref.saturating_sub(earliest);
+        let same_section = match (section_of(earliest), section_of(iat_ref)) {
+            (Some(a), Some(b)) => a == b,
+            _ => true, // no section table → cannot refute, keep old behaviour
+        };
+        if earliest != 0 && earliest < iat_ref && same_section && gap <= MAX_EARLIER_REF_GAP {
             info!(
                 oep_ref = format_args!("{iat_ref:#x}"),
                 earliest = format_args!("{earliest:#x}"),
+                gap,
                 "Found earlier IAT ref via full .text scan"
             );
             earliest
         } else {
+            if earliest != 0 && earliest < iat_ref {
+                info!(
+                    oep_ref = format_args!("{iat_ref:#x}"),
+                    earliest = format_args!("{earliest:#x}"),
+                    gap,
+                    same_section,
+                    "Ignoring earlier IAT ref: not in the confirmed reference's \
+                     section, or too far before it — trusting the OEP scan"
+                );
+            }
             iat_ref
         }
     };
