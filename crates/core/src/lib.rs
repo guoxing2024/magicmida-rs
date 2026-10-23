@@ -14,11 +14,13 @@ pub mod windows_debugger;
 
 // Re-export commonly used types.
 pub use breakpoint::{HwBreakpoint, HwbpType, SoftBpAction};
-pub use debugger::{ContinueStatus, DebugEvent, DebuggerCore};
+pub use debugger::{
+    ctx_ip, ctx_sp, set_ctx_ip, set_ctx_sp, ContinueStatus, DebugEvent, DebuggerCore,
+};
 pub use error::CoreError;
 pub use process::{
     cleanup_stub_exe, close_process_handles, create_debug_process, ensure_loader_host,
-    patch_peb_anti_debug, CreateProcessOptions, TargetProcess,
+    patch_peb_anti_debug, sweep_stale_loader_hosts, CreateProcessOptions, TargetProcess,
 };
 pub use windows_debugger::WindowsDebugger;
 

@@ -212,6 +212,8 @@ pub fn trace_imports(
     let mut failed_count: usize = 0;
     let mut failed_slots: Vec<usize> = Vec::new();
     let mut trash_counter: usize = 0;
+    // Slots holding a bare RVA into a non-executable section: data, not imports.
+    let mut not_import_count: usize = 0;
     let mut did_set_exit_process: bool = false;
 
     log(
@@ -239,7 +241,28 @@ pub fn trace_imports(
 
         // Classify the slot (pure function — see decision::classify_iat_slot
         // and tests/regression_guoxing_shiguang.rs for the frozen taxonomy).
-        match decision::classify_iat_slot(current, tm_start, tm_end, image_base, image_boundary) {
+        // Section executability is needed to tell a real import thunk from a
+        // bare RVA that points at data (see `IatSlotDecision::NotAnImport`).
+        let section_triples: Vec<(u32, u32, bool)> = state
+            .pe_info
+            .pe_sections
+            .iter()
+            .map(|s| {
+                (
+                    s.virtual_address,
+                    s.virtual_size,
+                    s.characteristics & 0x2000_0000 != 0,
+                )
+            })
+            .collect();
+        match decision::classify_iat_slot_in(
+            current as u64,
+            tm_start as u64,
+            tm_end as u64,
+            image_base as u64,
+            image_boundary as u64,
+            &section_triples,
+        ) {
             IatSlotDecision::Separator => {
                 // Block separator inside a fragmented v3 IAT — reset the trash
                 // counter and keep scanning the remaining blocks.
@@ -250,13 +273,29 @@ pub fn trace_imports(
                 // Themida decrypts IAT blocks progressively; by trace time
                 // whole blocks may already be resolved.  Adopt as-is — these
                 // are NOT trash (regression: slot-142 abort, see tests).
-                iat_data[i] = api;
+                iat_data[i] = api as usize;
                 resolved_count += 1;
                 trash_counter = 0;
                 log(
                     LogMsgType::Good,
                     &format!("IAT[{i}] {slot_va:#x}: already resolved → {api:#x}"),
                 );
+                continue;
+            }
+            IatSlotDecision::NotAnImport => {
+                // A bare RVA pointing at a non-executable section.  Not an
+                // import, not a failure: leave the slot exactly as the shell
+                // left it and keep going.  Verified on the reference DLL to
+                // have zero code references, so this is safe.
+                trash_counter = 0;
+                log(
+                    LogMsgType::Info,
+                    &format!(
+                        "IAT[{i}] {slot_va:#x}: value {current:#x} is a bare RVA into a \
+                         non-executable section — not an import thunk, left as-is"
+                    ),
+                );
+                not_import_count += 1;
                 continue;
             }
             IatSlotDecision::Trash => {
@@ -271,7 +310,7 @@ pub fn trace_imports(
                 continue;
             }
             IatSlotDecision::Trace { start } | IatSlotDecision::TraceRva { start } => {
-                let trace_start = start as u64;
+                let trace_start = start;
                 log(
                     LogMsgType::Info,
                     &format!("Tracing IAT slot {i} ({slot_va:#x}) from {current:#x} (trace_start={trace_start:#x})"),
@@ -385,8 +424,8 @@ pub fn trace_imports(
     log(
         LogMsgType::Good,
         &format!(
-            "IAT trace complete: {} resolved, {} failed",
-            resolved_count, failed_count
+            "IAT trace complete: {} resolved, {} failed, {} not-an-import",
+            resolved_count, failed_count, not_import_count
         ),
     );
 
@@ -467,6 +506,7 @@ pub(crate) fn thread_id_of(ev: &DebugEvent) -> u32 {
         DebugEvent::Breakpoint { thread_id, .. }
         | DebugEvent::SingleStep { thread_id, .. }
         | DebugEvent::AccessViolation { thread_id, .. }
+        | DebugEvent::UnhandledException { thread_id, .. }
         | DebugEvent::CreateThread { thread_id, .. }
         | DebugEvent::ExitThread { thread_id, .. }
         | DebugEvent::LoadDll { thread_id, .. }
@@ -593,10 +633,19 @@ mod tests {
         };
 
         let state = ThemidaState::new(pe_info, false);
-        let actual_image_base = 0x140000000;
+        // `get_themida_section_bounds` works in `usize`, so the x64 base
+        // 0x140000000 does not exist on a 32-bit host — and because `cfg!` is a
+        // *runtime* macro, both branches are still type-checked, so the x64
+        // literal has to be compiled out rather than selected at run time.  The
+        // arithmetic is identical at any base, so each target uses a base that
+        // fits and asserts the same relative offsets.
+        #[cfg(target_pointer_width = "64")]
+        let actual_image_base: usize = 0x140000000;
+        #[cfg(target_pointer_width = "32")]
+        let actual_image_base: usize = 0x400000;
         let (start, end) = get_themida_section_bounds(&state, actual_image_base);
-        assert_eq!(start, 0x140004000);
-        assert_eq!(end, 0x140009000);
+        assert_eq!(start, actual_image_base + 0x4000);
+        assert_eq!(end, actual_image_base + 0x9000);
     }
 
     #[test]

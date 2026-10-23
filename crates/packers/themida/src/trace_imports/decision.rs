@@ -165,17 +165,36 @@ pub enum IatSlotDecision {
     /// leaving ~900 slots — including the one behind `call [rip+disp]` at
     /// `.text+0x3b63` — still holding Themida VM trampolines.  The dumped
     /// image then crashed with 0xC0000005 on first launch.
-    Resolved { api: usize },
+    Resolved { api: u64 },
     /// Obfuscated pointer inside the Themida VM — single-step trace from
     /// `start` (the value as-is, already relocated).
-    Trace { start: usize },
+    Trace { start: u64 },
     /// Bare in-image RVA stored unrelocated (Themida v3 x64 occasionally
     /// leaves slots as file-base-relative values).  Trace from
     /// `image_base + rva`.
-    TraceRva { start: usize },
+    TraceRva { start: u64 },
     /// Non-zero value that is neither an API, nor in the image, nor in the
     /// Themida section — data garbage.  Counts toward the trash threshold.
     Trash,
+    /// Bare in-image RVA that points at a **non-executable** section.
+    ///
+    /// Such a slot cannot be an import thunk: a thunk must be callable, so its
+    /// target has to live in executable memory.  Themida v3 leaves a handful of
+    /// slots holding pointers to read-only data (measured on the reference DLL:
+    /// slots 901/965/1057 hold `0x141000`/`0x141064`/`0x1410DC`, which is the
+    /// start of a `.rdata` section), and the real Windows loader leaves them
+    /// exactly like that — they are data the shell keeps in the table, not
+    /// imports.
+    ///
+    /// Counting them as failures was wrong in two ways: it made the run look
+    /// less complete than it is, and it made the trace waste 500 000
+    /// single-steps per slot executing into a data section.
+    ///
+    /// Verified on the reference DLL: these slots have **zero** code
+    /// references (no RIP-relative operand targets them, and their addresses
+    /// appear zero times as absolute qwords anywhere in the image), so leaving
+    /// them untouched cannot break the product.
+    NotAnImport,
 }
 
 /// Pure computation: classify one IAT slot value before the trace scan acts
@@ -192,13 +211,65 @@ pub enum IatSlotDecision {
 /// 4. In image but outside Themida section → [`IatSlotDecision::Trace`] if
 ///    stored relocated, [`IatSlotDecision::TraceRva`] if stored as a bare RVA.
 /// 5. Everything else → [`IatSlotDecision::Trash`].
+/// # Why `u64` and not `usize`
+///
+/// An address is a `u64` concept, not a pointer-width one.  These parameters
+/// used to be `usize`, which meant an x64 runtime address such as
+/// `0x7FF6_F5D4_0000` could not be written as a literal at all when compiling
+/// for a 32-bit target — the build failed with "literal out of range for
+/// `usize`", and the same mistake elsewhere in this file had once silently
+/// produced `0usize`, mis-classifying every address.  Taking `u64` makes the
+/// classifier architecture-independent: the same fixture values work on both
+/// hosts, and 32-bit callers widen instead of truncating.
 #[must_use]
 pub fn classify_iat_slot(
-    value: usize,
-    themida_start: usize,
-    themida_end: usize,
-    image_base: usize,
-    image_boundary: usize,
+    value: u64,
+    themida_start: u64,
+    themida_end: u64,
+    image_base: u64,
+    image_boundary: u64,
+) -> IatSlotDecision {
+    classify_iat_slot_with_sections(
+        value,
+        themida_start,
+        themida_end,
+        image_base,
+        image_boundary,
+        &[],
+    )
+}
+
+/// Section-description-free classifier, kept for the existing call sites and
+/// tests.  See [`classify_iat_slot_in`] when section executability is known.
+#[must_use]
+pub fn classify_iat_slot_in(
+    value: u64,
+    themida_start: u64,
+    themida_end: u64,
+    image_base: u64,
+    image_boundary: u64,
+    sections: &[(u32, u32, bool)],
+) -> IatSlotDecision {
+    classify_iat_slot_with_sections(
+        value,
+        themida_start,
+        themida_end,
+        image_base,
+        image_boundary,
+        sections,
+    )
+}
+
+/// Shared implementation.  `sections` is `(rva, size, is_executable)` triples;
+/// when empty, the "points at data" check is skipped and the old behaviour is
+/// preserved.
+fn classify_iat_slot_with_sections(
+    value: u64,
+    themida_start: u64,
+    themida_end: u64,
+    image_base: u64,
+    image_boundary: u64,
+    sections: &[(u32, u32, bool)],
 ) -> IatSlotDecision {
     if value == 0 {
         return IatSlotDecision::Separator;
@@ -211,10 +282,11 @@ pub fn classify_iat_slot(
     // Already-resolved API: same heuristic as `iat::fix::is_likely_api_address`
     // (user-mode DLL range on x64/x86), inlined here so the classifier stays a
     // dependency-free pure function.
+    let value64 = value;
     let plausible_api = if cfg!(target_arch = "x86_64") {
-        (0x7ff0_0000_0000..0x0000_7FFF_FFFF_0000).contains(&value)
+        (0x7ff0_0000_0000u64..0x0000_7FFF_FFFF_0000u64).contains(&value64)
     } else {
-        (0x6000_0000..0x7FFF_0000).contains(&value)
+        (0x6000_0000u64..0x7FFF_0000u64).contains(&value64)
     };
     if plausible_api {
         return IatSlotDecision::Resolved { api: value };
@@ -228,6 +300,15 @@ pub fn classify_iat_slot(
         return IatSlotDecision::Trace { start: value };
     }
     if in_image_rva {
+        // A bare RVA that lands in a non-executable section is data the shell
+        // parked in the table, not an import thunk — see `NotAnImport`.
+        let rva = value as u32;
+        let lands_in_data = sections.iter().any(|&(va, size, exec)| {
+            !exec && rva >= va && (rva as u64) < va as u64 + size as u64
+        });
+        if lands_in_data {
+            return IatSlotDecision::NotAnImport;
+        }
         return IatSlotDecision::TraceRva { start: relocated };
     }
 
@@ -276,7 +357,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_pointer_width = "64")]
     fn outside_image_is_real_api() {
+        // An x64 user-mode API address.  Gated to 64-bit hosts because
+        // `is_real_api_address` takes `usize`, so the literal cannot exist on
+        // i686 — the 32-bit equivalent is `low_address_is_not_real_api` below.
         assert!(is_real_api_address(
             0x7FFE12345678,
             0x400000,
@@ -346,7 +431,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_pointer_width = "64")]
     fn trace_is_at_api_found_api_outside_image() {
+        // x64 IP literal: `trace_is_at_api` takes `usize`, so this only exists
+        // on a 64-bit host.
         assert_eq!(
             trace_is_at_api(
                 0x7FFE12340000, 0x10000, 0x10000, 50,
@@ -431,7 +519,10 @@ mod tests {
     //    taxonomy that fixed the slot-142 trash-abort bug.
 
     /// (image_base, image_boundary, themida_start, themida_end)
-    const SHIGUANG: (usize, usize, usize, usize) = (
+    ///
+    /// `u64`, not `usize`: these are x64 runtime addresses, and a `usize`
+    /// literal of this magnitude does not even compile on a 32-bit target.
+    const SHIGUANG: (u64, u64, u64, u64) = (
         0x0000_7FF6_F5D4_0000,
         0x0000_7FF6_F6A6_8000,
         0x0000_7FF6_F5EA_8000,
@@ -446,11 +537,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_pointer_width = "64")]
     fn shiguang_resolved_api_block_is_not_trash() {
         // Live slots 130-142 held already-resolved API addresses like these
         // (ntdll/KERNELBASE range) — the old code abort the scan here.
         let samples = [
-            0x0000_7FFF_E3FC_B050usize,
+            0x0000_7FFF_E3FC_B050u64,
             0x0000_7FFF_E3FC_B180,
             0x0000_7FFF_E3F6_D720,
             0x0000_7FFF_E3FB_4FD0,
@@ -462,9 +554,60 @@ mod tests {
     }
 
     #[test]
+    fn bare_rva_into_data_section_is_not_an_import() {
+        // Reference DLL, live loader: slots 901/965/1057 hold 0x141000 /
+        // 0x141064 / 0x1410DC, which is the start of a non-executable .rdata
+        // section.  A thunk must be callable, so these cannot be imports.
+        let image_base = 0x3205_C0000u64;
+        let image_boundary = image_base + 0x1B9000;
+        let themida_start = image_base + 0x198000;
+        let themida_end = image_base + 0xDB2000;
+        // (.rdata at 0x141000 size 0x2B98, not executable) + (.text, executable)
+        let sections = [
+            (0x141000u32, 0x2B98u32, false),
+            (0x1000u32, 0x1017C0u32, true),
+        ];
+        for v in [0x141000u64, 0x141064, 0x1410DC] {
+            let d = classify_iat_slot_in(
+                v, themida_start, themida_end, image_base, image_boundary, &sections,
+            );
+            assert_eq!(d, IatSlotDecision::NotAnImport, "value {v:#x}");
+        }
+    }
+
+    #[test]
+    fn bare_rva_into_executable_section_is_still_traced() {
+        // The data-section rule must not swallow a genuine in-image thunk that
+        // happens to be stored as a bare RVA into .text.
+        let image_base = 0x3205_C0000u64;
+        let image_boundary = image_base + 0x1B9000;
+        let themida_start = image_base + 0x198000;
+        let themida_end = image_base + 0xDB2000;
+        let sections = [(0x1000u32, 0x1017C0u32, true)];
+        let d = classify_iat_slot_in(
+            0x2BB10, themida_start, themida_end, image_base, image_boundary, &sections,
+        );
+        assert!(matches!(d, IatSlotDecision::TraceRva { .. }), "got {d:?}");
+    }
+
+    #[test]
+    fn no_section_info_keeps_old_behaviour() {
+        // Callers that cannot supply section characteristics must not suddenly
+        // start skipping slots.
+        let image_base = 0x3205_C0000u64;
+        let image_boundary = image_base + 0x1B9000;
+        let themida_start = image_base + 0x198000;
+        let themida_end = image_base + 0xDB2000;
+        let d = classify_iat_slot(
+            0x141000, themida_start, themida_end, image_base, image_boundary,
+        );
+        assert!(matches!(d, IatSlotDecision::TraceRva { .. }), "got {d:?}");
+    }
+
+    #[test]
     fn shiguang_vm_pointer_is_traced() {
         // Live slot 0: 0x7ff6f6026454 — inside the Themida section.
-        let v = 0x0000_7FF6_F602_6454usize;
+        let v = 0x0000_7FF6_F602_6454u64;
         assert!(v >= SHIGUANG.2 && v < SHIGUANG.3);
         let d = classify_iat_slot(v, SHIGUANG.2, SHIGUANG.3, SHIGUANG.0, SHIGUANG.1);
         assert_eq!(d, IatSlotDecision::Trace { start: v });
@@ -474,13 +617,14 @@ mod tests {
     fn shiguang_data_garbage_is_trash() {
         // Observed unresolvable pairs: 0x11303c0011303c / 0x11305000113050 —
         // two packed 32-bit data offsets, neither API nor image pointer.
-        for v in [0x0000_0113_03C0_0113_03C0usize, 0x0000_0113_0500_0113_0500] {
+        for v in [0x0000_0113_03C0_0113_03C0u64, 0x0000_0113_0500_0113_0500] {
             let d = classify_iat_slot(v, SHIGUANG.2, SHIGUANG.3, SHIGUANG.0, SHIGUANG.1);
             assert_eq!(d, IatSlotDecision::Trash, "value {v:#x}");
         }
     }
 
     #[test]
+    #[cfg(target_pointer_width = "64")]
     fn shiguang_image_internal_pointer_resolved_on_x64() {
         // On x64 the ASLR image base (0x7FF6_....) itself sits inside the
         // plausible-API range, so a relocated in-image non-Themida pointer
@@ -488,6 +632,10 @@ mod tests {
         // the exact ordering the successful 186-thunk run used — freeze it.
         // (The Trace branch for raw in-image pointers only fires on x86-style
         // bases, see `x86_style_image_pointer_is_traced` below.)
+        //
+        // Gated to 64-bit hosts: `classify_iat_slot` derives its API range from
+        // the host architecture, so on i686 a 0x7FF6_... base is outside the
+        // x86 range and this ordering does not apply.
         let v = SHIGUANG.0 + 0x5000; // inside .text, relocated
         let d = classify_iat_slot(v, SHIGUANG.2, SHIGUANG.3, SHIGUANG.0, SHIGUANG.1);
         assert_eq!(d, IatSlotDecision::Resolved { api: v });
@@ -522,12 +670,20 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_pointer_width = "64")]
     fn one_hundred_consecutive_resolved_slots_never_trash() {
         // The core regression: a long run of already-resolved API addresses
         // must classify as Resolved (never Trash), so the scan cannot abort
         // mid-table the way it did at slot 142/1063.
+        //
+        // Gated to 64-bit hosts on purpose: `classify_iat_slot` picks its
+        // "plausible API range" from the *host* architecture (`cfg!` on
+        // `target_arch`), which is correct because the CLI is built for the
+        // architecture it unpacks.  These fixtures are x64 addresses, so on an
+        // i686 host they fall outside the x86 range and are Trash by design —
+        // asserting otherwise would be testing the wrong thing.
         for i in 0..100 {
-            let v = 0x0000_7FFF_E3F0_0000usize + i * 0x10;
+            let v = 0x0000_7FFF_E3F0_0000u64 + i as u64 * 0x10;
             let d = classify_iat_slot(v, SHIGUANG.2, SHIGUANG.3, SHIGUANG.0, SHIGUANG.1);
             assert_eq!(
                 d,

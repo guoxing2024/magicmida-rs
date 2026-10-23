@@ -10,7 +10,7 @@ use tracing::{debug, trace, warn};
 use windows::Win32::Foundation::{
     CloseHandle, HANDLE,
     EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_SINGLE_STEP,
-    DBG_CONTINUE,
+    DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED,
 };
 use windows::Win32::System::Diagnostics::Debug::{
     ContinueDebugEvent, FlushInstructionCache, GetThreadContext, SetThreadContext,
@@ -44,6 +44,29 @@ use crate::process::{CreateProcessOptions, TargetProcess, create_debug_process, 
 /// Created from a [`CreateProcessOptions`] via [`WindowsDebugger::new`], which
 /// launches the target.  Every subsequent operation goes through the
 /// [`DebuggerCore`] trait implementation.
+/// The integer type of `CONTEXT::Dr0..Dr7`.
+///
+/// `u64` on x64, `u32` on x86.  Exists so the hardware-breakpoint writer can be
+/// written once instead of twice: pinning those fields to `u64` is what kept the
+/// x86 build from compiling at all.
+trait DrFields {
+    type Dr: Copy
+        + core::ops::Shl<usize, Output = Self::Dr>
+        + core::ops::BitOrAssign
+        + core::ops::Not<Output = Self::Dr>
+        + core::ops::BitAndAssign;
+}
+
+#[cfg(target_arch = "x86_64")]
+impl DrFields for CONTEXT {
+    type Dr = u64;
+}
+
+#[cfg(target_arch = "x86")]
+impl DrFields for CONTEXT {
+    type Dr = u32;
+}
+
 pub struct WindowsDebugger {
     /// Target process information (handles, pid, image base, etc.
     process: TargetProcess,
@@ -409,23 +432,34 @@ impl WindowsDebugger {
         //   G0–G3  (bits 1,3,5,7):   global enable (unused — set 0)
         //   LEN0–LEN3 (bits 8-15):       length (00=1, 01=2, 11=4 bytes)
         //   RW0–RW3  (bits 16-23):      type (00=execute, 01=write, 11=access)
-        let mut dr7: u64 = 0;
+        // `Dr0..Dr7` are `u64` in the x64 CONTEXT and `u32` in the x86 one, so the
+        // accumulator has to follow the target architecture rather than being
+        // pinned to `u64` (pinning it is what kept the x86 build from
+        // compiling at all).
+        type DrWord = <CONTEXT as DrFields>::Dr;
+        let mut dr7: DrWord = 0;
 
         // Helper: write one slot's data into DR7 and the context DRn register.
-        fn apply_slot(ctx: &mut CONTEXT, bp: Option<&HwBreakpoint>, slot: usize, dr7: &mut u64) {
+        fn apply_slot(
+            ctx: &mut CONTEXT,
+            bp: Option<&HwBreakpoint>,
+            slot: usize,
+            dr7: &mut <CONTEXT as DrFields>::Dr,
+        ) {
             let dr_shift = slot * 4;       // RW field: bits 16 + 4*slot
             let le_shift = slot * 2;        // L enable: bits 0,2,4,6
             match bp {
                 Some(b) if b.is_set() => {
+                    let addr = b.address as <CONTEXT as DrFields>::Dr;
                     match slot {
-                        0 => ctx.Dr0 = b.address,
-                        1 => ctx.Dr1 = b.address,
-                        2 => ctx.Dr2 = b.address,
-                        3 => ctx.Dr3 = b.address,
+                        0 => ctx.Dr0 = addr,
+                        1 => ctx.Dr1 = addr,
+                        2 => ctx.Dr2 = addr,
+                        3 => ctx.Dr3 = addr,
                         _ => unreachable!(),
                     }
-                    *dr7 |= 1u64 << le_shift;
-                    *dr7 |= (b.bp_type as u64) << (16 + dr_shift);
+                    *dr7 |= (1 as <CONTEXT as DrFields>::Dr) << le_shift;
+                    *dr7 |= (b.bp_type as <CONTEXT as DrFields>::Dr) << (16 + dr_shift);
                 }
                 _ => {
                     // Slot is empty or disabled; clear the DRn register.
@@ -447,7 +481,7 @@ impl WindowsDebugger {
 
         // Clear the BS (single-step) flag in DR6 (bit 14) so the OS
         // doesn't conflate a single-step with a hardware breakpoint.
-        ctx.Dr6 &= !(1u64 << 14);
+        ctx.Dr6 &= !((1 as <CONTEXT as DrFields>::Dr) << 14);
 
         ctx.Dr7 = dr7;
     }
@@ -642,6 +676,91 @@ impl WindowsDebugger {
 // Drop — clean up handles and stub EXE
 // ---------------------------------------------------------------------------
 
+/// True when `hresult` is Windows `ERROR_SEM_TIMEOUT` (121) in HRESULT form.
+///
+/// `WaitForDebugEvent` uses that error to mean "the timeout expired and no debug
+/// event arrived" — an ordinary idle interval, not a failure.  The `windows`
+/// crate surfaces it as `HRESULT_FROM_WIN32(121)` = `0x80070079` =
+/// 2147942521, so the Win32 code lives in the low 16 bits:
+///
+/// ```text
+/// 0x80070079 & 0xFFFF == 0x0079 == 121   -> true
+/// 0x80070079          == 121             -> false   (the original bug)
+/// ```
+///
+/// Comparing the whole HRESULT against 121 can never match, which is why
+/// `CoreError::Timeout` used to be unreachable and every idle tick surfaced as a
+/// hard `CoreError::Windows` error.  Callers each worked around it locally
+/// (`av_handler.rs`'s `sem_timeout`, the DLL settle loop); this is the single
+/// definition they now share.
+fn is_sem_timeout(hresult: u32) -> bool {
+    hresult & 0xFFFF == 121
+}
+
+impl WindowsDebugger {
+    /// Consume and acknowledge debug events until the debuggee's exit is seen.
+    ///
+    /// Called from `Drop` after `TerminateProcess` on the loader-host path.
+    ///
+    /// # Why this is required
+    ///
+    /// Windows keeps a terminated process in the "exiting" state while its
+    /// debugger still owes the kernel a `ContinueDebugEvent` for the pending
+    /// `EXIT_PROCESS_DEBUG_EVENT`.  Until that acknowledgement arrives the
+    /// process object is not torn down, its image section stays mapped, and the
+    /// file cannot be deleted — `remove_file` reports `ERROR_ACCESS_DENIED`.
+    ///
+    /// Measured on the reference DLL before this existed: the loader host was
+    /// terminated, `DebugActiveProcessStop` was refused, and the 62 KB stub was
+    /// still locked after 5 s of retries; it became deletable the instant the
+    /// CLI exited.  That is exactly the signature of a pending exit event.
+    ///
+    /// Bounded on purpose: this runs in `Drop`, so it must never hang a failing
+    /// run.  Any other event that arrives is answered normally, because leaving
+    /// one unanswered would block the exit event behind it.
+    fn drain_exit_events(&mut self, pid: u32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            let mut raw: RAW_DEBUG_EVENT = RAW_DEBUG_EVENT::default();
+            // SAFETY: `raw` is a valid out-pointer; a short timeout keeps the
+            // wait bounded.
+            if let Err(e) = unsafe { WaitForDebugEvent(&mut raw, 100) } {
+                // `windows` returns a full HRESULT: a timeout is
+                // `0x80070079` (2147942521), whose **low 16 bits** are
+                // `ERROR_SEM_TIMEOUT` (121).  Comparing the whole HRESULT
+                // against 121 never matches — that mistake made this loop bail
+                // out on its first idle tick.
+                let code = e.code().0 as u32;
+                if is_sem_timeout(code) {
+                    continue; // nothing pending
+                }
+                debug!(error_code = code, "drain: WaitForDebugEvent failed");
+                return;
+            }
+
+            let code = raw.dwDebugEventCode.0;
+            let is_exit = code == EXIT_PROCESS_DEBUG_EVENT.0;
+            let event_pid = raw.dwProcessId;
+
+            // SAFETY: the event came from `WaitForDebugEvent`, so it must be
+            // acknowledged exactly once.
+            unsafe {
+                let _ = ContinueDebugEvent(
+                    event_pid,
+                    raw.dwThreadId,
+                    DBG_CONTINUE,
+                );
+            }
+
+            if is_exit && event_pid == pid {
+                debug!(pid, "Consumed the loader host's exit event");
+                return;
+            }
+        }
+        debug!(pid, "No exit event for the loader host within the timeout");
+    }
+}
+
 impl Drop for WindowsDebugger {
     fn drop(&mut self) {
         // Close every registered thread handle EXCEPT the main thread.
@@ -659,9 +778,51 @@ impl Drop for WindowsDebugger {
                 }
             }
         }
+
+        // Terminate the debuggee and then **acknowledge its exit**, or the file
+        // never becomes deletable.
+        //
+        // A debuggee that terminates stays in the "exiting" state until its
+        // debugger consumes the pending `EXIT_PROCESS_DEBUG_EVENT` and answers
+        // it with `ContinueDebugEvent`.  Its image section therefore stays
+        // mapped and `remove_file` keeps failing with `ERROR_ACCESS_DENIED`.
+        //
+        // Measured on the reference DLL: `TerminateProcess` returned success,
+        // `DebugActiveProcessStop` failed with `ERROR_ACCESS_DENIED`, and the
+        // 62 KB loader host was *still* locked after 5 s of retries — yet it was
+        // deletable the instant the CLI process exited, i.e. as soon as the
+        // kernel tore the debug session down.  Draining the exit event here is
+        // what makes that happen while we are still alive.
+        //
+        // This only ever applies to our own child on the DLL path;
+        // `/dump-process` uses `ReadOnlyProcessDebugger`, which has no such
+        // teardown.
+        if !self.process.handle.is_invalid() && self.process.stub_exe.is_some() {
+            let pid = self.process.pid;
+
+            // SAFETY: the handle was opened with PROCESS_ALL_ACCESS, which
+            // includes PROCESS_TERMINATE.
+            match unsafe {
+                windows::Win32::System::Threading::TerminateProcess(
+                    self.process.handle,
+                    0,
+                )
+            } {
+                Ok(()) => debug!(pid, "Terminated the loader host"),
+                Err(e) => warn!(pid, "TerminateProcess on the loader host failed: {e}"),
+            }
+
+            self.drain_exit_events(pid);
+        }
+
         // Close process and main-thread handles.
         close_process_handles(self.process.handle, self.process.main_thread_handle);
+
         // Delete the stub EXE if one was generated.
+        //
+        // Even after `TerminateProcess` the kernel needs a moment to tear the
+        // section object down, so retry briefly rather than reporting a failure
+        // that is really just a race with process teardown.
         if let Some(ref stub) = self.process.stub_exe {
             cleanup_stub_exe(stub);
         }
@@ -727,12 +888,23 @@ impl DebuggerCore for WindowsDebugger {
                 }
             }
             Err(e) => {
-                // Check if this is a timeout (ERROR_SEM_TIMEOUT = 121)
-                let error_code = e.code().0 as u32;
-                if error_code == 121 {
+                // `WaitForDebugEvent` reports its timeout as a *HRESULT*, not as a
+                // bare Win32 error code: `ERROR_SEM_TIMEOUT` (121) arrives as
+                // `0x80070079`, which is -2147024775 as a signed 32-bit value.
+                // Comparing the whole value against 121 therefore never matches,
+                // so `CoreError::Timeout` was unreachable and every idle tick
+                // surfaced as a hard `CoreError::Windows` failure instead.
+                //
+                // The Win32 code is the low 16 bits.  This is the same test the
+                // callers had to duplicate locally to work around the bug
+                // (`av_handler.rs`'s `sem_timeout`, `mod.rs`'s inline check); with
+                // the mapping fixed here those workarounds become no-ops rather
+                // than the only thing keeping the loop alive.
+                let hresult = e.code().0 as u32;
+                if is_sem_timeout(hresult) {
                     Err(CoreError::Timeout)
                 } else {
-                    Err(CoreError::Windows(error_code))
+                    Err(CoreError::Windows(hresult & 0xFFFF))
                 }
             }
         }
@@ -747,9 +919,15 @@ impl DebuggerCore for WindowsDebugger {
             let wait_result = unsafe { WaitForDebugEvent(&mut raw, INFINITE) };
             if wait_result.is_err() {
                 let err = wait_result.unwrap_err();
-                let code = err.code().0 as u32;
-                debug!(error_code = code, "WaitForDebugEvent failed");
-                return Err(CoreError::Windows(code));
+                // Same HRESULT-vs-Win32 distinction as the outer `continue_event`
+                // loop above: the timeout arrives as 0x80070079 and must be
+                // reduced to its low 16 bits before it means anything.
+                let hresult = err.code().0 as u32;
+                debug!(hresult, "WaitForDebugEvent failed");
+                if is_sem_timeout(hresult) {
+                    return Err(CoreError::Timeout);
+                }
+                return Err(CoreError::Windows(hresult & 0xFFFF));
             }
 
             let _event_code = raw.dwDebugEventCode;
@@ -817,6 +995,11 @@ impl DebuggerCore for WindowsDebugger {
         let nt_status = match status {
             ContinueStatus::Continue => DBG_CONTINUE,
             ContinueStatus::ContinueNoStep => DBG_CONTINUE,
+            // DBG_EXCEPTION_NOT_HANDLED: hand the exception to the program's
+            // own SEH instead of resuming at the faulting instruction.  Required
+            // for first-chance faults the debugger does not handle — resuming
+            // with DBG_CONTINUE re-executes the faulting instruction and loops.
+            ContinueStatus::ExceptionNotHandled => DBG_EXCEPTION_NOT_HANDLED,
         };
 
         // SAFETY: pid and tid come from the current debug event.
@@ -1025,8 +1208,40 @@ impl WindowsDebugger {
                         }
                     }
                     other => {
-                        trace!(code = other.0, "Unhandled exception");
-                        return Err(CoreError::Windows(other.0 as u32));
+                        // Any other exception is a *first-chance* exception the
+                        // debuggee raised, not a debugger failure.
+                        //
+                        // This used to `return Err(CoreError::Windows(code))`,
+                        // which made the whole unpack abort.  That is wrong on
+                        // two counts:
+                        //
+                        // 1. Under `DEBUG_ONLY_THIS_PROCESS` the debugger is
+                        //    handed **every** exception first, including ones
+                        //    the program handles itself via SEH.  Returning an
+                        //    error for them kills runs that would have worked.
+                        // 2. Themida uses exactly this as an anti-debug probe.
+                        //    Measured on the x86 reference sample (Themida
+                        //    3.2.4, built here with `Themida.exe`): the shell
+                        //    executes a privileged instruction, Windows raises
+                        //    `STATUS_PRIVILEGED_INSTRUCTION` (0xC0000096), and
+                        //    the run died with `Windows API error: code
+                        //    3221225622` before ever reaching the OEP.  The
+                        //    x64 reference samples never hit this path, which is
+                        //    why it went unnoticed.
+                        //
+                        // Surfacing it as `DebugEvent::UnhandledException` lets
+                        // the caller decide: continue the event (the normal
+                        // first-chance case) or act on a specific code.
+                        trace!(
+                            code = %format!("{:#x}", other.0),
+                            address = %format!("{addr:#x}"),
+                            "First-chance exception"
+                        );
+                        DebugEvent::UnhandledException {
+                            thread_id: raw.dwThreadId,
+                            address: addr,
+                            code: other.0 as u32,
+                        }
                     }
                 }
             }
@@ -1118,5 +1333,55 @@ impl WindowsDebugger {
         };
 
         Ok(ev)
+    }
+}
+
+#[cfg(test)]
+mod sem_timeout_tests {
+    use super::is_sem_timeout;
+
+    /// The exact value `WaitForDebugEvent` returns when its timeout expires.
+    ///
+    /// This is the regression test for the bug: the old code compared this
+    /// number against 121 directly and therefore never matched, which made
+    /// `CoreError::Timeout` unreachable and turned every idle debug-loop tick
+    /// into a hard error.
+    #[test]
+    fn real_hresult_is_recognised() {
+        let hresult: u32 = 0x8007_0079;
+        assert_eq!(hresult, 2147942521, "the constant must be the real one");
+        assert!(
+            is_sem_timeout(hresult),
+            "HRESULT_FROM_WIN32(121) must map to a timeout"
+        );
+        // The bug in one line: the whole value is not 121.
+        assert_ne!(hresult, 121, "this is why the old comparison failed");
+    }
+
+    /// The bare Win32 code must also be recognised, because some paths reach
+    /// here with the code already reduced.
+    #[test]
+    fn bare_win32_code_is_recognised() {
+        assert!(is_sem_timeout(121));
+    }
+
+    /// A genuine failure must not be mistaken for an idle interval.
+    #[test]
+    fn other_errors_are_not_timeouts() {
+        // ERROR_PARTIAL_COPY — the real failure ScyllaHide timing races produce.
+        assert!(!is_sem_timeout(0x8007_012D));
+        // ERROR_ACCESS_DENIED.
+        assert!(!is_sem_timeout(0x8007_0005));
+        // ERROR_INVALID_HANDLE.
+        assert!(!is_sem_timeout(0x8007_0006));
+        // Zero is not a timeout either.
+        assert!(!is_sem_timeout(0));
+    }
+
+    /// A success HRESULT (0) and a plain non-Win32 HRESULT must not match.
+    #[test]
+    fn non_win32_hresults_do_not_match() {
+        // E_FAIL: low 16 bits are 0x8000, not 121.
+        assert!(!is_sem_timeout(0x8000_4005));
     }
 }

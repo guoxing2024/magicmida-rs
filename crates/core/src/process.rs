@@ -27,7 +27,7 @@ use windows::Win32::System::SystemServices::IMAGE_DOS_HEADER;
 use windows::Win32::System::Threading::{
     CreateProcessW, PROCESS_BASIC_INFORMATION, PROCESS_INFORMATION,
     STARTUPINFOW, STARTF_USESHOWWINDOW, CREATE_SUSPENDED,
-    DEBUG_ONLY_THIS_PROCESS, CREATE_NEW_CONSOLE,
+    DEBUG_ONLY_THIS_PROCESS, CREATE_NO_WINDOW,
     CREATE_DEFAULT_ERROR_MODE, NORMAL_PRIORITY_CLASS,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOW;
@@ -238,9 +238,11 @@ int main(int argc, char **argv) {
                             (int)(sizeof wide / sizeof wide[0])) == 0)
         return 2;
 
-    /* Log next to the DLL so the debugger's CWD does not matter. */
+    /* Log to %TEMP%, not next to the sample: the sample directory belongs to
+       the user, and a debug run must not leave files in it. */
     char log[MAX_PATH * 2];
-    snprintf(log, sizeof log, "%s.host.log", argv[1]);
+    snprintf(log, sizeof log, "%s\\magicmida-hosts\\host-%lu.log",
+             getenv("TEMP") ? getenv("TEMP") : ".", (unsigned long)GetCurrentProcessId());
     FILE *lf = fopen(log, "w");
 
     HMODULE h = LoadLibraryW(wide);
@@ -312,7 +314,17 @@ pub fn create_debug_process(
     let stub_exe = if is_dll {
         let host_path = ensure_loader_host(&opts.executable)?;
         info!("Created DLL loader host: {}", host_path.display());
-        host_arguments = Some(format!("\"{}\"", opts.executable.display()));
+        // The DLL argument must be **absolute**.
+        //
+        // `CreateProcess` sets the child's working directory to the host's own
+        // directory (below), which is now `%TEMP%\magicmida-hosts`, not the
+        // sample's directory.  A relative input path therefore resolves against
+        // the wrong place and `LoadLibraryW` fails with `ok=0` (measured: the
+        // host log showed `base=0000000000000000 ok=0`, and the run then died
+        // with "OEP not found" because nothing was ever loaded).
+        let dll_abs = std::fs::canonicalize(&opts.executable)
+            .unwrap_or_else(|_| opts.executable.clone());
+        host_arguments = Some(format!("\"{}\"", dll_abs.display()));
         executable_path = host_path.clone();
         Some(host_path)
     } else {
@@ -332,8 +344,25 @@ pub fn create_debug_process(
     debug!(%cmd_line, "Launching debuggee");
 
     // Step 4: create the process
+    //
+    // `CREATE_NO_WINDOW` instead of `CREATE_NEW_CONSOLE`:
+    //
+    // The debuggee is launched with `DEBUG_ONLY_THIS_PROCESS`, so nothing about
+    // the unpack pipeline needs a console of its own — the CLI/GUI drives it
+    // through the debug API and reads its output from the dump, not from a
+    // terminal.  `CREATE_NEW_CONSOLE` therefore only did one thing: flashed a
+    // black console window on every run, on top of the caller's window.  That is
+    // pure visual noise, and it is why unpacking from the GUI popped a CMD box.
+    //
+    // `CREATE_NO_WINDOW` keeps the same "no inherited console" property while
+    // creating no visible window.  It does not affect debugging, the child's
+    // ability to create its own windows, or `WaitForDebugEvent`; the Themida
+    // shell creates its GUI windows itself via `CreateWindowExW`, which is
+    // unaffected by console flags.  Verified by both end-to-end gates: the EXE
+    // product still reaches its `授权验证` window, and the DLL case still answers
+    // `GetAppVersion() == "1.1"`.
     let mut flags = CREATE_DEFAULT_ERROR_MODE
-        | CREATE_NEW_CONSOLE
+        | CREATE_NO_WINDOW
         | NORMAL_PRIORITY_CLASS
         | DEBUG_ONLY_THIS_PROCESS;
 
@@ -861,14 +890,68 @@ fn make_dll_executable(
 /// The source is written to `<dll>.host.c` and compiled with [`HOST_COMPILER`].
 /// The result is cached: if the EXE is newer than the source it is reused, so a
 /// repeated unpack does not pay the compile cost.
+///
+/// # Why the host goes in the temp directory, not beside the sample
+///
+/// It used to be written next to the input (`core.dllMMHost.exe`), which put two
+/// build artefacts into the user's sample folder on every run and — worse —
+/// left the EXE behind whenever the debuggee outlived the CLI.  A debuggee's
+/// image stays mapped while its process object is alive, so `remove_file`
+/// reports `ERROR_ACCESS_DENIED`; measured, the host survived every DLL run and
+/// only became deletable after the CLI process itself exited.
+///
+/// Writing it under `%TEMP%\magicmida-hosts\` keeps the sample directory clean
+/// and makes a leftover file a temp-file problem rather than a corrupted
+/// sample directory.  The path is still deterministic per DLL (a hash of the
+/// canonical path), so the compile cache keeps working.
 pub fn ensure_loader_host(dll_path: &Path) -> Result<PathBuf, CoreError> {
     let dll_str = dll_path
         .as_os_str()
         .to_str()
         .ok_or_else(|| CoreError::ProcessCreation("DLL path is not valid UTF-8".into()))?;
 
-    let src_path = PathBuf::from(format!("{dll_str}.host.c"));
-    let exe_path = PathBuf::from(format!("{dll_str}{HOST_EXE_SUFFIX}"));
+    // A stable, collision-free name for this DLL's host.  The canonical path is
+    // hashed rather than sanitised: sample names contain characters (spaces,
+    // CJK, dots) that would otherwise need escaping, and two different samples
+    // must never share one host binary.
+    let canonical = std::fs::canonicalize(dll_path)
+        .unwrap_or_else(|_| dll_path.to_path_buf());
+    let stem = canonical
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("target");
+    let hash = {
+        // FNV-1a over the canonical path — no dependency, stable across runs.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in canonical.to_string_lossy().as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    };
+    let host_dir = std::env::temp_dir().join("magicmida-hosts");
+    std::fs::create_dir_all(&host_dir).map_err(|e| {
+        CoreError::ProcessCreation(format!(
+            "Cannot create the loader-host directory '{}': {e}",
+            host_dir.display()
+        ))
+    })?;
+    sweep_stale_loader_hosts(&host_dir);
+
+    // Keep the sample's stem in the name so a leftover file is identifiable.
+    let safe_stem: String = stem
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .take(32)
+        .collect();
+    let src_path = host_dir.join(format!("{safe_stem}_{hash:016x}.host.c"));
+    let exe_path = host_dir.join(format!("{safe_stem}_{hash:016x}{HOST_EXE_SUFFIX}"));
+
+    debug!(
+        dll = %dll_str,
+        host = %exe_path.display(),
+        "Loader host location"
+    );
 
     // Write the source every time — it is tiny, and keeping it in sync with the
     // Rust constant matters more than saving a few hundred bytes of I/O.
@@ -891,18 +974,26 @@ pub fn ensure_loader_host(dll_path: &Path) -> Result<PathBuf, CoreError> {
         }
     }
 
-    let output = std::process::Command::new(HOST_COMPILER)
-        .arg("-O2")
-        .arg("-o")
-        .arg(&exe_path)
-        .arg(&src_path)
-        .output()
-        .map_err(|e| {
-            CoreError::ProcessCreation(format!(
-                "Cannot run '{HOST_COMPILER}' to build the loader host: {e}. \
-                 A C compiler on PATH is required to unpack DLL targets."
-            ))
-        })?;
+    let output = {
+        use std::os::windows::process::CommandExt;
+        // `gcc` is a console program.  Without `CREATE_NO_WINDOW` the OS gives it
+        // a fresh console, which shows up as a black box flashing on screen every
+        // time a DLL target needs its loader host rebuilt.  We capture stdout and
+        // stderr through pipes, so no console is needed at all.
+        std::process::Command::new(HOST_COMPILER)
+            .arg("-O2")
+            .arg("-o")
+            .arg(&exe_path)
+            .arg(&src_path)
+            .creation_flags(CREATE_NO_WINDOW.0)
+            .output()
+            .map_err(|e| {
+                CoreError::ProcessCreation(format!(
+                    "Cannot run '{HOST_COMPILER}' to build the loader host: {e}. \
+                     A C compiler on PATH is required to unpack DLL targets."
+                ))
+            })?
+    };
 
     if !output.status.success() {
         return Err(CoreError::ProcessCreation(format!(
@@ -1061,17 +1152,74 @@ pub fn patch_peb_anti_debug(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Delete the stub EXE file (if one was generated).
+/// Delete a generated host EXE, treating "still in use" as a non-event.
 ///
-/// Call this after the debug session ends.
+/// # Why this is not a warning
+///
+/// The loader host is a **cache**: `ensure_loader_host` reuses it when it is
+/// newer than its source, so deleting it after every run throws away the gcc
+/// compile.  Worse, the deletion cannot succeed while the process that maps it
+/// is still alive, and a debuggee that terminated while being debugged keeps
+/// its image mapped until the kernel tears the session down — measured: the
+/// file was locked for the whole life of the CLI and became deletable only
+/// after it exited.
+///
+/// So a failure here is the normal case, not an error: the file lives under
+/// `%TEMP%\magicmida-hosts\`, it is ours, and [`sweep_stale_loader_hosts`]
+/// removes entries that are no longer current.  Reporting `WARN` for it was
+/// noise on every single DLL run.
 pub fn cleanup_stub_exe(path: &Path) {
-    if let Err(e) = std::fs::remove_file(path) {
-        warn!(
-            "Failed to delete stub EXE '{}': {e}",
+    match std::fs::remove_file(path) {
+        Ok(()) => debug!("Deleted host EXE: {}", path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            debug!("Host EXE already gone: {}", path.display());
+        }
+        Err(e) => debug!(
+            "Keeping host EXE '{}' (still mapped, cleaned by sweep): {e}",
             path.display()
-        );
-    } else {
-        debug!("Deleted stub EXE: {}", path.display());
+        ),
+    }
+}
+
+/// Remove loader-host files that are no longer current.
+///
+/// Called once when a host is about to be built.  An entry is stale when
+/// nothing has touched it for a day, which is long enough that no live run can
+/// still own it — a run takes seconds — and short enough that a folder does not
+/// accumulate one host per sample forever.
+///
+/// The `.host.c` sources are removed together with their EXE: they are
+/// regenerated on demand, and leaving them behind would make the folder grow
+/// twice as fast.
+pub fn sweep_stale_loader_hosts(host_dir: &Path) {
+    const MAX_AGE_SECS: u64 = 24 * 60 * 60;
+    let Ok(entries) = std::fs::read_dir(host_dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // Only ever touch our own artefacts; the folder may be shared.
+        if !(name.ends_with(".host.c")
+            || name.ends_with(HOST_EXE_SUFFIX)
+            || (name.starts_with("host-") && name.ends_with(".log")))
+        {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age.as_secs() > MAX_AGE_SECS);
+        if stale && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        debug!(removed, dir = %host_dir.display(), "Swept stale loader hosts");
     }
 }
 

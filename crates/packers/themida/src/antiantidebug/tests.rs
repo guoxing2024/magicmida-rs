@@ -10,7 +10,12 @@ fn ptr_from_bytes_x86() {
 }
 
 #[test]
+#[cfg(target_pointer_width = "64")]
 fn ptr_from_bytes_x64() {
+    // Only meaningful on a 64-bit host: `ptr_from_bytes` returns `usize`, so on
+    // i686 the 8-byte read is truncated to 32 bits and the expectation below
+    // would be wrong (and, before this gate, the literal itself did not even
+    // compile: "literal out of range for `usize`").
     let bytes = [0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23, 0x01];
     let addr = ptr_from_bytes(&bytes);
     assert_eq!(addr, 0x0123_4567_89AB_CDEF);

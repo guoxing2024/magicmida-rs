@@ -241,6 +241,35 @@ pub(crate) fn trace_one_slot(
                     return Err(ThemidaError::Debugger(desc));
                 }
 
+                // A first-chance exception on our thread: hand it to the
+                // program's own SEH.
+                //
+                // This is *not* the same as the `Breakpoint`/`AccessViolation`
+                // arm above, which are the trace's own single-step machinery
+                // misfiring and therefore genuinely fatal.  A generic exception
+                // (e.g. Themida's `STATUS_PRIVILEGED_INSTRUCTION` anti-debug
+                // probe) is the program's business: `DBG_CONTINUE` would resume
+                // at the faulting instruction and re-raise it forever.
+                DebugEvent::UnhandledException {
+                    thread_id: tid,
+                    address,
+                    code,
+                } => {
+                    debug!(
+                        tid,
+                        address = %format!("{address:#x}"),
+                        code = %format!("{code:#x}"),
+                        "trace_one_slot: first-chance exception — handing to SEH"
+                    );
+                    debugger
+                        .continue_event(tid, ContinueStatus::ExceptionNotHandled)
+                        .map_err(|e| {
+                            ThemidaError::Debugger(format!(
+                                "trace_one_slot continue unhandled exception: {e}"
+                            ))
+                        })?;
+                }
+
                 // Non-exception events on our thread — continue.
                 _ => {
                     debug!(

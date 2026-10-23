@@ -384,3 +384,143 @@ pub(super) fn handle_hw_breakpoint(
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// read_tls_callback_oep
+// ---------------------------------------------------------------------------
+
+/// Read a packed DLL's real entry point out of the shell's own TLS callback
+/// array.
+///
+/// # Why this exists
+///
+/// An EXE target's OEP is found by arming a `PAGE_NOACCESS` guard over `.text`
+/// and taking the first execute fault.  A packed DLL cannot use that mechanism:
+/// at the moment the guard would be armed the shell is still inside its own
+/// `DllMain`, and the guard's fault/retry cycle derails it.  Measured with an
+/// identical debugger and ScyllaHide injection:
+///
+/// | `.text` guard | `.bss` non-zero | `hinstDLL` global |
+/// |---|---|---|
+/// | armed   | 0   | 0        |
+/// | not armed | 177 | set    |
+///
+/// The guard is also unnecessary.  Themida's DLL shell publishes the real
+/// `DllMain` into its TLS callback array during startup: measured on the
+/// reference `core.dll` after a full boot, `[image_base + 0x170010]` holds
+/// `image_base + 0x2BB10`, which is exactly the OEP the guarded path discovers.
+///
+/// # Returns
+///
+/// The first callback address that lies inside the image and is non-zero, or
+/// `None` while the array is still empty (the caller retries).
+pub(super) fn read_tls_callback_oep(
+    dbg: &ProcessSession,
+    image_base: usize,
+    image_boundary: usize,
+) -> Option<usize> {
+    const IMAGE_DIRECTORY_ENTRY_TLS: usize = 9;
+
+    // Locate the TLS directory from the live headers rather than from the
+    // in-memory `ThemidaPeInfo`, which does not carry the data directories.
+    let mut headers = vec![0u8; 0x1000];
+    if dbg.read_memory(image_base, &mut headers).is_err() {
+        return None;
+    }
+    let pe = mida_pe::PeHeader::from_bytes(&headers).ok()?;
+    let tls_dir = pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_TLS];
+    if tls_dir.virtual_address == 0 || tls_dir.size == 0 {
+        return None;
+    }
+
+    // The callback array is a pointer-sized slot at the end of the TLS
+    // directory: StartRawData, EndRawData, AddressOfIndex, AddressOfCallbacks.
+    // The directory is itself an address, not an RVA, so read it live rather
+    // than mapping it through the file.
+    let ptr = std::mem::size_of::<usize>();
+    let dir_addr = image_base + tls_dir.virtual_address as usize;
+    let mut dir = vec![0u8; ptr * 4];
+    if dbg.read_memory(dir_addr, &mut dir).is_err() {
+        return None;
+    }
+    let read_ptr = |off: usize| -> usize {
+        if ptr == 8 {
+            u64::from_le_bytes(dir[off..off + 8].try_into().unwrap_or([0u8; 8])) as usize
+        } else {
+            u32::from_le_bytes(dir[off..off + 4].try_into().unwrap_or([0u8; 4])) as usize
+        }
+    };
+
+    let callbacks = read_ptr(ptr * 3);
+    if callbacks == 0 {
+        return None;
+    }
+
+    // Walk the array: it is a NULL-terminated list of absolute addresses.
+    for i in 0..8 {
+        let mut slot = vec![0u8; ptr];
+        if dbg.read_memory(callbacks + i * ptr, &mut slot).is_err() {
+            return None;
+        }
+        let addr = if ptr == 8 {
+            u64::from_le_bytes(slot[..8].try_into().unwrap_or([0u8; 8])) as usize
+        } else {
+            u32::from_le_bytes(slot[..4].try_into().unwrap_or([0u8; 4])) as usize
+        };
+        if addr == 0 {
+            return None; // end of list; nothing published yet
+        }
+        // Only accept an address that lies inside the image: the shell also
+        // publishes its own internal callbacks, which are not the entry point.
+        let rva = addr.wrapping_sub(image_base);
+        if rva < image_boundary.wrapping_sub(image_base) {
+            return Some(addr);
+        }
+    }
+    None
+}
+
+
+
+// ---------------------------------------------------------------------------
+// live_bss_activity
+// ---------------------------------------------------------------------------
+
+/// Count non-zero bytes in the image's writable data sections.
+///
+/// # Why this is the right "initialisation finished" signal
+///
+/// A packed DLL's shell writes its state into uninitialised/writable sections
+/// (`.bss`, `.data`) during `DllMain`.  Measured on the reference `core.dll`,
+/// injected with ScyllaHide and running under this debugger, the shell goes from
+/// 0 to 177 non-zero bytes in one step around 300 ms and then stops changing.
+///
+/// The TLS callback array becomes non-zero at that same moment, so "the OEP is
+/// published" alone is not a safe stop condition — sampling finer than the
+/// 50 ms resolution used for that measurement shows the callback landing a few
+/// instructions before the rest of the state.  Waiting for the *activity* to
+/// settle is sample-independent: it does not name any RVA or any particular
+/// global, so it works for any packed DLL rather than just this one.
+pub(super) fn live_data_nonzero(dbg: &ProcessSession, image_base: usize, pe_sections: &[mida_pe::PeSection]) -> usize {
+    let mut total = 0;
+    for sec in pe_sections {
+        // Only writable data sections carry runtime state; skip code and
+        // read-only sections, which are static from the file.
+        let ch = sec.characteristics;
+        let writable = ch & 0x8000_0000 != 0;
+        let executable = ch & 0x2000_0000 != 0;
+        if !writable || executable {
+            continue;
+        }
+        let va = sec.virtual_address as usize;
+        let size = (sec.virtual_size as usize).min(0x100_000);
+        if size == 0 {
+            continue;
+        }
+        let mut buf = vec![0u8; size];
+        if dbg.read_memory(image_base + va, &mut buf).is_ok() {
+            total += buf.iter().filter(|b| **b != 0).count();
+        }
+    }
+    total
+}

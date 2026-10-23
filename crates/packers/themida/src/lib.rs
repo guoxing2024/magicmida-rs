@@ -55,7 +55,7 @@ pub use init::{init_pe_details, locate_themida_section, ThemidaPeInfo};
 pub use oep::{
     find_real_oep_by_scanning, find_real_oep_in_bytes, handle_tls_callbacks, is_oep_virtualized,
     try_find_correct_oep,
-    write_msvc_oep_x64, TlsCallbackResult,
+    write_msvc_oep_x64, TlsCallbackResult, KNOWN_MSVC_VERSIONS,
 };
 pub use postprocess::{
     create_data_sections, dump_process_code, install_anti_dump_fix,

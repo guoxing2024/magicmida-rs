@@ -13,6 +13,71 @@ use windows::Win32::System::Diagnostics::Debug::CONTEXT;
 
 use crate::error::CoreError;
 
+// ---------------------------------------------------------------------------
+// Architecture-neutral CONTEXT register access
+// ---------------------------------------------------------------------------
+//
+// `CONTEXT` names the instruction and stack pointers differently per
+// architecture: `Rip`/`Rsp` on x64, `Eip`/`Esp` on x86.  Code that spells out
+// one of those names compiles on exactly one target, which is why the x86 build
+// had never succeeded.  These four helpers are the single place that knows the
+// difference.
+
+/// Read the instruction pointer from a `CONTEXT`.
+#[inline]
+#[must_use]
+pub fn ctx_ip(ctx: &CONTEXT) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        ctx.Rip as usize
+    }
+    #[cfg(target_arch = "x86")]
+    {
+        ctx.Eip as usize
+    }
+}
+
+/// Write the instruction pointer into a `CONTEXT`.
+#[inline]
+pub fn set_ctx_ip(ctx: &mut CONTEXT, value: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        ctx.Rip = value as u64;
+    }
+    #[cfg(target_arch = "x86")]
+    {
+        ctx.Eip = value as u32;
+    }
+}
+
+/// Read the stack pointer from a `CONTEXT`.
+#[inline]
+#[must_use]
+pub fn ctx_sp(ctx: &CONTEXT) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        ctx.Rsp as usize
+    }
+    #[cfg(target_arch = "x86")]
+    {
+        ctx.Esp as usize
+    }
+}
+
+/// Write the stack pointer into a `CONTEXT`.
+#[inline]
+pub fn set_ctx_sp(ctx: &mut CONTEXT, value: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        ctx.Rsp = value as u64;
+    }
+    #[cfg(target_arch = "x86")]
+    {
+        ctx.Esp = value as u32;
+    }
+}
+
+
 /// Status returned to Windows by `ContinueDebugEvent`.
 ///
 /// Corresponds to the `dwContinueStatus` parameter.
@@ -20,9 +85,27 @@ use crate::error::CoreError;
 #[repr(u32)]
 pub enum ContinueStatus {
     /// Resume execution normally (`DBG_CONTINUE` = `0x00010002`).
+    ///
+    /// Means "the debugger handled this exception" — Windows resumes **at the
+    /// faulting instruction**.  Correct for breakpoints and single-steps, where
+    /// the debugger has already done the work the trap was asking for.
+    ///
+    /// **Wrong for a fault the program itself handles**: resuming at the faulting
+    /// instruction re-executes it, the same exception fires again, and the pair
+    /// (continue → same fault) loops forever.  Measured: 1.6 GB of log in under a
+    /// minute on the x86 reference sample before this was fixed.
     Continue = 0x0001_0002,
     /// Signal end-of-debug-session (`DBG_CONTROL_BREAK` = `0x40010008`).
     ContinueNoStep = 0x4001_0008,
+    /// Pass the exception to the program (`DBG_EXCEPTION_NOT_HANDLED` =
+    /// `0x80010001`).
+    ///
+    /// Means "the debugger did not handle this" — Windows delivers it to the
+    /// program's own SEH, exactly as it would with no debugger attached.  This is
+    /// the transparent choice for a first-chance exception the unpacker does not
+    /// model: if the program handles it, it proceeds normally; if it does not,
+    /// the process terminates just as it would unattended.
+    ExceptionNotHandled = 0x8001_0001,
 }
 
 // ---------------------------------------------------------------------------
@@ -70,6 +153,25 @@ pub enum DebugEvent {
         /// mode (matching `Themida64.pas`'s
         /// `ExcRecord.ExceptionInformation[0] = 8` check).
         exc_type: u8,
+    },
+
+    /// A first-chance exception the debugger does not model specifically.
+    ///
+    /// Under `DEBUG_ONLY_THIS_PROCESS` the debugger sees **every** exception
+    /// before the program's own SEH does, so most of these are routine and the
+    /// correct response is `DBG_CONTINUE`.  Reporting them as events instead of
+    /// as debugger errors is what lets a packed target use exceptions as
+    /// anti-debug probes without killing the run.
+    ///
+    /// Measured case: the x86 Themida 3.2.4 reference sample raises
+    /// `STATUS_PRIVILEGED_INSTRUCTION` (`0xC0000096`) during shell startup.
+    UnhandledException {
+        /// Thread that raised it.
+        thread_id: u32,
+        /// Address of the faulting instruction.
+        address: u64,
+        /// `ExceptionRecord.ExceptionCode`.
+        code: u32,
     },
 
     /// The target process has been created and the initial breakpoint was hit.
@@ -172,6 +274,16 @@ impl fmt::Debug for DebugEvent {
                 .field("is_write", is_write)
                 .field("target_address", &format_args!("{target_address:#x}"))
                 .field("exc_type", &format_args!("{exc_type}"))
+                .finish(),
+            Self::UnhandledException {
+                thread_id,
+                address,
+                code,
+            } => f
+                .debug_struct("UnhandledException")
+                .field("thread_id", thread_id)
+                .field("address", &format_args!("{address:#x}"))
+                .field("code", &format_args!("{code:#x}"))
                 .finish(),
             Self::CreateProcess {
                 process_id,

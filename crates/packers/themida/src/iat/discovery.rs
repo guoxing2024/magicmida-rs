@@ -265,11 +265,16 @@ pub(super) fn find_earliest_iat_ref(
             let iat_pointer = (ip as i64 + 6 + disp32 as i64) as usize;
 
             // Validate: pointer should be outside .text
+            let ptr_size = std::mem::size_of::<usize>();
             if iat_pointer < text_base || iat_pointer >= text_base + code_size {
                 // Read the slot to ensure it's a valid API address
+                // Pointer width follows the target: 8 bytes on PE32+, 4 on PE32.
                 let mut ptr_buf = [0u8; 8];
-                if debugger.read_memory(iat_pointer, &mut ptr_buf).is_ok() {
-                    let the_pointer = usize::from_le_bytes(ptr_buf);
+                if debugger
+                    .read_memory(iat_pointer, &mut ptr_buf[..ptr_size])
+                    .is_ok()
+                {
+                    let the_pointer = read_ptr_value(&ptr_buf, ptr_size);
                     if the_pointer > text_base + code_size {
                         // Valid IAT slot
                         if earliest_ref == 0 || iat_pointer < earliest_ref {
@@ -569,7 +574,7 @@ pub(super) fn scan_data_for_pointer(
             let mut slot_bytes = [0u8; 8];
             let copy_len = ptr_size.min(bytes_read - offset);
             slot_bytes[..copy_len].copy_from_slice(&buf[offset..offset + copy_len]);
-            let val = usize::from_le_bytes(slot_bytes);
+            let val = read_ptr_value(&slot_bytes, ptr_size);
             if val == target {
                 let iat_addr = data_section_base + offset;
                 info!("Found IAT reference to {target:#x} at {iat_addr:#x} (data section)");
@@ -580,4 +585,17 @@ pub(super) fn scan_data_for_pointer(
 
     warn!("Data-scan fallback for pointer {target:#x} — not found in data section");
     Ok(0)
+}
+
+/// Decode a pointer-sized little-endian value from `buf`.
+///
+/// `usize::from_le_bytes` pins the array width at compile time, which is `4` on
+/// x86 and `8` on x64; going through `u64` keeps one implementation for both.
+#[inline]
+fn read_ptr_value(buf: &[u8; 8], ptr_size: usize) -> usize {
+    if ptr_size == 8 {
+        u64::from_le_bytes(*buf) as usize
+    } else {
+        u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize
+    }
 }

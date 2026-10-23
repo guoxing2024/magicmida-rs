@@ -149,9 +149,9 @@ pub(super) fn resolve_v1_jumper(
 
     // Pattern 3: mov eax, imm32; jmp eax — B8 xx xx xx xx FF E0
     if code[0] == 0xB8 && n >= 7 && code[5] == 0xFF && code[6] == 0xE0 {
-        let imm = usize::from_le_bytes([
-            code[1], code[2], code[3], code[4], 0, 0, 0, 0,
-        ]);
+        // imm32 is always 4 bytes here; widen through u64 so this compiles on
+        // both targets (`usize::from_le_bytes` pins the array width).
+        let imm = u32::from_le_bytes([code[1], code[2], code[3], code[4]]) as usize;
         if is_likely_api_address(imm) {
             return Ok(Some(imm));
         }

@@ -18,7 +18,7 @@ pub use restore::{
     write_msvc_oep_x64,
 };
 
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use mida_core::DebuggerCore;
 
@@ -30,7 +30,13 @@ use crate::error::ThemidaError;
 
 /// Major linker versions known to use the MSVC CRT startup pattern
 /// (`call __security_init_cookie; jmp __scrt_common_main_seh`).
-pub(crate) const KNOWN_MSVC_VERSIONS: [u8; 9] = [2, 6, 7, 8, 9, 10, 11, 12, 14];
+///
+/// `2` is included on purpose: MinGW/GCC output reports
+/// `MajorLinkerVersion = 2` (measured: i686-w64-mingw32-gcc 16.2.0 emits 2.47),
+/// and its CRT has the same `call rel32; jmp rel32` shape.  Treating 2 as
+/// "ancient MSVC, no pattern" made every MinGW-built target skip the OEP
+/// pattern match entirely.
+pub const KNOWN_MSVC_VERSIONS: [u8; 9] = [2, 6, 7, 8, 9, 10, 11, 12, 14];
 
 // ---------------------------------------------------------------------------
 // Virtualized OEP detection
@@ -229,7 +235,20 @@ pub fn try_find_correct_oep(
             Ok(Some(real_oep))
         }
         None => {
-            warn!("Real OEP not found near {oep:#x} — target likely won't run");
+            // Deliberately `debug!`, not `warn!`.
+            //
+            // This function is one *attempt* at resolving a virtualised OEP, and
+            // it is allowed to fail: the caller retries through the
+            // "OEP is virtualized — scanning .text" path, which succeeds on the
+            // reference target (`new=0x7ff6622e1010`).  Reporting `warn!` here
+            // printed `Real OEP not found … target likely won't run` four times
+            // per successful run — four scary yellow lines on a run that then
+            // worked perfectly.  The message was also simply false: the target
+            // does run.
+            //
+            // A warning belongs at the point where *every* strategy has failed,
+            // which is the caller's decision, not this helper's.
+            debug!("No CRT startup pattern near {oep:#x} in this pass");
             Ok(None)
         }
     }
@@ -277,6 +296,12 @@ pub fn find_real_oep_in_bytes(text_buf: &[u8], oep_rva: u32) -> Option<u32> {
 /// Handle TLS callback execution during guarded access.
 pub fn handle_tls_callbacks(
     #[allow(unused)] debugger: &mut dyn DebuggerCore,
+    // `thread_id`: the thread that raised the fault.  Only the x86 branch needs
+    // it (it reads the thread context to recognise a TLS-callback frame), but it
+    // is part of the signature so that branch can compile at all — it previously
+    // referred to a `thread_id` that did not exist, which is why the x86 build
+    // never worked.
+    #[allow(unused)] thread_id: u32,
     exception_address: usize,
     execution_type: u32,
     tls_total: u32,

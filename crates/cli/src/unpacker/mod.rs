@@ -53,12 +53,13 @@ use crate::log::{self, LogType};
 use session::ProcessSession;
 use oep_scan::scan_live_memory_for_real_oep;
 use helpers::{
+    live_data_nonzero,
+    read_tls_callback_oep,
     scylla_injector_path, scylla_hook_path, resolve_output_path, resolve_api_addrs,
     resolve_host_api, compute_data_section_bounds, detect_packed_dll, pe_section_name_remote_rva,
     dotnet_dump_and_dump_output, handle_hw_breakpoint,
 };
 use av_handler::{AvAction, handle_access_violation};
-
 // Re-export public functions for commands.rs
 pub use verify::verify_unpacked;
 pub use dump::dump_process_code;
@@ -115,37 +116,23 @@ pub fn unpack(
     // ---- step 1: resolve output path ----
     let output_path = resolve_output_path(input, output);
 
-    // ---- step 1b: reject DLL targets up front ----
-    //
-    // A Themida-packed DLL's stub calls `ExitProcess` instead of `DllMain`, so
-    // the debug loop never reaches a usable OEP and the pipeline either hangs or
-    // emits a DLL that cannot be loaded.  Refuse instead of burning minutes.
-    // (Observed: a 6 MB `core.dll` sat for >10 minutes before being killed by
-    // hand.)  The `is_dll` flag is still propagated to CreateProcessOptions for
-    // the .NET path, which does handle DLLs.
+    // A `.dll` extension means the target is a library.  The flag drives two
+    // real behaviours downstream: the "packed DLL located" image-base retarget
+    // and the DLL-specific OEP acceptance rule in `handle_access_violation`.
+    // It no longer gates the run — the loader-host path (see
+    // `mida_core::create_debug_process`) loads a packed DLL through the real
+    // `LoadLibraryW`, which is exactly what its shell expects, so a native DLL
+    // target is supported.  The .NET case is handled separately via the COM
+    // descriptor directory.
     let looks_like_dll = input
         .extension()
         .map(|e| e.eq_ignore_ascii_case("dll"))
         .unwrap_or(false);
 
-    // ---- step 2: parse PE header ----
     log::log(LogType::Info, &format!("Loading: {}", input.display()));
 
     let mut pe = PeHeader::from_file(input)
         .map_err(|e| anyhow!("Failed to parse PE header: {e}"))?;
-
-    if looks_like_dll
-        && pe.nt_headers.optional_header.data_directory[14].virtual_address == 0
-        && std::env::var("MIDA_ALLOW_DLL").is_err()
-    {
-        return Err(anyhow!(
-            "Refusing to unpack a native DLL target: {}.\n\
-             Themida's DLL stub calls ExitProcess instead of DllMain, so no usable \
-             OEP is reached and the result cannot be loaded. Only EXE targets are \
-             supported (see README \"Verified capability\").",
-            input.display()
-        ));
-    }
 
     let is_64bit = pe.is_64bit;
     debug!(is_64bit, "PE architecture");
@@ -427,7 +414,262 @@ pub fn unpack(
                         let text_sec = &state.pe_info.pe_sections[0];
                         let text_start = dll_base + text_sec.virtual_address as usize;
                         let text_size = text_sec.virtual_size as usize;
-                        if text_size > 0 {
+
+                        // ---- DLL targets: no `.text` guard -------------------
+                        //
+                        // The guard exists to catch "first execution inside
+                        // `.text`", which is how an EXE's OEP is found.  For a
+                        // packed DLL that mechanism is both unnecessary and
+                        // harmful:
+                        //
+                        // * Unnecessary: the shell publishes the real `DllMain`
+                        //   into its own TLS callback array during startup.
+                        //   Measured on the reference `core.dll` after a full
+                        //   boot: `[rva 0x170010] = image_base + 0x2BB10`, which
+                        //   is exactly the OEP the guard path was discovering.
+                        // * Harmful: measured with an identical debugger and
+                        //   ScyllaHide, `.text` guarded (PAGE_NOACCESS) gives
+                        //   `.bss` = 0 non-zero bytes and `hinstDLL` = 0, while
+                        //   unguarded gives `.bss` = 177 and `hinstDLL` set.  The
+                        //   shell is still inside its own `DllMain` at this point,
+                        //   and the guard's fault/retry cycle derails it.
+                        //
+                        // So the DLL path skips the guard and takes its OEP from
+                        // the TLS callback array instead, after the shell has had
+                        // a chance to write it.
+                        if looks_like_dll {
+                            // The debuggee is suspended at this LOAD_DLL event, so
+                            // the shell cannot run and the array cannot be written
+                            // until the event is answered.  Answer it, then let the
+                            // shell run freely while polling the array.
+                            dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+
+                            let deadline =
+                                std::time::Instant::now() + std::time::Duration::from_secs(12);
+                            let mut oep_from_tls = None;
+                            let mut last_activity = usize::MAX;
+                            let mut quiet = 0u32;
+                            while std::time::Instant::now() < deadline {
+                                // Do not stop the moment the OEP is published:
+                                // measured on the reference DLL, the shell goes
+                                // from 0 to 177 non-zero data bytes in one step and
+                                // the callback array becomes non-zero a few
+                                // instructions earlier.  Stopping on the callback
+                                // alone captures `.bss` with the OEP present but
+                                // `hinstDLL` still unwritten (measured nz=75,
+                                // hinst=0), which is exactly why `GetAppVersion()`
+                                // then answers "0.0".
+                                //
+                                // So: remember the OEP when it appears, then keep
+                                // running until the writable-data non-zero count
+                                // stops changing for a few consecutive samples.
+                                let activity = live_data_nonzero(
+                                    &dbg,
+                                    dll_base,
+                                    &state.pe_info.pe_sections,
+                                );
+                                if let Some(oep) = read_tls_callback_oep(
+                                    &dbg,
+                                    dll_base,
+                                    state.pe_info.image_boundary as usize,
+                                ) {
+                                    if oep_from_tls.is_none() {
+                                        info!(
+                                            oep = %format!("{oep:#x}"),
+                                            activity,
+                                            "DLL OEP published — waiting for initialisation to settle"
+                                        );
+                                    }
+                                    oep_from_tls = Some(oep);
+                                }
+                                if oep_from_tls.is_some() {
+                                    if activity == last_activity {
+                                        quiet += 1;
+                                    } else {
+                                        quiet = 0;
+                                        last_activity = activity;
+                                    }
+                                    if quiet >= 6 {
+                                        info!(
+                                            activity,
+                                            quiet_samples = quiet,
+                                            "DLL initialisation settled — dumping"
+                                        );
+                                        break;
+                                    }
+                                }
+                                match dbg.wait_event_timeout(100) {
+                                    Ok(DebugEvent::ExitProcess { .. }) => {
+                                        warn!("Target exited while waiting for the DLL OEP");
+                                        break;
+                                    }
+                                    Ok(ev) => {
+                                        let tid = match &ev {
+                                            DebugEvent::Breakpoint { thread_id, .. }
+                                            | DebugEvent::SingleStep { thread_id, .. }
+                                            | DebugEvent::AccessViolation { thread_id, .. }
+                                            | DebugEvent::UnhandledException { thread_id, .. }
+                                            | DebugEvent::CreateThread { thread_id, .. }
+                                            | DebugEvent::ExitThread { thread_id, .. }
+                                            | DebugEvent::LoadDll { thread_id, .. }
+                                            | DebugEvent::UnloadDll { thread_id, .. }
+                                            | DebugEvent::CreateProcess { thread_id, .. }
+                                            | DebugEvent::Other { thread_id } => *thread_id,
+                                            DebugEvent::ExitProcess { .. } => 0,
+                                        };
+                                        if tid != 0 {
+                                            // First-chance exceptions must go to the
+                                            // program's own SEH, not back through the
+                                            // faulting instruction.
+                                            //
+                                            // `DBG_CONTINUE` means "the debugger handled
+                                            // it" and resumes *at* the fault, which for a
+                                            // privileged-instruction probe re-raises the
+                                            // same exception forever — and before it
+                                            // loops, it derails the shell's own
+                                            // initialisation, which is how this surfaced:
+                                            // the reference DLL's IAT came out as 357
+                                            // slots instead of 3283 and the trace
+                                            // resolved 14 imports instead of 289.
+                                            //
+                                            // Everything else (loads, threads, plain
+                                            // single-steps) is resumed normally.
+                                            let status = if matches!(
+                                                ev,
+                                                DebugEvent::UnhandledException { .. }
+                                            ) {
+                                                ContinueStatus::ExceptionNotHandled
+                                            } else {
+                                                ContinueStatus::Continue
+                                            };
+                                            let _ = dbg.continue_event(tid, status);
+                                        }
+                                    }
+                                    Err(mida_core::CoreError::Timeout) => {}
+                                    // Belt-and-braces: core maps
+                                    // `ERROR_SEM_TIMEOUT` itself now, so the arm
+                                    // above is the normal path.  Kept so a code
+                                    // path that reduced the HRESULT early still
+                                    // treats an idle tick as idle rather than as
+                                    // a fatal debug-event error.
+                                    Err(mida_core::CoreError::Windows(code))
+                                        if code & 0xFFFF == 121 => {}
+                                    Err(e) => {
+                                        warn!("DLL free-run: debug event error: {e}");
+                                        break;
+                                    }
+                                }
+                            }
+
+                            match oep_from_tls {
+                                Some(oep) => {
+                                    ls.oep = Some(oep);
+                                    info!(
+                                        oep = %format!("{oep:#x}"),
+                                        rva = %format!("{:#x}", oep - dll_base),
+                                        "DLL OEP taken from the shell's TLS callback array \
+                                         (free-run, no .text guard, no IAT guard)"
+                                    );
+                                }
+                                None => warn!(
+                                    "TLS callback array stayed empty — DLL OEP not published"
+                                ),
+                            }
+
+                            // ---- leave one event pending for the trace engine ---
+                            //
+                            // `trace_one_slot` starts by calling `continue_event`
+                            // for the event "that brought us here", so the debug
+                            // session must have one pending when the post-loop
+                            // phases begin.  The EXE path inherits that naturally:
+                            // its IAT window exits with an event already dequeued.
+                            // The DLL path has just free-run with every event
+                            // answered, so it has none — measured as
+                            // `trace_one_slot continue: Windows API error: code
+                            // 2147942487` (`E_INVALIDARG`) on every slot.
+                            //
+                            // Synthesise one: trap-flag the loader thread and let
+                            // it raise a single-step, then dequeue that event
+                            // without answering it.
+                            if let Some(tid) = Some(dbg.main_thread_id()) {
+                                if let Ok(mut ctx) = dbg.get_thread_context_control(tid) {
+                                    ctx.EFlags |= 0x100; // TF
+                                    let _ = session::set_thread_context_control(
+                                        &dbg, tid, &ctx,
+                                    );
+                                    if let Ok(ev) = dbg.wait_event_timeout(2000) {
+                                        let ev_tid = match &ev {
+                                            DebugEvent::SingleStep { thread_id, .. }
+                                            | DebugEvent::Breakpoint { thread_id, .. }
+                                            | DebugEvent::AccessViolation { thread_id, .. }
+                                            | DebugEvent::Other { thread_id } => *thread_id,
+                                            _ => 0,
+                                        };
+                                        debug!(
+                                            pending = ev_tid,
+                                            "DLL path: synthesised a pending debug event for the trace engine"
+                                        );
+                                    }
+                                }
+                            }
+
+                            // The shell has now run to completion, so the image is
+                            // fully initialised.  Raise the IAT to writable before
+                            // leaving: the shell leaves it `PAGE_READONLY` (0x2), and
+                            // the trace engine writes resolved addresses back into it
+                            // afterwards (measured: `trace_imports write IAT: failed to
+                            // write memory` unless this is raised).
+                            if let Ok(iat) = determine_iat_address(
+                                &dbg,
+                                ls.oep.unwrap_or(dll_base),
+                                dll_base + state.pe_info.pe_sections[0].virtual_address as usize,
+                                &{
+                                    let mut b = vec![0u8; state.pe_info.pe_sections[0]
+                                        .virtual_size.min(0x100_000) as usize];
+                                    let _ = dbg.read_memory(
+                                        dll_base + state.pe_info.pe_sections[0]
+                                            .virtual_address as usize,
+                                        &mut b,
+                                    );
+                                    b
+                                },
+                                dll_base + state.pe_info.base_of_data as usize,
+                                (state.pe_info.image_boundary - state.pe_info.base_of_data) as usize,
+                                state.pe_info.is_vm_oep,
+                                CompilerHint::Auto,
+                                &state.guard_addrs,
+                            ) {
+                                match iat {
+                                    Some(i) => {
+                                        let ok = mida_packers_themida::install_iat_guard;
+                                        let _ = ok;
+                                        // set PAGE_READWRITE over the IAT
+                                        use windows::Win32::System::Memory::{
+                                            VirtualProtectEx, PAGE_READWRITE,
+                                        };
+                                        let mut old = Default::default();
+                                        let r = unsafe {
+                                            VirtualProtectEx(
+                                                h_process,
+                                                i.address as *const std::ffi::c_void,
+                                                i.size,
+                                                PAGE_READWRITE,
+                                                &mut old,
+                                            )
+                                        };
+                                        info!(
+                                            iat = %format!("{:#x}", i.address),
+                                            size = %format!("{:#x}", i.size),
+                                            writable = r.is_ok(),
+                                            "DLL path: IAT raised to PAGE_READWRITE for the trace write-back"
+                                        );
+                                    }
+                                    None => warn!("DLL path: could not re-locate IAT to make it writable"),
+                                }
+                            }
+                            // go straight to the post-loop phases and dump it.
+                            break;
+                        } else if text_size > 0 {
                             match mida_packers_themida::install_code_section_guard(
                                 h_process,
                                 text_start,
@@ -450,7 +692,23 @@ pub fn unpack(
 
                 if !ls.close_handle_bp_set {
                     let close_handle_addr = dbg.apis.as_ref().map(|a| a.close_handle);
-                    if let Some(addr) = close_handle_addr {
+                    // ---- DLL targets: no CloseHandle breakpoint --------------
+                    //
+                    // This breakpoint exists to catch the *EXE* shell's
+                    // self-delete/cleanup call so the process can be dumped just
+                    // before it exits.  A packed DLL has no such call: the shell
+                    // is still inside `DllMain`, and it calls `CloseHandle`
+                    // routinely while setting up its own state.
+                    //
+                    // Measured: with this breakpoint armed, the loader thread
+                    // parks on `kernel32!CloseHandle` and never leaves it — the
+                    // thread was sampled at that exact address at 2 s and again at
+                    // 5 s, with `.bss` at 0 non-zero bytes and `hinstDLL` never
+                    // written.  Without it the same DLL, same debugger, same
+                    // ScyllaHide reaches `.bss` = 177 with `hinstDLL` set.
+                    if looks_like_dll {
+                        debug!("DLL target — skipping the CloseHandle breakpoint");
+                    } else if let Some(addr) = close_handle_addr {
                         match dbg.set_hw_breakpoint(0, addr, HwbpType::Execute) {
                             Ok(()) => {
                                 debug!("CloseHandle HW breakpoint set (slot 0) [fallback]");
@@ -686,6 +944,41 @@ pub fn unpack(
                 debug!(thread_id, "Other debug event — continuing");
                 dbg.continue_event(thread_id, ContinueStatus::Continue)?;
             }
+
+            // A first-chance exception we do not model specifically.
+            //
+            // Under `DEBUG_ONLY_THIS_PROCESS` the debugger is handed every
+            // exception before the program's own SEH sees it.
+            //
+            // The continue status here is `ExceptionNotHandled`, **not**
+            // `Continue`.  That distinction is the whole fix:
+            //
+            // * `DBG_CONTINUE` means "the debugger handled it" and resumes at
+            //   the faulting instruction.  For a privileged-instruction fault
+            //   that re-executes the same instruction, raises the same
+            //   exception, and loops forever — measured on the x86 reference
+            //   sample: the same `0xC0000096` at `0x42f396` repeating until the
+            //   log reached 1.6 GB.
+            // * `DBG_EXCEPTION_NOT_HANDLED` delivers the exception to the
+            //   program's own SEH.  Themida's shell has a handler for this
+            //   probe, so it proceeds exactly as it does without a debugger.
+            //
+            // This is what unblocks x86 Themida.  The x64 reference samples
+            // never raised this exception, which is why the wrong status went
+            // unnoticed for so long.
+            DebugEvent::UnhandledException {
+                thread_id,
+                address,
+                code,
+            } => {
+                debug!(
+                    thread_id,
+                    address = %format!("{address:#x}"),
+                    code = %format!("{code:#x}"),
+                    "First-chance exception — handing to the program's SEH"
+                );
+                dbg.continue_event(thread_id, ContinueStatus::ExceptionNotHandled)?;
+            }
         }
     }
 
@@ -914,3 +1207,5 @@ fn run_post_loop_phases(
     log::log(LogType::Good, &format!("Unpacked: {}", output_path.display()));
     Ok(())
 }
+
+

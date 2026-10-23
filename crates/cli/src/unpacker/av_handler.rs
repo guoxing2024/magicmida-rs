@@ -1,13 +1,16 @@
 use anyhow::anyhow;
 use tracing::{debug, info, warn};
 use windows::Win32::Foundation::HANDLE;
-use mida_core::{ContinueStatus, DebugEvent, DebuggerCore};
+use mida_core::{
+    ctx_ip, ctx_sp, set_ctx_ip, set_ctx_sp, ContinueStatus, DebugEvent, DebuggerCore,
+};
 use mida_pe::PeHeader;
 use mida_packers_themida::{
     GuardAccessResult, ThemidaState,
     find_real_oep_by_scanning, install_code_section_guard, install_iat_guard,
     is_oep_virtualized, process_guarded_access, remove_code_section_guard,
     try_find_correct_oep, handle_tls_callbacks, determine_iat_address,
+    KNOWN_MSVC_VERSIONS,
 };
 use crate::log::{self, LogType};
 use super::session::ProcessSession;
@@ -18,6 +21,81 @@ use super::LoopState;
 pub(super) enum AvAction {
     Continue,
     Break,
+}
+
+/// True when `code` is the HRESULT form of Windows `ERROR_SEM_TIMEOUT` (121).
+///
+/// `WaitForDebugEvent` uses that error to mean "the timeout expired and no debug
+/// event arrived" — a normal idle interval, not a failure.  The core's
+/// `wait_event_timeout` intends to convert it into `CoreError::Timeout` but
+/// compares the entire HRESULT against `121`, so it never matches; the raw
+/// `0x80070079` reaches the caller instead.
+fn sem_timeout(code: u32) -> bool {
+    code & 0xFFFF == 121
+}
+
+/// Read the page protection currently covering `addr` in the target.
+///
+/// Returns `None` when the range cannot be queried, so callers can fall back to
+/// a safe default rather than guessing.
+fn page_protection_of(h_process: HANDLE, addr: usize) -> Option<u32> {
+    use windows::Win32::System::Memory::{VirtualQueryEx, MEMORY_BASIC_INFORMATION};
+
+    let mut mbi = MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: h_process is a valid process handle; mbi is a valid out-pointer.
+    let written = unsafe {
+        VirtualQueryEx(
+            h_process,
+            Some(addr as *const std::ffi::c_void),
+            &mut mbi,
+            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    if written == 0 {
+        None
+    } else {
+        Some(mbi.Protect.0)
+    }
+}
+
+/// Apply `protect` to the range [`addr`, `addr + size`) in the target.
+fn set_protection(h_process: HANDLE, addr: usize, size: usize, protect: u32) -> bool {
+    use windows::Win32::System::Memory::{VirtualProtectEx, PAGE_PROTECTION_FLAGS};
+
+    let mut old = PAGE_PROTECTION_FLAGS::default();
+    // SAFETY: h_process is valid; the range is a committed region of the target.
+    unsafe {
+        VirtualProtectEx(
+            h_process,
+            addr as *const std::ffi::c_void,
+            size,
+            PAGE_PROTECTION_FLAGS(protect),
+            &mut old,
+        )
+        .is_ok()
+    }
+}
+
+/// Extract the thread ID from any [`DebugEvent`] variant.
+///
+/// The packers crate has an equivalent `thread_id_of`, but it is
+/// `pub(crate)` there and the settle window lives here.  Every variant except
+/// [`DebugEvent::ExitProcess`] carries a thread ID; `ExitProcess` returns 0 and
+/// is handled before this is ever consulted.
+fn settle_thread_id_of(ev: &DebugEvent) -> u32 {
+    match ev {
+        DebugEvent::Breakpoint { thread_id, .. }
+        | DebugEvent::SingleStep { thread_id, .. }
+        | DebugEvent::AccessViolation { thread_id, .. }
+        | DebugEvent::UnhandledException { thread_id, .. }
+        | DebugEvent::CreateThread { thread_id, .. }
+        | DebugEvent::ExitThread { thread_id, .. }
+        | DebugEvent::LoadDll { thread_id, .. }
+        | DebugEvent::UnloadDll { thread_id, .. }
+        | DebugEvent::CreateProcess { thread_id, .. }
+        | DebugEvent::Other { thread_id } => *thread_id,
+        DebugEvent::ExitProcess { .. } => 0,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -34,14 +112,50 @@ pub(super) enum AvAction {
 /// two orders of magnitude of headroom over legitimate bursts.
 const AV_STORM_LIMIT: u32 = 1024;
 
+/// How many times the `.text` guard may fault at an address whose return
+/// address lands inside the Themida section before the caller stops waiting for
+/// the shell to unwind and falls back to scanning.
+///
+/// Each retry is one full guard cycle (arm `PAGE_NOACCESS`, take the execute
+/// fault, single-step out, re-arm), so this is a *time* budget as much as a
+/// count.  It used to be 1000, which on the x86 reference sample meant the run
+/// sat silent for minutes and looked hung — the retry counter never advanced
+/// past 1 because the shell stops re-entering the guarded page at all.
+///
+/// 64 is chosen to be comfortably above the deepest observed unwind chain
+/// (3 on the x64 reference EXE) while keeping a stuck run bounded to seconds.
+const VIRTUALIZED_OEP_RETRY_LIMIT: u32 = 64;
+
 /// Seconds to let a packed DLL finish its own `DllMain` initialisation after
 /// its import table is ready, before the image is dumped.
 ///
-/// See the settle-window comment in [`handle_access_violation`]: the reference
-/// `core.dll` writes its version string into `.bss` after the IAT is complete,
-/// so a dump taken at the end of the IAT window yields `GetAppVersion() -> "0.0"`
-/// instead of `"1.1"`.
-const DLL_SETTLE_SECS: u64 = 0;
+/// # Measured status: this window does not currently change the outcome
+///
+/// The original rationale was that the reference `core.dll` writes its version
+/// string into `.bss` *after* the import table is complete, so a dump taken at
+/// the end of the IAT window would answer `GetAppVersion() -> "0.0"`.  That
+/// rationale has been tested and **does not hold as stated**:
+///
+/// * A 0 s, 2 s and 12 s window all produce a `.bss` with **1** non-zero byte,
+///   while the same DLL loaded by the real loader (`LoadLibraryW`, no debugger)
+///   has **177**.  Time is not the variable.
+/// * The dump's `.bss` is *byte-identical* to what an external reader sees in
+///   the debuggee at 8.4 s, so the reader is faithful — this is not a
+///   read-too-early defect either.
+/// * In the debuggee the loader thread is frozen at rva `0x2C387`
+///   (`call [InitializeCriticalSection]`) for the whole window and never leaves
+///   it; `.host.log` stays empty, so `LoadLibraryW` never returns.
+/// * Under a *plain* debugger (`cdb`) the same DLL raises a first-chance
+///   `0xC000008E` (FLT_DIVIDE_BY_ZERO) during initialisation.  Being debugged
+///   is therefore enough to divert the shell — the unpacker is not the sole
+///   cause.
+///
+/// The window is kept because it is harmless, it is the correct place for a
+/// settle phase, and the remaining non-zero bytes it does capture
+/// (`.bss+0x2CCC`, `.bss+0x2D08`, `.bss+0x2D20`, `.bss+0x2D40`) match the real
+/// loader's values.  It is documented as ineffective rather than presented as
+/// a fix.
+const DLL_SETTLE_SECS: u64 = 2;
 
 /// Counts consecutive identical access violations.
 ///
@@ -72,6 +186,22 @@ impl AvStorm {
         self.tuple = None;
         self.count = 0;
     }
+}
+
+/// True when a fault's *target* address lies inside the guarded `.text` range.
+///
+/// This is what distinguishes a guard-driven retry (expected, self-limiting, must
+/// not count toward the storm budget) from the shell faulting somewhere else
+/// (not expected, must count).
+///
+/// Measured failure this guards against: on the x86 reference sample the shell
+/// faulted at `.themida+0x538866` reading address `0x5` — far outside the guarded
+/// `.text` — 156,309 times.  The storm counter was reset on *every* fault
+/// regardless of where it landed, so the watchdog never fired and the log grew
+/// without bound instead of failing with a diagnosis.
+fn is_guarded_text_fault(target_address: u64, text_start: usize, text_end: usize) -> bool {
+    let t = target_address as usize;
+    t >= text_start && t < text_end
 }
 
 /// Union of all Themida section bounds, as `(start, end)` virtual addresses.
@@ -145,13 +275,24 @@ pub(super) fn handle_access_violation(
         return Ok(AvAction::Continue);
     }
 
-    // A guard-driven fault is expected and self-limiting; it must not count
-    // toward the storm budget.
-    ls.av_storm.reset();
-
     let text_start = (dbg.image_base() as usize)
         .wrapping_add(state.pe_info.pe_sections[0].virtual_address as usize);
     let text_end = dbg.image_base() as usize + state.pe_info.base_of_data as usize;
+
+    // Only a fault that actually lands inside the guarded `.text` range is a
+    // guard-driven fault, and only those are self-limiting.
+    //
+    // This distinction is the difference between "expected retry" and "the shell
+    // is dereferencing a null-ish pointer forever".  It used to reset
+    // unconditionally, which silently disabled the storm watchdog: measured on
+    // the x86 reference sample, the shell faulted at `.themida+0x538866`
+    // reading address `0x5` — nowhere near the guard — and because every one of
+    // those 156,309 faults reset the counter, the watchdog never fired and the
+    // log grew without bound instead of failing with a diagnosis.
+    let fault_in_guarded_text = is_guarded_text_fault(target_address, text_start, text_end);
+    if fault_in_guarded_text {
+        ls.av_storm.reset();
+    }
 
     match process_guarded_access(
         dbg,
@@ -254,6 +395,7 @@ pub(super) fn handle_access_violation(
             let tls_total = state.pe_info.tls_total;
             let tls_result = handle_tls_callbacks(
                 dbg,
+                thread_id,
                 address,
                 8u32,
                 tls_total,
@@ -267,10 +409,10 @@ pub(super) fn handle_access_violation(
                 let mut ret_bytes = [0u8; 8];
                 let ctx = dbg.get_thread_context_control(thread_id)
                     .map_err(|e| anyhow!("get_thread_context_control: {e}"))?;
-                if dbg.read_memory(ctx.Rsp as usize, &mut ret_bytes).is_ok() {
+                if dbg.read_memory(ctx_sp(&ctx), &mut ret_bytes).is_ok() {
                     ret_addr = u64::from_le_bytes(ret_bytes) as usize;
                     info!(
-                        rsp = %format!("{:#x}", ctx.Rsp as usize),
+                        rsp = %format!("{:#x}", ctx_sp(&ctx)),
                         ret_addr = %format!("{ret_addr:#x}"),
                         "Read return address from stack at PossibleOEP"
                     );
@@ -330,28 +472,39 @@ pub(super) fn handle_access_violation(
                         "Return address points into Themida section — OEP is virtualized"
                     );
 
-                    if ls.virtualized_oep_retries >= 1000 {
+                    if ls.virtualized_oep_retries >= VIRTUALIZED_OEP_RETRY_LIMIT {
                         warn!("Too many virtualized OEP retries ({}) — using last Possible OEP", ls.virtualized_oep_retries);
                         let text_sec = &state.pe_info.pe_sections[0];
                         let text_base = dbg.image_base() as usize + text_sec.virtual_address as usize;
                         let text_end = dbg.image_base() as usize + state.pe_info.base_of_data as usize;
                         let text_len = text_end.saturating_sub(text_base);
 
-                        let found_via_pattern: Option<usize> = if state.pe_info.major_linker_version == 2 {
-                            None
-                        } else if state.pe_info.major_linker_version == 0
-                            || [6u8, 7, 8, 9, 10, 11, 12, 14]
-                                .contains(&state.pe_info.major_linker_version)
-                        {
-                            try_find_correct_oep(
-                                dbg,
-                                address,
-                                text_base,
-                                text_len,
-                                state.pe_info.major_linker_version,
-                            )
-                            .unwrap_or(None)
-                        } else {
+                        // Do **not** special-case linker version 2 here.
+                        //
+                        // This used to be `if version == 2 { None } else if ...`,
+                        // which excluded MinGW/GCC output: its PE header reports
+                        // `MajorLinkerVersion = 2` (measured on the x86 reference
+                        // sample built with i686-w64-mingw32-gcc 16.2.0 — linker
+                        // 2.47).  Version 2 does not mean "no CRT startup pattern
+                        // to find"; it only meant that for the ancient MSVC 6
+                        // builds the original Pascal code was written against.
+                        // `try_find_correct_oep` already gates on
+                        // `KNOWN_MSVC_VERSIONS`, which *includes* 2, so letting it
+                        // decide is both simpler and correct.
+                        let found_via_pattern: Option<usize> =
+                            if state.pe_info.major_linker_version == 0
+                                || KNOWN_MSVC_VERSIONS
+                                    .contains(&state.pe_info.major_linker_version)
+                            {
+                                try_find_correct_oep(
+                                    dbg,
+                                    address,
+                                    text_base,
+                                    text_len,
+                                    state.pe_info.major_linker_version,
+                                )
+                                .unwrap_or(None)
+                            } else {
                             None
                         };
 
@@ -390,8 +543,9 @@ pub(super) fn handle_access_violation(
                     } else {
                         let mut ctx = dbg.get_thread_context_control(thread_id)
                             .map_err(|e| anyhow!("get_thread_context_control: {e}"))?;
-                        ctx.Rip = ret_addr as u64;
-                        ctx.Rsp += 8;
+                        set_ctx_ip(&mut ctx, ret_addr);
+                        let sp = ctx_sp(&ctx) + 8;
+                        set_ctx_sp(&mut ctx, sp);
                         super::session::set_thread_context_control(dbg, thread_id, &ctx)?;
 
                         let ts_start = (dbg.image_base() as usize)
@@ -457,14 +611,15 @@ pub(super) fn handle_access_violation(
                         .map_err(|e| anyhow!("get_thread_context_control: {e}"))?;
                     let mut ret_bytes = [0u8; 8];
                     let mut ret_addr = 0usize;
-                    if dbg.read_memory(ctx.Rsp as usize, &mut ret_bytes).is_ok() {
+                    if dbg.read_memory(ctx_sp(&ctx), &mut ret_bytes).is_ok() {
                         ret_addr = u64::from_le_bytes(ret_bytes) as usize;
                     }
                     if ret_addr != 0 {
                         let mut new_ctx = dbg.get_thread_context_control(thread_id)
                             .map_err(|e| anyhow!("get_thread_context_control: {e}"))?;
-                        new_ctx.Rip = ret_addr as u64;
-                        new_ctx.Rsp += 8;
+                        set_ctx_ip(&mut new_ctx, ret_addr);
+                        let sp = ctx_sp(&new_ctx) + 8;
+                        set_ctx_sp(&mut new_ctx, sp);
                         super::session::set_thread_context_control(dbg, thread_id, &new_ctx)?;
                     }
                     remove_code_section_guard(
@@ -564,7 +719,7 @@ pub(super) fn handle_access_violation(
 
         let mut ctx = dbg.get_thread_context_control(thread_id)
             .map_err(|e| anyhow!("get_thread_context_control: {e}"))?;
-        ctx.Rip = oep_addr as u64;
+        set_ctx_ip(&mut ctx, oep_addr);
         ctx.EFlags &= !0x100;
         super::session::set_thread_context_control(dbg, thread_id, &ctx)?;
 
@@ -605,13 +760,68 @@ pub(super) fn handle_access_violation(
 
         state.guard_start = iat.address;
         state.guard_end = iat.address + iat.size;
-        install_iat_guard(h_process, iat.address, iat.size)?;
 
-        info!("Letting program execute for 5 seconds to decrypt IAT...");
+        // ---- DLL targets: do NOT arm the IAT guard -------------------------
+        //
+        // Measured, and this is the whole point of this branch:
+        //
+        //   IAT guard armed (PAGE_NOACCESS, 5 s, faults answered with
+        //   DBG_CONTINUE):  `.bss` = 0 non-zero bytes, `hinstDLL` = 0
+        //   IAT guard not armed:                    `.bss` = 177, `hinstDLL` set
+        //
+        // Both runs had ScyllaHide injected and were under this same debugger,
+        // and the loader reached the DLL in both.  A packed DLL is still inside
+        // its own `DllMain` at this point; the guard makes every IAT access fault,
+        // the fault is answered "handled", the instruction retries, and the shell
+        // burns the entire window in a fault storm (measured 480,055 faults in
+        // 10 s) instead of initialising.  Releasing the guard afterwards does not
+        // recover it — measured `nz` stayed 0 and the fault count kept climbing —
+        // because the shell has already taken its "something is wrong" path.
+        //
+        // An EXE is different: by the time the OEP is reached the process is
+        // fully initialised, so the guard only observes IAT decryption.
+        //
+        // The guard's only downstream product is `state.guard_addrs`, which feeds
+        // `determine_iat_address` / `fixup_api_call_sites` as a *hint*.  For the
+        // DLL path the IAT is already known (`iat` above), so the hint is not
+        // needed; skipping the window costs nothing and preserves initialisation.
+        //
+        // Note this skips only the guard *window*: control falls through to the
+        // DllMain settle window below, which is where the shell is supposed to
+        // finish initialising.
+        let mut iat_violations = 0;
+        if is_dll_target {
+            // The import table must be writable before the trace engine writes
+            // resolved addresses back into it.  Measured on the reference DLL:
+            // the shell leaves the IAT at `PAGE_READONLY` (0x2), and the final
+            // `trace_imports write IAT` fails with a write fault unless this is
+            // raised.  Guarding it was what used to do that indirectly.
+            let before = page_protection_of(h_process, iat.address);
+            let ok = set_protection(h_process, iat.address, iat.size, 0x04);
+            info!(
+                iat = %format!("{:#x}", iat.address),
+                size = %format!("{:#x}", iat.size),
+                before = ?before.map(|p| format!("{p:#x}")),
+                writable = ok,
+                "DLL target — skipping the IAT guard window so DllMain can initialise"
+            );
+        } else {
+            // Record the IAT's real protection *before* the guard replaces it
+            // with `PAGE_NOACCESS`.  Querying afterwards only ever returns the
+            // guard's own value, which is why the restoration below must not
+            // re-read it later.
+            let iat_protect_before = page_protection_of(h_process, iat.address);
+            debug!(
+                protect = ?iat_protect_before.map(|p| format!("{p:#x}")),
+                "IAT protection before guard"
+            );
+
+            install_iat_guard(h_process, iat.address, iat.size)?;
+
+            info!("Letting program execute for 5 seconds to decrypt IAT...");
 
         let start_time = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(5);
-        let mut iat_violations = 0;
 
         loop {
             if start_time.elapsed() > timeout {
@@ -655,18 +865,46 @@ pub(super) fn handle_access_violation(
             }
         }
 
+        // ---- Restore the IAT's own protection ------------------------------
+        //
+        // `remove_code_section_guard` is named for a *code* section and hard-codes
+        // `PAGE_EXECUTE_READ` as the restored protection.  Calling it on the IAT
+        // range (a data section) therefore makes the import table read-only.
+        //
+        // So: restore what the IAT had before we armed the guard.  A committed
+        // data section is `PAGE_READWRITE`; anything else (including a failed
+        // query, or the guard's own `PAGE_NOACCESS`) falls back to that, because
+        // an import table is always written to.
         remove_code_section_guard(h_process, iat.address, iat.size)?;
+        let restored = match iat_protect_before {
+            Some(p) if p & 0x04 != 0 && p != 0x01 => p,
+            _ => 0x04, // PAGE_READWRITE — the only sane protection for an import table
+        };
+        if !set_protection(h_process, iat.address, iat.size, restored) {
+            warn!(
+                protect = %format!("{restored:#x}"),
+                "Could not restore IAT page protection — target initialisation may stall"
+            );
+        } else {
+            debug!(
+                before = ?iat_protect_before.map(|p| format!("{p:#x}")),
+                applied = %format!("{restored:#x}"),
+                "IAT page protection restored after guard removal"
+            );
+        }
+        } // end: non-DLL IAT guard window
         info!(violations = iat_violations, "IAT monitoring complete");
 
         // ---- DLL targets: let `DllMain` finish before dumping ----------------
         //
-        // A packed DLL does not stop at "IAT decrypted".  Its `DllMain` keeps
-        // initialising global state afterwards — on the reference `core.dll`
-        // the version string `"1.1"` is written into `.bss` *after* the import
-        // table is complete.  Dumping at the end of the IAT window therefore
-        // produced a DLL that loads and exports correctly but answers
-        // `GetAppVersion() -> "0.0"` instead of `"1.1"`, because `.bss` was
-        // captured before the shell filled it in.
+        // A packed DLL does not stop at "IAT decrypted": its `DllMain` keeps
+        // initialising global state afterwards.  This window is where that is
+        // meant to happen.
+        //
+        // It currently does *not* achieve it — see the measured status on
+        // `DLL_SETTLE_SECS`.  The window is retained as the correct place for a
+        // settle phase, and the loop below is kept correct so that when the real
+        // blocker is fixed the window will do its job.
         //
         // The dump point is therefore "the import table is ready AND the target
         // has had time to finish its own initialisation".  We cannot wait for
@@ -674,25 +912,78 @@ pub(super) fn handle_access_violation(
         // execution and the shell never reaches its epilogue while we hold it),
         // so the window is time-based, with the guard already removed so the
         // target runs at full speed.
-        if is_dll_target {
+        if is_dll_target && DLL_SETTLE_SECS > 0 {
             let settle = std::time::Duration::from_secs(DLL_SETTLE_SECS);
             info!(
                 secs = DLL_SETTLE_SECS,
                 "DLL target — letting DllMain finish its own initialisation before dumping"
             );
             let settle_start = std::time::Instant::now();
+
+            // This loop owns the debug session for the length of the window, so
+            // it must answer every event it takes, on the thread that raised it.
+            //
+            // The previous version got this exactly backwards and was therefore
+            // dead on arrival:
+            //
+            //   loop {
+            //       continue_event(thread_id, ...);   // <- no event pending here
+            //       match wait_event_timeout(100) {
+            //           Ok(_) => {}                   // <- event swallowed, never answered
+            //       }
+            //   }
+            //
+            // `continue_event` requires a pending event; called with nothing
+            // pending it fails with `E_INVALIDARG` (2147942487), which broke the
+            // loop on its first iteration (`elapsed_ms=114` instead of 2000).
+            // Every event it did dequeue was dropped, so the debug session was
+            // already dead when `fix_iat_v3` started: measured 289 resolved → 142,
+            // with every failure reporting `trace_one_slot continue: Windows API
+            // error: code 2147942487`.
+            //
+            // The correct shape is wait → answer → repeat, answering on the
+            // event's own thread (a helper thread may raise the event).
             while settle_start.elapsed() < settle {
-                if dbg.continue_event(thread_id, ContinueStatus::Continue).is_err() {
-                    break;
-                }
                 match dbg.wait_event_timeout(100) {
                     Ok(DebugEvent::ExitProcess { .. }) => {
                         info!("Target exited while waiting for DllMain to finish");
                         break;
                     }
-                    Ok(_) => {}
+                    Ok(ev) => {
+                        let ev_tid = settle_thread_id_of(&ev);
+                        // A fault during initialisation is not fatal for our
+                        // purposes — the shell may probe and recover.  Answer it
+                        // and keep the window open; the IAT is already captured.
+                        if let DebugEvent::AccessViolation { address, target_address, .. } = &ev {
+                            debug!(
+                                address = %format!("{address:#x}"),
+                                target = %format!("{target_address:#x}"),
+                                "settle window: access violation, continuing"
+                            );
+                        }
+                        if dbg.continue_event(ev_tid, ContinueStatus::Continue).is_err() {
+                            warn!("settle window: continue_event failed — ending window early");
+                            break;
+                        }
+                    }
                     Err(mida_core::CoreError::Timeout) => {}
-                    Err(_) => break,
+                    Err(mida_core::CoreError::Windows(code)) if sem_timeout(code) => {
+                        // Belt-and-braces.  Core now maps `ERROR_SEM_TIMEOUT`
+                        // correctly (`windows_debugger::is_sem_timeout`), so an
+                        // idle interval arrives as `CoreError::Timeout` and is
+                        // handled by the arm above.  This guard stays because a
+                        // caller that reduces the HRESULT itself would otherwise
+                        // turn a benign idle tick into an early exit — the
+                        // original symptom was the settle window ending at 105 ms
+                        // instead of the requested 2000 ms.
+                        //
+                        // The loop is bounded by `settle_start.elapsed()`, so this
+                        // cannot spin forever.
+                    }
+                    Err(e) => {
+                        warn!("settle window: debug event error: {e}");
+                        break;
+                    }
                 }
             }
             info!(
@@ -718,8 +1009,9 @@ pub(super) fn handle_access_violation(
         let actual_slots = bytes_read / ptr_size;
         slot_values.truncate(actual_slots);
 
+        // Bound in `u64`: the upper limit does not fit a 32-bit `usize`.
         let api_like_count = slot_values.iter()
-            .filter(|&&v| v > 0x10000 && v < 0x7FFF_FFFF_FFFF)
+            .filter(|&&v| (v as u64) > 0x10000 && (v as u64) < 0x7FFF_FFFF_FFFFu64)
             .count();
         info!(api_like = api_like_count, total = actual_slots, "IAT analysis after execution");
 
@@ -729,4 +1021,111 @@ pub(super) fn handle_access_violation(
 
     dbg.continue_event(thread_id, ContinueStatus::Continue)?;
     Ok(AvAction::Continue)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ------------------------------------------------------------------
+    // is_guarded_text_fault — the storm watchdog's scope test
+    // ------------------------------------------------------------------
+
+    /// A fault whose target is inside `.text` is a guard retry.
+    #[test]
+    fn fault_inside_text_is_a_guard_retry() {
+        // Reference x86 sample: .text at image_base+0x1000, base_of_data ends it.
+        let (start, end) = (0x401000usize, 0x403000usize);
+        assert!(is_guarded_text_fault(0x401810, start, end));
+        assert!(is_guarded_text_fault(0x401000, start, end));
+        assert!(is_guarded_text_fault(0x402fff, start, end));
+    }
+
+    /// The exact fault that produced 156,309 log lines must NOT be treated as a
+    /// guard retry — it lands in `.themida`, reading address `0x5`.
+    ///
+    /// This is the regression test for the watchdog being silently disabled:
+    /// because every fault reset the counter unconditionally, this one never
+    /// tripped it.
+    #[test]
+    fn fault_in_themida_is_not_a_guard_retry() {
+        let (start, end) = (0x401000usize, 0x403000usize);
+        assert!(
+            !is_guarded_text_fault(0x5, start, end),
+            "reading address 0x5 is nowhere near .text"
+        );
+        // The faulting instruction lived at .themida+0x538866; its *target* was 0x5.
+        // Either way it must not count as guarded.
+        assert!(!is_guarded_text_fault(0x538866, start, end));
+    }
+
+    /// Boundaries are half-open: `end` is exclusive.
+    #[test]
+    fn text_range_is_half_open() {
+        let (start, end) = (0x1000usize, 0x2000usize);
+        assert!(is_guarded_text_fault(0x1000, start, end), "start is inside");
+        assert!(!is_guarded_text_fault(0x2000, start, end), "end is outside");
+        assert!(!is_guarded_text_fault(0x0fff, start, end), "below start");
+    }
+
+    /// A zero-width range (no guard identified) accepts nothing.
+    #[test]
+    fn empty_range_accepts_nothing() {
+        assert!(!is_guarded_text_fault(0x1000, 0x1000, 0x1000));
+    }
+
+    // ------------------------------------------------------------------
+    // AvStorm — consecutive-identical detection
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn storm_fires_on_identical_faults() {
+        let mut s = AvStorm::default();
+        for i in 0..AV_STORM_LIMIT {
+            let fired = s.record(0x1000, 0x2000, 0);
+            if i + 1 < AV_STORM_LIMIT {
+                assert!(!fired, "must not fire before the limit (iteration {i})");
+            } else {
+                assert!(fired, "must fire at the limit");
+            }
+        }
+    }
+
+    #[test]
+    fn storm_survives_a_changing_fault() {
+        let mut s = AvStorm::default();
+        // A different fault resets the count, so a merely busy target is never
+        // killed.
+        for _ in 0..(AV_STORM_LIMIT * 2) {
+            assert!(!s.record(0x1000, 0x2000, 0));
+            assert!(!s.record(0x3000, 0x4000, 0), "alternating faults never storm");
+        }
+    }
+
+    #[test]
+    fn reset_clears_the_streak() {
+        let mut s = AvStorm::default();
+        for _ in 0..(AV_STORM_LIMIT - 1) {
+            s.record(0x1000, 0x2000, 0);
+        }
+        s.reset();
+        assert!(
+            !s.record(0x1000, 0x2000, 0),
+            "after reset the counter starts over"
+        );
+    }
+
+    /// The exc_type is part of the identity: a read fault and an execute fault at
+    /// the same addresses are different events.
+    #[test]
+    fn exc_type_is_part_of_the_identity() {
+        let mut s = AvStorm::default();
+        for _ in 0..(AV_STORM_LIMIT - 1) {
+            s.record(0x1000, 0x2000, 0);
+        }
+        assert!(
+            !s.record(0x1000, 0x2000, 8),
+            "changing exc_type starts a new streak"
+        );
+    }
 }

@@ -41,19 +41,19 @@ mod known_hashes {
 
 /// Known-good SHA-256 hashes for the x86 ScyllaHide helpers.
 ///
-/// **TODO**: Replace these placeholder hashes with the real SHA-256 values
-/// from your ScyllaHide x86 binaries. Run:
-/// ```bash
-/// sha256sum InjectorCLIx86.exe HookLibraryx86.dll
-/// ```
+/// Measured from the x86 helpers shipped with ScyllaHide
+/// (`D:\Tools\ScyllaHide\` on the dev machine).  These replace the all-zero
+/// placeholders that used to live here — with a placeholder, `verify_sha256`
+/// rejected every real file, so the x86 path could never have worked even if it
+/// had compiled.
 #[cfg(target_arch = "x86")]
 mod known_hashes {
-    /// `InjectorCLIx86.exe` (SHA-256) — **placeholder, replace with real value**.
+    /// `InjectorCLIx86.exe` (SHA-256).
     pub const INJECTOR_CLI_X86: &str =
-        "0000000000000000000000000000000000000000000000000000000000000000";
-    /// `HookLibraryx86.dll` (SHA-256) — **placeholder, replace with real value**.
+        "14e069cc2fc09fbc2d384843fa6a8f7ddae8c01437c59b62512b7ab4eba987e2";
+    /// `HookLibraryx86.dll` (SHA-256).
     pub const HOOK_LIBRARY_X86: &str =
-        "0000000000000000000000000000000000000000000000000000000000000000";
+        "08273dcde4c4039898fbae7fb568105c99e5dce3e2449d6bdc2f28db3967fb36";
 }
 
 /// Returns the expected hash for the matching injector binary based on the
