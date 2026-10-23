@@ -201,6 +201,15 @@ pub fn determine_iat_address(
         }
         section_index_of_rva(va.wrapping_sub(image_base) as u32, sections)
     };
+    // Highest section end, in bytes from the image base.  Used to tell an
+    // in-image Themida trampoline from a resolved import in a system module:
+    // both live in the 0x7FFx range on x64, so only the image span separates
+    // them.
+    let image_span = sections
+        .iter()
+        .map(|&(va, size, _)| va as usize + size as usize)
+        .max()
+        .unwrap_or(0);
 
     // Resolve the compiler hint.
     let compiler = match compiler_hint {
@@ -395,7 +404,12 @@ pub fn determine_iat_address(
     // The IAT is a contiguous array of pointers, preceded by a region of
     // zeros (or at least non-API pointers).  We also do a forward walk to
     // determine the end.
-    let iat = boundaries::scan_iat_boundaries(debugger, iat_ref)?;
+    let iat = boundaries::scan_iat_boundaries(
+        debugger,
+        iat_ref,
+        image_base,
+        image_base + image_span,
+    )?;
 
     Ok(Some(iat))
 }

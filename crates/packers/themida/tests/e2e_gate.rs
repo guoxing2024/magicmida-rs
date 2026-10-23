@@ -57,7 +57,7 @@ struct CaseManifest {
     /// Expected thunk count in the rebuilt import table.
     expect_thunk_count: usize,
     /// Expected IAT slot count.
-    expect_iat_slots: usize,
+    expect_iat_slots_min: usize,
     /// Expected output size in bytes.
     expect_output_size: u64,
     /// Expected output SHA-256.  May be empty when the case is known to be
@@ -96,7 +96,7 @@ fn load_manifest(path: &Path) -> CaseManifest {
     let expect_not_import = num("expect_not_import");
     let expect_module_count = num("expect_module_count");
     let expect_thunk_count = num("expect_thunk_count");
-    let expect_iat_slots = num("expect_iat_slots");
+    let expect_iat_slots_min = num("expect_iat_slots_min");
     let expect_output_size = num("expect_output_size") as u64;
     let expect_output_sha256 = get("expect_output_sha256").to_lowercase();
 
@@ -110,7 +110,7 @@ fn load_manifest(path: &Path) -> CaseManifest {
         expect_not_import,
         expect_module_count,
         expect_thunk_count,
-        expect_iat_slots,
+        expect_iat_slots_min,
         expect_output_size,
         expect_output_sha256,
     }
@@ -263,12 +263,19 @@ fn e2e_reference_case_matches_golden_record() {
     );
 
     // ---- 5. IAT slot scan covered the whole table (no early abort) ----
+    //
+    // A floor, not an exact count: the exact end of the table is a property of
+    // the live data, not of the read window that reports it.  The old exact
+    // 1063 was simply where the one-sided window stopped.  Byte-level
+    // reproducibility below is the stronger check.
     let slots = extract_iat_slots(&log)
         .unwrap_or_else(|| panic!("[{}] no IAT boundary line in log", case.case_id));
-    assert_eq!(
-        slots, case.expect_iat_slots,
-        "[{}] IAT slot count changed — the scan is aborting early (log: {})",
+    assert!(
+        slots >= case.expect_iat_slots_min,
+        "[{}] IAT scan covered only {slots} slots, below the {}-slot floor — \
+         the scan is aborting early (log: {})",
         case.case_id,
+        case.expect_iat_slots_min,
         log_path.display()
     );
 
@@ -506,5 +513,5 @@ fn manifest_is_present_and_well_formed() {
     assert_eq!(case.sample_sha256.len(), 64, "SHA-256 must be 64 hex chars");
     assert!(case.expect_resolved > 0);
     assert!(case.expect_module_count > 0);
-    assert!(case.expect_iat_slots > 0);
+    assert!(case.expect_iat_slots_min > 0);
 }

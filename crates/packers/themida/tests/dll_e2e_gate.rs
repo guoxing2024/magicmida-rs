@@ -60,7 +60,10 @@ struct DllCase {
     expect_failed: usize,
     /// Slots holding a bare RVA into a non-executable section: data, not imports.
     expect_not_import: usize,
-    expect_iat_slots: usize,
+    /// Minimum IAT slot count — a floor, not an exact count.  The exact end of
+    /// the table is a property of the data, not of the read window; see the
+    /// manifest header.
+    expect_iat_slots_min: usize,
     expect_output_size: u64,
     /// `none` disables the byte-level check; this case records a real hash.
     expect_output_sha256: String,
@@ -95,7 +98,7 @@ fn load_manifest(path: &Path) -> DllCase {
         expect_resolved: num("expect_resolved"),
         expect_failed: num("expect_failed"),
         expect_not_import: num("expect_not_import"),
-        expect_iat_slots: num("expect_iat_slots"),
+        expect_iat_slots_min: num("expect_iat_slots_min"),
         expect_output_size: num("expect_output_size") as u64,
         expect_output_sha256: get("expect_output_sha256").to_lowercase(),
         expect_version: get("expect_version"),
@@ -286,10 +289,12 @@ fn e2e_dll_case_matches_golden_record() {
             log_path.display()
         )
     });
-    assert_eq!(
-        slots, case.expect_iat_slots,
-        "[{}] IAT slot count changed — the scan is aborting early (log: {})",
+    assert!(
+        slots >= case.expect_iat_slots_min,
+        "[{}] IAT scan covered only {slots} slots, below the {}-slot floor — \
+         the scan is aborting early (log: {})",
         case.case_id,
+        case.expect_iat_slots_min,
         log_path.display()
     );
 

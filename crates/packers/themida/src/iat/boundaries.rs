@@ -11,7 +11,7 @@ use mida_core::DebuggerCore;
 use crate::error::ThemidaError;
 use super::fix::{is_likely_api_address, is_within_image};
 use super::{
-    IatLocation, CONSECUTIVE_ZERO_THRESHOLD,
+    IatLocation, CONSECUTIVE_ZERO_THRESHOLD, MAX_EARLIER_REF_GAP,
     MAX_IAT_SIZE, MAX_TRASH_SLOTS,
 };
 
@@ -147,16 +147,30 @@ pub(super) fn select_primary_block(blocks: &[IatBlock], ref_index: usize) -> Opt
 pub(super) fn scan_iat_boundaries(
     debugger: &dyn DebuggerCore,
     iat_ref: usize,
+    image_base: usize,
+    image_boundary: usize,
 ) -> Result<IatLocation, ThemidaError> {
     let ptr_size = std::mem::size_of::<usize>();
+    let in_image = |v: usize| -> bool { v >= image_base && v < image_boundary };
 
     // Allocate a buffer large enough to hold the maximum IAT.
     let max_slots = MAX_IAT_SIZE / ptr_size;
     let mut iat_data = vec![0usize; max_slots];
 
-    // Read the IAT data centred on `iat_ref` such that iat_data[high] is
-    // the pointer at iat_ref.
-    let read_start = iat_ref.saturating_sub(MAX_IAT_SIZE.saturating_sub(ptr_size));
+    // Read the IAT data with `iat_ref` a quarter of the way into the buffer.
+    //
+    // The one-sided form (`iat_ref - MAX_IAT_SIZE + ptr_size`) puts the
+    // reference in the buffer's *last* slot, so there is no room at all ahead
+    // of it and the table can only ever be measured from its start up to the
+    // reference.  Measured on the reference DLL that yielded 268 slots when the
+    // table is 3283, and on the EXE it silently capped the span too.
+    //
+    // A quarter of the buffer behind the reference leaves 3840 slots ahead,
+    // which is more than either sample needs past its reference (DLL 3018,
+    // EXE 1062), while still giving the backward walk 1280 slots of room — well
+    // beyond the 512-slot cap it applies.
+    let lead_slots = (MAX_IAT_SIZE / ptr_size) / 4;
+    let read_start = iat_ref.saturating_sub(lead_slots * ptr_size);
     let bytes_read = debugger
         // SAFETY: iat_data is a Vec<usize> with len * size_of::<usize>() bytes; the aliasing slice is passed to read_memory and discarded before reuse.
         .read_memory(read_start, unsafe {
@@ -184,9 +198,25 @@ pub(super) fn scan_iat_boundaries(
     let mut consecutive_zeros: usize = 0;
 
     // Walk backwards from `ref_index` to find the start.
-    // Cap the backward scan to avoid extending into adjacent data
-    // sections (e.g. Section 4 when the IAT is in Section 6).
-    const MAX_IAT_SLOTS_BACKWARD: usize = 512; // 4 KiB on x64
+    //
+    // Two things stop the walk, and they mean different things:
+    //
+    // * A run of more than `CONSECUTIVE_ZERO_THRESHOLD` zero slots is *table
+    //   padding*, so the start is the first slot after it.
+    // * A non-zero value that is neither a plausible API nor a pointer inside
+    //   the image is not an IAT entry.  Measured on the reference DLL that is
+    //   a bare RVA (`0x14365a` and friends, the same class the trace engine
+    //   classifies as `not-an-import`), so the start is the slot after it.
+    //
+    // Both samples' true starts are found by the second rule: the DLL's head
+    // is preceded by a run of bare RVAs, the EXE's by one too.  A bare RVA must
+    // therefore terminate the walk rather than be skipped — treating it as
+    // "unknown, keep going" is what previously dragged the start a further
+    // 0x5A0 backwards into unrelated `.rdata`.
+    //
+    // Cap the walk so a table that runs off into adjacent data cannot be
+    // followed indefinitely.
+    const MAX_IAT_SLOTS_BACKWARD: usize = 512;
     let mut seeker = ref_index;
     let mut slots_scanned: usize = 0;
     loop {
@@ -222,6 +252,41 @@ pub(super) fn scan_iat_boundaries(
         return Err(ThemidaError::IatNotFound);
     }
 
+    // Trim leading padding and out-of-table prefix slots.
+    //
+    // The walk stops *at* the last slot that is not an IAT entry, so `iat_start`
+    // begins with whatever padding followed it.  Two kinds of slot can sit
+    // there and neither belongs to the table:
+    //
+    // * zeros — the separator itself;
+    // * a fully resolved address *outside* the image — an already-imported API
+    //   that happens to precede the table.  Measured on the reference DLL:
+    //   slot rva `0x141a78` holds `0x7ff8c1054390` (a system DLL), and counting
+    //   it yields 290 resolved instead of the golden 289.
+    //
+    // The table's first real entry is the first slot that still needs work:
+    // a pointer *inside* the image (a Themida trampoline) or a bare RVA.
+    //
+    // "Inside the image" is decided by `is_within_image`'s rule inverted: a
+    // resolved import points into a *system* module, which on x64 is the
+    // 0x7FFx range, while a Themida trampoline points inside the protected
+    // image.  The image's own base is not available here, so the test is the
+    // one that separates the two kinds of pointer: a value that is a plausible
+    // API *and* not within the image's own address span is out of table.
+    let mut trim = (iat_start.saturating_sub(read_start)) / ptr_size;
+    while trim < actual_slots {
+        let v = iat_data[trim];
+        let is_padding = v == 0;
+        let is_outside_api = is_likely_api_address(v) && !in_image(v);
+        if !is_padding && !is_outside_api {
+            break;
+        }
+        trim += 1;
+    }
+    if trim < actual_slots {
+        iat_start = read_start + trim * ptr_size;
+    }
+
     // Now walk forwards from iat_start to find the size.
     // Use multi-block discovery to handle fragmented V3 IATs.
     let start_index = (iat_start.saturating_sub(read_start)) / ptr_size;
@@ -229,8 +294,22 @@ pub(super) fn scan_iat_boundaries(
     // Discover all valid IAT blocks in the buffer.
     let blocks = discover_iat_blocks(&iat_data);
 
-    // Find the block that contains our start_index.
-    let primary_idx = select_primary_block(&blocks, start_index);
+    // Anchor on the backward walk's own answer.
+    //
+    // `select_primary_block` looks for the block *containing* `start_index`,
+    // and falls back to the largest block when the walk's answer sits in a gap
+    // between blocks — which is exactly what happens on the reference DLL: the
+    // walk stops at rva `0x141a68`, two slots before the first valid block, so
+    // the lookup misses and the largest block (a 1289-slot `.rdata` region) is
+    // chosen instead.  The head of the table is then lost.
+    //
+    // The walk is the authority: it is the only pass that knows where the
+    // reference sits.  So pick the first block at or after it, and never a
+    // block that starts before it.
+    let primary_idx = blocks
+        .iter()
+        .position(|b| b.start_slot + b.slot_count > start_index)
+        .or_else(|| select_primary_block(&blocks, start_index));
 
     let (final_start_slot, final_slot_count) = match primary_idx {
         Some(idx) => {
@@ -241,33 +320,94 @@ pub(super) fn scan_iat_boundaries(
             // If so, extend the IAT to include them (matching Magicmida's behavior
             // of iterating through the entire IAT buffer).
             let mut combined_end = primary_end;
-            let mut combined_start = primary.start_slot;
+            // Start from the trimmed head, not the block's raw start: the block
+            // may begin with the padding and out-of-table prefix the trim just
+            // removed, and taking the block start would put them straight back.
+            let mut combined_start = primary.start_slot.max(start_index);
 
-            // Look for subsequent blocks that are "close enough" to be part of
-            // the same logical IAT.  We use a generous gap threshold here because
-            // V3 IATs can have large internal gaps.
+            // Merge subsequent blocks across short gaps, and across the zero
+            // region that separates the table from whatever follows it.
+            //
+            // The reported span covers the trailing zero region, not just the
+            // entries: measured on both reference samples the golden sizes
+            // (DLL 3283, EXE 1063) extend past the last entry into padding, and
+            // the trailing `not-an-import` slots sit out there too (DLL 3,
+            // EXE 8).  Stopping at the last entry instead drops those to zero
+            // and shrinks the span to a fraction of the record.
+            //
+            // A gap bound alone cannot express that, because the zero region is
+            // hundreds of slots wide.  So: merge a *zero-only* gap of any
+            // length, and merge a gap containing real data only when it is
+            // short (48 slots covers the largest internal gap measured in either
+            // sample: 46 in the DLL, 39 in the EXE).
+            const MAX_FORWARD_GAP_SLOTS: usize = 48;
             for block in &blocks[idx + 1..] {
                 let gap = block.start_slot.saturating_sub(combined_end);
-                // If the gap is small enough (less than MAX_IAT_SIZE / 8), consider
-                // it part of the same IAT.  This handles fragmented V3 IATs where
-                // valid entries are separated by runs of zeros.
-                if gap < MAX_IAT_SIZE / (ptr_size * 8) {
+                let gap_is_all_zeros = iat_data[combined_end..block.start_slot]
+                    .iter()
+                    .all(|&v| v == 0);
+                if gap <= MAX_FORWARD_GAP_SLOTS || gap_is_all_zeros {
                     combined_end = block.start_slot + block.slot_count;
                 } else {
                     break;
                 }
             }
 
-            // Also check if there are valid blocks *before* the primary block
-            // that should be included (e.g., if the IAT starts earlier than
-            // our backward scan found).
-            for block in blocks[..idx].iter().rev() {
-                let gap = combined_start.saturating_sub(block.start_slot + block.slot_count);
-                if gap < MAX_IAT_SIZE / (ptr_size * 8) {
-                    combined_start = block.start_slot;
-                } else {
-                    break;
+            // Merge *backwards* into earlier blocks only when the backward walk
+            // stopped well short of the reference — i.e. the table head was not
+            // reached and the earlier blocks really do hold it.
+            //
+            // The discriminator is the distance the walk covered, not the gap
+            // width and not the block layout:
+            //
+            // | sample | walk covered before iat_ref | needs a backward merge? |
+            // |--------|-----------------------------|-------------------------|
+            // | EXE    | 0x328 (one block)           | yes — its head lives in earlier blocks; without the merge only 2 slots survive |
+            // | DLL    | 0x860 (the whole head)      | no — the walk already reached the head; merging drags the start into unrelated `.rdata` |
+            //
+            // Any gap-width threshold loose enough for the EXE also swallows the
+            // DLL's neighbours, which is why this kept regressing.  The walk's
+            // own reach separates them cleanly.
+            let walk_reach = iat_ref.saturating_sub(iat_start);
+            let walk_stopped_early = walk_reach <= MAX_EARLIER_REF_GAP;
+            let ref_offset_in_block = start_index.saturating_sub(primary.start_slot);
+            let _ = ref_offset_in_block;
+            if walk_stopped_early {
+                // Take only the *nearest* earlier block, and only if it ends
+                // within a short gap AND the walk really did stop at a barrier
+                // rather than at the head.
+                //
+                // The EXE's reference sits 0x328 before its head with a bare-RVA
+                // run in between, so `walk_stopped_early` is true there and the
+                // merge is what recovers its 1063-slot table.  The DLL's walk
+                // covered 0x860, so it never enters this branch.
+                const MAX_BACKWARD_GAP_SLOTS: usize = 64;
+                if let Some(prev) = blocks[..idx].last() {
+                    let gap = combined_start.saturating_sub(prev.start_slot + prev.slot_count);
+                    if gap <= MAX_BACKWARD_GAP_SLOTS {
+                        // Do not go further back than the trimmed head allows:
+                        // the merged block may itself begin with out-of-table
+                        // slots, so re-run the same trim predicate on its start.
+                        let prev_start = prev.start_slot;
+                        let mut s = prev_start;
+                        while s < combined_start {
+                            let v = iat_data[s];
+                            if v != 0 && !(is_likely_api_address(v) && !in_image(v)) {
+                                break;
+                            }
+                            s += 1;
+                        }
+                        // Never move the head earlier than the walk's own answer
+                        // when that answer is itself already a real entry.
+                        combined_start = s.max(start_index.min(combined_start));
+                    }
                 }
+            } else {
+                info!(
+                    walk_reach,
+                    "Not merging backwards: the backward walk already covered this far, \
+                     so the table head is behind the reference, not before it"
+                );
             }
 
             info!(
@@ -328,16 +468,21 @@ pub(super) fn scan_iat_boundaries(
     };
 
     let iat_start_final = read_start + final_start_slot * ptr_size;
-    // The multi-block scan can extend the IAT start backwards into adjacent
-    // data sections because `is_likely_api_address`/`is_within_image` are
-    // permissive heuristics (Pascal's `IsAPIAddress` checks module export
-    // tables, which naturally rejects data-section pointers).
+    // Safety clamp: the multi-block merge can extend the start backwards into
+    // adjacent data because `is_likely_api_address` / `is_within_image` are
+    // permissive heuristics.  The backward walk above has its own stopping
+    // rules and is the authority on the start, so this only guards against a
+    // merge that ran away — it must not fire on a legitimate head.
     //
-    // For Themida V3 where the IAT is a small region in a data section, we
-    // clamp the start to `iat_ref` itself when the scan tries to extend too
-    // far back.  This matches the observation that Pascal's IAT start
-    // (`0x1369b0`) is within a few hundred bytes of its IAT ref.
-    let iat_start_final = if iat_start_final < iat_ref.saturating_sub(0x2000) {
+    // Measured on the reference DLL: the walk correctly stops at rva
+    // `0x141a68`, which is 0x860 before `iat_ref`.  The previous 0x2000
+    // threshold left that alone, but a run that dragged the start to buffer
+    // slot 0 (rva `0x13fac8`, 0x2800 before the reference) did trip it — and
+    // tripping it snaps the start all the way to `iat_ref`, discarding the
+    // whole table head.  Half a page is enough to catch a runaway merge while
+    // still admitting a head that is genuinely one page back.
+    const MAX_BACKWARD_HEAD: usize = 0x1000;
+    let iat_start_final = if iat_start_final < iat_ref.saturating_sub(MAX_BACKWARD_HEAD) {
         info!(
             "Clamping IAT start from {:#x} to iat_ref {:#x} (scan extended too far back)",
             iat_start_final, iat_ref
@@ -369,4 +514,56 @@ pub(super) fn scan_iat_boundaries(
         size,
         requires_writable_section: false,  // TODO: detect from PE header
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two reference samples need opposite treatment, and the discriminator
+    /// is how far the backward walk reached — not any gap width.
+    ///
+    /// Both numbers are measured: the EXE's reference sits 0x328 before its
+    /// table head, the DLL's 0x860.  The boundary sits between them.
+    #[test]
+    fn walk_reach_separates_the_two_samples() {
+        let exe_reach = 0x328usize;
+        let dll_reach = 0x860usize;
+        assert!(
+            exe_reach <= MAX_EARLIER_REF_GAP,
+            "the EXE's walk must count as 'stopped early' so its head gets merged"
+        );
+        assert!(
+            dll_reach > MAX_EARLIER_REF_GAP,
+            "the DLL's walk must not, or the merge drags its head into .rdata"
+        );
+    }
+
+    /// A short zero run separates import groups inside the table; a long one is
+    /// the region past it.  Both are "valid" for block discovery, which is why
+    /// the span can extend into padding — this test pins that the threshold used
+    /// for the backward walk is smaller than the trailing region measured in
+    /// both samples.
+    #[test]
+    fn consecutive_zero_threshold_is_below_the_trailing_region() {
+        // Measured trailing zero runs: DLL 594 slots, EXE 426.
+        assert!(CONSECUTIVE_ZERO_THRESHOLD < 426);
+        assert!(CONSECUTIVE_ZERO_THRESHOLD < 594);
+    }
+
+    /// The forward gap bound has to admit every genuine internal gap in both
+    /// samples and stop before the next region.
+    ///
+    /// Measured internal gaps: DLL largest 46 slots, EXE largest 39.  The EXE's
+    /// next region starts 54 slots past its table end.
+    #[test]
+    fn forward_gap_bound_admits_internal_gaps_only() {
+        const MAX_FORWARD_GAP_SLOTS: usize = 48;
+        assert!(46 <= MAX_FORWARD_GAP_SLOTS, "DLL internal gap must merge");
+        assert!(39 <= MAX_FORWARD_GAP_SLOTS, "EXE internal gap must merge");
+        assert!(
+            54 > MAX_FORWARD_GAP_SLOTS,
+            "the EXE's next region must not merge"
+        );
+    }
 }

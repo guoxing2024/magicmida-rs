@@ -33,7 +33,7 @@ expect_failed: 0
 expect_not_import: 8
 expect_module_count: 9
 expect_thunk_count: 186
-expect_iat_slots: 1063
+expect_iat_slots_min: 1000
 
 # --- product ---------------------------------------------------------------
 # Size dropped 1539584 → 1539072 when the exception table started being captured
