@@ -101,30 +101,37 @@ pub fn read_original_import_table(path: &Path) -> Vec<(String, Vec<String>)> {
         if (ft_rva as usize) >= sec_va {
             let ft_offset = (ft_rva as usize) - sec_va;
             let mut thunk_offset = ft_offset;
-            while thunk_offset + 8 <= section_data.len() {
-                let thunk = usize::from_le_bytes([
-                    section_data[thunk_offset],
-                    section_data[thunk_offset + 1],
-                    section_data[thunk_offset + 2],
-                    section_data[thunk_offset + 3],
-                    section_data[thunk_offset + 4],
-                    section_data[thunk_offset + 5],
-                    section_data[thunk_offset + 6],
-                    section_data[thunk_offset + 7],
-                ]);
+            // Thunk entries are pointer-sized: 8 bytes on PE32+, 4 on PE32.
+            // Hard-coding 8 is what kept the x86 build from compiling.
+            let ptr_size = std::mem::size_of::<usize>();
+            while thunk_offset + ptr_size <= section_data.len() {
+                // Read through `u64` so the width is chosen at run time rather
+                // than pinned by `usize::from_le_bytes`' array size.
+                let thunk: usize = if ptr_size == 8 {
+                    let raw: [u8; 8] = section_data[thunk_offset..thunk_offset + 8]
+                        .try_into()
+                        .unwrap_or([0u8; 8]);
+                    u64::from_le_bytes(raw) as usize
+                } else {
+                    let raw: [u8; 4] = section_data[thunk_offset..thunk_offset + 4]
+                        .try_into()
+                        .unwrap_or([0u8; 4]);
+                    u32::from_le_bytes(raw) as usize
+                };
 
                 if thunk == 0 {
                     break;
                 }
 
-                const IMAGE_ORDINAL_FLAG64: usize = 0x8000_0000_0000_0000;
-                if thunk & IMAGE_ORDINAL_FLAG64 != 0 {
+                // IMAGE_ORDINAL_FLAG: bit 63 on PE32+, bit 31 on PE32.
+                let ordinal_flag: usize = 1usize << (ptr_size * 8 - 1);
+                if thunk & ordinal_flag != 0 {
                     // Import by ordinal
                     let ordinal = thunk & 0xFFFF;
                     functions.push(format!("#{ordinal}"));
                 } else {
                     // Import by name - hint/name at thunk address
-                    let hint_rva = (thunk & 0x7FFFFFFF) as u32;
+                    let hint_rva = (thunk & (ordinal_flag - 1)) as u32;
                     if (hint_rva as usize) >= sec_va {
                         let hint_offset = (hint_rva as usize) - sec_va;
                         if hint_offset + 2 <= section_data.len() {
@@ -138,7 +145,7 @@ pub fn read_original_import_table(path: &Path) -> Vec<(String, Vec<String>)> {
                     }
                 }
 
-                thunk_offset += 8;
+                thunk_offset += ptr_size;
             }
         }
 

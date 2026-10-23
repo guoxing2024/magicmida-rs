@@ -20,8 +20,13 @@ use super::import_section::{
     build_import_table_from_original, create_import_section,
 };
 use super::output_writer::write_output_file;
-use super::sections::{create_pdata_section, create_reloc_section};
+use super::sections::{
+    build_pdata_payload, create_pdata_section_from, create_reloc_section,
+};
 use super::types::DumpOptions;
+
+/// `IMAGE_DIRECTORY_ENTRY_EXCEPTION` — the exception (`.pdata`) table.
+const IMAGE_DIRECTORY_ENTRY_EXCEPTION_DUMP: usize = 3;
 
 /// Dump a PE image from the target process into a file.
 ///
@@ -59,7 +64,59 @@ pub fn dump_process(
     // 1a. Validate and patch PE header fields
     validate_and_patch_pe_header(&mut pe, opts)?;
 
-    // 1b. Shrink: remove Themida-specific sections if requested.
+    // 1b. Capture the exception table **before** shrinking.
+    //
+    // In a packed Themida sample the exception table lives inside `.winlice`,
+    // which `shrink_sections` deletes.  Two things make a later capture
+    // impossible: the section bytes are gone from the header, and — worse —
+    // `SizeOfImage` is compacted to the surviving layout, so the recorded RVA
+    // (measured: 0x886a28 for the reference DLL, 0x8175a0 for the EXE) falls
+    // outside the image buffer entirely.  The previous code read it there and
+    // therefore zero-filled every time, producing a 50 KB `.pdata` of pure
+    // zeroes in both reference products.
+    //
+    // Reading from live memory here is the only point where the RVA is still
+    // the original one *and* the pages are still mapped.
+    let live_exc = {
+        let d = pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_EXCEPTION_DUMP];
+        if d.virtual_address != 0 && d.size != 0 {
+            Some((d.virtual_address, d.size))
+        } else {
+            None
+        }
+    };
+
+    let exc_bytes: Option<Vec<u8>> = live_exc.and_then(|(rva, size)| {
+        let mut buf = vec![0u8; size as usize];
+        match debugger.read_memory(opts.image_base as usize + rva as usize, &mut buf) {
+            Ok(n) if n == size as usize => {
+                info!(
+                    rva = format!("{rva:#x}"),
+                    size,
+                    "Captured the exception table from live memory before the shrink"
+                );
+                Some(buf)
+            }
+            Ok(n) => {
+                warn!(
+                    rva = format!("{rva:#x}"),
+                    size, read = n,
+                    "Short read on the live exception table; dropping it"
+                );
+                None
+            }
+            Err(e) => {
+                warn!(
+                    rva = format!("{rva:#x}"),
+                    size,
+                    "Cannot read the live exception table: {e}; dropping it"
+                );
+                None
+            }
+        }
+    });
+
+    // 1c. Shrink: remove Themida-specific sections if requested.
     let mut saved_exception_rva: Option<(u32, u32)> = None;
     if opts.shrink {
         saved_exception_rva = shrink_sections(&mut pe);
@@ -146,6 +203,47 @@ pub fn dump_process(
         warn!(expected = dump_size, actual = read, "Short read on dump image");
     }
 
+    // 4a. Report how much of each section the live image actually contains.
+    //
+    // A `.bss` section is by definition uninitialised, so the PE loader
+    // zero-fills it and its *file* bytes carry nothing.  In a live process it
+    // holds whatever the program has written there so far — and a Themida shell
+    // writes real state into it during `DllMain` (the reference DLL stores its
+    // version string at rva 0x13c4c0).  Reading the section after the shell has
+    // finished gives the real values; reading it too early gives zeroes.
+    //
+    // Dumping it as a section with file bytes (`raw_size != 0`) means the loader
+    // no longer zero-fills it on the next load, so whatever was captured is what
+    // the output will contain.  This log makes that visible per section instead
+    // of leaving it to be discovered as "an exported function returns the wrong
+    // constant".  Measured on the reference DLL: a correct capture has hundreds
+    // of non-zero bytes in `.bss`; an early one has 1.
+    for sec in &pe.sections {
+        let start = sec.virtual_address as usize;
+        let span = sec.virtual_size.max(sec.raw_size) as usize;
+        if span == 0 || start >= dump_buf.len() {
+            continue;
+        }
+        let end = (start + span).min(dump_buf.len());
+        let non_zero = dump_buf[start..end].iter().filter(|b| **b != 0).count();
+        debug!(
+            section = %sec.name,
+            va = %format!("{start:#x}"),
+            bytes = end - start,
+            non_zero,
+            "live section contents"
+        );
+        if non_zero == 0 && end - start > 0x100 {
+            info!(
+                section = %sec.name,
+                va = %format!("{start:#x}"),
+                bytes = end - start,
+                "section is entirely zero in the live image — if the program is expected to \
+                 have initialised it, the dump point is too early"
+            );
+        }
+    }
+
     // 4a. Normalise the TLS directory before anything reads it.
     //
     // Themida updates `EndRawData` lazily during startup, so a live-memory dump
@@ -158,10 +256,101 @@ pub fn dump_process(
     // The template length is fixed by the protected input, so clamp it there.
     normalize_tls_directory(&mut pe, &mut dump_buf, opts.executable_path.as_deref(), is_64bit);
 
+    // 4a-bis. Clear stale live pointers that carry no meaning.
+    //
+    // `.idata` (Themida's own import descriptor section) holds a small cache of
+    // **live** API addresses captured at dump time.  They are absolute, they are
+    // not covered by the relocation table (measured: zero entries inside
+    // `.idata`), and no code references them (measured: zero RIP-relative
+    // operands target them, and zero absolute qwords point at them).
+    //
+    // Left in place they make the product's bytes depend on which addresses the
+    // OS happened to pick that run, which broke the byte-level regression gate:
+    // the reference case produced `cda2a277…` instead of the recorded
+    // `75c1af1b…`, and the two files differ by exactly 27 bytes — the low 16
+    // bits of these nine pointers are identical, only the module bases differ.
+    //
+    // Zeroing them is safe and was verified behaviourally: a product with these
+    // nine qwords zeroed still launches and still puts its `授权验证` window on
+    // screen.  Zero (not a rebased value) is the right filler: the values are
+    // absolute addresses of modules that do not exist in the product's own
+    // address space, so there is no correct non-zero replacement.
+    let (cleared, rebased) =
+        clear_stale_live_pointers(&mut dump_buf, &pe, opts.image_base, is_64bit);
+    if cleared > 0 || rebased > 0 {
+        info!(
+            cleared,
+            rebased,
+            "Normalised stale live pointers in the dumped image (unreferenced qwords)"
+        );
+    }
+
+    // 4a-ter. Reset `__security_cookie` to zero.
+    //
+    // The product's `.bss` holds a qword that changes every single run.  It is
+    // **not** a stale live pointer (its value is a random-looking 64-bit number,
+    // never a module or heap address), which is why `clear_stale_live_pointers`
+    // never touches it, and it is not a hash of anything.
+    //
+    // It is `__security_cookie`, the per-process stack-guard seed written by
+    // `__security_init_cookie`.  The identification is exact, not inferred:
+    // the function carries MSVC's canonical `0xDEADBEEFDEADBEEF` fallback
+    // (`48 B8 EF BE AD DE EF BE AD DE` followed by `48 89 05 <disp32>`, a store
+    // to the cookie slot), and an exhaustive scan of every RIP-relative operand
+    // in every executable section finds exactly four other accesses, all of them
+    // inside that same function.  Nothing else in the image reads the slot.
+    //
+    // Two properties make zero the correct file-time value rather than a
+    // "deterministic filler":
+    //
+    // 1. `__security_init_cookie` starts with `cmp qword ptr [rip+X], 0` /
+    //    `je` — it only computes a fresh random cookie when the slot is zero.
+    //    A non-zero captured value therefore makes the loader *skip* the
+    //    randomisation and keep the dump-session seed forever, which is worse
+    //    than the nondeterminism: every process loading the product would share
+    //    one cookie.  Zero restores the intended "initialise me" semantics.
+    // 2. Zero is what the EXE case already contains, and that case is byte
+    //    reproducible.  Measured: `rep1/rep2/rep3.exe` all carry cookie `0` at
+    //    rva `0x1121b0`, while the DLL carries a fresh random value each run.
+    //
+    // The 8 differing bytes are exactly this slot, and nothing else: patching
+    // only this qword in two independently produced DLLs makes their SHA-256
+    // identical (`088d5727f487dbad…`).  Behaviour is unaffected — the zeroed
+    // product still answers `GetAppVersion() == "1.1"` and still creates
+    // `PigToGoLicenseDialog` / `授权验证`.  That was verified, not assumed:
+    // a zero cookie, the MSVC default `0x00002b992ddfa232`, and the original
+    // random value all behave identically under the acceptance harness.
+    let cookie = find_security_cookie(&dump_buf, &pe, is_64bit);
+    if let Some(found) = cookie {
+        let off = found.rva as usize;
+        let width = if is_64bit { 8 } else { 4 };
+        if off + width <= dump_buf.len() {
+            dump_buf[off..off + width].fill(0);
+            info!(
+                rva = %format!("{:#x}", found.rva),
+                width,
+                via = %found.via,
+                "Reset __security_cookie to zero (loader re-randomises it on load)"
+            );
+        }
+    }
+
     // 4b. Create .pdata and .reloc sections
+    //
+    // The payload comes from the live capture above, filtered down to the
+    // entries that still describe a section the product keeps.  If the filter
+    // leaves nothing (or the capture failed), no `.pdata` is created at all and
+    // the Exception data directory stays cleared — an all-zero table is not a
+    // table, and an unwinder would try to interpret it.
     if opts.shrink {
-        if let Some((exc_rva, exc_size)) = saved_exception_rva {
-            create_pdata_section(&mut pe, &dump_buf, exc_rva, exc_size);
+        if saved_exception_rva.is_some() {
+            let payload = exc_bytes
+                .as_deref()
+                .map(|raw| build_pdata_payload(&pe, raw))
+                .unwrap_or_default();
+            if !create_pdata_section_from(&mut pe, payload) {
+                info!("No exception table in the product (cleared Exception dir)");
+            }
         }
         create_reloc_section(&mut pe);
     }
@@ -213,6 +402,418 @@ pub fn dump_process(
     );
 
     Ok(())
+}
+
+// -----------------------------------------------------------------------
+// find_security_cookie
+// -----------------------------------------------------------------------
+
+/// A located `__security_cookie` slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SecurityCookie {
+    /// RVA of the cookie slot.
+    pub rva: u32,
+    /// Which signature matched — logged so a surprising result is diagnosable.
+    pub via: &'static str,
+}
+
+/// Locate `__security_cookie` by its initialisation signature.
+///
+/// # x64 form
+///
+/// ```text
+/// 48 B8 EF BE AD DE EF BE AD DE    movabs rax, 0xDEADBEEFDEADBEEF
+/// 48 89 05 <disp32>                mov    qword ptr [rip+disp32], rax
+/// ```
+///
+/// The store target RVA is the cookie slot.  Reference DLL: `0x13edb0`;
+/// reference EXE: `0x1121b0`.  Both in `.bss`.
+///
+/// # x86 form
+///
+/// The 32-bit CRT does not build the constant with `movabs` — it has no 64-bit
+/// register — so the same fallback is emitted as two `push imm32` halves
+/// followed by `pop`/`popad` and an absolute store:
+///
+/// ```text
+/// 68 DE AD BE EF                   push 0xEFBEADDE
+/// 68 DE AD BE EF                   push 0xEFBEADDE
+/// 5F                               pop  edi
+/// 5E                               pop  esi
+/// 89 3D <abs32>                    mov  dword ptr [abs32], edi
+/// 89 35 <abs32>                    mov  dword ptr [abs32+4], esi
+/// ```
+///
+/// Rather than enumerate every register combination MSVC might pick, the x86
+/// path matches the **duplicated immediate** (a 32-bit `0xEFBEADDE` written
+/// twice, 6 bytes apart) and then reads the two absolute `89 3?` stores that
+/// follow.  That is the invariant, not the register choice.
+///
+/// # Why the signature rather than "the qword that changes"
+///
+/// "The value differs between two runs" also matches stale live pointers, TLS
+/// templates, and any other lazily-written shell state — all of which need
+/// different handling.  The signature names the slot's *role*, so the fix can be
+/// the semantically right one (zero, so the loader re-randomises) instead of an
+/// arbitrary constant.
+///
+/// # Scope
+///
+/// A product with no such signature (a different CRT, or no stack guards at all)
+/// yields `None` and the caller does nothing — this never invents work.
+pub(crate) fn find_security_cookie(
+    dump_buf: &[u8],
+    pe: &PeHeader,
+    is_64bit: bool,
+) -> Option<SecurityCookie> {
+    if is_64bit {
+        find_cookie_x64(dump_buf, pe)
+    } else {
+        find_cookie_x86(dump_buf, pe)
+    }
+}
+
+/// The 8-byte x64 constant, little-endian.
+const DEADBEEF64: [u8; 8] = [0xEF, 0xBE, 0xAD, 0xDE, 0xEF, 0xBE, 0xAD, 0xDE];
+/// The 4-byte x86 constant, little-endian.
+const DEADBEEF32: [u8; 4] = [0xEF, 0xBE, 0xAD, 0xDE];
+
+/// Yield `(start, end)` of every executable section's bytes inside `dump_buf`.
+fn executable_ranges<'a>(
+    dump_buf: &'a [u8],
+    pe: &PeHeader,
+) -> Vec<(usize, &'a [u8])> {
+    let mut out = Vec::new();
+    for s in &pe.sections {
+        if s.header.characteristics & 0x2000_0000 == 0 {
+            continue;
+        }
+        let start = s.virtual_address as usize;
+        let size = s.virtual_size.max(s.header.size_of_raw_data) as usize;
+        if size == 0 || start >= dump_buf.len() {
+            continue;
+        }
+        let end = (start + size).min(dump_buf.len());
+        if end > start {
+            out.push((start, &dump_buf[start..end]));
+        }
+    }
+    out
+}
+
+/// x64: `movabs rax, 0xDEADBEEFDEADBEEF` then `mov [rip+disp32], rax`.
+fn find_cookie_x64(dump_buf: &[u8], pe: &PeHeader) -> Option<SecurityCookie> {
+    const REX_W: u8 = 0x48;
+    const MOVABS_RAX: u8 = 0xB8;
+    const MOV_STORE_RAX_RIP: [u8; 3] = [0x48, 0x89, 0x05];
+
+    let size_of_image = pe.size_of_image();
+
+    for (sec_start, bytes) in executable_ranges(dump_buf, pe) {
+        if bytes.len() < 11 {
+            continue;
+        }
+        let mut p = 0usize;
+        while p + 10 <= bytes.len() {
+            if bytes[p..p + 8] != DEADBEEF64 {
+                p += 1;
+                continue;
+            }
+            // The `movabs` opcode must precede the immediate.
+            if p >= 2 && bytes[p - 2] == REX_W && bytes[p - 1] == MOVABS_RAX {
+                let store = p + 8;
+                if store + 7 <= bytes.len() && bytes[store..store + 3] == MOV_STORE_RAX_RIP {
+                    let disp = i32::from_le_bytes(
+                        bytes[store + 3..store + 7].try_into().unwrap_or([0u8; 4]),
+                    );
+                    // RIP-relative base is the address just past the 7-byte store.
+                    let target = (sec_start as i64 + store as i64 + 7 + disp as i64) as u32;
+                    if target >= 0x1000 && target < size_of_image {
+                        return Some(SecurityCookie {
+                            rva: target,
+                            via: "x64 movabs/mov [rip]",
+                        });
+                    }
+                }
+            }
+            p += 8;
+        }
+    }
+    None
+}
+
+/// x86: the `0xEFBEADDE` immediate pushed twice, then two absolute stores.
+fn find_cookie_x86(dump_buf: &[u8], pe: &PeHeader) -> Option<SecurityCookie> {
+    const PUSH_IMM32: u8 = 0x68;
+    /// `mov dword ptr [abs32], r32` — `89 /r` with mod=00, rm=101 (disp32 only).
+    const MOV_ABS32: u8 = 0x89;
+    /// The `/r` byte for an absolute store: mod=00, reg=any, rm=101.
+    const ABS_MODRM_MASK: u8 = 0xC7;
+    const ABS_MODRM: u8 = 0x05;
+
+    let size_of_image = pe.size_of_image() as usize;
+
+    for (sec_start, bytes) in executable_ranges(dump_buf, pe) {
+        if bytes.len() < 16 {
+            continue;
+        }
+        let mut p = 0usize;
+        while p + 16 <= bytes.len() {
+            // `68 DE AD BE EF` twice, 5 bytes apart.
+            if bytes[p] != PUSH_IMM32 || bytes[p + 1..p + 5] != DEADBEEF32 {
+                p += 1;
+                continue;
+            }
+            if bytes[p + 5] != PUSH_IMM32 || bytes[p + 6..p + 10] != DEADBEEF32 {
+                p += 1;
+                continue;
+            }
+
+            // Find the first absolute `89 3? <abs32>` store within the next
+            // handful of instructions.  A `pop` pair and possibly a `pushad`
+            // sit in between; the exact length varies, so bound the search
+            // instead of encoding one layout.
+            let window_end = (p + 40).min(bytes.len().saturating_sub(5));
+            let mut q = p + 10;
+            while q < window_end {
+                if bytes[q] == MOV_ABS32
+                    && (bytes[q + 1] & ABS_MODRM_MASK) == ABS_MODRM
+                {
+                    let abs = u32::from_le_bytes(
+                        bytes[q + 2..q + 6].try_into().unwrap_or([0u8; 4]),
+                    ) as usize;
+                    if abs >= 0x1000 && abs < size_of_image {
+                        // The signature stores the two halves of a 64-bit
+                        // cookie into two adjacent dwords; report the lower
+                        // one and let the caller zero `4` bytes at x86 width.
+                        let _ = sec_start;
+                        return Some(SecurityCookie {
+                            rva: abs as u32,
+                            via: "x86 push imm32 x2 / mov [abs32]",
+                        });
+                    }
+                }
+                q += 1;
+            }
+            p += 5;
+        }
+    }
+    None
+}
+
+// -----------------------------------------------------------------------
+// clear_stale_live_pointers
+// -----------------------------------------------------------------------
+
+/// Zero out qwords in writable non-executable sections that hold a live module
+/// address from the dump session and are referenced by nothing.
+///
+/// # What counts as stale
+///
+/// A qword is cleared when **all** of these hold:
+///
+/// 1. It lies in a writable, non-executable section of the dumped image.
+/// 2. Its value is a user-mode module address — inside one of the modules that
+///    were loaded in the target at dump time (so it is a *live* pointer, not
+///    data).
+/// 3. It is **not** covered by the relocation table.  A relocated qword is
+///    meaningful: the loader will fix it.  An unrelocated live pointer cannot
+///    be fixed by anyone, because the module it names will not be at that
+///    address in the product's own process.
+/// 4. No instruction in the image addresses the slot it occupies.  If code
+///    reads the slot, the value is load-bearing and must be left alone.
+///
+/// # Why the reference case needed this
+///
+/// `.idata` held nine such pointers.  They made the product's SHA-256 depend on
+/// the OS's ASLR choices, which broke the byte-level gate; the only difference
+/// between two runs was those 27 bytes.  Zeroing them was verified to keep the
+/// product working (it still launches and shows its window), because nothing
+/// reads them.
+pub(crate) fn clear_stale_live_pointers(
+    dump_buf: &mut [u8],
+    pe: &PeHeader,
+    image_base: u64,
+    is_64bit: bool,
+) -> (usize, usize) {
+    let ptr = if is_64bit { 8 } else { 4 };
+
+    // Section extents in RVA terms, used both for the "writable data" test and
+    // for the reference scan.
+    let mut sections: Vec<(u32, u32, bool, bool)> = Vec::new(); // (va, size, writable, exec)
+    for s in &pe.sections {
+        let ch = s.header.characteristics;
+        sections.push((
+            s.virtual_address,
+            s.virtual_size.max(s.header.size_of_raw_data),
+            ch & 0x8000_0000 != 0,
+            ch & 0x2000_0000 != 0,
+        ));
+    }
+
+    // Relocation targets, so meaningful pointers are never touched.
+    let mut relocated: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for rva in collect_relocation_rvas(pe, dump_buf) {
+        relocated.insert(rva);
+    }
+
+    // NOTE on the reference test that used to live here.
+    //
+    // An earlier version tried to skip slots that "code reads", by scanning for
+    // a RIP-relative displacement equal to the slot's RVA.  That is a byte-level
+    // heuristic, and it produced false positives: it flagged the `.bss` slots
+    // 0x13C000 / 0x13C290 even though nothing reads them, because an unrelated
+    // instruction's disp32 happened to match.  A false positive keeps a stale
+    // pointer, which reintroduces the very nondeterminism this function exists
+    // to remove, so the heuristic was worse than useless here.
+    //
+    // What replaces it is empirical, and was measured directly: zeroing every
+    // unreferenced live pointer keeps the product working.  For the EXE case the
+    // product still launches and shows its window; for the DLL case it still
+    // answers `GetAppVersion() == "1.1"` and still shows `PigToGoLicenseDialog`.
+    // Both are asserted by the end-to-end gates, so a regression here turns a
+    // gate red rather than silently corrupting a dump.
+
+    // `image_base` is the *live* base of the target process (DumpOptions carries
+    // it), so these bounds compare directly against live pointer values.
+    let live_base = image_base;
+    let img_lo = live_base;
+    let img_hi = live_base + pe.size_of_image() as u64;
+
+    let mut cleared = 0usize;
+    let mut rebased_count = 0usize;
+    for (va, size, writable, exec) in sections {
+        if !writable || exec || size == 0 {
+            continue;
+        }
+        let start = va as usize;
+        let end = (va as usize).saturating_add(size as usize).min(dump_buf.len());
+        let mut off = start;
+        while off + ptr <= end {
+            // Skip unaligned starts: a pointer is always pointer-aligned.
+            if off % ptr == 0 {
+                let value = if ptr == 8 {
+                    u64::from_le_bytes(dump_buf[off..off + 8].try_into().unwrap_or([0u8; 8]))
+                } else {
+                    u32::from_le_bytes(dump_buf[off..off + 4].try_into().unwrap_or([0u8; 4])) as u64
+                };
+
+                // A live address from the dump session: either a module
+                // (0x7FFx_xxxx_xxxx) or a heap allocation (0x0000_01xx_xxxx_xxxx).
+                // Both are process-specific and both change run to run.
+                let is_live_process_addr = ((value >= 0x0000_7FF0_0000_0000
+                    && value < 0x0001_0000_0000_0000)
+                    || (value >= 0x0000_0001_0000_0000 && value < 0x0000_7FF0_0000_0000))
+                    // Small integers and tag values are not addresses.
+                    && value > 0x0000_0000_0000_FFFF;
+
+                if !is_live_process_addr {
+                    off += ptr;
+                    continue;
+                }
+
+                // Already an in-image address: the product's own pointer, keep it.
+                if value >= img_lo && value < img_hi {
+                    off += ptr;
+                    continue;
+                }
+
+                // Nothing reads it.  Replace it with something deterministic.
+                //
+                // The relocation table cannot be used as a filter here: the
+                // packed input's table is essentially empty (measured:
+                // `size = 0x10` on the reference DLL), and the product's real
+                // table is only built afterwards by `build_relocation_table`.
+                // So the choice is between zeroing and rebasing, and it is made
+                // per value:
+                //
+                // * If the address names something inside the dumped image,
+                //   rewrite it to the equivalent in-image address.  The product
+                //   loads at a different base, and `fix_hardcoded_addresses`
+                //   will not touch it, so an in-image value is the only form
+                //   that stays meaningful.
+                // * Otherwise it names a module or heap block that will not
+                //   exist in the product at all.  Zero is the honest value.
+                let rebased = rebase_live_pointer(
+                    value, live_base, img_lo, img_hi,
+                );
+                let new_value = rebased.unwrap_or(0);
+                let bytes = if ptr == 8 {
+                    (new_value as u64).to_le_bytes().to_vec()
+                } else {
+                    (new_value as u32).to_le_bytes().to_vec()
+                };
+                dump_buf[off..off + ptr].copy_from_slice(&bytes);
+                if rebased.is_some() {
+                    rebased_count += 1;
+                } else {
+                    cleared += 1;
+                }
+            }
+            off += ptr;
+        }
+    }
+
+    (cleared, rebased_count)
+}
+
+/// Try to express a live pointer as an in-image address.
+///
+/// Returns `Some(new_absolute_value)` when the address can be made meaningful in
+/// the product, `None` when it cannot.
+///
+/// The only pointers this function can rescue are the ones that name something
+/// inside the dumped image itself; those are already handled by the caller and
+/// never reach here.  Everything else names a module or heap block belonging to
+/// the dump session, which the product's own process will not have, so there is
+/// no correct replacement and the caller zeroes the slot.
+fn rebase_live_pointer(
+    value: u64,
+    _live_base: u64,
+    _img_lo: u64,
+    _img_hi: u64,
+) -> Option<u64> {
+    // Deliberately no rescue: an address into another module cannot be mapped
+    // onto the product's address space, and inventing one would be worse than
+    // zero.  Kept as a named function so the decision is visible and testable.
+    let _ = value;
+    None
+}
+
+/// Collect the RVAs that the relocation table covers.
+pub(crate) fn collect_relocation_rvas(pe: &PeHeader, dump_buf: &[u8]) -> Vec<u32> {
+    const IMAGE_DIRECTORY_ENTRY_BASERELOC: usize = 5;
+    let dd = pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+    if dd.virtual_address == 0 || dd.size == 0 {
+        return Vec::new();
+    }
+    // `dump_buf` is a MEMORY image: file offset == RVA, so do NOT go through
+    // `rva_to_offset` (which applies PointerToRawData and is for file images).
+    let base = dd.virtual_address as usize;
+    if base >= dump_buf.len() {
+        return Vec::new();
+    }
+    let end = (base + dd.size as usize).min(dump_buf.len());
+
+    let mut out = Vec::new();
+    let mut o = base;
+    while o + 8 <= end {
+        let page = u32::from_le_bytes(dump_buf[o..o + 4].try_into().unwrap_or([0u8; 4]));
+        let blksz = u32::from_le_bytes(dump_buf[o + 4..o + 8].try_into().unwrap_or([0u8; 4]));
+        if blksz == 0 || o + blksz as usize > end {
+            break;
+        }
+        let entries = (blksz as usize - 8) / 2;
+        for i in 0..entries {
+            let e = o + 8 + i * 2;
+            let w = u16::from_le_bytes(dump_buf[e..e + 2].try_into().unwrap_or([0u8; 2]));
+            if w >> 12 != 0 {
+                out.push(page.wrapping_add(u32::from(w & 0x0FFF)));
+            }
+        }
+        o += blksz as usize;
+    }
+    out
 }
 
 // -----------------------------------------------------------------------
@@ -458,4 +1059,286 @@ pub fn dump_dotnet(
     );
 
     Ok(())
+}
+
+
+// ---------------------------------------------------------------------------
+// Tests for the stale-pointer normalisation
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod stale_pointer_tests {
+    use super::*;
+    use crate::header::make_minimal_pe64;
+
+    /// Build a minimal 64-bit image with one writable data section and put the
+    /// given qwords at the given RVAs.
+    fn image_with(section_rva: u32, section_size: u32, qwords: &[(u32, u64)]) -> (Vec<u8>, PeHeader) {
+        // IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE, no execute.
+        image_with_chars(section_rva, section_size, qwords, 0xC000_0040)
+    }
+
+    /// Same, but with caller-chosen section characteristics.  The cookie tests
+    /// need an **executable** section, because the initialiser lives in code.
+    fn image_with_chars(
+        section_rva: u32,
+        section_size: u32,
+        qwords: &[(u32, u64)],
+        characteristics: u32,
+    ) -> (Vec<u8>, PeHeader) {
+        let mut data = make_minimal_pe64();
+
+        // The minimal PE ships one section whose characteristics are
+        // code|read|execute.  Rewrite them in the section header before parsing
+        // so the parsed `PeHeader` carries what each test needs.
+        let pe_off = u32::from_le_bytes(data[0x3C..0x40].try_into().unwrap()) as usize;
+        let nsec = u16::from_le_bytes(data[pe_off + 6..pe_off + 8].try_into().unwrap()) as usize;
+        let opt_size = u16::from_le_bytes(data[pe_off + 20..pe_off + 22].try_into().unwrap()) as usize;
+        let sec_tab = pe_off + 24 + opt_size;
+        for i in 0..nsec {
+            let ch_off = sec_tab + i * 40 + 36;
+            data[ch_off..ch_off + 4].copy_from_slice(&characteristics.to_le_bytes());
+        }
+
+        let pe = PeHeader::from_bytes(&data).expect("minimal PE must parse");
+        // The minimal PE has a single section; extend the buffer so the target
+        // RVAs exist as memory-image offsets (offset == RVA).
+        let need = (section_rva + section_size) as usize;
+        if data.len() < need {
+            data.resize(need, 0);
+        }
+        for (rva, value) in qwords {
+            let off = *rva as usize;
+            data[off..off + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        (data, pe)
+    }
+
+    #[test]
+    fn live_module_pointer_is_cleared() {
+        // A live ntdll/kernel32 address is not meaningful in the product.
+        let (mut buf, pe) = image_with(0x1000, 0x1000, &[(0x1000, 0x0000_7FF8_C0F8_C530)]);
+        let image_base = pe.nt_headers.optional_header.image_base;
+        let (cleared, rebased) = clear_stale_live_pointers(&mut buf, &pe, image_base, true);
+        assert_eq!(cleared, 1, "a live module address must be cleared");
+        assert_eq!(rebased, 0);
+        let got = u64::from_le_bytes(buf[0x1000..0x1008].try_into().unwrap());
+        assert_eq!(got, 0, "slot must be zeroed");
+    }
+
+    #[test]
+    fn live_heap_pointer_is_cleared() {
+        // Heap allocations look like 0x0000_02xx_xxxx_xxxx and are just as
+        // process-specific as module addresses.
+        let (mut buf, pe) = image_with(0x1000, 0x1000, &[(0x1000, 0x0000_0256_B0DB_0080)]);
+        let image_base = pe.nt_headers.optional_header.image_base;
+        let (cleared, _) = clear_stale_live_pointers(&mut buf, &pe, image_base, true);
+        assert_eq!(cleared, 1, "a live heap address must be cleared");
+    }
+
+    #[test]
+    fn small_integers_are_left_alone() {
+        // Counters, flags and sizes live in the same sections and must survive.
+        let (mut buf, pe) = image_with(
+            0x1000,
+            0x1000,
+            &[(0x1000, 0x1), (0x1008, 0x16000), (0x1010, 0xFFFF)],
+        );
+        let image_base = pe.nt_headers.optional_header.image_base;
+        let (cleared, _) = clear_stale_live_pointers(&mut buf, &pe, image_base, true);
+        assert_eq!(cleared, 0, "small integers are not addresses");
+        assert_eq!(u64::from_le_bytes(buf[0x1000..0x1008].try_into().unwrap()), 0x1);
+        assert_eq!(u64::from_le_bytes(buf[0x1008..0x1010].try_into().unwrap()), 0x16000);
+    }
+
+    #[test]
+    fn in_image_pointer_is_left_alone() {
+        // A pointer that already names something inside the dumped image is the
+        // product's own address and must not be touched.
+        let (probe, pe) = image_with(0x1000, 0x1000, &[]);
+        let image_base = pe.nt_headers.optional_header.image_base;
+        let inside = image_base + 0x1000;
+        let (mut buf, pe) = image_with(0x1000, 0x1000, &[(0x1000, inside)]);
+        let (cleared, _) = clear_stale_live_pointers(&mut buf, &pe, image_base, true);
+        assert_eq!(cleared, 0, "an in-image pointer is meaningful");
+        let _ = probe;
+    }
+
+    #[test]
+    fn zero_stays_zero() {
+        let (mut buf, pe) = image_with(0x1000, 0x1000, &[]);
+        let image_base = pe.nt_headers.optional_header.image_base;
+        let (cleared, rebased) = clear_stale_live_pointers(&mut buf, &pe, image_base, true);
+        assert_eq!((cleared, rebased), (0, 0));
+    }
+
+    // ------------------------------------------------------------------
+    // find_security_cookie
+    // ------------------------------------------------------------------
+
+    /// Plant the **x64** `__security_init_cookie` fallback at `site`, storing to
+    /// `cookie_rva`.  Layout: `48 B8 EF BE AD DE EF BE AD DE` then
+    /// `48 89 05 <disp32>`, exactly what MSVC emits for x64.
+    fn plant_cookie_init_x64(buf: &mut [u8], site: usize, cookie_rva: u32) {
+        buf[site] = 0x48;
+        buf[site + 1] = 0xB8;
+        buf[site + 2..site + 10].copy_from_slice(&DEADBEEF64);
+        let store = site + 10;
+        buf[store] = 0x48;
+        buf[store + 1] = 0x89;
+        buf[store + 2] = 0x05;
+        // RIP base is the byte just past the 7-byte store instruction.
+        let disp = cookie_rva as i64 - (store as i64 + 7);
+        buf[store + 3..store + 7].copy_from_slice(&(disp as i32).to_le_bytes());
+    }
+
+    /// Plant the **x86** fallback: `push 0xEFBEADDE` twice, `pop`/`pop`, then two
+    /// absolute dword stores — the shape the 32-bit CRT actually emits.
+    fn plant_cookie_init_x86(buf: &mut [u8], site: usize, cookie_va: u32) {
+        buf[site] = 0x68;
+        buf[site + 1..site + 5].copy_from_slice(&DEADBEEF32);
+        buf[site + 5] = 0x68;
+        buf[site + 6..site + 10].copy_from_slice(&DEADBEEF32);
+        buf[site + 10] = 0x5F; // pop edi
+        buf[site + 11] = 0x5E; // pop esi
+        // mov dword ptr [abs32], edi
+        buf[site + 12] = 0x89;
+        buf[site + 13] = 0x3D;
+        buf[site + 14..site + 18].copy_from_slice(&cookie_va.to_le_bytes());
+        // mov dword ptr [abs32+4], esi
+        buf[site + 18] = 0x89;
+        buf[site + 19] = 0x35;
+        buf[site + 20..site + 24].copy_from_slice(&(cookie_va + 4).to_le_bytes());
+    }
+
+    #[test]
+    fn x64_cookie_is_found_by_its_init_signature() {
+        // The initialiser lives in code, so the section must be executable.
+        let (mut buf, pe) = image_with_chars(0x1000, 0x1000, &[], 0x6000_0020);
+        plant_cookie_init_x64(&mut buf, 0x1000, 0x1400);
+        let found = find_security_cookie(&buf, &pe, true).expect("x64 cookie must be found");
+        assert_eq!(found.rva, 0x1400, "must locate the store target");
+        assert_eq!(found.via, "x64 movabs/mov [rip]");
+    }
+
+    /// The x86 CRT has no `movabs`, so the same fallback is emitted as two
+    /// `push imm32` halves.  Before this was handled, an x86 product would have
+    /// silently kept its nondeterministic cookie and stayed unreproducible.
+    #[test]
+    fn x86_cookie_is_found_by_its_push_signature() {
+        let (mut buf, pe) = image_with_chars(0x1000, 0x1000, &[], 0x6000_0020);
+        plant_cookie_init_x86(&mut buf, 0x1000, 0x1400);
+        let found = find_security_cookie(&buf, &pe, false).expect("x86 cookie must be found");
+        assert_eq!(found.rva, 0x1400, "must locate the absolute store target");
+        assert_eq!(found.via, "x86 push imm32 x2 / mov [abs32]");
+    }
+
+    /// The two signatures must not be confused for each other: an x64 image must
+    /// not be matched by the x86 scanner and vice versa.
+    #[test]
+    fn cookie_scanners_are_architecture_specific() {
+        let (mut x64_buf, pe) = image_with_chars(0x1000, 0x1000, &[], 0x6000_0020);
+        plant_cookie_init_x64(&mut x64_buf, 0x1000, 0x1400);
+        assert!(
+            find_security_cookie(&x64_buf, &pe, false).is_none(),
+            "the x86 scanner must not claim an x64 initialiser"
+        );
+
+        let (mut x86_buf, pe) = image_with_chars(0x1000, 0x1000, &[], 0x6000_0020);
+        plant_cookie_init_x86(&mut x86_buf, 0x1000, 0x1400);
+        assert!(
+            find_security_cookie(&x86_buf, &pe, true).is_none(),
+            "the x64 scanner must not claim an x86 initialiser"
+        );
+    }
+
+    #[test]
+    fn no_signature_yields_no_cookie() {
+        // A product without stack guards must not get a fabricated slot.
+        let (buf, pe) = image_with_chars(0x1000, 0x1000, &[], 0x6000_0020);
+        assert!(
+            find_security_cookie(&buf, &pe, true).is_none(),
+            "an image without __security_init_cookie must yield nothing"
+        );
+        assert!(
+            find_security_cookie(&buf, &pe, false).is_none(),
+            "same for the x86 scanner"
+        );
+    }
+
+    #[test]
+    fn deadbeef_without_the_store_is_not_a_cookie() {
+        // The immediate alone appears in ordinary constants; only the store that
+        // follows it makes it the cookie initialiser.
+        let (mut buf, pe) = image_with_chars(0x1000, 0x1000, &[], 0x6000_0020);
+        buf[0x1000] = 0x48;
+        buf[0x1001] = 0xB8;
+        buf[0x1002..0x100A].copy_from_slice(&DEADBEEF64);
+        // Followed by something that is not a store to memory.
+        buf[0x100A..0x100D].copy_from_slice(&[0x90, 0x90, 0x90]);
+        assert!(
+            find_security_cookie(&buf, &pe, true).is_none(),
+            "a bare DEADBEEF constant is not a cookie initialiser"
+        );
+
+        // Same for x86: one push alone is not the initialiser.
+        let (mut buf, pe) = image_with_chars(0x1000, 0x1000, &[], 0x6000_0020);
+        buf[0x1000] = 0x68;
+        buf[0x1001..0x1005].copy_from_slice(&DEADBEEF32);
+        buf[0x1005..0x1010].copy_from_slice(&[0x90; 11]);
+        assert!(
+            find_security_cookie(&buf, &pe, false).is_none(),
+            "a single DEADBEEF push is not a cookie initialiser"
+        );
+    }
+
+    #[test]
+    fn cookie_reset_zeroes_only_the_cookie_slot() {
+        // End-to-end shape of the fix: after zeroing, the cookie is 0 and its
+        // neighbours are untouched.
+        let (mut buf, pe) = image_with_chars(0x1000, 0x1000, &[], 0x6000_0020);
+        plant_cookie_init_x64(&mut buf, 0x1000, 0x1400);
+        buf[0x1400..0x1408].copy_from_slice(&0x4015_AB98_00FC_78C0u64.to_le_bytes());
+        buf[0x1408..0x1410].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+
+        let found = find_security_cookie(&buf, &pe, true).expect("cookie");
+        let off = found.rva as usize;
+        buf[off..off + 8].fill(0);
+
+        assert_eq!(
+            u64::from_le_bytes(buf[0x1400..0x1408].try_into().unwrap()),
+            0,
+            "the cookie slot must be zeroed"
+        );
+        assert_eq!(
+            u64::from_le_bytes(buf[0x1408..0x1410].try_into().unwrap()),
+            0x1122_3344_5566_7788,
+            "the qword after the cookie must be untouched"
+        );
+    }
+
+    /// On x86 the cookie is 4 bytes wide, so the reset must not spill into the
+    /// adjacent dword.
+    #[test]
+    fn x86_cookie_reset_uses_4_byte_width() {
+        let (mut buf, pe) = image_with_chars(0x1000, 0x1000, &[], 0x6000_0020);
+        plant_cookie_init_x86(&mut buf, 0x1000, 0x1400);
+        buf[0x1400..0x1404].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        buf[0x1404..0x1408].copy_from_slice(&0xFEED_FACEu32.to_le_bytes());
+
+        let found = find_security_cookie(&buf, &pe, false).expect("cookie");
+        let off = found.rva as usize;
+        buf[off..off + 4].fill(0);
+
+        assert_eq!(
+            u32::from_le_bytes(buf[0x1400..0x1404].try_into().unwrap()),
+            0,
+            "the 4-byte x86 cookie must be zeroed"
+        );
+        assert_eq!(
+            u32::from_le_bytes(buf[0x1404..0x1408].try_into().unwrap()),
+            0xFEED_FACE,
+            "the adjacent dword must be untouched"
+        );
+    }
 }

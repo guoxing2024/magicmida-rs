@@ -1,0 +1,61 @@
+# Case manifest — reference Themida v3 x64 **DLL** case
+#
+# Same format and same purpose as `guoxing_shiguang.case`: the sample identity
+# and the frozen pipeline metrics of the DLL end-to-end case live here, so
+# rotating a sample or recording a new golden record is a manifest edit that is
+# reviewable in isolation, not a silent edit to a test file.
+#
+# `expect_output_sha256` is now recorded: this case *is* byte-reproducible.
+#
+# The last source of run-to-run variance was one qword in `.bss` at rva
+# `0x13edb0`, which was long documented here as "a hash the shell computes at
+# run time".  That description was wrong.  The slot is `__security_cookie`, the
+# per-process stack-guard seed, and it was identified by signature rather than
+# by guesswork: MSVC's `__security_init_cookie` contains the canonical fallback
+# `48 B8 EF BE AD DE EF BE AD DE` (`movabs rax, 0xDEADBEEFDEADBEEF`) followed by
+# `48 89 05 <disp32>` (`mov [rip+disp32], rax`), and the store target is the
+# cookie slot.  An exhaustive scan of every RIP-relative operand in every
+# executable section finds exactly four other accesses to it, all inside that
+# same function.  Nothing else in the image reads it.
+#
+# `find_security_cookie_rvas()` now zeroes the slot before the dump is written,
+# which is the semantically correct file-time value: `__security_init_cookie`
+# begins with `cmp qword ptr [rip+X], 0` / `je`, so a zero slot makes the loader
+# compute a fresh random cookie per process.  Leaving the captured non-zero value
+# in place would instead make every process share one dump-session seed.
+#
+# Measured after the fix: two independent runs produce identical bytes,
+# `088d5727f487dbad…`, and behaviour is unchanged (`GetAppVersion() == "1.1"`,
+# window `PigToGoLicenseDialog` / `授权验证`).  The EXE case already carried a zero
+# cookie, which is exactly why it was reproducible all along.
+#
+# The gate therefore asserts *both* bytes and behaviour for this case now.
+
+case_id: core_dll
+
+# --- protected input -------------------------------------------------------
+sample_path: D:\Projects\Magicmida-RS\OUT\core.dll
+sample_sha256: 09f3dd344215c6aa608bc6a8e8ae24486e3bf425c3f3541272d065a1d9999144
+sample_size: 6038032
+
+# --- frozen pipeline metrics (log lines: `IAT trace complete`,
+#     `IAT boundaries`) ------------------------------------------------------
+expect_resolved: 289
+expect_failed: 0
+expect_not_import: 3
+expect_iat_slots: 3283
+
+# --- product ---------------------------------------------------------------
+expect_output_size: 1737216
+expect_output_sha256: 088d5727f487dbadcfe9ac49da767042deb912393f6a8b5c62568124c07e3c6f
+
+# --- behaviour (the real acceptance criteria for this case) ----------------
+# What `GetAppVersion()` must answer.  "0.0" is the product's own lazy-init
+# fallback and means the shell never wrote its state before the dump.
+expect_version: 1.1
+
+# The window the unpacked DLL puts on screen once `Run()` gets going.  Both the
+# class and the title are asserted, because a different window would mean the
+# wrong code path was reached.
+expect_window_class: PigToGoLicenseDialog
+expect_window_title: 授权验证

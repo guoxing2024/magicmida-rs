@@ -6,34 +6,150 @@ use tracing::{info, warn};
 
 use crate::header::PeHeader;
 
-/// Create a .pdata section holding the exception table bytes that were
-/// previously inside the deleted .winlice section.
-pub(crate) fn create_pdata_section(
-    pe: &mut PeHeader,
-    dump_buf: &[u8],
-    exc_rva: u32,
-    exc_size: u32,
-) {
-    let exc_off = exc_rva as usize;
-    let exc_len = exc_size as usize;
+/// One `RUNTIME_FUNCTION` entry, x64 layout: three `u32`s.
+///
+/// `BeginAddress` / `EndAddress` are RVAs into an executable section;
+/// `UnwindInfoAddress` is an RVA into a read-only data section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RuntimeFunction {
+    begin: u32,
+    end: u32,
+    unwind: u32,
+}
+
+impl RuntimeFunction {
+    const SIZE: usize = 12;
+
+    fn read(buf: &[u8], off: usize) -> Self {
+        let u32_at = |o: usize| {
+            u32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]])
+        };
+        Self {
+            begin: u32_at(off),
+            end: u32_at(off + 4),
+            unwind: u32_at(off + 8),
+        }
+    }
+
+    fn is_null(&self) -> bool {
+        self.begin == 0 && self.end == 0 && self.unwind == 0
+    }
+
+    fn to_bytes(self) -> [u8; 12] {
+        let mut out = [0u8; 12];
+        out[0..4].copy_from_slice(&self.begin.to_le_bytes());
+        out[4..8].copy_from_slice(&self.end.to_le_bytes());
+        out[8..12].copy_from_slice(&self.unwind.to_le_bytes());
+        out
+    }
+}
+
+/// Build the `.pdata` payload from the exception table bytes, keeping only the
+/// entries that still describe a section the product has.
+///
+/// # Why the entries have to be filtered rather than copied
+///
+/// The packed sample keeps its exception table inside `.winlice`, which
+/// `shrink_sections` deletes.  Measured on the reference DLL, the live table
+/// holds **4198** entries: **4193** point into `.text` with unwind info in
+/// `.rdata`, and **5** describe code that lived in `.winlice` and is gone.  An
+/// unwinder that looks up a range the product no longer has is worse than one
+/// that finds no entry, so those 5 are dropped.
+///
+/// The surviving 4193 need **no rebase**: `shrink_sections` removes only
+/// `.winlice`, `.boot` and `.reloc`, all of which sit *after* every section the
+/// product keeps, so `.text` (0x1000) and `.rdata` (0x106000) keep their RVAs.
+/// The filter is nevertheless written against the product's own section map
+/// rather than against those constants, so it stays correct if the layout ever
+/// changes.
+pub(crate) fn build_pdata_payload(pe: &PeHeader, raw: &[u8]) -> Vec<u8> {
+    let text = pe.sections.iter().find(|s| s.name.eq_ignore_ascii_case(".text"));
+    let Some(text) = text else {
+        warn!("No .text section in the product; dropping the exception table");
+        return Vec::new();
+    };
+    let text_lo = text.virtual_address;
+    let text_hi = text.virtual_address.saturating_add(text.virtual_size);
+
+    // Unwind info lives in whichever read-only data section the linker used.
+    let rdata: Vec<(u32, u32)> = pe
+        .sections
+        .iter()
+        .filter(|s| {
+            let n = s.name.to_lowercase();
+            n.contains("rdata") || n == ".data"
+        })
+        .map(|s| (s.virtual_address, s.virtual_address.saturating_add(s.virtual_size)))
+        .collect();
+
+    let in_text = |v: u32| v >= text_lo && v < text_hi;
+    let in_rdata = |v: u32| rdata.iter().any(|&(lo, hi)| v >= lo && v < hi);
+
+    let total = raw.len() / RuntimeFunction::SIZE;
+    let mut kept: Vec<RuntimeFunction> = Vec::with_capacity(total);
+    let mut dropped_not_code = 0usize;
+    let mut dropped_no_unwind = 0usize;
+
+    for i in 0..total {
+        let rf = RuntimeFunction::read(raw, i * RuntimeFunction::SIZE);
+        if rf.is_null() {
+            continue;
+        }
+        if !in_text(rf.begin) || !in_text(rf.end) || rf.begin >= rf.end {
+            dropped_not_code += 1;
+            continue;
+        }
+        if !in_rdata(rf.unwind) {
+            dropped_no_unwind += 1;
+            continue;
+        }
+        kept.push(rf);
+    }
+
+    // RtlLookupFunctionEntry binary-searches, so the array must be sorted by
+    // BeginAddress.  The source table already is (measured: sorted), but a
+    // filter cannot be trusted to preserve that, and sorting is cheap.
+    kept.sort_unstable_by_key(|rf| rf.begin);
+
+    info!(
+        total,
+        kept = kept.len(),
+        dropped_not_code,
+        dropped_no_unwind,
+        "Exception table filtered to the sections the product keeps"
+    );
+
+    let mut out = Vec::with_capacity(kept.len() * RuntimeFunction::SIZE);
+    for rf in kept {
+        out.extend_from_slice(&rf.to_bytes());
+    }
+    out
+}
+
+/// Create a .pdata section from exception-table bytes already extracted from
+/// the live process.
+///
+/// Returns `false` when the payload is empty, in which case **no section is
+/// created and the Exception data directory is left cleared**.  That is the
+/// correct outcome for a sample whose exception table is genuinely empty: an
+/// all-zero `.pdata` of 50 KB is not "an exception table", it is 50 KB of
+/// bytes an unwinder will try to interpret.
+pub(crate) fn create_pdata_section_from(pe: &mut PeHeader, exc_data: Vec<u8>) -> bool {
+    if exc_data.is_empty() {
+        info!("Exception table empty after filtering; not creating .pdata");
+        return false;
+    }
+    create_pdata_section(pe, &exc_data)
+}
+
+/// Create a .pdata section holding the given exception-table bytes.
+pub(crate) fn create_pdata_section(pe: &mut PeHeader, exc_data: &[u8]) -> bool {
+    let exc_len = exc_data.len();
+    if exc_len == 0 {
+        return false;
+    }
     let file_align = pe.nt_headers.optional_header.file_alignment;
     let section_align = pe.nt_headers.optional_header.section_alignment;
-
-    // Copy the exception table bytes out of the dump buffer.
-    let mut exc_data: Vec<u8> = Vec::with_capacity(exc_len);
-    if exc_off + exc_len <= dump_buf.len() {
-        exc_data.extend_from_slice(&dump_buf[exc_off..exc_off + exc_len]);
-    } else if exc_off < dump_buf.len() {
-        let avail = dump_buf.len() - exc_off;
-        exc_data.extend_from_slice(&dump_buf[exc_off..exc_off + avail]);
-        exc_data.resize(exc_len, 0);
-    } else {
-        warn!(
-            exc_rva = format!("{:#x}", exc_rva),
-            "Exception table RVA is outside dump_buf; zero-filling .pdata"
-        );
-        exc_data.resize(exc_len, 0);
-    }
 
     // SizeOfRawData must be FileAlignment-aligned.
     let raw_size = crate::utils::align_up(exc_len as u32, file_align);
@@ -53,7 +169,7 @@ pub(crate) fn create_pdata_section(
         pe.sections[pdata_idx].characteristics;
 
     // Pad raw data to alignment and store as extra_data.
-    let mut padded = exc_data;
+    let mut padded = exc_data.to_vec();
     if (padded.len() as u32) < raw_size {
         padded.resize(raw_size as usize, 0);
     }
@@ -80,6 +196,7 @@ pub(crate) fn create_pdata_section(
         exc_len,
         raw_size
     );
+    true
 }
 
 /// Create a placeholder .reloc section large enough for the full relocation
