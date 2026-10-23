@@ -22,12 +22,18 @@ better error handling, and a modular architecture.
 | Target | Status | Evidence |
 |---|---|---|
 | **Themida v3, x64, EXE** | ✅ Works | 186 imports / 9 modules / product launches to its auth window. Frozen as a gate: `crates/packers/themida/tests/e2e_gate.rs` |
-| Themida v3, **x86** | ❓ **Unverified** | The x86 code path has never been compiled on the dev machine (`rustup` only has `x86_64-pc-windows-gnu`), and the x86 ScyllaHide hashes in `binaries.rs` are all-zero placeholders, so `verify_sha256` would reject them |
+| Themida v3, **x64, DLL** | ✅ Works | 289 imports / 12 modules; the product loads, `GetAppVersion()` returns `"1.1"`, and `Run()` reaches its own auth window (`PigToGoLicenseDialog`). Frozen as a gate: `crates/packers/themida/tests/dll_e2e_gate.rs`. Slots 901/965/1057 are reported as `not-an-import` (bare RVAs into read-only data, zero code references) |
+| Themida v3, **x86** | ⚠️ **Builds, never run** | The x86 target now compiles (`i686-pc-windows-gnu`, real `pei-i386`, the CLI runs), and the x86 ScyllaHide hashes in `binaries.rs` are the real values instead of all-zero placeholders. **But there is no x86 sample, so the pipeline has never been executed end to end.** The link-time setup is documented in `AGENTS.md` |
 | Themida **v1 / v2** | ❓ **No evidence** | No sample, no test |
-| **DLL** targets | ❌ Not supported | The CLI now rejects `.dll` input explicitly; the DLL stub calls `ExitProcess` instead of `DllMain` |
 
-Only the first row has an automated end-to-end gate. Treat the rest as
-untested.
+Native `.dll` targets are accepted. A packed DLL is loaded through a generated
+loader host (`ensure_loader_host`) that calls the real `LoadLibraryW`, because a
+Themida DLL shell expects the loader's `DLL_PROCESS_ATTACH` sequencing; the older
+"rewrite the DLL into a stub EXE" approach bypassed it and the shell died at
+`.winlice+0x33E22E`.
+
+Only the EXE row has an automated end-to-end gate. Treat the rest as
+measured-but-ungated.
 
 ## Features
 
@@ -42,7 +48,7 @@ untested.
 | Requirement | Notes |
 |---|---|
 | **Windows 10/11** | x64 host. The debugger core uses Win32 Debug API; not cross-platform. |
-| **Rust toolchain** | stable MSVC target (`x86_64-pc-windows-msvc`). Install via [rustup](https://rustup.rs). |
+| **Rust toolchain** | stable GNU target (`x86_64-pc-windows-gnu`). Install via [rustup](https://rustup.rs). The x86 target (`i686-pc-windows-gnu`) also builds; see `AGENTS.md` for the extra link-time setup it needs. |
 | **ScyllaHide** (optional) | Required for Themida v3 targets with hardware-breakpoint detection. Download from [ScyllaHide Releases](https://github.com/x64dbg/ScyllaHide/releases). |
 
 ## Quick Start
@@ -193,8 +199,10 @@ exists" from "somebody ran it and checked the result".
   static analysis alone cannot resolve (`ThemidaVersion::Unknown`).
 - Import resolution for fully virtualized IAT (v3 VM-strong) may produce
   incomplete results; the original PE's import table is used as a fallback.
-- **DLL (.dll) targets**: rejected up front. The DLL stub calls `ExitProcess`
-  instead of `DllMain`, so an unpacked DLL would not load as a proper DLL.
+- **DLL (.dll) targets**: accepted, but with two measured defects — the
+  `GetAppVersion()` `.bss` value is captured too early (`"0.0"` vs `"1.1"`), and
+  slots 901/965/1057 fail to trace. The dump itself loads and its exports
+  resolve. Do not treat DLL output as verified.
 - **Relocation table generation** — scans non-executable sections for absolute
   addresses, builds a complete `.reloc` table, and enables ASLR (`DYNAMIC_BASE`).
   The table is clamped to fit the available VA space between `.reloc` and the

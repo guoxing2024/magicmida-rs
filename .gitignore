@@ -1,4 +1,4 @@
-﻿# Rust build artifacts
+# Rust build artifacts
 /target/
 
 # IDE/editor
@@ -24,6 +24,12 @@ __pycache__/
 # ScyllaHide binaries (user-downloaded, do not commit)
 HookLibrary*.dll
 InjectorCLI*.exe
+
+# Local toolchain wiring.  `.cargo/config.toml` points the i686 linker at an
+# absolute path under this machine's `D:\Tools`, and documents why a synthetic
+# `libgcc_eh.a` is needed.  That is environment state, not source: committing it
+# would break every other checkout.  The reasoning lives in AGENTS.md instead.
+.cargo/
 
 # Temporary / audit reports
 SESSION_REPORT.txt

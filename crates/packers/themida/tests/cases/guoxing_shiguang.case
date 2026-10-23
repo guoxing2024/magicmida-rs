@@ -21,16 +21,37 @@ sample_size: 5793808
 
 # --- frozen pipeline metrics (log lines: `IAT trace complete`,
 #     `Import table reconstructed`, `IAT boundaries`) ------------------------
+#
+# `expect_failed` is 0 and `expect_not_import` is 8 because the eight slots
+# previously counted as "failed" hold bare RVAs into `.text` data
+# (0x113000..0x1130A0).  They are data the shell keeps in the table, not import
+# thunks: verified to have zero code references.  The trace now reports them as
+# `not-an-import` instead of `failed`, and the product bytes are unchanged
+# (still cda2a277..., identical to the pre-change output).
 expect_resolved: 186
-expect_failed: 8
+expect_failed: 0
+expect_not_import: 8
 expect_module_count: 9
 expect_thunk_count: 186
 expect_iat_slots: 1063
 
 # --- product ---------------------------------------------------------------
-expect_output_size: 1539584
+# Size dropped 1539584 → 1539072 when the exception table started being captured
+# from live memory instead of being zero-filled: `.pdata` now holds 4008 real
+# RUNTIME_FUNCTION entries (48096 bytes) rather than 48132 zero bytes.
+expect_output_size: 1539072
 #
 # Set to `none` to disable the byte-level check for a case that is legitimately
 # non-reproducible (e.g. one whose dump picks up a lazily-updated field).  The
 # structural checks still run.  Leave a real hash here for cases that are.
-expect_output_sha256: 75c1af1b2c539c35f10e368858bca394bc8ebd6fb3cc964dc7cf9d77ada4810a
+# Reproducible again.  `clear_stale_live_pointers()` now removes the unreferenced
+# live pointers (module and heap addresses) that the dump used to capture from
+# the debuggee.  They are not covered by the input's relocation table (measured:
+# the packed sample's table is only 0x10 bytes) and nothing reads them, so
+# zeroing them is safe — verified by launching the product and watching it reach
+# its window.  Three consecutive runs now produce this identical hash.
+#
+# Re-recorded after the `.pdata` fix (previously 406440c9…): the exception table
+# is no longer zero-filled, so the product bytes necessarily changed.  Verified
+# 3/3 identical, and the product still launches to its `授权验证` window.
+expect_output_sha256: 9779e632d878fb9276c577d53a7d6c4372309c930512c1a0378957a3c2feae97

@@ -39,14 +39,20 @@ pub const SAMPLE_SIZE: u64 = 5_793_808;
 pub const UNPACKED_SIZE: u64 = 1_539_584;
 
 /// Runtime image bounds observed during the successful run (ASLR base).
-pub const RUNTIME_IMAGE_BASE: usize = 0x0000_7FF6_F5D4_0000;
-pub const RUNTIME_IMAGE_BOUNDARY: usize = 0x0000_7FF6_F6A6_8000;
+///
+/// These are `u64`, not `usize`.  They are *x64 runtime addresses*, and a
+/// `usize` literal of this magnitude does not fit in a 32-bit build: on
+/// `i686-pc-windows-gnu` `0x0000_7FF6_F5D4_0000` is a hard compile error
+/// ("literal out of range for `usize`").  The values describe the reference
+/// x64 sample, so `u64` is the honest type regardless of the host target.
+pub const RUNTIME_IMAGE_BASE: u64 = 0x0000_7FF6_F5D4_0000;
+pub const RUNTIME_IMAGE_BOUNDARY: u64 = 0x0000_7FF6_F6A6_8000;
 /// Themida section bounds (combined `.winlice` + `.boot`) at runtime.
-pub const RUNTIME_THEMIDA_START: usize = 0x0000_7FF6_F5EA_8000;
-pub const RUNTIME_THEMIDA_END: usize = 0x0000_7FF6_F6A6_6800;
+pub const RUNTIME_THEMIDA_START: u64 = 0x0000_7FF6_F5EA_8000;
+pub const RUNTIME_THEMIDA_END: u64 = 0x0000_7FF6_F6A6_6800;
 
 /// IAT located by `determine_iat_address`: runtime VA → file RVA.
-pub const IAT_RUNTIME_VA: usize = 0x0000_7FF6_F5E5_36E0;
+pub const IAT_RUNTIME_VA: u64 = 0x0000_7FF6_F5E5_36E0;
 pub const IAT_RVA: u32 = 0x0011_36E0;
 pub const IAT_SLOT_COUNT: usize = 1063;
 pub const IAT_BLOCK_COUNT: usize = 14;
@@ -225,9 +231,9 @@ fn fingerprint_themida_bounds_match_runtime() {
     assert_eq!(end, 0x1400_0000 + 0x0083_E000 + 0x004E_8800);
     // And the same numbers shifted by the observed ASLR delta equal the
     // runtime bounds recorded during the successful run.
-    let delta = RUNTIME_IMAGE_BASE - 0x1400_0000usize;
-    assert_eq!(start + delta, RUNTIME_THEMIDA_START);
-    assert_eq!(end + delta, RUNTIME_THEMIDA_END);
+    let delta = RUNTIME_IMAGE_BASE - 0x1400_0000u64;
+    assert_eq!(start as u64 + delta, RUNTIME_THEMIDA_START);
+    assert_eq!(end as u64 + delta, RUNTIME_THEMIDA_END);
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +251,7 @@ fn iat_fingerprint_consistency() {
 }
 
 #[test]
+#[cfg(target_pointer_width = "64")]
 fn iat_slot_taxonomy_frozen() {
     let (ib, ibd, ts, te) = (
         RUNTIME_IMAGE_BASE,
@@ -257,7 +264,7 @@ fn iat_slot_taxonomy_frozen() {
     assert_eq!(classify_iat_slot(0, ts, te, ib, ibd), IatSlotDecision::Separator);
 
     // Already-resolved APIs (live slots 130..142) — the abort bug's trigger.
-    for v in [0x7FFF_E3FC_B050usize, 0x7FFF_E3F6_D720, 0x7FFF_E3FB_4FD0] {
+    for v in [0x7FFF_E3FC_B050u64, 0x7FFF_E3F6_D720, 0x7FFF_E3FB_4FD0] {
         assert_eq!(
             classify_iat_slot(v, ts, te, ib, ibd),
             IatSlotDecision::Resolved { api: v }
@@ -265,7 +272,7 @@ fn iat_slot_taxonomy_frozen() {
     }
 
     // Themida VM trampoline (live slot 0) — must be traced.
-    let vm = 0x7FF6_F602_6454usize;
+    let vm = 0x7FF6_F602_6454u64;
     assert_eq!(
         classify_iat_slot(vm, ts, te, ib, ibd),
         IatSlotDecision::Trace { start: vm }
@@ -273,16 +280,21 @@ fn iat_slot_taxonomy_frozen() {
 
     // Data garbage (observed packed 32-bit pairs) — trash.
     assert_eq!(
-        classify_iat_slot(0x0113_03C0_0113_03C0, ts, te, ib, ibd),
+        classify_iat_slot(0x0113_03C0_0113_03C0u64, ts, te, ib, ibd),
         IatSlotDecision::Trash
     );
 }
 
 #[test]
+#[cfg(target_pointer_width = "64")]
 fn iat_long_resolved_run_cannot_abort_scan() {
     // 100 consecutive resolved slots (a full decrypted block) must classify
     // as Resolved — this is the exact shape that killed the pre-fix scan.
-    for i in 0..100usize {
+    //
+    // Gated to 64-bit hosts: `classify_iat_slot` derives its "plausible API
+    // range" from the host architecture, so these x64 fixtures are outside the
+    // x86 range and classify as Trash on i686 by design.
+    for i in 0..100u64 {
         let v = 0x7FFF_E3F0_0000 + i * 0x10;
         assert!(matches!(
             classify_iat_slot(v, RUNTIME_THEMIDA_START, RUNTIME_THEMIDA_END, RUNTIME_IMAGE_BASE, RUNTIME_IMAGE_BOUNDARY),
