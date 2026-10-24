@@ -4,7 +4,7 @@
 //! Windows API functions to hide the debugger's presence. It is **mandatory**
 //! for x64 Themida targets and optional (but recommended) for x86.
 
-use tracing::{debug, info, warn};
+use tracing::debug;
 
 use crate::error::ThemidaError;
 

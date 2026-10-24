@@ -425,8 +425,52 @@ pub fn build_relocation_table(
 
         // Update .reloc section header: VirtualSize = actual table size,
         // SizeOfRawData = aligned size. VA stays as created.
+        //
+        // **Unless that opens a hole in the virtual layout.**  The placeholder
+        // `.reloc` was created with a generous reserved size so the table would
+        // fit, and the next section (`.import`) was placed after it.  Rewriting
+        // `virtual_size` down to the real table length does not move `.import`,
+        // so for an image whose table is smaller than the reservation the
+        // aligned end of `.reloc` no longer reaches the next section:
+        //
+        //     x86 product: .reloc VA 0x17000, table 0xac -> aligned end 0x18000
+        //                  .import VA 0x19000                -> HOLE 0x1000
+        //     x64 golden:  .reloc VA 0x174000, table 0x1754 -> aligned end 0x176000
+        //                  .import VA 0x176000              -> no hole
+        //
+        // The loader rejects a non-contiguous image outright: measured
+        // `CreateProcess -> ERROR_BAD_EXE_FORMAT (193)` on the x86 product, and
+        // injecting the same hole into a working sample reproduces the 193.
+        //
+        // Closing it by growing `virtual_size` up to the next section's VA costs
+        // nothing and moves no other header.  The loader reads only
+        // `BaseReloc.size` bytes and zero-fills the rest, exactly as it does for
+        // `.bss`.  The golden x64 case has no hole, so this branch does not fire
+        // there and its bytes are untouched.
+        let section_align = pe.nt_headers.optional_header.section_alignment.max(1);
+        let reloc_end = reloc_va + reloc_data.len() as u32;
+        let aligned_end = crate::utils::align_up(reloc_end, section_align);
+        let next_va = pe
+            .sections
+            .iter()
+            .filter(|s| s.virtual_address > reloc_va)
+            .map(|s| s.virtual_address)
+            .min();
+        let announced_vsize = match next_va {
+            Some(next) if next > aligned_end => {
+                warn!(
+                    "Closing a {:#x}-byte hole after .reloc: virtual_size {:#x} -> {:#x} \
+                     (the loader refuses non-contiguous sections)",
+                    next - aligned_end,
+                    reloc_data.len() as u32,
+                    next - reloc_va
+                );
+                next - reloc_va
+            }
+            _ => reloc_data.len() as u32,
+        };
         out_data[sec_hdr_off + 8..sec_hdr_off + 12]
-            .copy_from_slice(&(reloc_data.len() as u32).to_le_bytes());
+            .copy_from_slice(&announced_vsize.to_le_bytes());
         out_data[sec_hdr_off + 16..sec_hdr_off + 20]
             .copy_from_slice(&aligned_size.to_le_bytes());
 

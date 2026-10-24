@@ -2,7 +2,7 @@ use anyhow::anyhow;
 use tracing::{debug, info, warn};
 use windows::Win32::Foundation::HANDLE;
 use mida_core::{
-    ctx_ip, ctx_sp, set_ctx_ip, set_ctx_sp, ContinueStatus, DebugEvent, DebuggerCore,
+    ctx_sp, set_ctx_ip, set_ctx_sp, ContinueStatus, DebugEvent, DebuggerCore,
 };
 use mida_pe::PeHeader;
 use mida_packers_themida::{

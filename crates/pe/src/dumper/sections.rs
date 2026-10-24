@@ -201,29 +201,33 @@ pub(crate) fn create_pdata_section(pe: &mut PeHeader, exc_data: &[u8]) -> bool {
 
 /// Create a placeholder .reloc section large enough for the full relocation
 /// table.  The actual bytes are written later by `build_relocation_table`.
+///
+/// # Why the reservation is two alignment units
+///
+/// The reserved size has two jobs:
+///
+/// 1. **Capacity.** `build_relocation_table` runs late — after
+///    `fix_hardcoded_addresses` and `pack_section_layout` — because the table
+///    describes the *finished* image, so its size is unknown here.  The
+///    reference v3 x64 case generates 2907 entries / **5972 bytes**, which does
+///    not fit in one alignment unit.
+/// 2. **Placement.** `create_section_index` snaps each new section to the
+///    previous one's *aligned* end, so this provisional size decides where
+///    `.import` lands and what `SizeOfImage` becomes.  In the recorded golden
+///    product `.import` sits at `0x176000` = `.reloc` VA + `0x2000` and
+///    `SizeOfImage` is `0x178000`.  Shrinking the reservation to `0x1000` moves
+///    both, and the byte-level gate goes red on a build where every other step
+///    is identical (measured 2026-10-24).
+///
+/// `build_relocation_table` then rewrites `virtual_size` to the real table
+/// length (`0x1754` for the reference case) without moving later sections,
+/// which leaves address space between the aligned end of `.reloc` and the next
+/// section.  That is the shape the golden product itself has, and it loads.
 pub(crate) fn create_reloc_section(pe: &mut PeHeader) {
     let file_align = pe.nt_headers.optional_header.file_alignment;
     let section_align = pe.nt_headers.optional_header.section_alignment;
 
-    // **The reserved size and the announced size must agree.**
-    //
-    // This section used to reserve a generous `0x2000` and announce it as its
-    // `virtual_size`, so that any later section was placed after `0x2000` of
-    // address space.  `build_relocation_table` then rewrote `virtual_size` to
-    // the real table length (~`0xac`) *without moving the sections after it*,
-    // which silently opened a `0x1000` hole in the virtual layout.
-    //
-    // The loader rejects any image whose section VAs are not contiguous:
-    // measured `CreateProcess -> ERROR_BAD_EXE_FORMAT (193)` on a product that
-    // was otherwise byte-perfect, and the same 193 when a hole was injected into
-    // the working control sample.
-    //
-    // So the reserved VA range is fixed at one section-alignment unit — enough
-    // for the relocation table (measured ~6 KB, well under 0x1000 for these
-    // images) — and the announced `virtual_size` matches it exactly.  If the
-    // real table ever exceeds one page the dump step below will say so instead
-    // of silently producing an unloadable file.
-    let reloc_vsize: u32 = section_align.max(0x1000);
+    let reloc_vsize: u32 = section_align.max(0x2000);
     let reloc_raw = crate::utils::align_up(reloc_vsize, file_align);
 
     let reloc_idx = pe.create_section_index(".reloc", reloc_vsize);

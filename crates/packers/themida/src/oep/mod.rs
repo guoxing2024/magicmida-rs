@@ -18,6 +18,10 @@ pub use restore::{
     write_msvc_oep_x64,
 };
 
+// `trace` is used only by the x86 branch below (the TLS-callback probes), so it
+// is "unused" when this crate is built for x86_64.  Keep it: removing it breaks
+// the i686 build with `cannot find macro trace in this scope`.
+#[allow(unused_imports)]
 use tracing::{debug, info, trace, warn};
 
 use mida_core::DebuggerCore;

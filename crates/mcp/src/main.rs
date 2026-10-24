@@ -632,6 +632,120 @@ fn tool_definitions() -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// Transport decoding
+// ---------------------------------------------------------------------------
+
+/// Decode one protocol line.
+///
+/// # Why this is not just `String::from_utf8`
+///
+/// The MCP stdio transport is defined as UTF-8, and the server must accept
+/// that.  But on Windows the *client* is frequently a PowerShell script or a
+/// .NET host, and `ProcessStartInfo.StandardInputEncoding` defaults to the
+/// console code page — GB2312 on a zh-CN machine.  Measured 2026-10-24: a
+/// `triage` call carrying `D:\Projects\shiguang\时光一键宏.exe` arrived as GBK
+/// bytes, `read_line` returned `InvalidData`, and the `?` in `main` killed the
+/// server outright.  The client saw a dead pipe and no diagnosis.
+///
+/// Two lessons, both implemented here:
+///
+/// 1. A malformed line must never terminate the server.  Any protocol peer can
+///    send garbage; dropping the connection turns a recoverable client bug into
+///    a crash with no error message.
+/// 2. UTF-8 first (that is the spec), then the system ANSI code page as a
+///    fallback.  A Windows client that forgot to set its encoding then still
+///    works instead of silently addressing a file whose name is mojibake.
+///
+/// Returns the text plus the encoding that produced it, so the log can say
+/// which path was taken.
+fn decode_line(bytes: &[u8]) -> (String, &'static str) {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => (s.to_string(), "utf-8"),
+        Err(_) => match ansi::decode(ansi::CP_ACP, bytes) {
+            Some(s) => (s, "ansi"),
+            // Neither UTF-8 nor the ANSI code page: keep going with replacement
+            // characters.  The JSON will fail to parse and the caller gets a
+            // warning, which is the correct outcome — but the server lives.
+            None => (String::from_utf8_lossy(bytes).into_owned(), "lossy"),
+        },
+    }
+}
+
+/// Minimal `MultiByteToWideChar` binding.
+///
+/// Deliberately hand-rolled rather than pulling in the `windows` crate: this is
+/// one function, used on one error path, and the MCP server's dependency set is
+/// kept small on purpose.
+#[cfg(windows)]
+mod ansi {
+    /// `CP_ACP` — the system default ANSI code page.
+    pub const CP_ACP: u32 = 0;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MultiByteToWideChar(
+            code_page: u32,
+            flags: u32,
+            multi_byte_str: *const u8,
+            cb_multi_byte: i32,
+            wide_char_str: *mut u16,
+            cch_wide_char: i32,
+        ) -> i32;
+    }
+
+    pub fn decode(code_page: u32, bytes: &[u8]) -> Option<String> {
+        if bytes.is_empty() {
+            return Some(String::new());
+        }
+        let len = i32::try_from(bytes.len()).ok()?;
+        // SAFETY: `bytes` is a valid slice of `len` bytes and we pass `len`
+        // explicitly; a null output buffer with a zero size is the documented
+        // way to ask for the required length.
+        let needed = unsafe { MultiByteToWideChar(code_page, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0) };
+        if needed <= 0 {
+            return None;
+        }
+        let mut buf = vec![0u16; needed as usize];
+        // SAFETY: `buf` has room for exactly `needed` UTF-16 code units, which
+        // is what the previous call reported.
+        let written = unsafe {
+            MultiByteToWideChar(code_page, 0, bytes.as_ptr(), len, buf.as_mut_ptr(), needed)
+        };
+        if written <= 0 {
+            return None;
+        }
+        buf.truncate(written as usize);
+        String::from_utf16(&buf).ok()
+    }
+}
+
+#[cfg(not(windows))]
+mod ansi {
+    pub const CP_ACP: u32 = 0;
+    pub fn decode(_code_page: u32, _bytes: &[u8]) -> Option<String> {
+        None
+    }
+}
+
+/// Read one newline-terminated message from the transport, or `None` at EOF.
+///
+/// Reads **bytes**, not a `String`: `BufRead::read_line` on a `String` returns
+/// `InvalidData` for a non-UTF-8 line and there is no way to recover the
+/// remaining stream, so one bad byte from one client would end the session.
+fn read_message(reader: &mut impl BufRead, buf: &mut Vec<u8>) -> std::io::Result<Option<(String, &'static str)>> {
+    buf.clear();
+    let n = reader.read_until(b'\n', buf)?;
+    if n == 0 {
+        return Ok(None);
+    }
+    // Trim the framing newline (and a CR, if the client writes CRLF).
+    while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
+        buf.pop();
+    }
+    Ok(Some(decode_line(buf)))
+}
+
+// ---------------------------------------------------------------------------
 // JSON-RPC plumbing
 // ---------------------------------------------------------------------------
 
@@ -744,12 +858,25 @@ fn main() -> Result<()> {
     let server = Server::new(cli_x64, cli_x86);
     let stdin = std::io::stdin();
     let mut reader = BufReader::new(stdin.lock());
-    let mut line = String::new();
+    let mut raw = Vec::with_capacity(4096);
 
     loop {
-        line.clear();
-        if reader.read_line(&mut line)? == 0 {
-            break; // EOF: client closed the pipe.
+        // Byte-level read: see `read_message`.  A `String`-based `read_line`
+        // would end the session on the first non-UTF-8 byte a client sends.
+        let (line, encoding) = match read_message(&mut reader, &mut raw) {
+            Ok(Some(v)) => v,
+            Ok(None) => break, // EOF: client closed the pipe.
+            Err(e) => {
+                tracing::warn!(error = %e, "transport read failed; ending session");
+                break;
+            }
+        };
+        if encoding != "utf-8" {
+            tracing::warn!(
+                encoding,
+                "protocol line was not UTF-8; decoded with a fallback. \
+                 Set the client's stdio encoding to UTF-8 to avoid this."
+            );
         }
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -900,6 +1027,56 @@ mod tests {
         // up at 60 s and the call would look hung.
         assert_eq!(600_000u64.min(MAX_WAIT_MS), MAX_WAIT_MS);
         assert!(MAX_WAIT_MS < 60_000, "must answer before the 60 s client timeout");
+    }
+
+    #[test]
+    fn utf8_lines_are_decoded_as_utf8() {
+        let (s, enc) = decode_line(b"{\"id\":1}");
+        assert_eq!(s, "{\"id\":1}");
+        assert_eq!(enc, "utf-8");
+    }
+
+    #[test]
+    fn non_utf8_bytes_never_kill_the_session() {
+        // Measured 2026-10-24: PowerShell's `StandardInputEncoding` defaults to
+        // the console code page (GB2312 here), so a call carrying a Chinese
+        // path arrived as GBK.  `BufRead::read_line` on a `String` returned
+        // `InvalidData` and the `?` in `main` terminated the server — the client
+        // saw a dead pipe with no diagnosis.
+        //
+        // The contract now: decoding always succeeds, whatever the bytes.
+        let gbk = [0xCA, 0xB1, 0xB9, 0xE2]; // 时光 in GBK
+        let (s, enc) = decode_line(&gbk);
+        assert_ne!(enc, "utf-8");
+        assert!(!s.is_empty(), "must produce *something* the parser can reject");
+    }
+
+    #[test]
+    fn read_message_stops_at_eof_without_error() {
+        let mut r = std::io::BufReader::new(&b""[..]);
+        let mut buf = Vec::new();
+        assert!(read_message(&mut r, &mut buf).unwrap().is_none());
+    }
+
+    #[test]
+    fn read_message_trims_crlf_and_lf_alike() {
+        let mut r = std::io::BufReader::new(&b"a\r\nb\n"[..]);
+        let mut buf = Vec::new();
+        assert_eq!(read_message(&mut r, &mut buf).unwrap().unwrap().0, "a");
+        assert_eq!(read_message(&mut r, &mut buf).unwrap().unwrap().0, "b");
+        assert!(read_message(&mut r, &mut buf).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_bad_line_does_not_consume_the_rest_of_the_stream() {
+        // The whole point of byte-level reading: the next line must still arrive.
+        let mut r = std::io::BufReader::new(&[0xFFu8, 0xFE, b'\n', b'o', b'k', b'\n'][..]);
+        let mut buf = Vec::new();
+        let first = read_message(&mut r, &mut buf).unwrap().unwrap();
+        assert_ne!(first.1, "utf-8");
+        let second = read_message(&mut r, &mut buf).unwrap().unwrap();
+        assert_eq!(second.0, "ok");
+        assert_eq!(second.1, "utf-8");
     }
 }
 
