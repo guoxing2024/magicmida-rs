@@ -269,16 +269,40 @@ fn collect_candidates(
     forward_map: &std::collections::HashMap<u64, (usize, String)>,
     forward_string_map: &std::collections::HashMap<u64, (usize, String)>,
 ) {
-    // Variant A: direct match
+    // Variant A: direct match against every module's export map.
+    //
+    // **No address-range test, and no `break`.**
+    //
+    // Two independent reasons, both measured on the x86 reference sample.
+    //
+    // 1. `break` at the first containing module.  A single resolved address can
+    //    be exported under several names.  IAT slot rva 0x7208 holds
+    //    `0x77ba5610`, which `GetProcAddress` resolves as both
+    //    `ntdll!NtdllDefWindowProc_A` and `user32!DefWindowProcA` — the two
+    //    names return the identical address.  Stopping early kept only one
+    //    spelling and made the slot disagree with its group.
+    //
+    // 2. The range test itself is wrong for aliased exports.  `user32`'s export
+    //    map contains `0x77ba5610` = `user32.base + 0x1115610`, but
+    //    `0x1115610` is larger than user32's own image (0x1ED000), so the
+    //    address lies *outside* user32's `[base, end_off)` range — inside
+    //    ntdll's instead.  An export map is keyed by the address the export
+    //    really has, so it is the authority; the range test only ever subtracted
+    //    real candidates from it.
+    //
+    // Together they made the rebuilt table declare `user32!NtdllDefWindowProc_A`
+    // — a pair `GetProcAddress` cannot resolve — and the loader died with
+    // `0xC0000139 STATUS_ENTRYPOINT_NOT_FOUND`.  The original program imported
+    // `user32!DefWindowProcA`.
+    //
+    // Keeping every module's spelling lets `pass2_vote`'s "prefer the winning
+    // module" rule choose the one that matches the slot's own group.
     for (mi, m) in modules.iter().enumerate() {
-        if slot_val > m.base && slot_val < m.end_off {
-            if m.exports.contains_key(&slot_val) {
-                slot.candidates.push(ResolutionCandidate {
-                    address: slot_val,
-                    module_index: mi,
-                });
-            }
-            break;
+        if m.exports.contains_key(&slot_val) {
+            slot.candidates.push(ResolutionCandidate {
+                address: slot_val,
+                module_index: mi,
+            });
         }
     }
 
