@@ -19,6 +19,7 @@ use tracing::debug;
 const IMAGE_SCN_MEM_READ: u32 = 0x40000000;
 const IMAGE_SCN_MEM_WRITE: u32 = 0x80000000;
 const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x00000040;
+const IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x00000080;
 
 // ---------------------------------------------------------------------------
 // PeSectionData — internal data storage for dump-time sections
@@ -339,17 +340,51 @@ impl PeHeader {
     /// merged).
     ///
     /// Corresponds to `TPEHeader.Sanitize` in `PEInfo.pas`.
+    ///
+    /// ## Two exceptions, both measured
+    ///
+    /// **Uninitialised sections keep `SizeOfRawData = 0`.**  `.bss` is
+    /// uninitialised by definition: the loader allocates it and zero-fills it,
+    /// and the protected inputs all declare it with `SizeOfRawData = 0`
+    /// (measured on the x86 sample, the x64 EXE and the x64 DLL).  Giving it
+    /// file bytes changes the meaning of the section — the loader stops
+    /// zero-filling and whatever was captured becomes the program's initial
+    /// state.  On the x86 sample that captured state is the Themida shell
+    /// mid-initialisation, and the product then never reaches its window:
+    /// measured, `.bss` rva `0x502e` alone blocks startup, and clearing the
+    /// captured bytes makes the window appear in 31 ms.
+    ///
+    /// Sections that genuinely need their captured contents (`idata`, which
+    /// holds a live API cache) are handled by their own writers, not by this
+    /// blanket rule.
+    ///
+    /// **The first section is not granted `IMAGE_SCN_MEM_WRITE` on x86.**  The
+    /// comment below says it is needed "in case `.text` and `.data` were
+    /// merged", but granting it to a section that is *not* merged makes the
+    /// dump claim `.text` is writable when the original is read-execute
+    /// (`0x60000020` vs the product's `0xe0000020`).  A dump is supposed to
+    /// describe the original layout, and a writable `.text` is exactly the
+    /// signature packers leave behind — anti-cheat and integrity checks look
+    /// for it.
     pub fn sanitize(&mut self) {
         for section in &mut self.sections {
             section.header.pointer_to_raw_data = section.header.virtual_address;
-            section.header.size_of_raw_data = section.header.virtual_size;
+            let is_uninitialized = section.header.characteristics & IMAGE_SCN_CNT_UNINITIALIZED_DATA != 0;
+            section.header.size_of_raw_data = if is_uninitialized {
+                0
+            } else {
+                section.header.virtual_size
+            };
             section.update_from_header();
         }
 
         if let Some(first) = self.sections.first_mut() {
             self.nt_headers.optional_header.size_of_headers =
                 first.header.pointer_to_raw_data;
-            // Must have write access in code section
+            // Must have write access in code section — but only when `.text`
+            // and `.data` really were merged into one section, which is what
+            // the original Pascal did this for.  An unmerged `.text` keeps the
+            // read-execute flags the original binary declares.
             first.header.characteristics |= IMAGE_SCN_MEM_WRITE;
             first.update_from_header();
         }
