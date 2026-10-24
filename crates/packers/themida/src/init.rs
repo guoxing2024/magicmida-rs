@@ -189,7 +189,16 @@ fn resolve_tls_callback_count(
         return 0;
     };
     let tls_dir = pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_TLS];
-    if tls_dir.virtual_address == 0 || tls_dir.size < 40 {
+    // The data-directory `Size` for TLS is the size of the TLS directory
+    // *structure*, which differs by architecture:
+    //   IMAGE_TLS_DIRECTORY32 = 24 bytes (0x18)
+    //   IMAGE_TLS_DIRECTORY64 = 40 bytes (0x28)
+    //
+    // This used to be a flat `< 40`, which silently rejected **every** PE32
+    // target: the x86 reference sample reports 0x18, so `tls_total` was always
+    // 0.  x64 was unaffected only because 0x28 >= 40.
+    let min_tls_dir_size = if is_64bit { 40 } else { 24 };
+    if tls_dir.virtual_address == 0 || tls_dir.size < min_tls_dir_size {
         return 0;
     }
 
@@ -198,13 +207,21 @@ fn resolve_tls_callback_count(
         return 0;
     };
 
-    // TLS directory field layout (both PE32 and PE32+ use offset 0x18 for
-    // AddressOfCallBacks, because the first 3 u64-sized fields precede it):
-    //   0x00  RawDataStartVA
-    //   0x08  RawDataEndVA
-    //   0x10  Index
-    //   0x18  AddressOfCallBacks
-    let cb_rva = tls_dir.virtual_address + 0x18;
+    // TLS directory field layout — the field offsets differ by architecture
+    // because the first three fields are pointer-sized:
+    //   IMAGE_TLS_DIRECTORY32 (24 bytes):
+    //     0x00 StartAddressOfRawData (4)   0x04 EndAddressOfRawData (4)
+    //     0x08 AddressOfIndex        (4)   0x0C AddressOfCallBacks   (4)
+    //   IMAGE_TLS_DIRECTORY64 (40 bytes):
+    //     0x00 StartAddressOfRawData (8)   0x08 EndAddressOfRawData (8)
+    //     0x10 AddressOfIndex        (8)   0x18 AddressOfCallBacks   (8)
+    //
+    // This used to read a flat `+ 0x18`, correct only for PE32+.  Measured on
+    // the x86 reference sample, the directory is
+    // `00 60 41 00 | 04 60 41 00 | 08 60 41 00 | 10 60 41 00 | 00...`:
+    // AddressOfCallBacks = 0x416010 sits at 0x0C and offset 0x18 is zero.
+    let cb_field_offset = if is_64bit { 0x18 } else { 0x0C };
+    let cb_rva = tls_dir.virtual_address + cb_field_offset;
     let Some(cb_section) = pe.get_section_by_rva(cb_rva) else {
         return 0;
     };
@@ -233,19 +250,94 @@ fn resolve_tls_callback_count(
         return 0;
     }
 
-    // The TLS callbacks VA in the image should be BEFORE the TLS directory VA.
-    let tls_dir_va = tls_dir.virtual_address as u64;
-    if callbacks_va >= tls_dir_va {
-        return 0;
-    }
-    let distance = tls_dir_va - callbacks_va;
-    let count_including_null = (distance as usize) / ptr_size;
-    if count_including_null == 0 || count_including_null > MAX_TLS_CALLBACKS_GUESS + 1 {
-        return 0;
+    // A valid TLS directory with a non-null `AddressOfCallBacks` proves callbacks
+    // exist, but the array itself may be **unreadable on disk**.
+    //
+    // Measured on both packed reference samples: the callback array is entirely
+    // zero in the packed input, because the shell encrypts it and only writes it
+    // at run time.
+    //   x86 `x86_c.exe`     : .tls raw at file 0x4410, 16 bytes, all 0x00
+    //   x64 `时光一键宏.exe` : callback array 64 bytes, all 0x00
+    // The same array in the *unpacked* original holds the real pointers
+    // (`0x401810`, `0x4017d0` on the x86 sample).
+    //
+    // So counting from disk can never succeed on a packed binary, and live
+    // memory is not available here (this runs before the debug session exists).
+    //
+    // The fallback is applied to **x86 only**, and that is a measured decision,
+    // not a convenience:
+    //
+    // * x86 `handle_tls_callbacks` validates the callback *argument signature*
+    //   `(hInstance & 0xFFF) == 0 && fdwReason <= 3` before skipping, so a
+    //   non-zero budget is safe: a real OEP that is not a callback simply fails
+    //   the signature test and is accepted as the OEP.  Without a budget the
+    //   function bails out at `tls_total == 0` and the correct TLS-callback OEP
+    //   at `0x401810` gets rejected by the "return address points into the
+    //   Themida section" heuristic, which then retries until the shell stalls.
+    // * x64 `handle_tls_callbacks` skips on `execution_type == 8` alone, with no
+    //   argument check.  Giving it a non-zero budget makes it treat the *real*
+    //   OEP as a callback and skip it: measured `TLS callback 1/4 at
+    //   0x7ff6c13e2820` followed by `FATAL: OEP not found`, turning a green gate
+    //   into a 466 s failure.  x64 must therefore keep the budget at 0.
+    if cfg!(target_arch = "x86") {
+        let count = count_callbacks_in(&file_data, callbacks_va, ptr_size, is_64bit, pe);
+        if count == 0 {
+            tracing::debug!(
+                callbacks_va = format_args!("{callbacks_va:#x}"),
+                "TLS callback array is unreadable on disk (packer-encrypted) — \
+                 using the bounded Themida budget (x86 only)"
+            );
+            return MAX_TLS_CALLBACKS_GUESS as u32;
+        }
+        return count as u32;
     }
 
-    // Subtract one for the zero terminator.
-    count_including_null.saturating_sub(1) as u32
+    let count = count_callbacks_in(&file_data, callbacks_va, ptr_size, is_64bit, pe);
+    count as u32
+}
+
+/// Count non-null entries in the on-disk TLS callback array, if readable.
+///
+/// Returns 0 when the array cannot be resolved or is packed (all zeroes).
+fn count_callbacks_in(
+    file_data: &[u8],
+    callbacks_va: u64,
+    ptr_size: usize,
+    is_64bit: bool,
+    pe: &PeHeader,
+) -> usize {
+    let image_base = pe.nt_headers.optional_header.image_base;
+    let array_rva = callbacks_va.wrapping_sub(image_base);
+    // `wrapping_sub` underflows to a huge value when the VA sits below the image
+    // base, which also means it cannot be inside this image.
+    if array_rva >= image_base {
+        return 0;
+    }
+    let Some(array_section) = pe.get_section_by_rva(array_rva as u32) else {
+        return 0;
+    };
+    let array_file_offset =
+        array_section.raw_offset as usize + (array_rva as usize - array_section.virtual_address as usize);
+
+    let mut count = 0usize;
+    for i in 0..=MAX_TLS_CALLBACKS_GUESS {
+        let off = array_file_offset + i * ptr_size;
+        if off + ptr_size > file_data.len() {
+            break;
+        }
+        let mut bytes = [0u8; 8];
+        bytes[..ptr_size].copy_from_slice(&file_data[off..off + ptr_size]);
+        let entry = if is_64bit {
+            u64::from_le_bytes(bytes)
+        } else {
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64
+        };
+        if entry == 0 {
+            break;
+        }
+        count += 1;
+    }
+    count
 }
 
 // ---------------------------------------------------------------------------
