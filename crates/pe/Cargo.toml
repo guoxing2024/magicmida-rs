@@ -9,6 +9,8 @@ readme.workspace = true
 
 [dependencies]
 mida-core = { path = "../core" }
+mida-disasm = { path = "../disasm" }
+iced-x86 = { workspace = true }
 pelite = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

@@ -1,7 +1,7 @@
 //! iced-x86 disassembly wrapper providing high-level instruction iteration
 //! and pattern-matching over decoded instructions.
 
-use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind};
+use iced_x86::{ConstantOffsets, Decoder, DecoderOptions, Instruction, Mnemonic, OpKind};
 
 /// High-level wrapper around `iced_x86::Decoder`.
 ///
@@ -57,6 +57,31 @@ impl Disassembler {
         } else {
             None
         }
+    }
+
+    /// Decode a single instruction and also report where its displacement and
+    /// immediate fields live inside the instruction.
+    ///
+    /// Callers that need to know whether a 32-bit constant *inside* an
+    /// instruction is an absolute address (x86 code addresses globals with
+    /// `mov dword ptr [0x403010], 2` and `push 0x400000`) must use the operand
+    /// offsets, not a fixed byte stride: x86 absolute operands are frequently
+    /// unaligned, and a stride-4 walk misses most of them.
+    ///
+    /// Returns `None` only when there are no bytes left to decode.  An
+    /// undecodable byte yields an instruction whose `is_invalid()` is true.
+    pub fn decode_one_with_offsets(
+        &self,
+        code: &[u8],
+        ip: u64,
+    ) -> Option<(Instruction, ConstantOffsets)> {
+        let mut decoder = Decoder::with_ip(self.bitness, code, ip, DecoderOptions::NONE);
+        if !decoder.can_decode() {
+            return None;
+        }
+        let insn = decoder.decode();
+        let offsets = decoder.get_constant_offsets(&insn);
+        Some((insn, offsets))
     }
 
     /// Decode sequentially from `base_ip` and return the first instruction that

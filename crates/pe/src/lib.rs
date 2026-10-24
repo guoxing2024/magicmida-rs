@@ -21,6 +21,7 @@ pub mod error;
 pub mod header;
 pub mod section;
 pub mod utils;
+pub mod code_relocations;
 pub mod import_table;
 pub mod apiset;
 pub mod apiset_data;

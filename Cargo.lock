@@ -1661,7 +1661,9 @@ dependencies = [
 name = "mida-pe"
 version = "0.1.0"
 dependencies = [
+ "iced-x86",
  "mida-core",
+ "mida-disasm",
  "pelite",
  "thiserror 1.0.69",
  "tracing",

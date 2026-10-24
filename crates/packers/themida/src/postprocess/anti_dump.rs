@@ -54,8 +54,28 @@ pub(super) fn install_anti_dump_fix_x86(
         ));
     }
 
-    // The OEP should start with jmp rel32 (E9) — the displacement is used
-    // for the final jump (adjusted for the new stub size).
+    // The OEP must start with `jmp rel32` (`E9`) for the stub's tail jump to be
+    // derivable from it.  **Verify that before trusting bytes 1..5 as a
+    // displacement.**  Blindly reading them is a real defect: the x86 sample's
+    // OEP is `C7 05 50 50 40 00 01 00 00 00` (`mov dword ptr [0x405050], 1`),
+    // so bytes 1..5 are `05 50 50 40` = `0x40505005`, and the stub's tail
+    // `jmp` went to `0x4050645f` — outside the image.  Measured: the product
+    // died with `0xC0000005 addr=<base+0x1450> target 0x405050` because the
+    // stub's own write then targeted an unreachable address.
+    //
+    // When the opcode is not `E9` the stub cannot be installed safely: it needs
+    // to resume the original code, and there is no displacement to re-aim.
+    // Report it instead of writing a stub that jumps into nowhere.  The caller
+    // treats this as non-fatal (`warn!`), which is correct — the anti-dump fix
+    // is a mitigation, not a requirement for a working dump.
+    if oep_buf[0] != 0xE9 {
+        return Err(ThemidaError::PostProcess(format!(
+            "anti-dump stub needs the OEP to start with `jmp rel32` (E9), but it starts with \
+             {:02X} {:02X} {:02X} {:02X} {:02X} — refusing to install a stub whose tail jump \
+             would be aimed at a value that is not a displacement",
+            oep_buf[0], oep_buf[1], oep_buf[2], oep_buf[3], oep_buf[4]
+        )));
+    }
     let orig_jmp_disp = i32::from_le_bytes([oep_buf[1], oep_buf[2], oep_buf[3], oep_buf[4]]);
 
     // Compute PE header fields.

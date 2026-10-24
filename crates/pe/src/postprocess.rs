@@ -360,9 +360,17 @@ fn import_metadata_ranges(pe: &PeHeader, data: &[u8], is_64bit: bool) -> Vec<(u3
 /// to the image and generates relocation entries. Must be called AFTER
 /// fix_hardcoded_addresses (which patches addresses to file_image_base).
 ///
-/// CRITICAL: Only scans non-executable sections. x64 code uses RIP-relative
-/// addressing, so absolute addresses in .text are instruction operands,
-/// not pointers. Relocating them corrupts instructions → 0xC0000005.
+/// CRITICAL: Only scans non-executable sections **on x64**.  x64 code uses
+/// RIP-relative addressing, so absolute addresses in .text are instruction
+/// operands, not pointers.  Relocating them corrupts instructions →
+/// 0xC0000005.
+///
+/// On x86 the opposite is true and the section must be scanned: 32-bit code has
+/// no RIP-relative addressing, so every global access is an absolute operand
+/// (`cmp dword ptr [0x403010], 2`).  See [`crate::code_relocations`] for the
+/// measurements — the reference x86 sample's own table has 256 of its 277
+/// entries inside `.text`, and skipping them leaves the product crashing at the
+/// first absolute global access after the loader picks a different base.
 ///
 /// CRITICAL: Also refuses any entry that lands inside the import table's
 /// metadata — see [`import_metadata_ranges`] for why that rule exists.
@@ -401,10 +409,47 @@ pub fn build_relocation_table(
     let ptr_size = if is_64bit { 8 } else { 4 };
     let image_end = image_base + image_size as u64;
 
+    // ---- x86 only: absolute operands inside executable sections ------------
+    //
+    // `dump_buf` uses file offset == RVA for mapped sections, which is exactly
+    // the layout `scan_code_relocations` expects.  The x64 rule is unchanged:
+    // RIP-relative code has no absolute operands worth rebasing.
+    if !is_64bit {
+        let sections: Vec<(u32, u32, u32)> = pe
+            .sections
+            .iter()
+            .filter(|s| s.name.trim_end_matches('\0') != ".reloc")
+            .map(|s| (s.virtual_address, s.raw_size, s.characteristics))
+            .collect();
+        let code_hits = crate::code_relocations::scan_code_relocations(
+            out_data,
+            image_base as u32,
+            image_size,
+            sections,
+            |rva| in_import_metadata(rva),
+        );
+        info!(
+            "Code relocation scan (x86): {} absolute operands inside executable sections",
+            code_hits.len()
+        );
+        for hit in &code_hits {
+            builder.add_relocation(hit.rva, 3); // IMAGE_REL_BASED_HIGHLOW
+            debug!(
+                "  code relocation at rva {:#x} -> {:#x}",
+                hit.rva, hit.target
+            );
+        }
+    }
+
     for section in &pe.sections {
         let is_executable = (section.characteristics & 0x20000000) != 0;
         if is_executable {
-            debug!("Skipping executable section {} for relocations", section.name);
+            // x86 already covered executable sections above with an
+            // instruction-aware scan; the pointer-stride walk below would
+            // miss 79% of them and cannot tell an operand from a pointer.
+            if is_64bit {
+                debug!("Skipping executable section {} for relocations", section.name);
+            }
             continue;
         }
 
