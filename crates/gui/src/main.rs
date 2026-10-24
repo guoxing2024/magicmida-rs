@@ -12,8 +12,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod fonts;
-mod job;
-mod parse;
+
+
 mod theme;
 mod ui;
 
@@ -63,5 +63,7 @@ fn main() -> eframe::Result<()> {
 /// Resolve the CLI once at startup so the UI can report a clear error instead
 /// of failing at the moment the user clicks 开始.
 fn cli_path() -> Option<PathBuf> {
-    job::find_cli()
+    mida_run::find_cli()
 }
+
+

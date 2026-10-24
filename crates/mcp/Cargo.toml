@@ -1,0 +1,21 @@
+[package]
+name = "mida-mcp"
+version.workspace = true
+edition.workspace = true
+description = "MCP server exposing the Magicmida unpacker to AI clients"
+repository.workspace = true
+license.workspace = true
+readme.workspace = true
+
+[[bin]]
+name = "mida-mcp"
+path = "src/main.rs"
+
+[dependencies]
+mida-run = { path = "../run" }
+mida-pe = { path = "../pe" }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

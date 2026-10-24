@@ -12,8 +12,8 @@ use eframe::egui::{
     StrokeKind, Ui, Vec2,
 };
 
-use crate::job::Job;
-use crate::parse::{Level, LogLine, Metrics, Phase, RunState, TargetKind};
+use mida_run::Job;
+use mida_run::{Level, LogLine, Metrics, Phase, RunState, TargetKind};
 use crate::theme;
 
 const RAIL_W: f32 = 300.0;
@@ -1044,3 +1044,4 @@ fn is_supported(p: &Path) -> bool {
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("exe") || e.eq_ignore_ascii_case("dll"))
 }
+

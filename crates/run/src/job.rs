@@ -115,6 +115,16 @@ impl Job {
         (dirty, exit)
     }
 
+    /// PID of the `mida-cli` process itself.
+    ///
+    /// Exposed because the MCP server hands ownership of the [`Job`] to a pump
+    /// thread, so it cannot call [`Job::cancel`] (which needs `&mut self`).
+    /// Cancellation must target *this* PID, never the debuggee.
+    #[must_use]
+    pub fn cli_pid(&self) -> u32 {
+        self.cli_pid
+    }
+
     /// Ask the child to stop.
     ///
     /// The process handle lives on the waiter thread, so cancellation goes
@@ -131,11 +141,20 @@ impl Job {
                 return;
             }
         }
-        let _ = Command::new("taskkill")
-            .args(["/PID", &self.cli_pid.to_string(), "/T", "/F"])
-            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-            .output();
+        kill_tree(self.cli_pid);
     }
+}
+
+/// Kill a process and its whole tree.
+///
+/// Shared by [`Job::cancel`] and the MCP server's cancel path so both use the
+/// same `/T` semantics — killing only the CLI would leave the debuggee (and, on
+/// the DLL path, the generated loader host) running.
+pub fn kill_tree(pid: u32) {
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .output();
 }
 
 /// Read a pipe line by line into the channel.
@@ -180,3 +199,4 @@ pub fn find_cli() -> Option<PathBuf> {
 
     None
 }
+

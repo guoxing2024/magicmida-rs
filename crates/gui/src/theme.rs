@@ -87,8 +87,8 @@ pub fn install(ctx: &egui::Context) {
 }
 
 /// Colour for a log severity.
-pub fn level_color(level: crate::parse::Level) -> Color32 {
-    use crate::parse::Level;
+pub fn level_color(level: mida_run::Level) -> Color32 {
+    use mida_run::Level;
     match level {
         Level::Good => GOOD,
         Level::Warn => WARN,
@@ -97,3 +97,4 @@ pub fn level_color(level: crate::parse::Level) -> Color32 {
         Level::Info => TEXT,
     }
 }
+

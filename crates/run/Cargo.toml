@@ -1,0 +1,10 @@
+[package]
+name = "mida-run"
+version.workspace = true
+edition.workspace = true
+description = "Drives `mida-cli` as a child process and parses its log into structured run state"
+repository.workspace = true
+license.workspace = true
+readme.workspace = true
+
+[dependencies]
