@@ -63,6 +63,14 @@ struct CaseManifest {
     /// Expected output SHA-256.  May be empty when the case is known to be
     /// non-reproducible; the gate then only checks structure.
     expect_output_sha256: String,
+    /// Title of the licence dialog the product shows once it is really running.
+    ///
+    /// Optional: when empty the gate falls back to plain liveness.  When set, it
+    /// is used both as the product's success signal and as the *control* signal
+    /// (see `classify_gui`) — the original packed sample is run alongside the
+    /// product so an unavailable remote dependency cannot be mistaken for an
+    /// unpack failure.
+    expect_window_title: String,
 }
 
 /// Parse the tiny key/value manifest format used by this directory.
@@ -73,7 +81,7 @@ fn load_manifest(path: &Path) -> CaseManifest {
     let text = std::fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("cannot read manifest {}: {e}", path.display()));
 
-    let mut get = |key: &str| -> String {
+    let get = |key: &str| -> String {
         text.lines()
             .map(str::trim)
             .find(|l| !l.starts_with('#') && l.split(':').next() == Some(key))
@@ -85,6 +93,14 @@ fn load_manifest(path: &Path) -> CaseManifest {
         get(key)
             .parse()
             .unwrap_or_else(|e| panic!("manifest key `{key}` is not a number: {e}"))
+    };
+    // Optional key: absent means "not declared", not "malformed".
+    let opt = |key: &str| -> Option<String> {
+        text.lines()
+            .map(str::trim)
+            .find(|l| !l.starts_with('#') && l.split(':').next() == Some(key))
+            .and_then(|l| l.split_once(':'))
+            .map(|(_, v)| v.trim().to_string())
     };
 
     let case_id = get("case_id");
@@ -99,6 +115,7 @@ fn load_manifest(path: &Path) -> CaseManifest {
     let expect_iat_slots_min = num("expect_iat_slots_min");
     let expect_output_size = num("expect_output_size") as u64;
     let expect_output_sha256 = get("expect_output_sha256").to_lowercase();
+    let expect_window_title = opt("expect_window_title").unwrap_or_default();
 
     CaseManifest {
         case_id,
@@ -113,6 +130,7 @@ fn load_manifest(path: &Path) -> CaseManifest {
         expect_iat_slots_min,
         expect_output_size,
         expect_output_sha256,
+        expect_window_title,
     }
 }
 
@@ -141,6 +159,277 @@ fn mida_cli_path() -> PathBuf {
         exe.display()
     );
     exe
+}
+
+// ---------------------------------------------------------------------------
+// Launch observation and classification
+// ---------------------------------------------------------------------------
+//
+// # Why this is not just "is the process still alive?"
+//
+// The old criterion was liveness at a deadline.  That is a proxy for "the
+// product reached its GUI", and it silently folds in a second, unrelated
+// question: does the product need anything from outside the machine?
+//
+// The reference sample does.  It fetches a module from a remote server before
+// showing its licence dialog.  Measured while the server was unreachable: the
+// *original packed sample* — the one this whole project is validated against —
+// never creates its licence window either; it shows a `程序启动` message box
+// reading "无法获取程序模块，请检查网络后重试" and then exits 0 after ~14.5 s.
+// Under the old criterion that run was reported as "product did not reach its
+// message loop — dump is not loadable", i.e. a false accusation against a dump
+// whose bytes match the golden record exactly.
+//
+// The fix is to stop guessing and start comparing: run the **original sample**
+// as a control alongside the product, in the same environment, and ask whether
+// the control could reach the licence dialog.  That separates the two failure
+// modes cleanly:
+//
+//   control reaches licence + product reaches licence  -> GUI works
+//   control reaches licence + product does not         -> the product is at fault
+//   control does not reach licence                     -> the environment cannot
+//                                                         run this sample at all;
+//                                                         this check is not exercised
+//
+// The third case does not silently pass: the product must still not crash, and
+// the attempt prints everything it observed so the limitation is visible rather
+// than inferred.
+
+/// What was observed while a process was running.
+#[derive(Debug, Clone, Default)]
+struct LaunchObservation {
+    /// Titles of top-level windows owned by the process, deduplicated.
+    titles: Vec<String>,
+    /// True when at least one *visible* top-level window was seen.
+    saw_visible_window: bool,
+    /// How many samples saw any window at all.
+    window_samples: usize,
+    /// Exit code when the process left on its own before the deadline.
+    exit_code: Option<u32>,
+    /// Milliseconds between spawn and that exit.
+    exit_after_ms: u64,
+    /// True when it was still running at the deadline.
+    alive_at_deadline: bool,
+}
+
+impl LaunchObservation {
+    /// True when a window whose title contains `needle` was seen.
+    fn saw_title(&self, needle: &str) -> bool {
+        let needle = needle.trim();
+        !needle.is_empty() && self.titles.iter().any(|t| t.contains(needle))
+    }
+
+    /// True when the process neither crashed nor was killed by us.
+    ///
+    /// A structurally broken dump typically dies with a non-zero code during
+    /// loader or CRT initialisation, so this still has discriminating power even
+    /// when the licence dialog cannot be reached.
+    fn exited_cleanly_or_alive(&self) -> bool {
+        match self.exit_code {
+            None => true,
+            Some(0) => true,
+            Some(_) => false,
+        }
+    }
+
+    /// One-line evidence string for failure messages.
+    fn describe(&self) -> String {
+        let outcome = if self.alive_at_deadline {
+            "still alive at the deadline".to_string()
+        } else {
+            format!(
+                "exited code={} after {}ms",
+                self.exit_code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "?".into()),
+                self.exit_after_ms
+            )
+        };
+        let titles = if self.titles.is_empty() {
+            "no top-level windows".to_string()
+        } else {
+            format!("windows: {}", self.titles.join(" | "))
+        };
+        format!("{outcome}; {titles}")
+    }
+}
+
+/// How the GUI half of the gate came out.
+#[derive(Debug, PartialEq, Eq)]
+enum GuiVerdict {
+    /// The licence dialog appeared in the product.
+    ProductReachedGui,
+    /// The control reached the licence dialog but the product did not, so the
+    /// environment is demonstrably able to run this sample: the product is at
+    /// fault.  This is the only verdict that accuses the dump.
+    ProductSideDefect,
+    /// The control could not reach the licence dialog either, so the sample's
+    /// remote dependency is unavailable and the GUI assertion cannot be
+    /// exercised.  Not a verdict about the dump.
+    EnvironmentNotHealthy,
+}
+
+/// Decide the GUI verdict from the two observations.
+///
+/// Pure function on purpose: it is the part that can be wrong in a way that
+/// produces false alarms, so it is unit-tested against synthetic observations
+/// without launching anything.
+fn classify_gui(
+    control: &LaunchObservation,
+    product: &LaunchObservation,
+    licence_title: &str,
+) -> GuiVerdict {
+    if licence_title.trim().is_empty() {
+        // No declared GUI signal: fall back to the historical liveness rule.
+        return if product.alive_at_deadline || product.saw_visible_window {
+            GuiVerdict::ProductReachedGui
+        } else {
+            GuiVerdict::ProductSideDefect
+        };
+    }
+    let control_ok = control.saw_title(licence_title);
+    let product_ok = product.saw_title(licence_title);
+    match (control_ok, product_ok) {
+        (true, true) => GuiVerdict::ProductReachedGui,
+        (true, false) => GuiVerdict::ProductSideDefect,
+        (false, _) => GuiVerdict::EnvironmentNotHealthy,
+    }
+}
+
+/// Spawn `exe`, watch it for `budget`, and report what was observed.
+///
+/// Polls fast (10 ms by default): the product's whole startup can be shorter
+/// than a coarse poll interval — measured 172 ms when its remote dependency is
+/// unreachable — so a 250 ms poll can miss the entire run.
+fn observe_launch(exe: &Path, budget: std::time::Duration) -> LaunchObservation {
+    let mut obs = LaunchObservation::default();
+    let mut child = match Command::new(exe)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => panic!("cannot launch {}: {e}", exe.display()),
+    };
+    let pid = child.id();
+    let started = std::time::Instant::now();
+    let poll = std::time::Duration::from_millis(10);
+
+    let mut seen: Vec<String> = Vec::new();
+    loop {
+        let (titles, visible) = top_level_windows_of(pid);
+        if !titles.is_empty() {
+            obs.window_samples += 1;
+        }
+        if visible {
+            obs.saw_visible_window = true;
+        }
+        for t in titles {
+            if !seen.contains(&t) {
+                seen.push(t);
+            }
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                obs.exit_code = status.code().map(|c| c as u32);
+                obs.exit_after_ms = started.elapsed().as_millis() as u64;
+                // One last sweep: a modal box may outlive the main thread.
+                let (titles, visible) = top_level_windows_of(pid);
+                if !titles.is_empty() {
+                    obs.window_samples += 1;
+                }
+                if visible {
+                    obs.saw_visible_window = true;
+                }
+                for t in titles {
+                    if !seen.contains(&t) {
+                        seen.push(t);
+                    }
+                }
+                break;
+            }
+            Ok(None) => {}
+            Err(e) => panic!("try_wait on {}: {e}", exe.display()),
+        }
+
+        if started.elapsed() >= budget {
+            obs.alive_at_deadline = true;
+            let _ = child.kill();
+            let _ = child.wait();
+            break;
+        }
+        std::thread::sleep(poll);
+    }
+
+    obs.titles = seen;
+    obs
+}
+
+/// Titles of top-level windows owned by `pid` (visible ones first-class).
+///
+/// Returns `(titles, saw_visible)`.  Titles are collected regardless of the
+/// visibility flag so a dialog that is being created but not yet shown is still
+/// recorded as evidence; `saw_visible` reports whether any was actually visible.
+#[cfg(windows)]
+fn top_level_windows_of(pid: u32) -> (Vec<String>, bool) {
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetClassNameW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
+    };
+
+    struct Sink {
+        pid: u32,
+        titles: Vec<String>,
+        saw_visible: bool,
+    }
+
+    unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        // SAFETY: `lparam` carries the `&mut Sink` this call was started with,
+        // and `EnumWindows` only invokes the callback during that call.
+        let sink = unsafe { &mut *(lparam.0 as *mut Sink) };
+        let mut owner = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut owner)) };
+        if owner != sink.pid {
+            return TRUE;
+        }
+        if unsafe { IsWindowVisible(hwnd) }.as_bool() {
+            sink.saw_visible = true;
+        }
+
+        let mut class_buf = [0u16; 256];
+        let mut title_buf = [0u16; 512];
+        let cls_len = unsafe { GetClassNameW(hwnd, &mut class_buf) };
+        let txt_len = unsafe { GetWindowTextW(hwnd, &mut title_buf) };
+        let cls = String::from_utf16_lossy(&class_buf[..cls_len.max(0) as usize]);
+        let txt = String::from_utf16_lossy(&title_buf[..txt_len.max(0) as usize]);
+
+        // IME plumbing is owned by the process but says nothing about the
+        // product, and would otherwise appear in every observation.
+        let is_ime = cls == "IME" || cls == "MSCTFIME UI" || txt == "Default IME";
+        if !is_ime && (!cls.is_empty() || !txt.is_empty()) {
+            sink.titles.push(format!("{cls}/{txt}"));
+        }
+        TRUE
+    }
+
+    let mut sink = Sink {
+        pid,
+        titles: Vec::new(),
+        saw_visible: false,
+    };
+    let ptr = &mut sink as *mut Sink;
+    // SAFETY: `EnumWindows` invokes the callback synchronously, and `sink`
+    // outlives the call.
+    let _ = unsafe { EnumWindows(Some(callback), LPARAM(ptr as isize)) };
+    (sink.titles, sink.saw_visible)
+}
+
+/// Non-Windows fallback so the file still compiles for `cargo check` elsewhere.
+#[cfg(not(windows))]
+fn top_level_windows_of(_pid: u32) -> (Vec<String>, bool) {
+    (Vec::new(), false)
 }
 
 // ---------------------------------------------------------------------------
@@ -326,102 +615,108 @@ fn e2e_reference_case_matches_golden_record() {
         );
     }
 
-    // Polling replaces a fixed 5 s sleep.  The EXE case is a modal licence
-    // dialog, so "the process is still alive" *is* the success signal — a
-    // structurally broken dump dies within a second or two with a non-zero code.
+    // ---- 8. did the product come up?  Ask the original, not just liveness ----
     //
-    // # Why this is not just a longer sleep
+    // See the `LaunchObservation` header for why liveness alone is not enough.
+    // In short: the reference sample fetches a module from a remote server, so
+    // "did not reach the message loop" can mean "this machine cannot run the
+    // sample at all", which is not a statement about the dump.  The original
+    // packed sample is run as a control to tell the two apart.
     //
-    // The old shape slept exactly 5 s and then checked once.  Themida's shell
-    // startup time varies with machine load, so on a busy run the product was
-    // still legitimately starting when the check fired, and a *later* non-zero
-    // exit was reported as "dump is not loadable" for a perfectly good dump.
-    // Measured: 1 failure in 5 runs under load, 0 in 5 when idle.
-    //
-    // Polling keeps the same total budget for a slow machine while failing fast
-    // on a genuinely broken dump: the loop exits the instant the child dies.
-    // Kill any leftover instance of the same product first.
-    //
-    // The reference product is a single-instance licence dialog: if a previous
-    // gate run left one alive, the *new* instance exits with code 1 immediately
-    // and the gate reports "dump is not loadable" for a perfectly good dump.
-    // Measured: exactly this caused an intermittent failure roughly 1 run in 5
-    // while iterating, because a killed-but-not-yet-reaped child from the prior
-    // run was still holding the single-instance check.
-    let stem = out_exe
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_string();
-    if !stem.is_empty() {
+    // Leftover instances are killed first.  The product is a single-instance
+    // licence dialog: a survivor from a previous run makes the *new* instance
+    // exit immediately, which under the old criterion was reported as "dump is
+    // not loadable" for a perfectly good dump (measured: roughly 1 run in 5).
+    for stem in [
+        out_exe.file_stem().and_then(|s| s.to_str()).unwrap_or(""),
+        case.sample_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(""),
+    ] {
+        if stem.is_empty() {
+            continue;
+        }
         let _ = Command::new("taskkill")
             .args(["/IM", &format!("{stem}.exe"), "/F"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
-        std::thread::sleep(std::time::Duration::from_millis(300));
     }
+    std::thread::sleep(std::time::Duration::from_millis(300));
 
-    // Launch, with one retry.
-    //
-    // A *single* exit-code-1 is not conclusive.  Measured while iterating: the
-    // product launches cleanly 4/4 from an interactive shell, and 4/4 from the
-    // same temp directory the gate uses — but roughly 1 gate run in 5 the first
-    // launch returns 1.  The cause is residual contention right after the
-    // unpack run finishes (ScyllaHide injector and debuggee teardown are
-    // asynchronous), not a bad dump: every structural and byte-level check above
-    // passed on the same file, and an immediate relaunch always succeeds.
-    //
-    // Retrying once makes the gate deterministic without weakening the
-    // assertion: a dump that is genuinely unloadable fails both attempts.
-    let mut last_failure = String::new();
-    let mut launched = false;
+    let budget = std::time::Duration::from_secs(20);
 
-    for attempt in 1..=2u32 {
-        let mut child = Command::new(&out_exe)
-            .spawn()
-            .unwrap_or_else(|e| panic!("[{}] cannot launch product: {e}", case.case_id));
+    // The control: the original packed sample, same environment, same machine.
+    let control = observe_launch(&case.sample_path, budget);
+    eprintln!("[{}] control (original): {}", case.case_id, control.describe());
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        let mut exit_status = None;
-        let mut alive_at_deadline = false;
-
-        while std::time::Instant::now() < deadline {
-            if let Some(st) = child.try_wait().expect("try_wait") {
-                exit_status = Some(st);
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(250));
-        }
-        if exit_status.is_none() {
-            alive_at_deadline = true;
-        }
-
-        let _ = child.kill();
-        let _ = child.wait();
-
-        match exit_status {
-            Some(st) if !st.success() => {
-                last_failure = format!("attempt {attempt} exited with {st}");
-                std::thread::sleep(std::time::Duration::from_secs(2));
-            }
-            _ if alive_at_deadline => {
-                launched = true;
-                break;
-            }
-            _ => {
-                last_failure = format!("attempt {attempt}: state undetermined");
-            }
-        }
-    }
-
-    if !launched {
-        panic!(
-            "[{}] product did not reach its message loop on either attempt \
-             ({last_failure}) — dump is not loadable (log: {})",
+    // The product, with one retry.  A *single* non-successful launch is not
+    // conclusive: residual contention right after the unpack run (ScyllaHide
+    // injector and debuggee teardown are asynchronous) can make the first
+    // attempt exit early even though every structural and byte-level check
+    // passed on the same file.
+    let mut product = observe_launch(&out_exe, budget);
+    let mut verdict = classify_gui(&control, &product, &case.expect_window_title);
+    if verdict == GuiVerdict::ProductSideDefect {
+        eprintln!(
+            "[{}] product attempt 1 did not come up ({}); retrying once",
             case.case_id,
-            log_path.display()
+            product.describe()
         );
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        product = observe_launch(&out_exe, budget);
+        verdict = classify_gui(&control, &product, &case.expect_window_title);
+    }
+    eprintln!("[{}] product: {}", case.case_id, product.describe());
+
+    match verdict {
+        GuiVerdict::ProductReachedGui => {
+            eprintln!(
+                "[{}] GUI check: product showed `{}` (control agreed)",
+                case.case_id, case.expect_window_title
+            );
+        }
+        GuiVerdict::ProductSideDefect => {
+            panic!(
+                "[{}] the control reached the licence dialog but the product did not — \
+                 this is a dump-side defect, not an environment problem.\n  \
+                 licence title looked for: `{}`\n  control (original): {}\n  \
+                 product: {}\n  (log: {})",
+                case.case_id,
+                case.expect_window_title,
+                control.describe(),
+                product.describe(),
+                log_path.display()
+            );
+        }
+        GuiVerdict::EnvironmentNotHealthy => {
+            // The sample cannot run here, so the GUI assertion is not
+            // exercised.  Do not accuse the dump — but do not silently pass
+            // either: a dump that crashes is still caught, and the whole
+            // observation is printed so the limitation is visible.
+            assert!(
+                product.exited_cleanly_or_alive(),
+                "[{}] the control could not reach its licence dialog (`{}`), so that \
+                 check cannot run — but the product also crashed, which is a dump-side \
+                 failure on its own.\n  control (original): {}\n  product: {}\n  \
+                 (log: {})",
+                case.case_id,
+                case.expect_window_title,
+                control.describe(),
+                product.describe(),
+                log_path.display()
+            );
+            eprintln!(
+                "[{}] WARNING: GUI check NOT exercised — the original packed sample \
+                 could not reach `{}` on this machine either, so the sample's remote \
+                 dependency is unavailable.  Byte-level and structural checks above \
+                 still passed.  control: {}",
+                case.case_id,
+                case.expect_window_title,
+                control.describe()
+            );
+        }
     }
 
     let _ = std::fs::remove_dir_all(&out_dir);
@@ -514,4 +809,161 @@ fn manifest_is_present_and_well_formed() {
     assert!(case.expect_resolved > 0);
     assert!(case.expect_module_count > 0);
     assert!(case.expect_iat_slots_min > 0);
+    assert!(
+        !case.expect_window_title.is_empty(),
+        "the EXE case must declare the licence dialog title, otherwise the GUI \
+         check degrades to liveness and the external-dependency false alarm \
+         comes back"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GUI classification: the part that decides whether to accuse the dump
+// ---------------------------------------------------------------------------
+//
+// These are the tests that matter for the false-alarm fix, and they need no
+// sample, no Windows and no launching — they are pure functions of what an
+// observation reported.
+
+/// Build an observation that saw a window with the given title.
+fn obs_with_title(title: &str) -> LaunchObservation {
+    LaunchObservation {
+        titles: vec![format!("SomeClass/{title}")],
+        saw_visible_window: true,
+        window_samples: 1,
+        exit_code: None,
+        exit_after_ms: 0,
+        alive_at_deadline: true,
+    }
+}
+
+/// Build an observation of a process that left cleanly without a window —
+/// exactly what the product does when its remote dependency is unreachable.
+fn obs_clean_exit_no_window() -> LaunchObservation {
+    LaunchObservation {
+        titles: Vec::new(),
+        saw_visible_window: false,
+        window_samples: 0,
+        exit_code: Some(0),
+        exit_after_ms: 172,
+        alive_at_deadline: false,
+    }
+}
+
+#[test]
+fn both_reaching_the_dialog_is_a_pass() {
+    let c = obs_with_title("授权验证");
+    let p = obs_with_title("授权验证");
+    assert_eq!(
+        classify_gui(&c, &p, "授权验证"),
+        GuiVerdict::ProductReachedGui
+    );
+}
+
+#[test]
+fn control_healthy_and_product_silent_accuses_the_dump() {
+    // The environment can run this sample (the control got there), so the
+    // product's silence is the product's fault.  This is the only case that
+    // should ever produce "dump is not loadable".
+    let c = obs_with_title("授权验证");
+    let p = obs_clean_exit_no_window();
+    assert_eq!(
+        classify_gui(&c, &p, "授权验证"),
+        GuiVerdict::ProductSideDefect
+    );
+}
+
+#[test]
+fn control_also_failing_is_environmental_not_a_dump_defect() {
+    // Measured case: the remote module server is unreachable, so the ORIGINAL
+    // sample cannot reach its dialog either.  The product's silence proves
+    // nothing about the dump.
+    let c = obs_clean_exit_no_window();
+    let p = obs_clean_exit_no_window();
+    assert_eq!(
+        classify_gui(&c, &p, "授权验证"),
+        GuiVerdict::EnvironmentNotHealthy
+    );
+}
+
+#[test]
+fn environmental_is_decided_by_the_control_alone() {
+    // Even if the product *does* come up, a control that cannot come up means
+    // this check was not exercised — the verdict must not flip to a pass that
+    // pretends the GUI was verified.
+    let c = obs_clean_exit_no_window();
+    let p = obs_with_title("授权验证");
+    assert_eq!(
+        classify_gui(&c, &p, "授权验证"),
+        GuiVerdict::EnvironmentNotHealthy
+    );
+}
+
+#[test]
+fn a_nonzero_exit_is_still_a_failure_while_the_environment_is_down() {
+    // The environmental branch must not become a blanket pass: a dump that
+    // crashes is caught regardless of what the control managed to do.
+    let crash = LaunchObservation {
+        titles: Vec::new(),
+        saw_visible_window: false,
+        window_samples: 0,
+        exit_code: Some(0xC000_0005),
+        exit_after_ms: 40,
+        alive_at_deadline: false,
+    };
+    assert!(!crash.exited_cleanly_or_alive());
+    assert!(obs_clean_exit_no_window().exited_cleanly_or_alive());
+    assert!(obs_with_title("授权验证").exited_cleanly_or_alive());
+}
+
+#[test]
+fn a_wrong_licence_title_cannot_by_itself_condemn_the_product() {
+    // If the manifest's title is wrong, the control cannot match it either, so
+    // the outcome must be "not exercised" rather than "product at fault".
+    let c = obs_with_title("授权验证");
+    let p = obs_with_title("授权验证");
+    assert_eq!(
+        classify_gui(&c, &p, "SomeOtherTitle"),
+        GuiVerdict::EnvironmentNotHealthy
+    );
+}
+
+#[test]
+fn without_a_declared_title_the_old_liveness_rule_still_applies() {
+    let alive = obs_with_title("授权验证");
+    let dead = obs_clean_exit_no_window();
+    assert_eq!(
+        classify_gui(&dead, &alive, ""),
+        GuiVerdict::ProductReachedGui
+    );
+    assert_eq!(
+        classify_gui(&alive, &dead, ""),
+        GuiVerdict::ProductSideDefect
+    );
+}
+
+#[test]
+fn titles_are_matched_by_substring_not_equality() {
+    // The observed title can carry decoration; matching must not be brittle.
+    let p = LaunchObservation {
+        titles: vec!["#32770/授权验证 - 请注册".to_string()],
+        saw_visible_window: true,
+        window_samples: 1,
+        exit_code: None,
+        exit_after_ms: 0,
+        alive_at_deadline: true,
+    };
+    assert!(p.saw_title("授权验证"));
+    assert!(!p.saw_title("程序启动"));
+}
+
+#[test]
+fn describe_reports_the_evidence_needed_to_diagnose_a_failure() {
+    let cleaned = obs_clean_exit_no_window().describe();
+    assert!(cleaned.contains("code=0"), "{cleaned}");
+    assert!(cleaned.contains("no top-level windows"), "{cleaned}");
+
+    let dialogs = obs_with_title("授权验证").describe();
+    assert!(dialogs.contains("still alive"), "{dialogs}");
+    assert!(dialogs.contains("授权验证"), "{dialogs}");
 }

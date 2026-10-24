@@ -55,3 +55,21 @@ expect_output_size: 1539072
 # is no longer zero-filled, so the product bytes necessarily changed.  Verified
 # 3/3 identical, and the product still launches to its `授权验证` window.
 expect_output_sha256: 9779e632d878fb9276c577d53a7d6c4372309c930512c1a0378957a3c2feae97
+
+# The licence dialog the product shows once it is really running.
+#
+# Used twice: as the product's success signal, and as the *control* signal — the
+# gate also runs the original packed sample and asks whether IT could reach this
+# dialog.  That is what separates "the dump is broken" from "this machine cannot
+# run the sample at all".
+#
+# Why the distinction is needed here: the sample fetches a module from a remote
+# server before showing the dialog.  Measured 2026-10-24 with that server
+# unreachable: the original packed sample never creates the dialog either; it
+# puts up a `程序启动` box reading "无法获取程序模块，请检查网络后重试" and exits 0
+# after ~14.5 s.  The old liveness-only criterion reported that as
+# "dump is not loadable" for a product whose bytes match the golden record.
+#
+# Same title the DLL case asserts, and the same string observed on screen for the
+# original sample earlier the same day.
+expect_window_title: 授权验证
