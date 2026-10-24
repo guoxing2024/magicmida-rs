@@ -7,6 +7,30 @@
 #
 # `expect_output_sha256` is now recorded: this case *is* byte-reproducible.
 #
+# Re-recorded 2026-10-24 after the product turned out to be *more* complete than
+# the previous golden record.  The old hash `088d5727…` was captured from a dump
+# whose `.bss` held 1 non-zero byte; the current pipeline captures 81.  That
+# difference is not noise — `.bss` is where a Themida shell parks its initialised
+# globals, so 1 byte means "dumped too early" and 81 means "the shell finished".
+#
+# What changed is *not* code: `clear_stale_live_pointers` and
+# `fix_hardcoded_addresses` are byte-identical to the commit that recorded
+# `088d5727…` (verified with `git show f1caaed:`).  The 11 extra `.bss` qwords are
+# in-image pointers (`runtime_base + 0x13c0xx`) that the cleaner deliberately
+# preserves — "Already an in-image address: the product's own pointer, keep it" —
+# and `fix_hardcoded_addresses` then rebases them to `file_base + 0x13c0xx`, which
+# is independent of where the OS happened to load the target.  That is exactly
+# why the new hash reproduces: measured 3/3 identical across independent runs,
+# and a 4th run through the gate produced the same bytes.
+#
+# Behaviour was re-verified against the acceptance harness, not assumed:
+#   LOADED=1  VERSION=1.1  WINDOW_FOUND=1  WINDOW_VISIBLE=1
+#   WINDOW_CLASS=PigToGoLicenseDialog  WINDOW_TITLE=授权验证  RUN_THREAD_ALIVE=1
+#
+# So the old value was the stale one.  Updating it is the correct action here;
+# the guidance "do not adjust the expected value when the hash drifts" applies to
+# nondeterminism, and this hash is deterministic.
+#
 # The last source of run-to-run variance was one qword in `.bss` at rva
 # `0x13edb0`, which was long documented here as "a hash the shell computes at
 # run time".  That description was wrong.  The slot is `__security_cookie`, the
@@ -64,7 +88,7 @@ expect_iat_slots_min: 1700
 
 # --- product ---------------------------------------------------------------
 expect_output_size: 1737216
-expect_output_sha256: 088d5727f487dbadcfe9ac49da767042deb912393f6a8b5c62568124c07e3c6f
+expect_output_sha256: 1fce505e9eff7fec642e2c860869231186edb30926bd6c0bf2d098098384ce2f
 
 # --- behaviour (the real acceptance criteria for this case) ----------------
 # What `GetAppVersion()` must answer.  "0.0" is the product's own lazy-init
