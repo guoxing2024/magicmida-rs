@@ -593,6 +593,41 @@ mod tests {
         );
     }
 
+    /// `.bss` must keep `SizeOfRawData = 0` after sanitize.
+    ///
+    /// Measured defect: sanitize used to give every section
+    /// `SizeOfRawData = VirtualSize`, so the dumped `.bss` carried the Themida
+    /// shell's mid-initialisation state as file bytes.  The loader then stops
+    /// zero-filling it, the captured bytes become the program's initial state,
+    /// and the x86 product never reached its window — clearing them made the
+    /// window appear in 31 ms.
+    #[test]
+    fn sanitize_keeps_uninitialised_section_raw_size_zero() {
+        let mut pe = make_test_pe();
+        // Append a `.bss` the way a real linker does: virtual size only.
+        let idx = pe.create_section_index(".bss", 0x94);
+        pe.sections[idx].characteristics |= IMAGE_SCN_CNT_UNINITIALIZED_DATA;
+        pe.sections[idx].header.characteristics |= IMAGE_SCN_CNT_UNINITIALIZED_DATA;
+
+        pe.sanitize();
+
+        assert_eq!(
+            pe.sections[idx].header.size_of_raw_data, 0,
+            "an uninitialised section must not carry file bytes — the loader \
+             would stop zero-filling it and the captured dump state would \
+             become the program's initial state"
+        );
+        assert_eq!(
+            pe.sections[idx].header.pointer_to_raw_data, pe.sections[idx].header.virtual_address,
+            "the raw pointer still mirrors the RVA so the layout stays contiguous"
+        );
+        // A normal initialised section is unaffected.
+        assert_eq!(
+            pe.sections[0].header.size_of_raw_data, pe.sections[0].header.virtual_size,
+            "initialised sections still mirror their virtual size"
+        );
+    }
+
     #[test]
     fn test_rename_section() {
         let mut pe = make_test_pe();
@@ -635,4 +670,5 @@ mod tests {
         assert_eq!(sect.name, "wow");
     }
 }
+
 
