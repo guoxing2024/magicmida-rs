@@ -308,6 +308,62 @@ pub(super) fn find_iat_ref_from_address(
     ignore_boundary: bool,
     max_instructions: usize,
 ) -> Result<usize, ThemidaError> {
+    // The recursion below follows `call rel32` into other functions, which makes
+    // mutual recursion (A calls B, B calls A) an infinite descent.  Measured on
+    // the x86 reference sample: the run found its OEP at 0x401450, then died
+    // with `thread 'main' has overflowed its stack` while scanning
+    // `0x401470..0x40148d` — a two-function cycle.
+    //
+    // Bound it two ways: a visit set (a function is only entered once per
+    // search, which makes the walk terminate on any cycle) and a hard depth
+    // cap (a defensive backstop for pathological chain depth).
+    let mut visited = std::collections::HashSet::new();
+    find_iat_ref_inner(
+        debugger,
+        text,
+        text_base,
+        start_addr,
+        code_size,
+        ignore_boundary,
+        max_instructions,
+        &mut visited,
+        0,
+    )
+}
+
+/// Maximum `call rel32` follow depth.  Thunk chains are shallow in practice
+/// (MSVC startup is 2–3 deep); anything beyond this is a cycle the visit set
+/// should already have caught.
+const MAX_IAT_FOLLOW_DEPTH: u32 = 32;
+
+#[allow(clippy::too_many_arguments)]
+fn find_iat_ref_inner(
+    debugger: &dyn DebuggerCore,
+    text: &[u8],
+    text_base: usize,
+    start_addr: usize,
+    code_size: usize,
+    ignore_boundary: bool,
+    max_instructions: usize,
+    visited: &mut std::collections::HashSet<usize>,
+    depth: u32,
+) -> Result<usize, ThemidaError> {
+    if depth > MAX_IAT_FOLLOW_DEPTH {
+        debug!(
+            start = format_args!("{start_addr:#x}"),
+            depth,
+            "IAT scan: follow-depth limit reached — stopping this branch"
+        );
+        return Ok(0);
+    }
+    // A function already on the current path cannot lead anywhere new.
+    if !visited.insert(start_addr) {
+        debug!(
+            start = format_args!("{start_addr:#x}"),
+            "IAT scan: {start_addr:#x} already visited (call cycle) — stopping this branch"
+        );
+        return Ok(0);
+    }
     let bitness = if std::mem::size_of::<usize>() == 8 {
         64
     } else {
@@ -436,8 +492,9 @@ pub(super) fn find_iat_ref_from_address(
             let target = (ip as i64 + 5 + rel32 as i64) as usize;
 
             if target >= text_base && target < text_base + code_size {
-                // Recurse into the callee.
-                let result = find_iat_ref_from_address(
+                // Recurse into the callee.  `visited` + `depth` make this
+                // terminate even when the callee calls back into the caller.
+                let result = find_iat_ref_inner(
                     debugger,
                     text,
                     text_base,
@@ -445,6 +502,8 @@ pub(super) fn find_iat_ref_from_address(
                     code_size,
                     false,
                     max_instructions,
+                    visited,
+                    depth + 1,
                 )?;
                 if result != 0 {
                     return Ok(result);

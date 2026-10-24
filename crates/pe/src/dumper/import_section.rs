@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::header::PeHeader;
 use crate::import_table::{
@@ -335,6 +335,18 @@ pub(crate) fn write_iat_to_output(
 
     let ptr_size = if is_64bit { 8 } else { 4 };
 
+    // Lowest file offset that is not part of the DOS/NT headers.  Sparse IAT
+    // writes must never land below this: the headers are what make the file a
+    // PE at all.
+    let min_header_end = pe
+        .sections
+        .iter()
+        .map(|s| s.header.pointer_to_raw_data as usize)
+        .filter(|&p| p > 0)
+        .min()
+        .unwrap_or(0x200)
+        .max(0x100);
+
     // Sparse path: write each Hint/Name RVA to the slot the thunk actually came
     // from.
     //
@@ -370,6 +382,25 @@ pub(crate) fn write_iat_to_output(
                 let end = file_off + ptr_size;
                 if end > out_data.len() {
                     out_data.resize(end, 0);
+                }
+                // Never write into the DOS/NT headers.  `thunk.iat_address` is an
+                // RVA the trace engine recorded; when it lands outside every
+                // section (or the section table has been compacted so the RVA no
+                // longer resolves), `section_rva_to_file_offset` falls back to
+                // `rva as usize`, which for a small value lands in the headers.
+                //
+                // Measured on the x86 reference sample: the sparse write put
+                // `BF 90 01 00` at file offset 0, overwriting `MZ`, and the whole
+                // dump then failed with `Invalid DOS signature`.  A thunk we
+                // cannot place is a thunk we skip — the loader resolves from the
+                // rebuilt `.idata` regardless.
+                if file_off < min_header_end {
+                    warn!(
+                        iat_address = format_args!("{:#x}", thunk.iat_address),
+                        file_off = format_args!("{file_off:#x}"),
+                        "IAT slot resolves into the headers — skipping this write"
+                    );
+                    continue;
                 }
                 if ptr_size == 8 {
                     out_data[file_off..end].copy_from_slice(&val.to_le_bytes());

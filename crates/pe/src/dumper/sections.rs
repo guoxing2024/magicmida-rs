@@ -205,9 +205,25 @@ pub(crate) fn create_reloc_section(pe: &mut PeHeader) {
     let file_align = pe.nt_headers.optional_header.file_alignment;
     let section_align = pe.nt_headers.optional_header.section_alignment;
 
-    // 0x2000 (8 KiB) virtual size — comfortably larger than the ~5992-byte
-    // table the builder produces, with headroom.
-    let reloc_vsize: u32 = 0x2000;
+    // **The reserved size and the announced size must agree.**
+    //
+    // This section used to reserve a generous `0x2000` and announce it as its
+    // `virtual_size`, so that any later section was placed after `0x2000` of
+    // address space.  `build_relocation_table` then rewrote `virtual_size` to
+    // the real table length (~`0xac`) *without moving the sections after it*,
+    // which silently opened a `0x1000` hole in the virtual layout.
+    //
+    // The loader rejects any image whose section VAs are not contiguous:
+    // measured `CreateProcess -> ERROR_BAD_EXE_FORMAT (193)` on a product that
+    // was otherwise byte-perfect, and the same 193 when a hole was injected into
+    // the working control sample.
+    //
+    // So the reserved VA range is fixed at one section-alignment unit — enough
+    // for the relocation table (measured ~6 KB, well under 0x1000 for these
+    // images) — and the announced `virtual_size` matches it exactly.  If the
+    // real table ever exceeds one page the dump step below will say so instead
+    // of silently producing an unloadable file.
+    let reloc_vsize: u32 = section_align.max(0x1000);
     let reloc_raw = crate::utils::align_up(reloc_vsize, file_align);
 
     let reloc_idx = pe.create_section_index(".reloc", reloc_vsize);

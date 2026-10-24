@@ -1,4 +1,4 @@
-﻿//! Code section guard for Themida unpacking.
+//! Code section guard for Themida unpacking.
 //!
 //! Sets `.text` to `PAGE_NOACCESS` so writes/executes from the packer
 //! trigger access violations that the debugger intercepts.
@@ -262,12 +262,94 @@ pub fn process_guarded_access(
     // and Themida-write (3) so those common faults never increment the TLS
     // counter.
     if exc_type == 8 && state.tls_total > 0 && state.tls_counter < state.tls_total {
+        // The counter is incremented only once we are sure this is a callback —
+        // see `looks_like_tls_callback` below.  Counting first would let a
+        // mis-guessed budget consume the real OEP and still report progress.
+        info!(
+            "TLS candidate {}/{} at {:#x}",
+            state.tls_counter + 1, state.tls_total, exception_address
+        );
+
+        // Diagnostic: record what the faulting thread looks like, and what
+        // `.text` carried *before* this function relaxed it.  This is the
+        // measurement that tells us whether the shell is about to execute in
+        // `.text` (callback body) or is merely passing through.
+        #[cfg(target_arch = "x86")]
+        if let Ok(ctx) = debugger.get_thread_context_control(thread_id) {
+            let sp = mida_core::ctx_sp(&ctx);
+            let ip = mida_core::ctx_ip(&ctx);
+            let mut ret_bytes = [0u8; 4];
+            let ret = if debugger.read_memory(sp, &mut ret_bytes).is_ok() {
+                u32::from_le_bytes(ret_bytes) as usize
+            } else {
+                0
+            };
+            let mut args = [0u8; 12];
+            let _ = debugger.read_memory(sp + 4, &mut args);
+            let a0 = u32::from_le_bytes([args[0], args[1], args[2], args[3]]);
+            let a1 = u32::from_le_bytes([args[4], args[5], args[6], args[7]]);
+            info!(
+                eip = format_args!("{ip:#x}"),
+                esp = format_args!("{sp:#x}"),
+                ret = format_args!("{ret:#x}"),
+                hinst = format_args!("{a0:#x}"),
+                reason = a1,
+                "TLS callback frame (diagnostic)"
+            );
+        }
+
+        // ---- Is this really a TLS callback, or is it the OEP? ----------------
+        //
+        // The `tls_total` budget is a *bounded guess* (4) whenever the on-disk
+        // callback array is packer-encrypted, which it is for every packed
+        // sample.  On the x86 reference sample the real count is **2**
+        // (`0x401810`, `0x4017d0`), so a budget of 4 will happily swallow the
+        // real entry point.
+        //
+        // That is not hypothetical: with the FTMGuard re-arm fixed, the run
+        // proceeded 0x401810 -> 0x4017d0 -> **0x401450**, and 0x401450 *is* the
+        // OEP.  It was logged as "TLS callback 3/4", skipped, and the run then
+        // sat in the shell's thread loop forever.
+        //
+        // The x86 TLS-callback signature is the callback's argument pair:
+        // `(hInstance & 0xFFF) == 0 && fdwReason <= 3`.  `handle_tls_callbacks`
+        // already validates exactly this on x86 (see `oep::handle_tls_callbacks`);
+        // the guard's own TLS branch never did, which is why the guess could
+        // misfire here.
+        //
+        // When the signature does not match, this is not a callback — fall
+        // through to branch 6 and let the caller treat it as the OEP.
+        #[cfg(target_arch = "x86")]
+        let looks_like_tls_callback = {
+            let mut ok = false;
+            if let Ok(ctx) = debugger.get_thread_context_control(thread_id) {
+                let sp = mida_core::ctx_sp(&ctx);
+                let mut args = [0u8; 12];
+                if debugger.read_memory(sp + 4, &mut args).is_ok() {
+                    let hinst = u32::from_le_bytes([args[0], args[1], args[2], args[3]]);
+                    let reason = u32::from_le_bytes([args[4], args[5], args[6], args[7]]);
+                    ok = (hinst & 0xFFF) == 0 && reason <= 3;
+                    if !ok {
+                        info!(
+                            hinst = format_args!("{hinst:#x}"),
+                            reason,
+                            "TLS budget not exhausted but the argument signature does not \
+                             match a callback — treating this hit as the OEP instead"
+                        );
+                    }
+                }
+            }
+            ok
+        };
+        #[cfg(target_arch = "x86_64")]
+        let looks_like_tls_callback = true;
+
+        if looks_like_tls_callback {
         state.tls_counter += 1;
         info!(
             "TLS callback {}/{} at {:#x}",
             state.tls_counter, state.tls_total, exception_address
         );
-
         // Compute Themida section bounds.  Fall back to full image bounds if
         // no Themida section was identified.
         let (tm_start, tm_end) = match state.pe_info.themida_section {
@@ -301,10 +383,69 @@ pub fn process_guarded_access(
         state.guard_end = tm_end;
         state.ftm_guard = true;
 
+        // ---- Plant an `int3` at the callback's return site --------------------
+        //
+        // The whole FTMGuard mechanism depends on *something* faulting after the
+        // callback finishes, because branch 1 — the only path that re-arms
+        // `.text` as PAGE_NOACCESS — runs on that fault.  The design assumes the
+        // callback returns into the Themida section and that the
+        // `PAGE_READWRITE` protection set just above makes that return
+        // non-executable.
+        //
+        // **That assumption is false whenever DEP is not enforced for the
+        // image.**  Measured on the x86 reference sample:
+        //
+        //   `x86_c.exe`              DllCharacteristics = 0x0000 (NX_COMPAT clear)
+        //   unpacked `x86_sample.exe` DllCharacteristics = 0x0140 (NX_COMPAT set)
+        //
+        // A 32-bit image that omits NX_COMPAT opts out of DEP, so
+        // `PAGE_READWRITE` stays executable and the return into `.themida`
+        // simply runs.  Measured consequence over a 40 s run: `.text` pinned at
+        // `PAGE_EXECUTE_READWRITE` (0x40), `.themida` at `PAGE_READWRITE` (0x4),
+        // **zero** further access violations, and the real EP never executed.
+        //
+        // So the re-arm trigger must not depend on the page protection doing
+        // something the OS has been told not to do.  `int3` at the return
+        // address is DEP-independent: it always raises `EXCEPTION_BREAKPOINT`
+        // when the callback returns, which the debug loop turns into the same
+        // "re-arm `.text`" transition branch 1 would have performed.
+        //
+        // This is additive: if the return *does* fault first (DEP enforced), the
+        // breakpoint is simply never reached and branch 1 handles it as before.
+        #[cfg(target_arch = "x86")]
+        {
+            if let Ok(ctx) = debugger.get_thread_context_control(thread_id) {
+                let sp = mida_core::ctx_sp(&ctx);
+                let mut ret_bytes = [0u8; 4];
+                if debugger.read_memory(sp, &mut ret_bytes).is_ok() {
+                    let ret = u32::from_le_bytes(ret_bytes) as usize;
+                    // Only inside the Themida section: that is where the shell's
+                    // own code lives, and the return address we measured
+                    // (0x9ae2b6) sits there.  A return into `.text` would be the
+                    // OEP itself and must not be patched.
+                    if ret >= tm_start && ret < tm_end {
+                        let mut orig = [0u8; 1];
+                        if debugger.read_memory(ret, &mut orig).is_ok() {
+                            if debugger.write_memory(ret, &[0xCC]).is_ok() {
+                                state.tm_return_int3 = Some((ret, orig[0]));
+                                info!(
+                                    ret = format_args!("{ret:#x}"),
+                                    orig = format_args!("{:#x}", orig[0]),
+                                    "FTMGuard: planted int3 at the TLS callback return site \
+                                     (re-arm trigger that does not depend on DEP)"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Tell the debug loop we've handled this access (no OEP yet, just TLS).
         return Ok(GuardAccessResult::TlsCallback {
             address: exception_address,
         });
+        } // end: looks_like_tls_callback
     }
 
     // -- Branch 5: FTraceMSVCOEP -------------------------------------------------
@@ -342,6 +483,84 @@ pub fn process_guarded_access(
     Ok(GuardAccessResult::PossibleOEP {
         address: exception_address,
     })
+}
+
+/// Handle the `int3` planted at the TLS callback's return site.
+///
+/// Returns `true` when `address` was our planted breakpoint and it has been
+/// consumed — the caller should then restore the original byte, re-arm the
+/// `.text` guard as `PAGE_NOACCESS`, and continue.
+///
+/// This is the DEP-independent replacement for the FTMGuard re-arm fault.  See
+/// the long comment in [`process_guarded_access`] branch 4 for the measurement
+/// that forced it.
+pub fn consume_tm_return_int3(
+    debugger: &mut dyn DebuggerCore,
+    h_process: HANDLE,
+    state: &mut ThemidaState,
+    address: usize,
+    thread_id: u32,
+    text_section_start: usize,
+    text_section_end: usize,
+    protection: u32,
+) -> Result<bool, ThemidaError> {
+    let Some((site, orig)) = state.tm_return_int3 else {
+        return Ok(false);
+    };
+    if site != address {
+        return Ok(false);
+    }
+
+    // Put the original byte back: the shell's own code resumes from here and
+    // would hit the breakpoint again forever otherwise.
+    debugger
+        .write_memory(site, &[orig])
+        .map_err(|e| ThemidaError::Debugger(format!("restore byte at {site:#x}: {e}")))?;
+    state.tm_return_int3 = None;
+
+    // **Rewind `Eip` to the patched site.**
+    //
+    // A breakpoint exception leaves `Eip` pointing at the byte *after* the
+    // `int3`.  Resuming there would skip the shell's first real instruction at
+    // `site` — measured: the original byte at the return site was `0x9c`
+    // (`pushfd`), and skipping it sent the shell off into `0x77f70c30` where it
+    // executed non-executable memory and stormed 1024 times.  Rewinding is the
+    // standard `int3` dance and is what makes the resume faithful.
+    let mut ctx = debugger
+        .get_thread_context_control(thread_id)
+        .map_err(|e| ThemidaError::Debugger(format!("get_thread_context_control for int3 rewind: {e}")))?;
+    mida_core::set_ctx_ip(&mut ctx, site);
+    debugger
+        .set_thread_context(thread_id, &ctx)
+        .map_err(|e| ThemidaError::Debugger(format!("set_thread_context for int3 rewind: {e}")))?;
+
+    // Re-arm `.text` exactly as branch 1 would have.
+    let text_size = text_section_end.saturating_sub(text_section_start);
+    let mut old_protect = PAGE_PROTECTION_FLAGS::default();
+    // SAFETY: h_process is valid; the range is the target's committed .text.
+    unsafe {
+        VirtualProtectEx(
+            h_process,
+            text_section_start as *const std::ffi::c_void,
+            text_size,
+            page_protect(protection),
+            &mut old_protect,
+        )
+    }
+    .map_err(|e| ThemidaError::Debugger(format!("VirtualProtectEx int3 re-arm: {e}")))?;
+
+    state.ftm_guard = false;
+    state.guard_stepping = false;
+
+    info!(
+        site = format_args!("{site:#x}"),
+        text = format_args!("{text_section_start:#x}"),
+        protection = format_args!("{protection:#x}"),
+        thread_id,
+        "FTMGuard: callback returned — restored the patched byte and re-armed the .text guard"
+    );
+
+    Ok(true)
 }
 
 /// Re-apply the code-section guard after a single-step completes.

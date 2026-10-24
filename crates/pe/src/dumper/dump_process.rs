@@ -376,6 +376,11 @@ pub fn dump_process(
 
     // DEBUG: Verify section 1 characteristics
     debug_section_chars(&out_data, "Before fix_hardcoded_addresses");
+    info!(
+        "out_data before fix_hardcoded_addresses: len={:#x} first8={:02X?}",
+        out_data.len(),
+        &out_data[..out_data.len().min(8)]
+    );
 
     // Fix hardcoded runtime addresses
     crate::postprocess::fix_hardcoded_addresses(&mut out_data, Some(opts.image_base), is_64bit)?;

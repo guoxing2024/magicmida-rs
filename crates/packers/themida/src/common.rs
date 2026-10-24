@@ -1,4 +1,4 @@
-﻿//! Common state carried through the Themida unpacking process.
+//! Common state carried through the Themida unpacking process.
 
 use std::collections::HashSet;
 use crate::init::ThemidaPeInfo;
@@ -52,6 +52,16 @@ pub struct ThemidaState {
     /// Timeout: if total writes exceed this without reaching unique threshold,
     /// force IAT ready (VM may be stuck in a loop).
     pub iat_timeout_threshold: u64,
+    /// A planted `int3` standing in for the FTMGuard re-arm fault.
+    ///
+    /// `Some((address, original_byte))` while armed.  See
+    /// [`crate::guard::process_guarded_access`] branch 4: the TLS-callback
+    /// branch leaves `.text` executable and expects the callback's return into
+    /// the Themida section to fault, which is what re-arms `.text`.  When DEP is
+    /// not enforced for the image that fault never arrives, so the return site
+    /// is patched with `int3` instead — a deterministic, DEP-independent trigger
+    /// for the same transition.
+    pub tm_return_int3: Option<(usize, u8)>,
 }
 
 impl ThemidaState {
@@ -90,6 +100,7 @@ impl ThemidaState {
             // Timeout: if we see 1000 writes but still haven't reached the unique
             // threshold, the VM is likely stuck in a loop. Force ready.
             iat_timeout_threshold: 1_000,
+            tm_return_int3: None,
         }
     }
 }

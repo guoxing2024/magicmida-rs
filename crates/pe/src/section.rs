@@ -13,6 +13,7 @@
 
 use crate::header::{ImageSectionHeader, PeHeader, PeSection};
 use crate::utils::align_up;
+use tracing::debug;
 
 // Section characteristics constants
 const IMAGE_SCN_MEM_READ: u32 = 0x40000000;
@@ -74,9 +75,54 @@ impl PeHeader {
     /// Create a new section and return the index of the new section.
     pub fn create_section_index(&mut self, name: &str, virtual_size: u32) -> usize {
         let prev = &self.sections[self.sections.len() - 1];
+        debug!(
+            new_name = name,
+            prev_name = %prev.name,
+            prev_va = format_args!("{:#x}", prev.virtual_address),
+            prev_vs = format_args!("{:#x}", prev.virtual_size),
+            "create_section_index: previous section"
+        );
 
         let mut virtual_address = prev.virtual_address + prev.virtual_size;
         self.section_align(&mut virtual_address);
+
+        // The loader requires section virtual addresses to be contiguous: a gap
+        // between one section's aligned end and the next section's start makes
+        // `CreateProcess` fail with `ERROR_BAD_EXE_FORMAT` (193), even when the
+        // file is otherwise perfectly well formed.
+        //
+        // Measured on the x86 reference sample: the product passed every
+        // `pefile` structural check, yet the loader refused it.  Bisecting the
+        // header showed the rejection is caused by the hole alone — moving
+        // `.import` down to close it makes the same bytes load, and injecting a
+        // hole into the *working* control sample makes *that* fail with 193.
+        //
+        // Deriving the new VA from `prev.virtual_address + prev.virtual_size` is
+        // not enough: `.reloc` already carried an inflated `virtual_size`
+        // (0x2000 instead of its real 0xac) by the time we got here, so the sum
+        // overshot.  The authoritative end of the mapped image is `SizeOfImage`,
+        // which every earlier phase maintains.  Place the new section there, and
+        // never above `prev`'s own aligned end.
+        let sa = self.nt_headers.optional_header.section_alignment.max(1);
+        let prev_aligned_end = align_up(prev.virtual_address + prev.virtual_size, sa);
+        let size_of_image = self.nt_headers.optional_header.size_of_image;
+
+        // Contiguity means the new VA must be exactly the end of what precedes
+        // it, so `prev_aligned_end` is the answer.  `SizeOfImage` is only used to
+        // explain the mismatch in the log.
+        let contiguous = prev_aligned_end;
+
+        if virtual_address != contiguous {
+            debug!(
+                name,
+                computed = format_args!("{virtual_address:#x}"),
+                prev_end = format_args!("{contiguous:#x}"),
+                size_of_image = format_args!("{size_of_image:#x}"),
+                prev_name = %prev.name,
+                "section VA would leave a gap — snapping to the previous section's aligned end"
+            );
+            virtual_address = contiguous;
+        }
 
         let mut raw_size = virtual_size;
         self.file_align(&mut raw_size);
@@ -554,3 +600,4 @@ mod tests {
         assert_eq!(sect.name, "wow");
     }
 }
+

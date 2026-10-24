@@ -44,7 +44,7 @@ pub use binaries::{expected_hook_hash, expected_injector_hash, verify_sha256};
 pub use common::ThemidaState;
 pub use error::ThemidaError;
 pub use guard::{
-    install_code_section_guard, install_iat_guard, process_guarded_access, remove_code_section_guard, restore_code_section_guard,
+    consume_tm_return_int3, install_code_section_guard, install_iat_guard, process_guarded_access, remove_code_section_guard, restore_code_section_guard,
     GuardAccessResult,
 };
 pub use iat::{

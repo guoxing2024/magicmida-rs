@@ -37,6 +37,34 @@ pub(crate) fn write_output_file(
     // 6a. Synthetic DOS header
     out_data.extend_from_slice(&create_dos_header());
 
+    // The DOS header must survive everything that follows.  A section whose
+    // `PointerToRawData` is 0 (or below the header) would otherwise write its
+    // bytes over `MZ` — measured on the x86 reference sample, the first section
+    // carried `pointer_to_raw_data = 0` after the dump-stage shrink compacted
+    // the layout, and the resulting buffer began `BF 90 01 00` instead of
+    // `4D 5A`.  `fix_hardcoded_addresses` then failed with
+    // `Invalid DOS signature` and the whole unpack aborted.
+    //
+    // Clamping every section's raw pointer to at least the end of the headers
+    // is what keeps the file loadable.  `write_section_data` also guards this,
+    // but doing it here fixes the value in the serialised section table too, so
+    // the file on disk is self-consistent rather than merely non-crashing.
+    let min_raw_ptr = 0x80usize + 4 + 20 + 224 + 16 * 8 + pe.sections.len() * 40;
+    for section in &mut pe.sections {
+        if section.header.size_of_raw_data > 0
+            && (section.header.pointer_to_raw_data as usize) < min_raw_ptr
+        {
+            debug!(
+                name = %section.name,
+                was = %format!("{:#x}", section.header.pointer_to_raw_data),
+                now = %format!("{min_raw_ptr:#x}"),
+                "section raw pointer overlapped the headers — clamped"
+            );
+            section.header.pointer_to_raw_data = min_raw_ptr as u32;
+            section.raw_offset = min_raw_ptr as u32;
+        }
+    }
+
     // 6b. Update header fields
     pe.nt_headers.file_header.number_of_sections = pe.sections.len() as u16;
     pe.nt_headers.optional_header.address_of_entry_point = opts.entry_point;
@@ -71,15 +99,19 @@ pub(crate) fn write_output_file(
 
     // 6d. Manually re-write the data directories
     rewrite_data_directories(&mut out_data, pe, pe_offset, is_64bit);
+    check_dos(&out_data, "after rewrite_data_directories");
 
     // 6e. Write each section's data
     write_section_data(&mut out_data, pe, dump_buf);
+    check_dos(&out_data, "after write_section_data");
 
     // 6f. Write Hint/Name RVAs to the IAT location
     write_iat_to_output(&mut out_data, pe, _import_builder, import_thunks, original_iat_rva, is_64bit);
+    check_dos(&out_data, "after write_iat_to_output");
 
     // 6g. Fill additional IAT locations
     fill_additional_iat_locations(&mut out_data, pe, opts, import_thunks, is_64bit);
+    check_dos(&out_data, "after fill_additional_iat_locations");
 
     // Final sanity check
     let final_chars_offset = pe_offset + 22;
@@ -92,6 +124,15 @@ pub(crate) fn write_output_file(
 }
 
 /// Debug output for serialize_headers.
+fn check_dos(out_data: &[u8], stage: &str) {
+    let mz = out_data.len() >= 2 && out_data[0] == 0x4D && out_data[1] == 0x5A;
+    let head: Vec<u8> = out_data.iter().take(8).copied().collect();
+    if mz {
+        debug!(stage, head = ?head, "DOS header intact");
+    } else {
+        warn!(stage, head = ?head, "DOS header CLOBBERED at this stage");
+    }
+}
 fn debug_serialize_output(header_data: &[u8]) {
     let sec1_offset_in_header = 0x108 + 40;
     let chars_offset_in_header = sec1_offset_in_header + 36;

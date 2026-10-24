@@ -780,6 +780,37 @@ pub fn unpack(
             DebugEvent::Breakpoint { thread_id, address } => {
                 debug!(addr = %format!("{address:#x}"), "Breakpoint hit");
 
+                // ---- FTMGuard re-arm trigger --------------------------------
+                //
+                // The TLS-callback branch plants an `int3` at the callback's
+                // return site because the FTMGuard re-arm depends on that return
+                // faulting, and it does not fault when DEP is not enforced for
+                // the image (measured on `x86_c.exe`, which omits NX_COMPAT:
+                // `.text` stayed PAGE_EXECUTE_READWRITE and the real EP ran
+                // unguarded).  Consuming the breakpoint re-arms `.text` exactly
+                // as the fault path would have.
+                {
+                    let ts_start = image_base_usize
+                        .wrapping_add(state.pe_info.pe_sections[0].virtual_address as usize);
+                    let ts_end = image_base_usize + state.pe_info.base_of_data as usize;
+                    if mida_packers_themida::consume_tm_return_int3(
+                        &mut dbg,
+                        h_process,
+                        &mut state,
+                        address as usize,
+                        thread_id,
+                        ts_start,
+                        ts_end,
+                        guard_protection,
+                    )? {
+                        ls.guard_installed = true;
+                        // The breakpoint byte is gone, so no RF juggling is
+                        // needed: the shell's own instruction resumes normally.
+                        dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+                        continue;
+                    }
+                }
+
                 // .NET target special: if this is the _CorExeMain HW BP
                 // (slot 3), dump raw memory and exit the debug loop.
                 if is_dotnet {
