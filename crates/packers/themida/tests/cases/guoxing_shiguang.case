@@ -54,7 +54,30 @@ expect_output_size: 1539072
 # Re-recorded after the `.pdata` fix (previously 406440c9…): the exception table
 # is no longer zero-filled, so the product bytes necessarily changed.  Verified
 # 3/3 identical, and the product still launches to its `授权验证` window.
-expect_output_sha256: 9779e632d878fb9276c577d53a7d6c4372309c930512c1a0378957a3c2feae97
+#
+# Re-recorded a third time, 2026-10-24, for the `.text` fidelity fix.  The dump
+# used to grant `IMAGE_SCN_MEM_WRITE` to the first section unconditionally, so
+# the product claimed `.text` was writable (`0xe0000020`) while the reference
+# declares read-execute (`0x60000020`).  That is the packer's layout, not the
+# program's, and integrity / anti-cheat checks key on it.
+#
+# Measured *before* touching any code: hand-patching the write bit off both x64
+# products changes exactly **one byte each** and behaviour is unchanged — this
+# EXE still reaches `授权验证`, the DLL still reports `LOADED=1 VERSION=1.1
+# WINDOW_CLASS=PigToGoLicenseDialog RUN_THREAD_ALIVE=1`.  So the bit was never
+# load-bearing and the golden was allowed to move.
+#
+# The new value reproduces 2/2 independent runs, and is byte-identical to the
+# hand-patched product — which is the proof that the delta is exactly that bit
+# and nothing else.
+expect_output_sha256: af092f96970874b32012fc12a0102cc2a78f7bc440c35c0f766f398df09b9fdd
+
+# Characteristics the product's first section must declare.
+#
+# The reference binary declares `0x60000020` (read + execute + code) — measured
+# directly off `时光一键宏.exe` with pefile, not copied from the product.  The
+# old product's `0xe0000020` was the packer signature.
+expect_first_section_characteristics: 0x60000020
 
 # The licence dialog the product shows once it is really running.
 #

@@ -67,6 +67,13 @@ struct DllCase {
     expect_output_size: u64,
     /// `none` disables the byte-level check; this case records a real hash.
     expect_output_sha256: String,
+    /// Characteristics the product's first section must declare.  See the same
+    /// field in `e2e_gate.rs`: the dump used to grant `MEM_WRITE`
+    /// unconditionally, so the product claimed a writable `.text`
+    /// (`0xe0000020`) where the reference declares read-execute
+    /// (`0x60000020`).  Hand-patching the bit off changes one byte and
+    /// behaviour is identical, so it was never load-bearing.
+    expect_first_section_characteristics: u32,
     expect_version: String,
     expect_window_class: String,
     expect_window_title: String,
@@ -85,9 +92,16 @@ fn load_manifest(path: &Path) -> DllCase {
             .unwrap_or_else(|| panic!("manifest {} is missing key `{key}`", path.display()))
     };
     let num = |key: &str| -> usize {
-        get(key)
-            .parse()
-            .unwrap_or_else(|e| panic!("manifest key `{key}` is not a number: {e}"))
+        let raw = get(key);
+        // Accept `0x` hex as well as decimal: the manifest records section
+        // characteristics, and writing `60000020` in decimal would be
+        // unreadable next to the reference's `0x60000020`.
+        let parsed = if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+            usize::from_str_radix(hex, 16)
+        } else {
+            raw.parse()
+        };
+        parsed.unwrap_or_else(|e| panic!("manifest key `{key}` is not a number: {e}"))
     };
 
     DllCase {
@@ -101,6 +115,7 @@ fn load_manifest(path: &Path) -> DllCase {
         expect_iat_slots_min: num("expect_iat_slots_min"),
         expect_output_size: num("expect_output_size") as u64,
         expect_output_sha256: get("expect_output_sha256").to_lowercase(),
+        expect_first_section_characteristics: num("expect_first_section_characteristics") as u32,
         expect_version: get("expect_version"),
         expect_window_class: get("expect_window_class"),
         expect_window_title: get("expect_window_title"),
@@ -313,6 +328,18 @@ fn e2e_dll_case_matches_golden_record() {
         pe.entry_point, 0,
         "[{}] product has a null entry point",
         case.case_id
+    );
+
+    // The first section must declare what the original declares — a writable
+    // `.text` describes the packer's layout, not the program's.
+    assert_eq!(
+        pe.sections[0].characteristics,
+        case.expect_first_section_characteristics,
+        "[{}] first section characteristics are {:#010x}, expected {:#010x} — \
+         a writable `.text` is the packer signature, not the original layout",
+        case.case_id,
+        pe.sections[0].characteristics,
+        case.expect_first_section_characteristics
     );
 
     const IMAGE_DIRECTORY_ENTRY_IMPORT: usize = 1;
@@ -598,5 +625,13 @@ fn manifest_is_present_and_well_formed() {
         64,
         "core_dll is byte-reproducible now; record its SHA-256, or investigate \
          why the product became nondeterministic again"
+    );
+    // The fidelity assertion must encode the *reference's* flags.  `0xe0000020`
+    // is what a packer leaves behind; accepting it as the goal would make the
+    // gate assert the defect it exists to catch.
+    assert_eq!(
+        case.expect_first_section_characteristics, 0x6000_0020,
+        "the reference declares read-execute `.text`; a writable-text \
+         expectation would encode the packer signature as the goal"
     );
 }

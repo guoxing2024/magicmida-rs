@@ -88,7 +88,26 @@ expect_iat_slots_min: 1700
 
 # --- product ---------------------------------------------------------------
 expect_output_size: 1737216
-expect_output_sha256: 1fce505e9eff7fec642e2c860869231186edb30926bd6c0bf2d098098384ce2f
+#
+# Re-recorded 2026-10-24 for the `.text` fidelity fix (previously `1fce505e…`).
+# The dump used to grant `IMAGE_SCN_MEM_WRITE` to the first section
+# unconditionally, so the product claimed `.text` was writable (`0xe0000020`)
+# while the reference declares read-execute (`0x60000020`).
+#
+# Measured before the code change: hand-patching the write bit off the product
+# changes exactly **one byte**, and `dll_gate_harness.exe` still reports
+# `LOADED=1 VERSION=1.1 WINDOW_FOUND=1 WINDOW_CLASS=PigToGoLicenseDialog
+# WINDOW_TITLE=授权验证 RUN_THREAD_ALIVE=1`.  So the bit was never load-bearing.
+#
+# The new value reproduces 2/2 independent runs and is byte-identical to the
+# hand-patched product.
+expect_output_sha256: 97b9f20f61b53b5481ed3ba7d82db1abecc51e7ebe5f62fe80eb946889aa9f67
+
+# Characteristics the product's first section must declare.
+#
+# The reference DLL declares `0x60000020` (read + execute + code) — measured off
+# `OUT\core.dll` with pefile.  The old `0xe0000020` was the packer signature.
+expect_first_section_characteristics: 0x60000020
 
 # --- behaviour (the real acceptance criteria for this case) ----------------
 # What `GetAppVersion()` must answer.  "0.0" is the product's own lazy-init

@@ -63,6 +63,18 @@ struct CaseManifest {
     /// Expected output SHA-256.  May be empty when the case is known to be
     /// non-reproducible; the gate then only checks structure.
     expect_output_sha256: String,
+    /// Characteristics the product's **first** section must declare.
+    ///
+    /// This is a fidelity assertion, not a cosmetic one.  The dump used to grant
+    /// `IMAGE_SCN_MEM_WRITE` to the first section unconditionally, so the
+    /// product claimed `.text` was writable (`0xe0000020`) while the reference
+    /// declares read-execute (`0x60000020`).  A writable `.text` is the
+    /// signature packers leave behind, and anti-cheat / integrity checks look
+    /// for exactly that — a dump is supposed to describe the original layout.
+    ///
+    /// The bit was never load-bearing: hand-patching the product to
+    /// `0x60000020` changes one byte and behaviour is identical.
+    expect_first_section_characteristics: u32,
     /// Title of the licence dialog the product shows once it is really running.
     ///
     /// Optional: when empty the gate falls back to plain liveness.  When set, it
@@ -90,9 +102,16 @@ fn load_manifest(path: &Path) -> CaseManifest {
             .unwrap_or_else(|| panic!("manifest {} is missing key `{key}`", path.display()))
     };
     let num = |key: &str| -> usize {
-        get(key)
-            .parse()
-            .unwrap_or_else(|e| panic!("manifest key `{key}` is not a number: {e}"))
+        let raw = get(key);
+        // Accept `0x` hex as well as decimal: the manifest records section
+        // characteristics, and writing `60000020` in decimal would be
+        // unreadable next to the reference's `0x60000020`.
+        let parsed = if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+            usize::from_str_radix(hex, 16)
+        } else {
+            raw.parse()
+        };
+        parsed.unwrap_or_else(|e| panic!("manifest key `{key}` is not a number: {e}"))
     };
     // Optional key: absent means "not declared", not "malformed".
     let opt = |key: &str| -> Option<String> {
@@ -115,6 +134,7 @@ fn load_manifest(path: &Path) -> CaseManifest {
     let expect_iat_slots_min = num("expect_iat_slots_min");
     let expect_output_size = num("expect_output_size") as u64;
     let expect_output_sha256 = get("expect_output_sha256").to_lowercase();
+    let expect_first_section_characteristics = num("expect_first_section_characteristics") as u32;
     let expect_window_title = opt("expect_window_title").unwrap_or_default();
 
     CaseManifest {
@@ -130,6 +150,7 @@ fn load_manifest(path: &Path) -> CaseManifest {
         expect_iat_slots_min,
         expect_output_size,
         expect_output_sha256,
+        expect_first_section_characteristics,
         expect_window_title,
     }
 }
@@ -581,6 +602,19 @@ fn e2e_reference_case_matches_golden_record() {
     assert!(pe.is_64bit, "[{}] product is not PE32+", case.case_id);
     assert_ne!(pe.entry_point, 0, "[{}] product has a null entry point", case.case_id);
 
+    // The first section must declare what the original declares.  A dump that
+    // claims `.text` is writable is describing the packer's layout, not the
+    // program's, and integrity checks key on exactly that bit.
+    assert_eq!(
+        pe.sections[0].characteristics,
+        case.expect_first_section_characteristics,
+        "[{}] first section characteristics are {:#010x}, expected {:#010x} — \
+         a writable `.text` is the packer signature, not the original layout",
+        case.case_id,
+        pe.sections[0].characteristics,
+        case.expect_first_section_characteristics
+    );
+
     // Every section must lie inside the declared image.
     let image_size = pe.size_of_image();
     for s in &pe.sections {
@@ -814,6 +848,14 @@ fn manifest_is_present_and_well_formed() {
         "the EXE case must declare the licence dialog title, otherwise the GUI \
          check degrades to liveness and the external-dependency false alarm \
          comes back"
+    );
+    // The fidelity assertion must encode the *reference's* flags, not the old
+    // product's.  `0xe0000020` is what a packer leaves behind; accepting it as
+    // the goal would make the gate assert the defect it exists to catch.
+    assert_eq!(
+        case.expect_first_section_characteristics, 0x6000_0020,
+        "the reference declares read-execute `.text`; a writable-text \
+         expectation would encode the packer signature as the goal"
     );
 }
 

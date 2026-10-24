@@ -375,24 +375,25 @@ impl PeHeader {
     /// contents (`idata`, which holds a live API cache) are handled by their own
     /// writers either way.
     ///
-    /// **The first section is not granted `IMAGE_SCN_MEM_WRITE` on 32-bit
-    /// targets.**  The comment below says it is needed "in case `.text` and
-    /// `.data` were merged", but granting it to a section that is *not* merged
-    /// makes the dump claim `.text` is writable when the original is
-    /// read-execute (`0x60000020` vs the product's `0xe0000020`).  A dump is
-    /// supposed to describe the original layout, and a writable `.text` is
-    /// exactly the signature packers leave behind — anti-cheat and integrity
-    /// checks look for it.
+    /// **The first section is granted `IMAGE_SCN_MEM_WRITE` only when it
+    /// declares itself a merged text+data blob** (code *and* initialised data).
+    /// The comment below says the bit is needed "in case `.text` and `.data`
+    /// were merged", but granting it to a section that is *not* merged makes the
+    /// dump claim `.text` is writable when the original is read-execute
+    /// (`0x60000020` vs the old product's `0xe0000020`).  A dump is supposed to
+    /// describe the original layout, and a writable `.text` is exactly the
+    /// signature packers leave behind — anti-cheat and integrity checks look for
+    /// it.
     ///
-    /// Measured that the bit is not load-bearing for the x86 product: forcing
-    /// its `.text` back to `0x60000020` by hand still starts it (window at
-    /// 16 ms, no crash), so suppressing it costs nothing.
-    ///
-    /// The x64 side keeps the historical behaviour for the same reason as above:
-    /// the recorded x64 goldens carry `0xe0000020`, both products behave
-    /// identically either way, and changing it would move two byte-reproducible
-    /// golden records for a cosmetic gain.  That fidelity gap is deliberate and
-    /// documented here rather than silently fixed.
+    /// All four protected inputs declare a plain read-execute first section
+    /// (`0x60000020`), so on all four this bit is now absent.  Measured that it
+    /// is not load-bearing anywhere: hand-patching either x64 product to
+    /// `0x60000020` changes exactly **one byte** and behaviour is identical
+    /// (`dll_gate_harness.exe`: `VERSION=1.1`, `PigToGoLicenseDialog`,
+    /// `RUN_THREAD_ALIVE=1`; EXE still reaches `授权验证`), and the x86 product
+    /// starts 16 ms after the same hand-patch.  The two x64 golden records were
+    /// therefore re-recorded rather than preserved, which is what closed the
+    /// last known fidelity gap on the x64 side.
     pub fn sanitize(&mut self) {
         // `is_64bit` is the *target's* architecture, which is what decides how
         // the loader will treat this image — not the host's.
@@ -421,13 +422,23 @@ impl PeHeader {
             // "Merged" is decided by what the section *declares*, not by
             // whether we feel like granting the bit: a section is treated as a
             // merged text+data blob only when it is code **and** carries
-            // initialised data.  The four protected inputs all declare a plain
+            // initialised data.  All four protected inputs declare a plain
             // read-execute first section (`0x60000020`, no `CNT_INITIALIZED_DATA`),
-            // so none of them is merged.
-            let is_merged_text_data = zero_bss
-                && first.header.characteristics & IMAGE_SCN_CNT_CODE != 0
+            // so none of them is merged and none of them gets the bit.
+            //
+            // This is architecture-independent on purpose.  The rule used to be
+            // "grant on 64-bit, decide on 32-bit", which was only ever a way to
+            // keep the two x64 golden records from moving.  Measured that the
+            // bit is not load-bearing on x64 either: hand-patching both products
+            // to `0x60000020` changes exactly one byte each, and behaviour is
+            // unchanged — `dll_gate_harness.exe` still reports
+            // `LOADED=1 VERSION=1.1 WINDOW_CLASS=PigToGoLicenseDialog
+            // RUN_THREAD_ALIVE=1` for the DLL, and the EXE still reaches its
+            // `授权验证` dialog.  So the x64 side now declares what the original
+            // declares, and both goldens were re-recorded.
+            let is_merged_text_data = first.header.characteristics & IMAGE_SCN_CNT_CODE != 0
                 && first.header.characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA != 0;
-            if is_merged_text_data || !zero_bss {
+            if is_merged_text_data {
                 first.header.characteristics |= IMAGE_SCN_MEM_WRITE;
                 first.update_from_header();
             }
@@ -630,57 +641,67 @@ mod tests {
             assert_eq!(s.header.pointer_to_raw_data, s.header.virtual_address);
             assert_eq!(s.header.size_of_raw_data, s.header.virtual_size);
         }
-        // The fixture is PE32+, so the historical behaviour applies: the first
-        // section gets write access.  The 32-bit branch is covered separately
-        // below, where the difference actually matters.
-        assert_ne!(
+        // The fixture's first section is plain read-execute, so it is not a
+        // merged text+data blob and must not be granted write access — on
+        // either architecture.  Measured that the bit is not load-bearing:
+        // hand-patching both x64 products to `0x60000020` changes one byte each
+        // and behaviour is unchanged.
+        assert_eq!(
             pe.sections[0].characteristics & IMAGE_SCN_MEM_WRITE,
             0,
-            "PE32+ keeps the historical write grant on the first section"
+            "an unmerged read-execute first section must not be granted \
+             MEM_WRITE, on PE32+ either — the reference declares 0x60000020"
         );
     }
 
-    /// A 32-bit target's unmerged read-execute `.text` must stay read-execute.
+    /// An unmerged read-execute `.text` must stay read-execute on either target.
     ///
     /// Measured defect: the x86 product's first section came out `0xe0000020`
     /// while the reference is `0x60000020`.  Forcing the product back to the
     /// read-execute value by hand still starts it (window at 16 ms), so the bit
     /// was never load-bearing — it was inherited from a blanket rule that only
-    /// made sense for a merged text+data section.
+    /// made sense for a merged text+data section.  The same hand-patch on both
+    /// x64 products changed exactly one byte each and behaviour was identical,
+    /// so the rule is now architecture-independent.
     #[test]
-    fn sanitize_does_not_mark_x86_text_writable() {
-        let mut pe = make_test_pe();
-        pe.is_64bit = false; // the fixture parses as PE32+, but the rule follows the target
+    fn sanitize_does_not_mark_unmerged_text_writable() {
+        for is_64bit in [false, true] {
+            let mut pe = make_test_pe();
+            pe.is_64bit = is_64bit; // the fixture parses as PE32+, but the rule follows the target
 
-        pe.sanitize();
+            pe.sanitize();
 
-        assert_eq!(
-            pe.sections[0].characteristics & IMAGE_SCN_MEM_WRITE,
-            0,
-            "an unmerged read-execute .text must not be granted MEM_WRITE on a \
-             32-bit target — the reference declares 0x60000020"
-        );
+            assert_eq!(
+                pe.sections[0].characteristics & IMAGE_SCN_MEM_WRITE,
+                0,
+                "an unmerged read-execute .text must not be granted MEM_WRITE \
+                 (is_64bit={is_64bit}) — the reference declares 0x60000020"
+            );
+        }
     }
 
-    /// A genuinely merged text+data first section still gets write access.
+    /// A genuinely merged text+data first section still gets write access —
+    /// on **both** architectures, since the rule no longer depends on the target.
     ///
-    /// This is the branch the original Pascal rule existed for.  Pinning both
-    /// branches keeps the fix from turning into "never grant it".
+    /// This is the branch the original Pascal rule existed for.  Pinning it
+    /// keeps the fix from turning into "never grant it".
     #[test]
     fn sanitize_grants_write_to_a_merged_text_data_section() {
-        let mut pe = make_test_pe();
-        pe.is_64bit = false;
-        pe.sections[0].header.characteristics |= IMAGE_SCN_CNT_INITIALIZED_DATA;
-        pe.sections[0].characteristics |= IMAGE_SCN_CNT_INITIALIZED_DATA;
+        for is_64bit in [false, true] {
+            let mut pe = make_test_pe();
+            pe.is_64bit = is_64bit;
+            pe.sections[0].header.characteristics |= IMAGE_SCN_CNT_INITIALIZED_DATA;
+            pe.sections[0].characteristics |= IMAGE_SCN_CNT_INITIALIZED_DATA;
 
-        pe.sanitize();
+            pe.sanitize();
 
-        assert_ne!(
-            pe.sections[0].characteristics & IMAGE_SCN_MEM_WRITE,
-            0,
-            "a first section that declares both code and initialised data is a \
-             merged blob and needs write access"
-        );
+            assert_ne!(
+                pe.sections[0].characteristics & IMAGE_SCN_MEM_WRITE,
+                0,
+                "a first section that declares both code and initialised data is \
+                 a merged blob and needs write access (is_64bit={is_64bit})"
+            );
+        }
     }
 
     /// `.bss` must keep `SizeOfRawData = 0` after sanitize — on a 32-bit target.
