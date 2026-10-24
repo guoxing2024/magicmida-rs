@@ -55,9 +55,11 @@ pub(crate) const THREAD_HIDE_FROM_DEBUGGER: u32 = 0x11; // = 17 decimal
 pub(crate) const STATUS_SUCCESS: u32 = 0x0000_0000;
 
 /// Syscall number for `NtQueryInformationProcess` on x86 (used by the
-/// `KiFastSystemCall` hook).
+/// `KiFastSystemCall` hook).  Pinned by `nt_qip_syscall_fallback_is_sensible`,
+/// which is itself x86-only — hence the `allow(dead_code)`.
 #[cfg(target_arch = "x86")]
-pub(crate) const NtQIP_SYSCALL_NUMBER: u32 = 0x16;
+#[allow(dead_code)]
+pub(crate) const NT_QIP_SYSCALL_NUMBER: u32 = 0x16;
 
 /// Pointer size in the target — matches the *compile target*, not the host.
 #[cfg(target_arch = "x86")]

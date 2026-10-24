@@ -234,8 +234,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Some((s, sz)) = text {
                                 let _ = protect(h, s, sz, PAGE_EXECUTE_READ.0);
                             }
-                            armed = false;
-                            status = DBG_CONTINUE;
                             break;
                         }
 

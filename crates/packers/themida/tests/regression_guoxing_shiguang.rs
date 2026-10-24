@@ -22,9 +22,14 @@
 //! — every byte comes from the measured values recorded here.
 
 use mida_packers_themida::{
-    check_virtualized_oep, classify_iat_slot, compute_themida_section_bounds_inline,
-    detect_version, is_themida_section, IatSlotDecision, ThemidaVersion,
+    check_virtualized_oep, compute_themida_section_bounds_inline,
+    detect_version, is_themida_section, ThemidaVersion,
 };
+// The slot classifier's "plausible API range" is derived from the *host*
+// architecture, so the fixtures that use it are `#[cfg(target_pointer_width =
+// "64")]`.  Importing it unconditionally would leave it unused on an i686 host.
+#[cfg(target_pointer_width = "64")]
+use mida_packers_themida::{classify_iat_slot, IatSlotDecision};
 use mida_pe::PeHeader;
 
 // ---------------------------------------------------------------------------

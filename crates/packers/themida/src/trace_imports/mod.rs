@@ -25,9 +25,6 @@ mod slot;
 pub use decision::{
     classify_iat_slot, trace_is_at_api, IatSlotDecision, TraceStepDecision,
 };
-// is_real_api_address is only used internally by tests but keep it accessible.
-#[cfg(test)]
-pub(crate) use decision::is_real_api_address;
 
 use mida_core::debugger::{DebugEvent, DebuggerCore};
 use mida_core::LogMsgType;

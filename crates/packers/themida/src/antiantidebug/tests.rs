@@ -41,5 +41,5 @@ fn constants_are_correct() {
 #[test]
 #[cfg(target_arch = "x86")]
 fn nt_qip_syscall_fallback_is_sensible() {
-    assert_eq!(NtQIP_SYSCALL_NUMBER, 0x16);
+    assert_eq!(NT_QIP_SYSCALL_NUMBER, 0x16);
 }

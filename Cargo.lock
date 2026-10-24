@@ -1589,7 +1589,7 @@ dependencies = [
 
 [[package]]
 name = "mida-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "mida-core",
@@ -1602,7 +1602,7 @@ dependencies = [
 
 [[package]]
 name = "mida-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pelite",
  "thiserror 1.0.69",
@@ -1612,7 +1612,7 @@ dependencies = [
 
 [[package]]
 name = "mida-disasm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "iced-x86",
  "thiserror 1.0.69",
@@ -1621,7 +1621,7 @@ dependencies = [
 
 [[package]]
 name = "mida-gui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "eframe",
  "mida-pe",
@@ -1632,7 +1632,7 @@ dependencies = [
 
 [[package]]
 name = "mida-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "mida-pe",
@@ -1645,7 +1645,7 @@ dependencies = [
 
 [[package]]
 name = "mida-packers-themida"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "iced-x86",
  "mida-core",
@@ -1659,7 +1659,7 @@ dependencies = [
 
 [[package]]
 name = "mida-pe"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "iced-x86",
  "mida-core",
@@ -1672,7 +1672,7 @@ dependencies = [
 
 [[package]]
 name = "mida-run"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "miniz_oxide"

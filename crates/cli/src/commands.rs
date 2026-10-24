@@ -24,5 +24,20 @@ pub fn run_command(cmd: Command) -> Result<(), anyhow::Error> {
             unpacked,
             reference,
         } => crate::unpacker::verify_unpacked(&unpacked, &reference),
+        Command::Version => {
+            println!("mida-cli {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Command::Help => {
+            println!("Magicmida-RS {}", env!("CARGO_PKG_VERSION"));
+            println!("Themida automatic unpacker.");
+            println!();
+            println!("Usage:");
+            println!("  mida-cli /unpack <filename> [--data-sections] [--shrink] [-v]");
+            println!("  mida-cli /dump-process <pid> <unpacked-file>");
+            println!("  mida-cli /verify <unpacked-file> <reference-file>");
+            println!("  mida-cli /version | /help");
+            Ok(())
+        }
     }
 }

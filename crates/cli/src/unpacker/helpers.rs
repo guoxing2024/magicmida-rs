@@ -282,7 +282,6 @@ pub(super) fn detect_packed_dll(
 struct RemoteSection {
     name: [u8; 8],
     virtual_address: u32,
-    virtual_size: u32,
 }
 
 /// Parse the section table of the PE mapped at `base` in the debuggee.
@@ -320,7 +319,6 @@ fn read_remote_sections(dbg: &ProcessSession, base: usize) -> Option<Vec<RemoteS
         name.copy_from_slice(&sh[0..8]);
         out.push(RemoteSection {
             name,
-            virtual_size: u32::from_le_bytes(sh[8..12].try_into().ok()?),
             virtual_address: u32::from_le_bytes(sh[12..16].try_into().ok()?),
         });
     }

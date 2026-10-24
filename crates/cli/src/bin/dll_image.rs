@@ -153,7 +153,7 @@ fn import_dll_names(path: &str) -> Option<Vec<String>> {
     }
 
     // Map the import directory's RVA to a file offset via the section table.
-    let mut file = std::fs::read(path).ok()?;
+    let file = std::fs::read(path).ok()?;
     let off = pe
         .sections
         .iter()

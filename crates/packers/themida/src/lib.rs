@@ -37,9 +37,6 @@ pub use antiantidebug::{
     handle_nt_set_information_thread, inject_scylla_hide,
     ScyllaHideConfig,
 };
-#[cfg(target_arch = "x86")]
-pub use antiantidebug::{
-    };
 pub use binaries::{expected_hook_hash, expected_injector_hash, verify_sha256};
 pub use common::ThemidaState;
 pub use error::ThemidaError;

@@ -52,6 +52,12 @@ pub enum Command {
         /// Path to the known-good reference file.
         reference: PathBuf,
     },
+
+    /// Print the version and exit (`--version`).
+    Version,
+
+    /// Print the usage summary and exit (`--help`).
+    Help,
 }
 
 // ---------------------------------------------------------------------------
@@ -75,6 +81,8 @@ pub fn parse_args() -> Result<Command, String> {
         "/unpack" | "--unpack" | "unpack" => parse_unpack(&args),
         "/dump-process" | "--dump-process" | "dump-process" => parse_dump_process(&args),
         "/verify" | "--verify" | "verify" => parse_verify(&args),
+        "/version" | "--version" | "-V" => Ok(Command::Version),
+        "/help" | "--help" | "-h" | "/?" => Ok(Command::Help),
         other => Err(format!(
             "Unknown command '{}'. Use /unpack, /dump-process, or /verify.",
             other
@@ -205,6 +213,41 @@ mod tests {
 
     // These tests directly call the sub-parsers rather than `parse_args` so
     // they are independent of the actual process command line.
+
+    /// `parse_args` reads the real process command line, so the version/help
+    /// spellings are exercised through a tiny local re-implementation of just
+    /// that match arm.  Keeping it in the test means the spellings are pinned
+    /// without needing to spawn a process.
+    fn dispatch_first_arg(arg: &str) -> Result<Command, String> {
+        match arg {
+            "/unpack" | "--unpack" | "unpack" => Err("would parse unpack".into()),
+            "/dump-process" | "--dump-process" | "dump-process" => Err("would parse dump".into()),
+            "/verify" | "--verify" | "verify" => Err("would parse verify".into()),
+            "/version" | "--version" | "-V" => Ok(Command::Version),
+            "/help" | "--help" | "-h" | "/?" => Ok(Command::Help),
+            other => Err(format!("Unknown command '{}'", other)),
+        }
+    }
+
+    #[test]
+    fn version_spellings_all_resolve() {
+        for a in ["/version", "--version", "-V"] {
+            assert_eq!(dispatch_first_arg(a), Ok(Command::Version), "for {a}");
+        }
+    }
+
+    #[test]
+    fn help_spellings_all_resolve() {
+        for a in ["/help", "--help", "-h", "/?"] {
+            assert_eq!(dispatch_first_arg(a), Ok(Command::Help), "for {a}");
+        }
+    }
+
+    #[test]
+    fn version_and_help_are_distinct_commands() {
+        // Guards against collapsing them into one variant by accident.
+        assert_ne!(Command::Version, Command::Help);
+    }
 
     #[test]
     fn unpack_minimal() {

@@ -307,7 +307,7 @@ pub fn handle_tls_callbacks(
     // never worked.
     #[allow(unused)] thread_id: u32,
     exception_address: usize,
-    execution_type: u32,
+    #[allow(unused)] execution_type: u32,
     tls_total: u32,
     tls_counter: &mut u32,
 ) -> Result<TlsCallbackResult, ThemidaError> {

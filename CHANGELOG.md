@@ -5,9 +5,217 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] — 2026-10-25
+
+First tagged release.  Everything below was measured on the dev machine; where
+something is unverified it says so.
+
 
 ### Fixed
+- **x86 pipeline now runs end to end** (`packers::themida`, `core`).  The x86
+  target compiled but had never produced an unpacked binary.  Four independent
+  defects were located by measurement:
+  1. *The OEP guard assumed DEP.*  Branch 4 relaxed `.text` to
+     `PAGE_EXECUTE_READWRITE` and relied on a fault when a TLS callback returned
+     into the Themida section — but `x86_c.exe` does not set `NX_COMPAT`
+     (`DllCharacteristics = 0x0000`), so DEP is off for that image and the
+     return simply executed.  Measured: 40 s with zero further access
+     violations and the real EP never reached.  Fix: plant `int3` on the callback
+     return address, which fires regardless of DEP; consume it by rewinding
+     `Eip`, because otherwise the shell's first instruction (`pushfd`) is
+     skipped and the target storms.
+  2. *TLS-callback detection never worked on PE32.*  Three stacked defects:
+     `tls_dir.size < 40` hardcoded the **64-bit** `IMAGE_TLS_DIRECTORY` size
+     (PE32's is 24, so every 32-bit target returned 0); `AddressOfCallBacks` was
+     read at `+0x18` instead of `+0x0C`; and the callback count divided a VA by
+     an RVA.  The callback array is also encrypted on disk in both reference
+     samples, so it can only be read from live memory — a bounded guess of 4 is
+     used, and the guard now validates the callback parameter signature
+     (`(hInstance & 0xFFF) == 0 && fdwReason <= 3`) so a real OEP is not
+     swallowed as a callback.
+  3. *`find_iat_ref_from_address` had no cycle detection.*  Recursing into
+     `call rel32` targets with neither a depth limit nor a visited set overflowed
+     the main thread's stack on x86 `.text` (which is mutually recursive).
+  4. *`.reloc` reservation left a hole in the virtual layout.*  `create_reloc_section`
+     reserved `0x2000` and declared it as `virtual_size`; when
+     `build_relocation_table` later shrank it to the real length the following
+     sections were not moved, so their VAs were no longer contiguous.  **The
+     loader rejects any image with a VA gap**: measured
+     `ERROR_BAD_EXE_FORMAT (193)`, while the same product passed every `pefile`
+     structural check — and injecting a gap into a known-working control sample
+     failed with the same 193.  The reservation stays `0x2000` (it determines
+     where `.import` lands and therefore `SizeOfImage`, so shrinking it would
+     move the x64 golden); `build_relocation_table` now grows `.reloc`'s
+     `virtual_size` up to the next section's VA instead.
+- **`.bss` raw-size rule was an x64 regression** (`pe::section`).  Making
+  `SizeOfRawData = 0` for uninitialised sections is correct on x86 (with captured
+  bytes the product loads and resolves its imports but **never creates a
+  window**; zeroing them makes the window appear in 16 ms) and wrong on x64
+  **DLL**, where it discards the globals the shell had finished writing
+  (`GetAppVersion()` returned `"0.0"` instead of `"1.1"`).  The same rule has
+  opposite conclusions per architecture, so it is now gated on the *target*
+  architecture (`PeHeader::is_64bit`).  This went unnoticed because the binary
+  used for that round's verification predated the commit that introduced the
+  rule.
+- **The first section's flags were wrong on x64** (`pe::section`).  The code
+  granted `MEM_WRITE` unconditionally to 64-bit targets and only conditionally to
+  32-bit ones — an arch split kept solely so the two x64 goldens would not move,
+  not a measured requirement.  All four protected inputs declare `0x60000020`,
+  so none of them should receive the bit.  Before changing it the bit was proved
+  not load-bearing: hand-patching one byte in each x64 product left behaviour
+  identical (DLL still `VERSION=1.1` / `PigToGoLicenseDialog` /
+  `RUN_THREAD_ALIVE=1`; EXE still reached `授权验证`).  The rule is now
+  uniform — a section gets `MEM_WRITE` only if it declares code *and*
+  initialised data.  Products changed by exactly one byte and both goldens were
+  re-recorded.
+- **`ERROR_SEM_TIMEOUT` was unreachable** (`core::windows_debugger`).  The code
+  compared the whole HRESULT against `121`:
+  `HRESULT_FROM_WIN32(121) = 0x80070079`, so `CoreError::Timeout` never fired and
+  every idle tick became a hard error.  Now a single
+  `windows_debugger::is_sem_timeout(hresult)` (`& 0xFFFF == 121`), and
+  `CoreError::Windows` stores the low 16 bits.  Four unit tests guard it,
+  including `assert_ne!(hresult, 121)` to pin the original bug.
+- **The `Real OEP not found` false alarm is now `debug!`** (`oep`).  It is one
+  attempt among several and the caller retries successfully; it nevertheless
+  printed four yellow lines on every successful EXE run, and the claim itself was
+  false.  Measured count after the change: 0.
+- **`.pdata` was emitted as zeros** (`postprocess`).  Both products carried a
+  50 KB exception table whose non-zero byte count was **0** — not a harmless
+  warning, because the dispatcher treats it as a `RUNTIME_FUNCTION` array.  The
+  root cause is ordering: `shrink_sections()` compacted the header before the
+  live image was read, and the table lives in `.winlice`, which was already
+  excluded from the buffer.  Live memory held real data (DLL 4198 entries, EXE
+  4011).  The table is now read *before* shrinking and filtered against the
+  product's own section table; if nothing survives, no `.pdata` is emitted at
+  all, because an all-zero table is worse than none.
+- **A non-UTF-8 line killed the whole MCP server** (`mcp`).  MCP's stdio
+  transport is UTF-8, but on Windows the client is often a PowerShell script
+  whose `StandardInputEncoding` defaults to the console code page (GB2312 here).
+  A `triage` call carrying `D:\Projects\shiguang\时光一键宏.exe` arrived as GBK
+  bytes, `BufRead::read_line` returned `InvalidData`, and `?` in `main` ended the
+  process — the client saw a dead pipe with no diagnostic.  Reading is now
+  byte-oriented (`read_until(b'\n')`) with a `decode_line()` that tries UTF-8,
+  falls back to the ANSI code page, then to lossy: no byte sequence can end the
+  session.  Five unit tests pin it.
+- **The MCP server announced a protocol version no SDK recognises** (`mcp`).
+  It replied to every `initialize` with a hardcoded `"2026-07-28"` — a string
+  that was assumed, never measured.  The SDK bundled with the client lists
+  `["2025-11-25","2025-06-18","2025-03-26","2024-11-05","2024-10-07"]`, so the
+  real client rejected the handshake and the tools never appeared, while the
+  server itself was fine.  All three harnesses asserted the invented version, so
+  they agreed with each other and were all wrong.  `initialize` now negotiates.
+  A unit test pins `SUPPORTED_PROTOCOL_VERSIONS` against the real SDK list.
+- **`JobHandle::snapshot()` deadlocked itself** (`mcp`).  It re-locked the same
+  `std::sync::Mutex` by calling `self.report()` while holding `state`; the first
+  run therefore hung the server permanently (measured: `unpack_status` never
+  returned, the client timed out at 150 s).  The lock is now released before the
+  JSON is built.
+- **The MCP server only knew about one CLI** (`mcp`).  An x86 target produced
+  `File is for the wrong architecture (Machine=IMAGE_FILE_MACHINE(332))` — a
+  correct diagnosis through the wrong pipe.  It now reads the target's own PE
+  header and selects `mida-cli.exe` or `mida-cli-x86.exe`, reporting a precise
+  error when the x86 CLI is absent.
+- **ScyllaHide injection deadlocked the debug loop** (`core`,
+  `packers::themida`).  `inject_scylla_hide` waited for the injector to exit.
+  The injector hijacks the target's main thread, and a debuggee holding an
+  unacknowledged debug event has **all** its threads frozen until the debugger
+  calls `ContinueDebugEvent` — so waiting inside the `CREATE_PROCESS` handler
+  deadlocks.  Measured with a probe: target running → injector exits in 47 ms;
+  target `CREATE_SUSPENDED` → still running after 15 s; resume-then-spawn →
+  47 ms again.  The function now spawns and returns immediately.
+- **The EXE gate blamed the dump for an external dependency** (`test`).  "Still
+  alive after 20 s" conflated "the product reached its GUI" with "the product
+  needed the network".  Measured on one machine: the original packed sample
+  showed `程序启动` ("cannot fetch program module, check your network") and was
+  alive at 20 s, while the byte-identical-to-golden product showed **zero**
+  top-level windows and exited after 198 ms — neither reached `授权验证`.  The
+  gate now runs the original packed sample as a control: control reaches the
+  window + product does → pass; control reaches + product does not → dump-side
+  defect; control does not → the check is not exercised on this machine, which
+  is reported loudly and still requires the product not to crash.
+- **The DLL golden hash was wrong twice** (`test`).  First: the old record
+  corresponded to a product whose `.bss` held **1** non-zero byte; `.bss` is
+  where the shell parks initialised globals, so 1 byte means "dumped before the
+  shell finished" and 81 means "it finished".  The 11 extra qwords are in-image
+  pointers, deliberately kept and then rebased by `fix_hardcoded_addresses`.
+  Second: the `.text` fidelity fix above.  Both new values are deterministic;
+  the old ones were the error.
+- **IAT head location regressed on the DLL line** (`resolved` 289 → 14,
+  `packers::themida`).  Five independent defects: a bare RVA was treated as
+  "unknown, keep walking" when it is in fact a boundary (both samples have one
+  immediately before the table head); the walk result was discarded twice (once
+  by `select_primary_block` falling back to the largest block, once by
+  `combined_start` re-adding the padding); the merge conditions conflict between
+  the two samples and are only separable by *how far the walk travelled*, not by
+  gap width; the read window was one-sided, leaving zero forward space when
+  `iat_ref` sat in the last slot; and the table head was never trimmed of its
+  leading padding.
+- **Stale live pointers were dumped into the file** (`dump_process`).  Pointer-
+  width qwords in writable, non-executable sections that hold this process's
+  live addresses and lie outside the image are now cleared (EXE 21, DLL 28).
+  Filtering by the relocation table is impossible — the packed input's table is
+  empty (`size = 0x10`) and the real one is only built later.
+- **TLS template length made the whole-file hash non-reproducible** (`dumper`).
+  Themida updates `IMAGE_TLS_DIRECTORY.EndRawData` lazily; ten runs of one
+  binary produced `StartRawData+0x8` and `StartRawData+0x8008` interchangeably.
+  `normalize_tls_directory()` now clamps it to the template length declared by
+  the protected input, and only ever shrinks.  10/10 runs now match.
+- **Module snapshot order leaked into the output** (`dumper::remote_modules`).
+  `TH32CS_SNAPMODULE` returns loader order, which varies because the OS resolves
+  some dependencies asynchronously.  Sorted by module base now.
+- **IAT trace aborted early on fragmented v3 IATs** (`trace_imports`).  The
+  trash counter treated already-resolved API addresses as garbage and stopped at
+  slot 142 of 1063; ~900 slots kept VM trampolines and the dump crashed with
+  `0xC0000005`.  Slot classification is now a pure function
+  (`classify_iat_slot` / `IatSlotDecision`).  On the reference sample: 50 → 186
+  resolved imports, 8 → 9 modules, the product launches.
+- **Eight / three / fifty-five IAT slots were mis-reported as failures**
+  (`trace_imports`).  They hold bare RVAs into read-only data, exactly what the
+  real Windows loader sees.  A new `IatSlotDecision::NotAnImport` classifies them
+  separately so that a genuine failure cannot hide inside "data"; the EXE's
+  product bytes were unchanged by the reclassification.
+- **Loader host polluted the user's sample directory** (`core`).  It is now
+  written under `%TEMP%\magicmida-hosts\`, and "cannot delete yet" is a
+  `debug!` rather than a `WARN`, because the host is a cache.  Passing a relative
+  DLL path broke after the move — `CreateProcess` sets the child's CWD to the
+  host directory — so the DLL argument is canonicalised first.
+- **`major_linker_version == 2` was treated as "no CRT pattern"**
+  (`cli::unpacker::av_handler`).  MinGW/GCC reports `MajorLinkerVersion = 2`
+  (measured: i686-w64-mingw32-gcc 16.2.0 → 2.47) and its CRT has the same
+  `call rel32; jmp rel32` shape, so that line made **every MinGW target** skip
+  OEP pattern matching.
+- **The AV storm watchdog was silently disabled** (`cli::unpacker::av_handler`).
+  The counter was reset unconditionally on every guard fault, including faults
+  that are not in the guarded page at all — the shell dereferencing a null
+  pointer (`0x538866` reading `0x5`, 156,000 times, log grown to 1.6 GB).  Reset
+  now happens only when the fault target lies inside the guarded `.text`, and the
+  run fails in 4 s with `Target is stuck: 1024 consecutive identical access
+  violations`.  Eight unit tests guard the semantics.
+- **`DBG_CONTINUE` was the wrong status for first-chance exceptions**
+  (`core::windows_debugger`).  Unmodelled exceptions were returned as errors,
+  which killed runs that the program's own SEH would have handled — and Themida
+  uses exactly that (`STATUS_PRIVILEGED_INSTRUCTION`, `0xC0000096`) as an
+  anti-debug probe.  They are now `DebugEvent::UnhandledException`, and the
+  continue status must be `DBG_EXCEPTION_NOT_HANDLED`, not `DBG_CONTINUE`
+  (the latter resumes at the faulting instruction and re-raises forever).
+- **A sparse IAT write could land in the PE header** (`unpacker`).
+  `section_rva_to_file_offset` fell back to `rva as usize` for out-of-section
+  RVAs, so a thunk the trace could not locate wrote `BF 90 01 00` at file
+  offset 0 and overwrote `MZ`; the dump then failed with
+  `Invalid DOS signature`.  It is now skipped and reported.
+- **Two shrink counters read like a contradiction** (`postprocess`,
+  `dumper::header_patch`).  One counts sections dropped from the in-memory model,
+  the other from the live header; they were never meant to match but both said
+  "Shrink complete".  They are labelled by stage now.
+- **GUI console flashes, window sizing** (`gui`).  Four sources of a black CMD
+  box were fixed (debuggee `CREATE_NEW_CONSOLE` → `CREATE_NO_WINDOW`, the gcc
+  invocation, ScyllaHide's injector, and the GUI's own subsystem).  The window
+  now fits the screen on the first frame using `DWMWA_EXTENDED_FRAME_BOUNDS`
+  (measured 1076×699 natural size on a 1600×900 screen with an 852-high work
+  area).
+- **x86 ScyllaHide hashes were all-zero placeholders** (`binaries`), which
+  `verify_sha256` rejects by design.  Real hashes are filled in.
+
 - **Non-reproducible output: TLS template length** (`dumper`).  Themida updates
   `IMAGE_TLS_DIRECTORY.EndRawData` lazily during startup, so a live-memory dump
   can capture an intermediate value.  On the reference v3 x64 target, ten
@@ -57,6 +265,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hardcoded local paths) (N1).
 
 ### Changed
+- **Zero compiler warnings on both architectures.**  Starting from 16 (x64) the
+  cleanup removed the dead stub-EXE path, arch-gated the `*_AMD64` imports that
+  only exist on 64-bit hosts, dropped an empty `#[cfg(x86)] pub use` block,
+  removed an unread struct field, and renamed `NtQIP_SYSCALL_NUMBER` to
+  `NT_QIP_SYSCALL_NUMBER`.  `cargo build --release --workspace` is now silent for
+  both `x86_64-pc-windows-gnu` and `i686-pc-windows-gnu`.
+- **README rewritten to match measurement.**  The previous text contradicted
+  itself: it claimed the DLL product returned `"1.1"` in one section and `"0.0"`
+  in another, described x86 as "builds, never run" with "no x86 sample", and
+  said "only the EXE row has an automated gate" when three gates were green.
+- **Version 0.2.0.**  First tagged release.
+
 - **Removed the duplicate in-loop IAT trace engine** (`cli::unpacker::iat_trace`,
   558 lines).  Two engines resolved IAT slots in the same process: the
   production one in `packers/themida/trace_imports` (post-loop, 186 resolved)
@@ -89,12 +309,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (14,902,098 B → 101,049 B).
 
 ### Removed
+- **The dead `DLL → stub EXE` code path** (`core::process`).  Replacing a packed
+  DLL's headers and appending an entry-point shim was abandoned when the real
+  loader host was introduced; the shim bypassed `DLL_PROCESS_ATTACH` sequencing
+  and the shell died at `.winlice+0x33E22E`.  Removed: `make_dll_executable`
+  (276 lines), the x86/x64 stub byte arrays and their patch offsets,
+  `STUB_EXE_SUFFIX`, `PeInfo::has_force_integrity`, and the two
+  `DllCharacteristics` helpers that only served it.  `cleanup_stub_exe` stays —
+  it still sweeps the loader-host cache.
 - Removed `CLAUDE.md` (internal development guide) from the public repository
   and added it to `.gitignore` (P1-5).
 - Removed the dead free function `session::get_thread_context_control`; every
   call site goes through the `DebuggerCore` trait method of the same name.
+- Removed the duplicate in-loop IAT trace engine (`cli::unpacker::iat_trace`,
+  558 lines).  Two engines resolved IAT slots in the same process: the
+  production one in `packers/themida/trace_imports` (post-loop, 186 resolved)
+  and a second in-loop copy that resolved 0 of 46, discarded its own result, and
+  polluted the target's memory.  Deleting it left the product byte-identical.
+- Removed three dead dependencies and the `mida-tracer` crate (`LogMsgType`
+  moved down into `core`): 6 crates → 5.
 
 ### Added
+- **MCP server** (`mida-mcp.exe`, `crates/mcp`).  Five tools —
+  `triage`, `unpack_start`, `unpack_status`, `unpack_cancel`, `verify` — so an
+  AI client can drive the pipeline.  The job model exists because unpacking is
+  not a 60-second operation: measured x86 success 5.5 s, x64 success ~27 s, x64
+  failure path 466 s, and the debug loop's `wait_event()` has no timeout at all.
+  A single blocking tool would be cut off by the client on exactly the failure
+  path where its diagnostics matter.  `unpack_status` long-polls for at most
+  45 s, deliberately below the client's 60 s.
+- **`mida-run` crate** (`crates/run`).  The GUI's log parsing and job state were
+  lifted out so the GUI and the MCP server share one definition of "success".
+  `RunReport` requires all three of: exit code 0, a `Done.` line, and no fatal
+  error.
+- **GUI** (`mida-gui.exe`, `crates/gui`).  Graphical front-end over the same
+  pipeline.
+- **Fifth end-to-end gate: x86** (`tests/x86_e2e_gate.rs`,
+  `tests/cases/x86_sample.case`).  Asserts **both** byte reproducibility
+  (4/4 runs → `cf176ac9…`, 110,592 B) and behaviour (window `MidaX86Sample` /
+  `验证 x86 样本` in ~24 ms).  Unlike the EXE gate it needs no control sample:
+  the x86 sample is a local program with no remote dependency.
+- **`.text` first-section-characteristics assertion** in both x64 gates
+  (`expect_first_section_characteristics: 0x60000020`), plus a manifest
+  self-test that pins "do not write `0xe0000020` here" — treating the packer's
+  own signature as the target is exactly what the assertion exists to prevent.
+- **Documentation**: `docs/RUNBOOK.md` (toolchain setup, test order, gates,
+  building x86 samples) and `docs/POSTMORTEMS.md` (every fixed defect with the
+  measurement that located it).
+
 - **End-to-end acceptance gate** (`crates/packers/themida/tests/e2e_gate.rs`).
   Until now no test ran the pipeline over a real protected binary, so the
   headline numbers of the only successful case were protected by prose alone.

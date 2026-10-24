@@ -15,13 +15,17 @@ use windows::Win32::Foundation::{
 use windows::Win32::System::Diagnostics::Debug::{
     ContinueDebugEvent, FlushInstructionCache, GetThreadContext, SetThreadContext,
     ReadProcessMemory, WriteProcessMemory, WaitForDebugEvent,
-    CONTEXT, CONTEXT_ALL_AMD64, CONTEXT_FLAGS,
-    CONTEXT_DEBUG_REGISTERS_AMD64, CONTEXT_CONTROL_AMD64, CONTEXT_INTEGER_AMD64,
+    CONTEXT, CONTEXT_FLAGS,
     CREATE_PROCESS_DEBUG_EVENT, CREATE_THREAD_DEBUG_EVENT,
     DEBUG_EVENT as RAW_DEBUG_EVENT, EXCEPTION_DEBUG_EVENT,
     EXIT_PROCESS_DEBUG_EVENT, EXIT_THREAD_DEBUG_EVENT,
     LOAD_DLL_DEBUG_EVENT, UNLOAD_DLL_DEBUG_EVENT,
     OUTPUT_DEBUG_STRING_EVENT, RIP_EVENT,
+};
+#[cfg(target_arch = "x86_64")]
+use windows::Win32::System::Diagnostics::Debug::{
+    CONTEXT_ALL_AMD64, CONTEXT_DEBUG_REGISTERS_AMD64, CONTEXT_CONTROL_AMD64,
+    CONTEXT_INTEGER_AMD64,
 };
 #[cfg(target_arch = "x86")]
 use windows::Win32::System::Diagnostics::Debug::{

@@ -152,7 +152,7 @@ pub fn inject_scylla_hide(pid: u32, config: &ScyllaHideConfig) -> Result<(), The
     //                             Themida VM dispatcher session, and
     //                             WaitForDebugEvent fails with
     //                             `ERROR_PARTIAL_COPY`.
-    let mut child = {
+    let child = {
         use std::os::windows::process::CommandExt;
         // InjectorCLI is a console program and we discard all of its output, so
         // it must not get a console window of its own.  Without this flag every
