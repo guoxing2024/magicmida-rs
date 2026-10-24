@@ -273,11 +273,29 @@ pub(super) fn scan_iat_boundaries(
     // image.  The image's own base is not available here, so the test is the
     // one that separates the two kinds of pointer: a value that is a plausible
     // API *and* not within the image's own address span is out of table.
+    //
+    // **This rule is x64-only.**  On x86 the inference collapses: the image
+    // loads at 0x400000, far below the 0x6000_0000..0x7FFF_0000 window every
+    // DLL occupies, so *every* resolved API counts as "outside the image" —
+    // including every entry of the table itself.  Applying the x64 rule there
+    // walks the head forward straight past the whole table and lands in the
+    // bare-RVA region beyond it.  Measured on the x86 reference sample: the
+    // located IAT moved from the real table at rva 0x714c (56 API slots, the
+    // target of the `FF 15` operand the disassembler found) to rva 0x7570,
+    // where all 54 slots hold bare RVAs and no `.text` operand references that
+    // range at all (0 hits vs 60 into the real table).  The product's import
+    // descriptors were then built from that region, which is why their
+    // FirstThunk slots held `0x7000`-class RVAs instead of Hint/Name RVAs.
+    //
+    // So on x86 only padding trims the head.  The backward walk already stops
+    // at the bare-RVA barrier (measured: rva 0x7144 holds 0x755c), so the head
+    // starts one slot after it and the table stays intact.
     let mut trim = (iat_start.saturating_sub(read_start)) / ptr_size;
     while trim < actual_slots {
         let v = iat_data[trim];
         let is_padding = v == 0;
-        let is_outside_api = is_likely_api_address(v) && !in_image(v);
+        let is_outside_api =
+            cfg!(target_arch = "x86_64") && is_likely_api_address(v) && !in_image(v);
         if !is_padding && !is_outside_api {
             break;
         }
@@ -565,5 +583,63 @@ mod tests {
             54 > MAX_FORWARD_GAP_SLOTS,
             "the EXE's next region must not merge"
         );
+    }
+
+    /// The "already-resolved API prefix" trim rule must apply on x64 only.
+    ///
+    /// x64: the image loads inside the 0x7FFx range, so `!in_image(v)` really
+    /// does separate a prefix slot (a system DLL address just before the table)
+    /// from a table entry.
+    ///
+    /// x86: the image loads at 0x400000, far below the 0x6000_0000 window every
+    /// DLL occupies, so `!in_image(v)` is true for *every* resolved API — that
+    /// is, for the whole table.  Measured on the x86 reference sample, applying
+    /// it walked the head from the real table at rva 0x714c to rva 0x7570,
+    /// which holds only bare RVAs and is referenced by no `.text` operand
+    /// (0 absolute operands vs 60 into the real table).  The product's import
+    /// descriptors were built from that region, which is why their FirstThunk
+    /// slots held `0x7000`-class RVAs instead of Hint/Name RVAs.
+    ///
+    /// NOTE: the fixtures use `#[cfg]` attributes, NOT `if cfg!(..)`.
+    /// `cfg!` is a runtime macro whose branches are BOTH type-checked, so
+    /// `if cfg!(target_arch = "x86_64") { 0x7ff8_c105_4390usize }` fails to
+    /// compile on i686 with "literal out of range for `usize`".  That is the
+    /// exact trap recorded in AGENTS.md, and the first version of this test
+    /// had it and broke the x86 test build.
+    #[test]
+    fn the_outside_api_trim_rule_is_x64_only() {
+        #[cfg(target_arch = "x86_64")]
+        let (api, image_base): (usize, usize) = (0x7ff8_c105_4390, 0x7ff6_0000_0000);
+        #[cfg(target_arch = "x86")]
+        let (api, image_base): (usize, usize) = (0x75df_d770, 0x0040_0000);
+
+        let image_end = image_base + 0x200_0000;
+
+        // The fixture must be outside the image on BOTH architectures, or the
+        // assertion below proves nothing about the trim rule.
+        let outside_image = !(api >= image_base && api < image_end);
+        assert!(
+            outside_image,
+            "the fixture must be outside the image on both architectures"
+        );
+
+        // x64 is where the rule fires; x86 must never consult it.
+        #[cfg(target_arch = "x86_64")]
+        {
+            let is_outside_api = cfg!(target_arch = "x86_64") && outside_image;
+            assert!(
+                is_outside_api,
+                "x64 must treat a system-DLL address as an out-of-table prefix"
+            );
+        }
+        #[cfg(target_arch = "x86")]
+        {
+            let is_outside_api = cfg!(target_arch = "x86_64") && outside_image;
+            assert!(
+                !is_outside_api,
+                "x86 must not trim resolved API addresses — every table entry \
+                 is 'outside the image' there, so the rule would eat the table"
+            );
+        }
     }
 }

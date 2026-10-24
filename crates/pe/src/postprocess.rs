@@ -244,6 +244,116 @@ pub fn pack_section_layout(out_data: &mut Vec<u8>, pe: &PeHeader) -> Result<(), 
     Ok(())
 }
 
+/// Byte ranges belonging to the import table's *metadata*: descriptors, DLL
+/// name strings, function name strings, and the lookup/thunk tables.
+///
+/// **No relocation entry may ever point inside one of these.**  The loader
+/// applies relocations before it resolves imports, so an entry landing on a
+/// name string adds the load delta to ASCII and the lookup then fails with
+/// `STATUS_ENTRYPOINT_NOT_FOUND` (0xC0000139).
+///
+/// This is not hypothetical.  The x86 product emitted a HIGHLOW entry at rva
+/// `0x19344`, which sits inside the name string `"GetMessageA"` at `0x1933a`
+/// and straddles `"geA\0"` = `0x00416567` — a value that genuinely falls inside
+/// the image range `0x400000..0x41b000`, so the range test alone cannot reject
+/// it.  Measured: clearing that one entry turned 0xC0000139 into a successful
+/// load, while every import name resolved under `GetProcAddress` both before and
+/// after (`imp_check`: 54 named imports, 0 failed) — the disagreement between
+/// the two is exactly what a clobbered name string looks like.
+///
+/// x86 is where this bites because an image based at `0x400000` is only 1.7 MB,
+/// so four ASCII bytes of a name are likely to land in range; the x64 goldens
+/// base at `0x140000000` and no name string can reach it (measured: 0 such
+/// entries in both).
+fn import_metadata_ranges(pe: &PeHeader, data: &[u8], is_64bit: bool) -> Vec<(u32, u32)> {
+    const IMAGE_DIRECTORY_ENTRY_IMPORT: usize = 1;
+    let ptr = if is_64bit { 8usize } else { 4 };
+    let dir = pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if dir.virtual_address == 0 {
+        return Vec::new();
+    }
+
+    let u32_at = |o: usize| -> u32 {
+        if o + 4 <= data.len() {
+            u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]])
+        } else {
+            0
+        }
+    };
+    let str_len = |o: usize| -> Option<usize> {
+        let mut n = 0usize;
+        while o + n < data.len() && n < 256 {
+            if data[o + n] == 0 {
+                return Some(n);
+            }
+            n += 1;
+        }
+        None
+    };
+
+    let mut ranges: Vec<(u32, u32)> = Vec::new();
+    let mut cursor = dir.virtual_address;
+    let mut guard = 0usize;
+
+    // Walk descriptors until the null terminator, collecting each descriptor,
+    // its DLL name, and both thunk tables with every function name they cite.
+    loop {
+        guard += 1;
+        if guard > 512 {
+            break;
+        }
+        let Some(off) = pe.rva_to_offset(cursor) else {
+            break;
+        };
+        let off = off as usize;
+        let (oft, name_rva, ft) = (u32_at(off), u32_at(off + 12), u32_at(off + 16));
+        ranges.push((cursor, 20));
+        if name_rva == 0 {
+            break;
+        }
+
+        if let Some(n) = pe.rva_to_offset(name_rva) {
+            if let Some(len) = str_len(n as usize) {
+                ranges.push((name_rva, len as u32 + 1));
+            }
+        }
+
+        for table in [oft, ft] {
+            if table == 0 {
+                continue;
+            }
+            let Some(t0) = pe.rva_to_offset(table) else {
+                continue;
+            };
+            let t0 = t0 as usize;
+            let mut k = 0usize;
+            loop {
+                k += 1;
+                if k > 4096 {
+                    break;
+                }
+                let entry = u32_at(t0 + (k - 1) * ptr);
+                if entry == 0 {
+                    break;
+                }
+                // Only a name entry cites a string; an ordinal has the high bit set.
+                if entry & 0x8000_0000 == 0 {
+                    if let Some(f) = pe.rva_to_offset(entry) {
+                        if let Some(len) = str_len(f as usize + 2) {
+                            ranges.push((entry, len as u32 + 2 + 1));
+                        }
+                    }
+                }
+            }
+            ranges.push((table, (k * ptr) as u32));
+        }
+
+        cursor += 20;
+    }
+
+    ranges
+}
+
 /// Build Base Relocation Table for ASLR support
 ///
 /// Scans non-executable, initialized sections for absolute addresses pointing
@@ -253,6 +363,9 @@ pub fn pack_section_layout(out_data: &mut Vec<u8>, pe: &PeHeader) -> Result<(), 
 /// CRITICAL: Only scans non-executable sections. x64 code uses RIP-relative
 /// addressing, so absolute addresses in .text are instruction operands,
 /// not pointers. Relocating them corrupts instructions → 0xC0000005.
+///
+/// CRITICAL: Also refuses any entry that lands inside the import table's
+/// metadata — see [`import_metadata_ranges`] for why that rule exists.
 pub fn build_relocation_table(
     out_data: &mut Vec<u8>,
     _runtime_image_base: Option<u64>,
@@ -266,9 +379,23 @@ pub fn build_relocation_table(
 
     let mut builder = RelocationTableBuilder::new(image_base, image_size);
 
+    // Anything inside the import table's own metadata must never be relocated:
+    // the loader applies relocations before resolving imports, so an entry on a
+    // name string adds the load delta to ASCII and the lookup dies with
+    // 0xC0000139.  See `import_metadata_ranges` for the measured x86 case.
+    let metadata_ranges = import_metadata_ranges(&pe, out_data, is_64bit);
+    let in_import_metadata = |rva: u32| -> bool {
+        metadata_ranges
+            .iter()
+            .any(|&(start, len)| rva >= start && rva < start.saturating_add(len))
+    };
+
     info!(
-        "Building relocation table: image_base={:#x}, image_size={:#x}",
-        image_base, image_size
+        "Building relocation table: image_base={:#x}, image_size={:#x}, \
+         {} import-metadata ranges protected",
+        image_base,
+        image_size,
+        metadata_ranges.len()
     );
 
     let ptr_size = if is_64bit { 8 } else { 4 };
@@ -332,6 +459,16 @@ pub fn build_relocation_table(
 
             if addr >= image_base && addr < image_end {
                 let entry_rva = section_rva + offset as u32;
+                // Reject entries that would corrupt the import table.  The range
+                // test above is not enough on its own: ASCII in a name string can
+                // land inside a small image's address range.
+                if in_import_metadata(entry_rva) {
+                    debug!(
+                        "Refusing relocation at rva {:#x}: inside import-table metadata",
+                        entry_rva
+                    );
+                    continue;
+                }
                 let reloc_type = if is_64bit { 10 } else { 3 }; // DIR64 or HIGHLOW
                 builder.add_relocation(entry_rva, reloc_type);
                 section_count += 1;
@@ -503,4 +640,190 @@ pub fn build_relocation_table(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod relocation_metadata_tests {
+    use super::*;
+
+    /// Build a minimal 32-bit PE with two sections:
+    ///   `.data`  rva 0x1000, holds a genuine image pointer at rva 0x1000
+    ///   `.import` rva 0x2000, holds one descriptor + names, and — critically —
+    ///             a *function name string* whose ASCII bytes also happen to
+    ///             encode a value inside the image range.
+    ///
+    /// The last part is the whole point: it reproduces the real x86 defect where
+    /// `"geA\0"` inside `"GetMessageA"` read as `0x00416567`, which is inside
+    /// `0x400000..0x41b000`.  A range test alone accepts it; the metadata
+    /// exclusion must reject it.
+    fn make_pe32_with_trap_name() -> Vec<u8> {
+        let mut b = vec![0u8; 0x1000];
+        // DOS header
+        b[0] = b'M';
+        b[1] = b'Z';
+        b[0x3c] = 0x80;
+        // PE signature
+        b[0x80..0x84].copy_from_slice(b"PE\0\0");
+        let coff = 0x84;
+        // Machine = i386
+        b[coff..coff + 2].copy_from_slice(&0x014cu16.to_le_bytes());
+        b[coff + 2..coff + 4].copy_from_slice(&3u16.to_le_bytes()); // 3 sections
+        b[coff + 16..coff + 18].copy_from_slice(&224u16.to_le_bytes()); // SizeOfOptionalHeader
+
+        let opt = coff + 20;
+        b[opt..opt + 2].copy_from_slice(&0x010bu16.to_le_bytes()); // PE32
+        b[opt + 16..opt + 20].copy_from_slice(&0x1000u32.to_le_bytes()); // EP
+        b[opt + 28..opt + 32].copy_from_slice(&0x400000u32.to_le_bytes()); // ImageBase
+        b[opt + 32..opt + 36].copy_from_slice(&0x1000u32.to_le_bytes()); // SectionAlign
+        b[opt + 36..opt + 40].copy_from_slice(&0x200u32.to_le_bytes()); // FileAlign
+        // SizeOfImage must be large enough that the trap dword 0x00416567
+        // (from "geA\0") falls *inside* the image range.  The real x86 product
+        // had SizeOfImage 0x1b000, i.e. range 0x400000..0x41b000, and 0x416567
+        // is inside it.  A smaller SizeOfImage makes the trap harmless and the
+        // test passes even with the fix disabled — verified by mutation.
+        b[opt + 56..opt + 60].copy_from_slice(&0x1b000u32.to_le_bytes()); // SizeOfImage
+        b[opt + 60..opt + 64].copy_from_slice(&0x200u32.to_le_bytes()); // SizeOfHeaders
+
+        let dd = opt + 96;
+        // Import directory -> rva 0x2000
+        b[dd + 8..dd + 12].copy_from_slice(&0x2000u32.to_le_bytes());
+        b[dd + 12..dd + 16].copy_from_slice(&40u32.to_le_bytes());
+
+        let sh = opt + 224;
+        // .data @ rva 0x1000, raw 0x200
+        b[sh..sh + 5].copy_from_slice(b".data");
+        b[sh + 8..sh + 12].copy_from_slice(&0x1000u32.to_le_bytes());
+        b[sh + 12..sh + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+        b[sh + 16..sh + 20].copy_from_slice(&0x1000u32.to_le_bytes());
+        b[sh + 20..sh + 24].copy_from_slice(&0x200u32.to_le_bytes());
+        b[sh + 36..sh + 40].copy_from_slice(&0xC0000040u32.to_le_bytes());
+
+        // .import @ rva 0x2000, raw 0x1200
+        let sh2 = sh + 40;
+        b[sh2..sh2 + 7].copy_from_slice(b".import");
+        b[sh2 + 8..sh2 + 12].copy_from_slice(&0x1000u32.to_le_bytes());
+        b[sh2 + 12..sh2 + 16].copy_from_slice(&0x2000u32.to_le_bytes());
+        b[sh2 + 16..sh2 + 20].copy_from_slice(&0x1000u32.to_le_bytes());
+        b[sh2 + 20..sh2 + 24].copy_from_slice(&0x1200u32.to_le_bytes());
+        b[sh2 + 36..sh2 + 40].copy_from_slice(&0x40000040u32.to_le_bytes());
+
+        // .reloc @ rva 0x3000, raw 0x2200 — `build_relocation_table` writes here.
+        let sh3 = sh2 + 40;
+        b[sh3..sh3 + 6].copy_from_slice(b".reloc");
+        b[sh3 + 8..sh3 + 12].copy_from_slice(&0x1000u32.to_le_bytes());
+        b[sh3 + 12..sh3 + 16].copy_from_slice(&0x3000u32.to_le_bytes());
+        b[sh3 + 16..sh3 + 20].copy_from_slice(&0x1000u32.to_le_bytes());
+        b[sh3 + 20..sh3 + 24].copy_from_slice(&0x2200u32.to_le_bytes());
+        b[sh3 + 36..sh3 + 40].copy_from_slice(&0x42000040u32.to_le_bytes());
+
+        b.resize(0x3200, 0);
+        // genuine pointer in .data
+        b[0x200..0x204].copy_from_slice(&0x400000u32.to_le_bytes());
+        // descriptor at rva 0x2000 -> file 0x1200
+        let d = 0x1200;
+        b[d..d + 4].copy_from_slice(&0x2060u32.to_le_bytes()); // OFT
+        b[d + 12..d + 16].copy_from_slice(&0x2040u32.to_le_bytes()); // Name
+        b[d + 16..d + 20].copy_from_slice(&0x2060u32.to_le_bytes()); // FirstThunk
+        // DLL name "user32.dll" at rva 0x2040
+        b[0x1240..0x124a].copy_from_slice(b"user32.dll");
+        // Lookup table at rva 0x2060: one name entry -> rva 0x2072, then terminator.
+        b[0x1260..0x1264].copy_from_slice(&0x2072u32.to_le_bytes());
+        // Hint/Name entry at rva 0x2072: 2-byte hint, then "GetMessageA" at rva
+        // 0x2074.  Character 8 of that name is 'g', so "geA\0" lands at rva
+        // 0x207c — 4-byte aligned relative to the section start, and therefore
+        // actually visited by the relocation scanner.  The dword there is
+        // 'g','e','A',0 = 0x00416567, inside 0x400000..0x405000, so the range
+        // test alone accepts it.
+        //
+        // This geometry is copied from the real defect: the x86 product had its
+        // Hint/Name entry at rva 0x1933a, the name at 0x1933c (4-aligned), and
+        // "geA\0" at 0x19344 — the rva that got the bogus HIGHLOW entry.
+        //
+        // Alignment matters for the test's power.  A first attempt put the trap
+        // at an unaligned rva; the scanner never looked at it, so the test
+        // passed even with the fix disabled.  Verified by mutation.
+        b[0x1274..0x127f].copy_from_slice(b"GetMessageA");
+        b
+    }
+
+    /// The trap string must really contain an in-image dword, otherwise the test
+    /// proves nothing about the real defect.
+    #[test]
+    fn trap_name_encodes_an_in_image_dword() {
+        let b = make_pe32_with_trap_name();
+        // "geA\0" begins 7 bytes into "GetMessageA"
+        let mut found = None;
+        for i in 0..b.len().saturating_sub(3) {
+            let v = u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+            if v == 0x0041_6567 {
+                found = Some(i);
+            }
+        }
+        assert_eq!(
+            found,
+            Some(0x127c),
+            "the name string must encode 0x00416567, which sits inside \
+             0x400000..0x404000 and therefore survives a pure range test"
+        );
+    }
+
+    #[test]
+    fn relocation_never_lands_inside_import_metadata() {
+        let mut data = make_pe32_with_trap_name();
+        build_relocation_table(&mut data, None, false).expect("relocation build");
+
+        let pe = PeHeader::from_bytes(&data).unwrap();
+        let ranges = import_metadata_ranges(&pe, &data, false);
+        assert!(
+            ranges.iter().any(|&(s, l)| s <= 0x207c && 0x207c < s + l),
+            "the name-string range must be protected: {ranges:#x?}"
+        );
+
+        // Every emitted entry must be outside those ranges.
+        let rva = pe.nt_headers.optional_header.data_directory[5].virtual_address;
+        let size = pe.nt_headers.optional_header.data_directory[5].size;
+        let base = pe.rva_to_offset(rva).unwrap() as usize;
+        let mut off = base;
+        let mut entries = 0;
+        while off < base + size as usize {
+            let page = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+            let bs = u32::from_le_bytes(data[off + 4..off + 8].try_into().unwrap());
+            if bs == 0 {
+                break;
+            }
+            for i in 0..((bs - 8) / 2) as usize {
+                let eo = off + 8 + i * 2;
+                let en = u16::from_le_bytes(data[eo..eo + 2].try_into().unwrap());
+                if en >> 12 == 0 {
+                    continue;
+                }
+                let target = page + u32::from(en & 0xfff);
+                entries += 1;
+                for &(s, l) in &ranges {
+                    assert!(
+                        !(target >= s && target < s + l),
+                        "relocation at rva {target:#x} lands inside import metadata \
+                         {s:#x}+{l:#x} — the loader would corrupt it and then fail \
+                         with 0xC0000139"
+                    );
+                }
+            }
+            off += bs as usize;
+        }
+        assert!(entries >= 1, "the genuine .data pointer should still be relocated");
+    }
+
+    /// The genuine pointer must survive: excluding import metadata must not
+    /// degenerate into excluding everything.
+    #[test]
+    fn genuine_pointer_is_still_relocated() {
+        let mut data = make_pe32_with_trap_name();
+        build_relocation_table(&mut data, None, false).expect("relocation build");
+        let pe = PeHeader::from_bytes(&data).unwrap();
+        let ranges = import_metadata_ranges(&pe, &data, false);
+        assert!(
+            !ranges.iter().any(|&(s, l)| s <= 0x1000 && 0x1000 < s + l),
+            "rva 0x1000 is a real pointer, not import metadata"
+        );
+    }
 }
