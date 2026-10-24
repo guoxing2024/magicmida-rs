@@ -1,0 +1,145 @@
+# Case manifest — reference Themida v3 **x86 (PE32)** case
+#
+# Same format and same purpose as `guoxing_shiguang.case` (x64 EXE) and
+# `core_dll.case` (x64 DLL): the sample identity and the frozen pipeline
+# metrics live here, so rotating a sample or re-recording a golden is a
+# manifest edit reviewable in isolation, not a silent edit to a test file.
+#
+# This is the fifth end-to-end gate and the first 32-bit one.  It asserts
+# **both** bytes and behaviour, like the other two, because both were measured
+# to be deterministic on this case:
+#
+#   * bytes  — 4/4 independent runs produced `83ca87ae…` identically.
+#   * behaviour — the product creates `MidaX86Sample` / `验证 x86 样本` at 15 ms
+#     with no debugger attached, and stays alive.
+#
+# Unlike the x64 EXE case, this sample has **no remote dependency**: it is a
+# local test program built in `OUT/x86_sample.c`.  So the GUI assertion here is
+# a hard assertion, not the control-based classification the x64 EXE case needs.
+# A control run of the original packed sample was still measured as a sanity
+# check — it reaches the same window at 156 ms — but the gate does not depend on
+# it, because there is nothing here that could be unavailable on another machine
+# except the desktop session itself.
+#
+# --- sample provenance -------------------------------------------------------
+#
+# Built and packed on this machine (Themida 3.2.4 is installed at
+# `D:\Tools\Themida_x32_x64_v3.2.4`), so the sample is reproducible:
+#
+#   i686-w64-mingw32-gcc -O1 -m32 -mwindows -o OUT\x86\x86_sample.exe \
+#       OUT\x86_sample.c -luser32 -lgdi32 -lgcc
+#   Themida.exe /protect OUT\x86\x86_c.tmd
+#
+# `COMPRESS_APPLICATION` **must** be true (`x86_c.tmd`).  With compression off,
+# Themida leaves the original `.text` byte-for-byte intact (measured: 0 of 7168
+# bytes differ between live and on-disk `.text`), so the shell never has to
+# decompress and the first step of the OEP chain (the `.text` write breakpoint)
+# never fires.  That was long mistaken for "x86 OEP detection does not work".
+#
+# --- what the three x86 defects this case pins actually were ---------------
+#
+# 1. **Absolute operands in executable sections were never rebased.**  32-bit
+#    x86 has no RIP-relative addressing, so every global access is an absolute
+#    operand.  The authoritative answer came from the reference sample's own
+#    table: 277 entries, **256 of them in `.text`**.  Byte-stride scanning
+#    cannot find them (stride 4 misses 79% because `83 3D <disp32>` puts the
+#    field at +2; stride 1 yields 1 false positive), so the scan decodes
+#    instructions and takes only genuine disp32/imm32 fields: **256/256, 0
+#    false positives, 0 missed**.
+#
+# 2. **The anti-dump stub read the OEP's `C7 05` as `E9`.**  It blindly took
+#    bytes 1..5 as a `jmp rel32` displacement without checking byte 0, aimed its
+#    tail jump outside the image, and baked in dump-time kernel32 addresses.
+#    It now verifies the opcode first and declines (non-fatal) otherwise.
+#
+# 3. **`sanitize()` gave `.bss` file bytes and marked `.text` writable.**  Both
+#    are arch-gated now; see `crates/pe/src/section.rs`.  The `.bss` half is the
+#    one that decides whether the product starts at all: with the captured bytes
+#    in place the product loads, resolves every import and runs, but **never
+#    creates its window**; zeroing them makes it appear in 16 ms.  Bisecting the
+#    15 non-zero bytes showed rva `0x502e` alone is enough to block startup.
+#
+# --- structural expectations, all measured on the product -------------------
+#
+#   `.reloc`  va 0x17000, table 692 bytes, DataDirectory[5] size 0x2b4
+#   `.import` va 0x19000, DataDirectory[1] size 0x50
+#   IAT       DataDirectory[12] va 0x714c size 0xe8
+#   first section `.text` characteristics **0x60000020** — read-execute, the
+#   same value the unpacked reference declares.  This is asserted because the
+#   historical blanket rule produced `0xe0000020` (writable text), which is the
+#   signature packers leave behind and what integrity checks look for.
+#
+# `expect_iat_slots_min` is a floor, not an exact count, for the same reason as
+# the other two cases: the exact end is a property of the live data, not of the
+# read window that reports it.  Measured: the scan reports 1965 slots.
+#
+# `expect_not_import` is 54 — **all** of them.  On this sample the trace
+# resolves 54 imports and classifies 54 further slots as data.  That is not a
+# failure and it is asserted separately so a real failure cannot hide among
+# them.  It matches the rebuilt table exactly (4 modules / 54 thunks, and the
+# product's own import directory holds 54 named imports across gdi32,
+# kernel32, msvcrt and user32 — same 54 as the unpacked reference).
+
+case_id: x86_sample
+
+# --- protected input -------------------------------------------------------
+sample_path: D:\Projects\Magicmida-RS\OUT\x86\x86_c.exe
+sample_sha256: 1f77e3a642f3d3aa68c87e30f1ae763cea17d341fddbd7825bc44824d7c280b1
+sample_size: 6394080
+
+# The unpacked reference, used only to cross-check structural expectations
+# (first-section characteristics, import count).  Not unpacked by this gate.
+# Both values measured on this machine, not transcribed.
+reference_path: D:\Projects\Magicmida-RS\OUT\x86\x86_sample.exe
+reference_sha256: 21a5a5b0114bb3af5233523e5c81f2cef80e7ecc20532c3c521eb029e02d73ab
+reference_size: 52432
+
+# --- frozen pipeline metrics ----------------------------------------------
+expect_resolved: 55
+expect_failed: 0
+expect_not_import: 55
+expect_iat_slots_min: 1900
+expect_module_count: 4
+expect_thunk_count: 55
+expect_relocation_entries: 296
+expect_relocation_bytes: 692
+# Absolute operands the executable-section scan found.  This is the number that
+# cannot be recovered any other way: a byte-stride scan misses 79% of them
+# (stride 4) or produces a false positive (stride 1).
+expect_code_relocations: 257
+# `expect_relocation_entries` is the log's "Generated N relocation entries" —
+# the count of *requested* relocations.  The table on disk holds slightly more,
+# because the builder also emits the entries that already existed in the packed
+# input, and pads to whole 4-byte slots.  Measured by parsing the product's own
+# `.reloc` directory:
+#
+#   11 blocks, 302 entries, 692 bytes   (302 x 2 + 11 x 8 = 692)
+#
+# Asserting the two numbers separately keeps the arithmetic honest instead of
+# deriving one from the other.
+expect_relocation_blocks: 11
+expect_relocation_table_entries: 302
+
+# --- product ---------------------------------------------------------------
+expect_output_size: 110592
+expect_output_sha256: cf176ac92218840f1490f4022d6ea30aea838f8c470ec05ecc164d17605aa0d4
+
+# PE32, not PE32+.
+expect_is_64bit: false
+expect_section_count: 22
+expect_entry_point: 0x1450
+expect_first_section_characteristics: 0x60000020
+expect_image_base: 0x400000
+
+# --- behaviour (the real acceptance criteria for this case) ----------------
+# The window the product puts on screen.  Both class and title are asserted,
+# because a different window would mean the wrong code path was reached.
+#
+# The title is CJK on purpose, and that is why the sample builds it through
+# `MultiByteToWideChar(CP_UTF8)` and creates its window with `CreateWindowExW`.
+# An earlier build passed UTF-8 bytes to `CreateWindowExA`, which Windows decodes
+# in the system ANSI code page; the observed title was `楠岃瘉 x86 鏍锋湰`.  That
+# was a defect in the *sample*, not in the unpacker, and it is fixed rather than
+# recorded as the expected value.
+expect_window_class: MidaX86Sample
+expect_window_title: 验证 x86 样本

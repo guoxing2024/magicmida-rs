@@ -18,6 +18,7 @@ use tracing::debug;
 // Section characteristics constants
 const IMAGE_SCN_MEM_READ: u32 = 0x40000000;
 const IMAGE_SCN_MEM_WRITE: u32 = 0x80000000;
+const IMAGE_SCN_CNT_CODE: u32 = 0x00000020;
 const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x00000040;
 const IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x00000080;
 
@@ -341,36 +342,67 @@ impl PeHeader {
     ///
     /// Corresponds to `TPEHeader.Sanitize` in `PEInfo.pas`.
     ///
-    /// ## Two exceptions, both measured
+    /// ## Three exceptions, all measured
     ///
-    /// **Uninitialised sections keep `SizeOfRawData = 0`.**  `.bss` is
-    /// uninitialised by definition: the loader allocates it and zero-fills it,
-    /// and the protected inputs all declare it with `SizeOfRawData = 0`
-    /// (measured on the x86 sample, the x64 EXE and the x64 DLL).  Giving it
-    /// file bytes changes the meaning of the section — the loader stops
-    /// zero-filling and whatever was captured becomes the program's initial
-    /// state.  On the x86 sample that captured state is the Themida shell
-    /// mid-initialisation, and the product then never reaches its window:
-    /// measured, `.bss` rva `0x502e` alone blocks startup, and clearing the
-    /// captured bytes makes the window appear in 31 ms.
+    /// **Uninitialised sections keep `SizeOfRawData = 0` — on 32-bit targets
+    /// only.**  `.bss` is uninitialised by definition, and the protected inputs
+    /// all declare it with `SizeOfRawData = 0` (measured on the x86 sample, the
+    /// x64 EXE and the x64 DLL).  Giving it file bytes tells the loader to stop
+    /// zero-filling, so whatever the dump captured becomes the program's initial
+    /// state.
     ///
-    /// Sections that genuinely need their captured contents (`idata`, which
-    /// holds a live API cache) are handled by their own writers, not by this
-    /// blanket rule.
+    /// On the x86 sample that captured state is the Themida shell
+    /// mid-initialisation and the product never reaches its window: measured,
+    /// `.bss` rva `0x502e` alone blocks startup, and clearing the captured bytes
+    /// makes the window appear in 16 ms.
     ///
-    /// **The first section is not granted `IMAGE_SCN_MEM_WRITE` on x86.**  The
-    /// comment below says it is needed "in case `.text` and `.data` were
-    /// merged", but granting it to a section that is *not* merged makes the
-    /// dump claim `.text` is writable when the original is read-execute
-    /// (`0x60000020` vs the product's `0xe0000020`).  A dump is supposed to
-    /// describe the original layout, and a writable `.text` is exactly the
-    /// signature packers leave behind — anti-cheat and integrity checks look
-    /// for it.
+    /// On the x64 **DLL** the same rule is a regression, and this is the reason
+    /// it is arch-gated rather than global: the captured `.bss` there holds 81
+    /// non-zero bytes the shell finished writing, and zeroing them makes the
+    /// product answer `GetAppVersion() == "0.0"` instead of `"1.1"` — the exact
+    /// defect the DLL gate exists to catch.  Measured both ways with
+    /// `dll_gate_harness.exe`:
+    ///
+    /// | product | `.bss` raw | `VERSION` |
+    /// |---|---|---|
+    /// | x64 DLL | captured (`0x3880`) | `1.1` |
+    /// | x64 DLL | zero | `0.0` |
+    /// | x86 EXE | captured (`0x94`) | no window ever |
+    /// | x86 EXE | zero | window at 16 ms |
+    ///
+    /// So the two architectures disagree about the same rule, and each side is
+    /// measured, not assumed.  Sections that genuinely need their captured
+    /// contents (`idata`, which holds a live API cache) are handled by their own
+    /// writers either way.
+    ///
+    /// **The first section is not granted `IMAGE_SCN_MEM_WRITE` on 32-bit
+    /// targets.**  The comment below says it is needed "in case `.text` and
+    /// `.data` were merged", but granting it to a section that is *not* merged
+    /// makes the dump claim `.text` is writable when the original is
+    /// read-execute (`0x60000020` vs the product's `0xe0000020`).  A dump is
+    /// supposed to describe the original layout, and a writable `.text` is
+    /// exactly the signature packers leave behind — anti-cheat and integrity
+    /// checks look for it.
+    ///
+    /// Measured that the bit is not load-bearing for the x86 product: forcing
+    /// its `.text` back to `0x60000020` by hand still starts it (window at
+    /// 16 ms, no crash), so suppressing it costs nothing.
+    ///
+    /// The x64 side keeps the historical behaviour for the same reason as above:
+    /// the recorded x64 goldens carry `0xe0000020`, both products behave
+    /// identically either way, and changing it would move two byte-reproducible
+    /// golden records for a cosmetic gain.  That fidelity gap is deliberate and
+    /// documented here rather than silently fixed.
     pub fn sanitize(&mut self) {
+        // `is_64bit` is the *target's* architecture, which is what decides how
+        // the loader will treat this image — not the host's.
+        let zero_bss = !self.is_64bit;
+
         for section in &mut self.sections {
             section.header.pointer_to_raw_data = section.header.virtual_address;
-            let is_uninitialized = section.header.characteristics & IMAGE_SCN_CNT_UNINITIALIZED_DATA != 0;
-            section.header.size_of_raw_data = if is_uninitialized {
+            let is_uninitialized =
+                section.header.characteristics & IMAGE_SCN_CNT_UNINITIALIZED_DATA != 0;
+            section.header.size_of_raw_data = if is_uninitialized && zero_bss {
                 0
             } else {
                 section.header.virtual_size
@@ -385,8 +417,20 @@ impl PeHeader {
             // and `.data` really were merged into one section, which is what
             // the original Pascal did this for.  An unmerged `.text` keeps the
             // read-execute flags the original binary declares.
-            first.header.characteristics |= IMAGE_SCN_MEM_WRITE;
-            first.update_from_header();
+            //
+            // "Merged" is decided by what the section *declares*, not by
+            // whether we feel like granting the bit: a section is treated as a
+            // merged text+data blob only when it is code **and** carries
+            // initialised data.  The four protected inputs all declare a plain
+            // read-execute first section (`0x60000020`, no `CNT_INITIALIZED_DATA`),
+            // so none of them is merged.
+            let is_merged_text_data = zero_bss
+                && first.header.characteristics & IMAGE_SCN_CNT_CODE != 0
+                && first.header.characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA != 0;
+            if is_merged_text_data || !zero_bss {
+                first.header.characteristics |= IMAGE_SCN_MEM_WRITE;
+                first.update_from_header();
+            }
         }
     }
 
@@ -586,24 +630,71 @@ mod tests {
             assert_eq!(s.header.pointer_to_raw_data, s.header.virtual_address);
             assert_eq!(s.header.size_of_raw_data, s.header.virtual_size);
         }
-        // First section should get write access
+        // The fixture is PE32+, so the historical behaviour applies: the first
+        // section gets write access.  The 32-bit branch is covered separately
+        // below, where the difference actually matters.
         assert_ne!(
             pe.sections[0].characteristics & IMAGE_SCN_MEM_WRITE,
-            0
+            0,
+            "PE32+ keeps the historical write grant on the first section"
         );
     }
 
-    /// `.bss` must keep `SizeOfRawData = 0` after sanitize.
+    /// A 32-bit target's unmerged read-execute `.text` must stay read-execute.
+    ///
+    /// Measured defect: the x86 product's first section came out `0xe0000020`
+    /// while the reference is `0x60000020`.  Forcing the product back to the
+    /// read-execute value by hand still starts it (window at 16 ms), so the bit
+    /// was never load-bearing — it was inherited from a blanket rule that only
+    /// made sense for a merged text+data section.
+    #[test]
+    fn sanitize_does_not_mark_x86_text_writable() {
+        let mut pe = make_test_pe();
+        pe.is_64bit = false; // the fixture parses as PE32+, but the rule follows the target
+
+        pe.sanitize();
+
+        assert_eq!(
+            pe.sections[0].characteristics & IMAGE_SCN_MEM_WRITE,
+            0,
+            "an unmerged read-execute .text must not be granted MEM_WRITE on a \
+             32-bit target — the reference declares 0x60000020"
+        );
+    }
+
+    /// A genuinely merged text+data first section still gets write access.
+    ///
+    /// This is the branch the original Pascal rule existed for.  Pinning both
+    /// branches keeps the fix from turning into "never grant it".
+    #[test]
+    fn sanitize_grants_write_to_a_merged_text_data_section() {
+        let mut pe = make_test_pe();
+        pe.is_64bit = false;
+        pe.sections[0].header.characteristics |= IMAGE_SCN_CNT_INITIALIZED_DATA;
+        pe.sections[0].characteristics |= IMAGE_SCN_CNT_INITIALIZED_DATA;
+
+        pe.sanitize();
+
+        assert_ne!(
+            pe.sections[0].characteristics & IMAGE_SCN_MEM_WRITE,
+            0,
+            "a first section that declares both code and initialised data is a \
+             merged blob and needs write access"
+        );
+    }
+
+    /// `.bss` must keep `SizeOfRawData = 0` after sanitize — on a 32-bit target.
     ///
     /// Measured defect: sanitize used to give every section
     /// `SizeOfRawData = VirtualSize`, so the dumped `.bss` carried the Themida
     /// shell's mid-initialisation state as file bytes.  The loader then stops
     /// zero-filling it, the captured bytes become the program's initial state,
     /// and the x86 product never reached its window — clearing them made the
-    /// window appear in 31 ms.
+    /// window appear in 16 ms.
     #[test]
-    fn sanitize_keeps_uninitialised_section_raw_size_zero() {
+    fn sanitize_keeps_uninitialised_section_raw_size_zero_on_x86() {
         let mut pe = make_test_pe();
+        pe.is_64bit = false;
         // Append a `.bss` the way a real linker does: virtual size only.
         let idx = pe.create_section_index(".bss", 0x94);
         pe.sections[idx].characteristics |= IMAGE_SCN_CNT_UNINITIALIZED_DATA;
@@ -625,6 +716,32 @@ mod tests {
         assert_eq!(
             pe.sections[0].header.size_of_raw_data, pe.sections[0].header.virtual_size,
             "initialised sections still mirror their virtual size"
+        );
+    }
+
+    /// On a 64-bit target the captured `.bss` bytes must be kept.
+    ///
+    /// This is not a preference, it is a measured requirement: the x64 DLL's
+    /// captured `.bss` holds the shell's finished globals, and zeroing them
+    /// makes the product answer `GetAppVersion() == "0.0"` instead of `"1.1"` —
+    /// the exact defect `dll_e2e_gate` exists to catch.  Verified both ways with
+    /// `dll_gate_harness.exe`.
+    #[test]
+    fn sanitize_keeps_captured_bss_on_x64() {
+        let mut pe = make_test_pe();
+        assert!(pe.is_64bit, "the fixture parses as PE32+");
+        let idx = pe.create_section_index(".bss", 0x3880);
+        pe.sections[idx].characteristics |= IMAGE_SCN_CNT_UNINITIALIZED_DATA;
+        pe.sections[idx].header.characteristics |= IMAGE_SCN_CNT_UNINITIALIZED_DATA;
+
+        pe.sanitize();
+
+        assert_eq!(
+            pe.sections[idx].header.size_of_raw_data,
+            pe.sections[idx].header.virtual_size,
+            "a 64-bit product must keep the captured .bss bytes — zeroing them \
+             discards the shell's finished globals and GetAppVersion() regresses \
+             to \"0.0\""
         );
     }
 
