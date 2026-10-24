@@ -52,9 +52,65 @@ use mida_run::{kill_tree, Job, Phase, RunReport, RunState};
 // Protocol constants
 // ---------------------------------------------------------------------------
 
-/// Protocol revision we advertise.  Clients negotiate; this is the value DSH's
-/// SDK sends when it selects the modern revision.
-const PROTOCOL_VERSION: &str = "2026-07-28";
+/// Protocol revisions this server can speak, newest first.
+///
+/// # Why a list and not one constant
+///
+/// MCP `initialize` is a *negotiation*: the client sends the revision it wants,
+/// and the server answers with the revision it will use.  An earlier version of
+/// this server replied with a single hard-coded string, which broke every real
+/// client:
+///
+/// Measured 2026-10-24 against DSH's bundled SDK
+/// (`@modelcontextprotocol/client` 2.2.0, via `dsh-mcp-client`):
+///
+/// ```text
+/// SUPPORTED: ["2025-11-25","2025-06-18","2025-03-26","2024-11-05","2024-10-07"]
+/// server replied 2026-07-28  ->  "Server's protocol version is not supported"
+/// ```
+///
+/// The client rejects a version it does not know, so the handshake fails and the
+/// tools never appear — even though the server is otherwise correct.  The
+/// constant had been *assumed* rather than measured; it is not a version any
+/// shipped SDK recognises.
+///
+/// So: echo the client's revision when it is one we implement, else answer with
+/// our newest supported one.  That is what the specification asks for, and it
+/// keeps working as clients move forward.
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+    "2024-10-07",
+];
+
+/// The revision used when the client asks for one we do not implement.
+///
+/// Newest-first ordering above means this is the first entry; keeping it a
+/// named constant makes the intent explicit at the call site.
+const PREFERRED_PROTOCOL_VERSION: &str = SUPPORTED_PROTOCOL_VERSIONS[0];
+
+/// Pick the revision to answer with.
+///
+/// Returns the client's own revision when we implement it (the spec's
+/// negotiation), otherwise [`PREFERRED_PROTOCOL_VERSION`].  A client that sends
+/// no revision at all gets the preferred one.
+fn negotiate_protocol_version(params: &Value) -> &'static str {
+    let requested = params.get("protocolVersion").and_then(Value::as_str);
+    match requested {
+        Some(v) if SUPPORTED_PROTOCOL_VERSIONS.contains(&v) => {
+            // The caller's string is not 'static, so map it back to the static
+            // entry.  `contains` above guarantees the lookup succeeds.
+            SUPPORTED_PROTOCOL_VERSIONS
+                .iter()
+                .copied()
+                .find(|s| *s == v)
+                .unwrap_or(PREFERRED_PROTOCOL_VERSION)
+        }
+        _ => PREFERRED_PROTOCOL_VERSION,
+    }
+}
 
 /// Long-poll ceiling for `unpack_status`.
 ///
@@ -752,7 +808,11 @@ fn read_message(reader: &mut impl BufRead, buf: &mut Vec<u8>) -> std::io::Result
 fn handle_request(server: &Server, method: &str, params: &Value) -> Result<Value> {
     match method {
         "initialize" => Ok(json!({
-            "protocolVersion": PROTOCOL_VERSION,
+            // Echo the client's revision when we implement it; the client
+            // rejects a version it does not know, and a rejected handshake
+            // means the tools never appear.  See
+            // `SUPPORTED_PROTOCOL_VERSIONS`.
+            "protocolVersion": negotiate_protocol_version(params),
             "capabilities": { "tools": {} },
             "serverInfo": {
                 "name": "magicmida-rs",
@@ -948,9 +1008,65 @@ mod tests {
     fn initialize_advertises_tools_and_instructions() {
         let server = Server::new(PathBuf::from("x"), None);
         let r = handle_request(&server, "initialize", &json!({})).unwrap();
-        assert_eq!(r["protocolVersion"], PROTOCOL_VERSION);
+        // No revision requested -> the preferred one, which must be a version a
+        // real SDK actually lists.
+        assert_eq!(r["protocolVersion"], PREFERRED_PROTOCOL_VERSION);
         assert!(r["capabilities"]["tools"].is_object());
         assert!(r["instructions"].as_str().unwrap().contains("triage"));
+    }
+
+    #[test]
+    fn initialize_echoes_a_supported_client_revision() {
+        // MCP `initialize` is a negotiation, not an announcement.  A client that
+        // asks for a revision we implement must get that same revision back.
+        let server = Server::new(PathBuf::from("x"), None);
+        for v in SUPPORTED_PROTOCOL_VERSIONS {
+            let r = handle_request(
+                &server,
+                "initialize",
+                &json!({ "protocolVersion": v }),
+            )
+            .unwrap();
+            assert_eq!(r["protocolVersion"], *v, "should echo {v}");
+        }
+    }
+
+    #[test]
+    fn initialize_falls_back_when_the_client_asks_for_an_unknown_revision() {
+        // Measured 2026-10-24: the server used to hard-code "2026-07-28", which
+        // DSH's SDK does not list, so the client refused the handshake with
+        // "Server's protocol version is not supported" and the tools never
+        // appeared.  An unknown request must degrade to a version we implement,
+        // never to the caller's string.
+        let server = Server::new(PathBuf::from("x"), None);
+        let r = handle_request(
+            &server,
+            "initialize",
+            &json!({ "protocolVersion": "2026-07-28" }),
+        )
+        .unwrap();
+        assert_eq!(r["protocolVersion"], PREFERRED_PROTOCOL_VERSION);
+        assert_ne!(r["protocolVersion"], "2026-07-28");
+    }
+
+    #[test]
+    fn advertised_revisions_are_the_ones_dshs_sdk_lists() {
+        // Pinned against the real list, so a future edit that invents a version
+        // fails here rather than in a client's handshake.
+        //
+        // Source: `SUPPORTED_PROTOCOL_VERSIONS` exported by
+        // `@modelcontextprotocol/client` 2.2.0 (the SDK `dsh-mcp-client` bundles).
+        const SDK_LIST: &[&str] = &[
+            "2025-11-25",
+            "2025-06-18",
+            "2025-03-26",
+            "2024-11-05",
+            "2024-10-07",
+        ];
+        for v in SUPPORTED_PROTOCOL_VERSIONS {
+            assert!(SDK_LIST.contains(v), "{v} is not in the SDK's list");
+        }
+        assert_eq!(PREFERRED_PROTOCOL_VERSION, SDK_LIST[0]);
     }
 
     #[test]
