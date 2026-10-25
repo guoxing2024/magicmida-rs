@@ -141,12 +141,12 @@ The full measurement tables are in [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
 - **VMProtect branch** — mode classification, structure report, in-file payload
   extraction, a debugger-free live image capture, and a measured payload decode
   to a runnable PE. Backed by a CI gate over 14 third-party samples
-- **UPX branch** — detection, `PackHeader` parsing (version/format/method/level/
-  filter/checksum) and a static layout report, measured against UPX 5.2.1
-  output and cross-checked against UPX's own source. The whole original image
-  is one statically-decodable stream, so no desktop session is involved; the
-  static unpacker (NRV/LZMA + filter undo) is the next increment and is not
-  claimed yet. Also fixes a real trap: UPX's `UPX0` section would otherwise
+- **UPX branch** — detection, `PackHeader` parsing, a static layout report,
+  and the **static unpacker**: `/unpack --packer upx` restores the original
+  file with no process and no desktop session, byte-for-byte identical to
+  `upx -d` on the corpus (NRV2E/LZMA decode, filter undo, full `unpack0` PE
+  rebuild). Measured against UPX 5.2.1 output and cross-checked against UPX's
+  own source. Also fixes a real trap: UPX's `UPX0` section would otherwise
   fire the Themida heuristic and hand a UPX file to the Themida debugger loop
 - **Verify mode** — diff unpacked output against a known-good reference,
   section by section

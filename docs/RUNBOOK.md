@@ -211,6 +211,22 @@ cargo test --release -p mida-cli --test vmprotect_packed_gate -- --ignored --noc
 `#[ignore]`（要真进程 + 桌面会话）。三条：捕获+carve（5/5 通过）、
 输入文件仍必须拒绝提取、以及一条**不需要样本**的常量自检（参考镜像仍是 9 段 / 43,315,200 B）。
 
+## UPX：静态解包（2026-10-26 打通）
+
+无进程、无桌面会话，纯文件操作；头less 环境可用：
+
+```powershell
+.\target\release\mida-cli.exe /unpack <packed.exe> --packer upx
+# auto 也行：检测到 UPX 就走静态解包（闸序 VMProtect → UPX → Themida）
+```
+
+对账：**`upx -d` 自己的输出**，不是加壳前的原始文件（UPX 打包时改写 DOS stub 区且从不还原，
+4 样本实测尺寸全同、哈希全异）。golden sha256：injector `2f391f08…`、mida_x64 `459f4f8e…`、
+x86 `da7a1dce…`。gate：`cargo test -p mida-packers-upx`（默认就跑；语料缺目录时显式 SKIP，
+样本在 `OUT\upx_samples\`，upx 5.2.1 可再生；单测用手工位流向量，无样本也全绿）。
+移植参考：UPX v5.2.1 源码（`OUT\upx-5.2.1\` + `OUT\ucl_src\`）与 Python 原型
+（`OUT\upx_unpack_proto.py`）。
+
 ## x86 编译（2026-10-23 打通）
 
 ```powershell

@@ -23,6 +23,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   increment and is not claimed anywhere. `--packer upx` parses and refuses
   with that exact answer. `l_info`/`p_info` do not appear in UPX 5.2.1 PE
   output — measured, not assumed.
+- **UPX static unpacker** — `/unpack <file> --packer upx` (and auto-detection)
+  restores the original file with **no process and no desktop session**:
+  NRV2E `le32` decode (UCL `n2e_d.c` port), LZMA with UPX's 2-byte property
+  header (`compress_lzma.cpp` — *not* the `.lzma`-alone format), call-trick
+  filter undo (`cto.h` 0x26 / `ctok.h` 0x49 including the `0F 8x` jcc arm),
+  and the `unpack0` PE rebuild: imports from the compact blob, relocations
+  from the delta stream (byte-swapped values, `size_of_block` counts the
+  align-to-4 padding), resources from the packed tree. Verified
+  **byte-for-byte against `upx -d`** on all four corpus samples — both
+  architectures, both methods, both filters — with the recorded caveat that
+  the ground truth is `upx -d`'s own output, not the pre-pack original (UPX
+  rewrites the DOS stub area when packing and never restores it). Ported from
+  the v5.2.1 sources fetched for the purpose; prototyped in Python first
+  (`OUT\upx_unpack_proto.py`) exactly like the measurement round. `/analyze`
+  no longer claims the decode is missing.
 - **MCP `triage` classifies the packer** — the tool now answers with a `packer`
   object: `family` (`Themida` / `VMProtect` / `UPX` / `unknown`), the VMProtect
   `mode` (`min-protection` / `packed`), and the `evidence` / `absent` lists
