@@ -161,13 +161,20 @@ The full measurement tables are in [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
 # 1. Build
 cargo build --release
 
-# 2. (Optional) Place ScyllaHide binaries next to the executable
-#    The project ships a default config at scylla_hide.ini
+# 2. (Optional, Themida only) Place the ScyllaHide helpers next to the CLI.
+#    VMProtect commands (/analyze, /dump-image) never inject anything and do
+#    not need these.
 cp HookLibraryx64.dll InjectorCLIx64.exe target/release/
+cp crates/cli/assets/scylla_hide.ini target/release/   # the profile the packer selects at run time
 
-# 3. Unpack
+# 3. Identify what you have (always start here)
+target/release/mida-cli.exe /analyze "protected.exe"
+
+# 4a. Themida target → unpack
 target/release/mida-cli.exe /unpack "protected.exe"
 # → writes protectedU.exe
+
+# 4b. VMProtect target → see "Worked example" below
 ```
 
 ### Building the x86 target
@@ -182,6 +189,72 @@ libraries in `--start-group`. The full recipe is in
 rustup target add i686-pc-windows-gnu
 cargo build --release --target i686-pc-windows-gnu
 ```
+
+### Worked example — a VMProtect target, end to end
+
+Everything below ran against a real VMProtect 3.11 `Packed` sample. Start from
+`/analyze` on any unknown file; it tells you which branch to use.
+
+```text
+> mida-cli /analyze target.exe
+[GOOD] Packer: VMProtect (packed)
+  + notpaged-executable-section: sections [".rdata2"]
+  ...
+  large resources     1:
+    type 10 id 131 lang 0x409: 12782080 B (not in file — memory-only)
+```
+
+`Packed` means the original code is **not in the file** (`SizeOfRawData == 0`),
+so there is nothing to extract statically — the refusal at the end of
+`--extract` is the correct answer, and it names the command to use next.
+
+**Step 1 — launch the target yourself, then note its PID.** The tool reads a
+running process; it does not launch one, because attaching a debugger makes this
+family self-terminate.
+
+**Step 2 — capture the image, with `--wait`:**
+
+```text
+> mida-cli /dump-image 12345 image.exe --wait
+[INFO] Image 'target.exe' loaded at 0x140000000 (preferred 0x140000000, ASLR delta 0 …)
+[INFO]   .text   rva 0x001000 1224796 B read (0x12c000 raw), 0 page(s) unreadable
+[INFO]   ...     9 section(s)
+[INFO] Image settled after 3 sample(s) in 2.83s
+[GOOD] Wrote 43315200 bytes to image.exe
+[GOOD] Carved payload type 10 id 131 to image.rcdata131.bin (12782080 B, sha256 14596cbd…)
+[GOOD] Decoded payload type 10 id 131 to image.rcdata131.decoded.exe (12782080 B, sha256 e7004e89…)
+```
+
+Three files come out:
+
+| File | What it is |
+|---|---|
+| `image.exe` | The flattened live image (offset == RVA for all 9 sections). Feed this to a disassembler. |
+| `image.rcdata131.bin` | The payload as the packer leaves it — still an encrypted container. |
+| `image.rcdata131.decoded.exe` | **The runnable product.** PE32+ x64, 9 sections. |
+
+**Step 3 — verify what you got** (optional but cheap):
+
+```text
+> mida-cli /analyze image.rcdata131.decoded.exe
+Architecture: x64, 9 sections … Packer: (none of the known packers)
+```
+
+Three traps this workflow has already paid for:
+
+1. **`--wait` is not optional.** The payload is rewritten in place after
+   start-up; measured, it passes through about ten distinct states before
+   settling at t≈1.65 s. Without `--wait` you can capture a half-decoded
+   intermediate that looks completely plausible.
+2. **This sample family registers a `RUNASADMIN` compatibility layer for its own
+   path** the first time it runs — including a path it has never seen. An
+   elevated process cannot be read from an unelevated one (`拒绝访问
+   0x80070005`), so the *second* run from the same path always fails. Run the
+   target from a fresh path, or clear the layer first:
+   `reg delete "HKCU\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers" /v "<full path>" /f`
+3. **The whole-image hash is not stable.** Live images carry resolved pointers
+   and the stack cookie, so three captures give three hashes. The payload hash is
+   the golden; pin that, never the image.
 
 ## Usage
 
