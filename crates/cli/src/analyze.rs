@@ -86,11 +86,10 @@ pub fn analyze_file(opts: &AnalyzeOptions<'_>) -> Result<(), anyhow::Error> {
 }
 
 /// `/analyze` answers for UPX too: the whole layout is static, so the report
-/// is complete without a debugger — but the decode itself is not implemented
-/// yet, and the report says so instead of pretending.
-///
-/// `--extract` is a deliberate failure here: the only payload UPX carries is
-/// the compressed stream, and it is useless until the NRV/LZMA decoder lands.
+/// is complete without a debugger.  The decode itself lives in
+/// `/unpack --packer upx` (static, no process) — `--extract` stays a
+/// deliberate failure because UPX has no separate payload to carve: the
+/// stream decodes into the whole original file.
 fn analyze_upx(
     pe: &PeHeader,
     image: &[u8],
@@ -110,8 +109,8 @@ fn analyze_upx(
     print!("{report}");
     if opts.extract_to.is_some() {
         return Err(anyhow!(
-            "--extract is not implemented for UPX yet: the compressed stream is \
-             not usable until the NRV/LZMA decoder lands"
+            "--extract does not apply to UPX: there is no separate payload to \
+             carve; use /unpack --packer upx for the full static unpack"
         ));
     }
     Ok(())

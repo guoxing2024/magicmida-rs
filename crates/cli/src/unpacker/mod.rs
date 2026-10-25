@@ -120,7 +120,9 @@ fn log_detection(detection: &mida_packer_api::Detection, pe: &PeHeader, image: &
 ///
 /// This is the main entry point for the `/unpack` command. It orchestrates the
 /// full pipeline: PE parsing, Themida detection, process creation, debug loop,
-/// IAT repair, dump, and post-processing.
+/// IAT repair, dump, and post-processing.  UPX targets never reach the debug
+/// loop — they are handled entirely in-file by [`unpack_upx_static`] (selected
+/// by `--packer upx`, or by auto-detection).
 ///
 /// # Arguments
 ///
@@ -192,11 +194,11 @@ pub fn unpack(
     // between a non-Themida target and the Themida loop.
     let packer_kind = match (packer, detection.as_ref()) {
         (PackerChoice::Upx, _) => {
-            return Err(anyhow!(
-                "UPX target — its whole original image is one statically-decodable \
-                 stream in the file, so the debugger pipeline has nothing to do; \
-                 /analyze reports the layout, and a static unpacker is the next increment"
-            ));
+            return unpack_upx_static(&pe, &image, &output_path);
+        }
+        (PackerChoice::Auto, Some(d)) if d.is_upx() => {
+            log_detection(d, &pe, &image);
+            return unpack_upx_static(&pe, &image, &output_path);
         }
         (PackerChoice::Auto, Some(d)) => {
             log_detection(d, &pe, &image);
@@ -1172,6 +1174,46 @@ pub fn unpack(
         &output_path,
     )?;
 
+    log::log(LogType::Good, "Done.");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// UPX static unpack
+// ---------------------------------------------------------------------------
+
+/// UPX's static unpack: decode the single-block stream, undo the call-trick
+/// filter, rebuild imports/relocations/resources and write the original file.
+///
+/// The whole pipeline is file work (`mida_packers_upx::unpack_static`), so
+/// unlike the Themida branch there is no debuggee, no injection and no
+/// desktop-session requirement — headless environments can unpack UPX.  The
+/// product is byte-for-byte what `upx -d` produces (verified against the
+/// corpus in the packer crate's gate); note UPX itself rewrites the DOS stub
+/// area when packing and never restores it, so "byte-for-byte" means `upx -d`'s
+/// output, not the pre-pack original.
+fn unpack_upx_static(pe: &PeHeader, image: &[u8], output_path: &Path) -> Result<(), anyhow::Error> {
+    log::log(
+        LogType::Info,
+        "UPX target — running the static unpacker (no process is created)",
+    );
+    let product = mida_packers_upx::unpack_static(pe, image)
+        .map_err(|e| anyhow!("static UPX unpack failed: {e}"))?;
+    std::fs::write(output_path, &product)
+        .with_context(|| format!("writing {}", output_path.display()))?;
+    let ph = mida_packers_upx::find_pack_header(image);
+    let shape = ph
+        .map(|h| format!("method {} / filter {:#x}", h.method_label(), h.filter))
+        .unwrap_or_else(|| "unknown shape".to_string());
+    log::log(
+        LogType::Good,
+        &format!(
+            "Wrote {} ({} bytes), decoded with {}",
+            output_path.display(),
+            product.len(),
+            shape
+        ),
+    );
     log::log(LogType::Good, "Done.");
     Ok(())
 }

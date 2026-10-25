@@ -30,8 +30,8 @@ pub enum PackerChoice {
     VmProtect,
     /// UPX has no live pipeline in this project: its whole original image is
     /// one statically-decodable stream, so there is nothing for a debugger to
-    /// do.  `/analyze` reports the layout; the static unpacker is the next
-    /// increment.
+    /// do.  `/unpack --packer upx` runs the static unpacker (no process, no
+    /// desktop session); `/analyze` reports the layout.
     Upx,
 }
 
