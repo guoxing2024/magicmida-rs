@@ -45,7 +45,8 @@ pub mod resources;
 mod test_support;
 
 pub use detect::{
-    classify_mode, detect, fptable_section, is_executable, is_not_paged, is_template_named_section,
+    body_lost_sections, classify_mode, detect, fptable_section, is_executable, is_not_paged,
+    is_template_named_section,
     is_vmp_named_section, notpaged_executable_sections, packed_sections,
     plausible_runtime_function_triples, runtime_sections, scrambled_pdata, section_bytes,
     section_name, shannon_entropy, VmProtectDetector, IMAGE_SCN_MEM_EXECUTE,

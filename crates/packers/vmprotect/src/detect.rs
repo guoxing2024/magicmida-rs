@@ -184,17 +184,54 @@ pub fn plausible_runtime_function_triples(data: &[u8], max: usize) -> (usize, us
     (ok, n)
 }
 
-/// `MinProtection` when every executable section still has file bytes,
-/// `Packed` as soon as one executable section does not.
+/// `MinProtection` when every body-bearing section still has file bytes,
+/// `Packed` as soon as one of them does not.
 ///
 /// Measured: 伦伦 has no `raw_size == 0` section → `MinProtection`;
-/// `zz_test.exe` has `.text` and `.rdata0` → `Packed`.
+/// `zz_test.exe` has `.text`, `.rdata`, `.data`, `.pdata`, `.fptable` and
+/// `.rdata0` all at zero → `Packed`.
+///
+/// # The bug this signature fixes
+///
+/// The first version asked "is any executable section empty?", which is right
+/// for VMProtect's *own* sections but wrong for the original image's.  Measured
+/// on `hello_world.vmp.exe` (VMProtect 3): `.textbss` is an **uninitialised**
+/// section — `raw_size 0`, `virtual_size 0x10000` — exactly what `.bss` looks
+/// like in any ordinary build, and it is marked executable.  That made a
+/// MinProtection sample report as `Packed`, while `.text` still held `0x8000`
+/// bytes of real code and the entry point `0x11267` was inside it.
+///
+/// A `.bss`-like section never had a body, so its emptiness carries no
+/// information.  `.text` / `.rdata` / `.pdata` always do.
 pub fn classify_mode(pe: &PeHeader) -> VmProtectMode {
-    if packed_sections(pe).is_empty() {
+    if body_lost_sections(pe).is_empty() {
         VmProtectMode::MinProtection
     } else {
         VmProtectMode::Packed
     }
+}
+
+/// Sections that normally carry a body but have none in this file.
+///
+/// Distinct from [`packed_sections`], which answers "which executable sections
+/// are empty".  This one answers "did the packer take the original code away",
+/// which is the question `Packed` actually means.
+pub fn body_lost_sections(pe: &PeHeader) -> Vec<&PeSection> {
+    pe.sections
+        .iter()
+        .filter(|s| s.raw_size == 0 && s.virtual_size > 0 && normally_has_body(section_name(s)))
+        .collect()
+}
+
+/// Section names that always carry a body in an ordinary build, so a zero
+/// `raw_size` on one of them means the packer removed it.
+const BODY_BEARING_NAMES: &[&str] = &[
+    ".text", ".rdata", ".data", ".pdata", ".idata", ".reloc", ".rsrc", ".tls",
+];
+
+/// `true` when the section normally holds data, so an empty body is meaningful.
+fn normally_has_body(name: &str) -> bool {
+    BODY_BEARING_NAMES.iter().any(|n| n.eq_ignore_ascii_case(name))
 }
 
 /// The `Packer` implementation for VMProtect.
