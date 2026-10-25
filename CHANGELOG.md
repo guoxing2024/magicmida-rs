@@ -5,6 +5,86 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-10-25
+
+Adds a second packer branch. It is **not** a Themida variant and **not** a
+devirtualiser: VMProtect identification, mode classification, a static structure
+report, in-file payload extraction, and a debugger-free runtime image dump.
+Every capability below is measured; the measurement tables are in
+[`docs/RUNBOOK.md`](docs/RUNBOOK.md).
+
+### Added
+- **`mida-packer-api`** — the workspace's first real packer abstraction:
+  `PackerKind` / `VmProtectMode` / `Family` / `Evidence` / `Detection` and the
+  `Packer` trait. A verdict carries the evidence that produced it *and* the
+  markers that were absent, because `likely_themida: false` with no reason is
+  not diagnosable.
+- **`mida-packers-vmprotect`** — detection, mode classification, and a static
+  structure report: runtime section, packed sections, virtualised-function stubs,
+  scrambled `.pdata`, relocated exception directory, and large `RT_RCDATA`
+  payloads with size, file offset, entropy, sha256 and printable magic.
+- **`/analyze <file> [--extract <dir>]`** — static analysis with no debugger and
+  no desktop session. The static report used to be reachable only by running
+  `/unpack` and reading the resulting error, which is not a usable entry point
+  for a documented capability. It answers for Themida as well, and names the
+  markers it looked for when nothing matches.
+- **`/dump-image <pid> <out>`** — flatten a running process's loaded image into a
+  file, reading memory through `OpenProcess` + `ReadProcessMemory` and never
+  attaching a debugger. Output is a flat image (`file offset == RVA`), and ASLR
+  is undone by walking `.reloc` and subtracting the load-base delta.
+- **`--packer auto|themida|vmprotect`** for `/unpack` — `auto` keeps the refusal;
+  the other two make a heuristic verdict overridable for diagnostics, with the
+  override logged.
+- **Per-packer ScyllaHide profile** — `crates/cli/assets/scylla_hide.ini` is now
+  tracked and carries three profiles. The VMProtect profile's hook set is
+  ScyllaHide's own `[VMProtect x86/x64]` preset; six debugger-integration keys
+  are taken from this project's working profile instead, because those presets
+  target an interactive debugger and this project drives its own CLI loop.
+- **A static gate that runs in CI** — `tests/vmprotect_static_gate.rs` is
+  deliberately **not** `#[ignore]`d: it only reads files, so it needs no desktop
+  session. It skips with an explicit `SKIP:` line when a sample is absent rather
+  than failing, and includes a Themida negative control.
+
+### Fixed
+- **A VMProtect target was classified as Themida and driven as one.** `/unpack`
+  on the `Packed` sample printed `Themida version: V3`, created the debuggee and
+  ran the entire Themida loop against it, ending in `OEP not found` after 8 s.
+  Themida's section heuristic (`raw_size == 0` plus a large virtual size) is
+  satisfied by that sample's `.rdata0` **and** by 6 genuine Themida samples, so it
+  could not be tightened into a VMProtect test. The packer decision now runs
+  first; the same command refuses in 20 ms with evidence and a structure report,
+  and creates no process.
+- **`ScyllaHideConfig::ini_path` was inert.** The injector is launched as
+  `InjectorCLIx64.exe pid:<pid> <HookLibraryx64.dll> nowait` — with no ini
+  argument — and nothing ever read the field; both call sites set it to `None`.
+  The field is removed and `select_profile()` is the real mechanism.
+- **`.gitignore`'s bare `scylla_hide.ini` pattern matched at any depth** and
+  swallowed the profile file this project authors, so the first commit shipped
+  the README describing it but not the file.
+- **`/analyze --extract` recommended the wrong follow-up command** for `Packed`
+  samples: `/dump-process` writes a single section and is Themida-specific.
+- `replace_current_profile` wrote `\r\r\n` for a CRLF line and did not recognise
+  `currentprofile = A`. Both were caught by the tests written for it.
+
+### Changed
+- `README.md` capability tables now cover VMProtect, with the modes and the
+  non-claims stated explicitly.
+- `mida-cli /help` and the usage strings list the new commands.
+
+### Not verified
+- **`/dump-image`'s read path cannot be exercised in CI** — it needs a live
+  process. The relocation walk it depends on has unit tests, and the read was
+  measured end to end (8/8 sections flat, `.text` decodes 100.0 %, 1,484
+  relocation slots applied), but reproducing the given reference artefact
+  (`b6355439…`) needs an elevated session: that sample's path carries a
+  `RUNASADMIN` compatibility flag, and creating it un-elevated fails with
+  `ERROR_ELEVATION_REQUIRED`.
+- **The ScyllaHide profile's hook set was not observed on a live target**, for
+  the same reason.
+- **devirtualisation** is not attempted and not claimed.
+- **The mode boundary rests on two samples from one vendor family** (all carry
+  `.fptable`), not on a validated cross-section of VMProtect builds.
+
 ## [0.2.0] — 2026-10-25
 
 First tagged release.  Everything below was measured on the dev machine; where

@@ -1,6 +1,6 @@
 # Magicmida-RS
 
-Themida automatic unpacker, Rust reimplementation.
+Themida unpacker and static packer analysis, Rust reimplementation.
 
 Based on the reverse engineering of [Hendi48/Magicmida](https://github.com/Hendi48/Magicmida) (Pascal),
 the entire unpacking pipeline is rewritten in Rust for safer memory management,
@@ -26,6 +26,8 @@ SHA-256 recorded in `crates/packers/themida/tests/cases/`.
 | **Themida v3, x64, EXE** | ✅ Works | 186 resolved imports / 0 failed / 8 `not-an-import`; product launches to its `授权验证` window. Gate: `e2e_gate.rs` |
 | **Themida v3, x64, DLL** | ✅ Works | 289 resolved / 0 failed / 3 `not-an-import`; product loads through a real `LoadLibraryW`, `GetAppVersion()` returns `"1.1"`, `Run()` reaches `PigToGoLicenseDialog`. Gate: `dll_e2e_gate.rs` |
 | **Themida v3, x86, EXE** | ✅ Works | 55 resolved / 0 failed / 55 `not-an-import`; product's `MidaX86Sample` window appears in ~24 ms. Gate: `x86_e2e_gate.rs` |
+| **VMProtect 3.x, x64, `MinProtection`** | ⚠️ Static only | Identified with evidence; structure reported; in-file payload extracted byte-exactly (`91d585e6…`). There is **no** VMProtect unpacking pipeline — see below. |
+| **VMProtect 3.x, x64, `Packed`** | ⚠️ Runtime image dump | Identified with evidence. Original sections are absent from the file, so `/dump-image` reads them from a live process and rebases the image flat. |
 | Themida **v1 / v2** | ❓ No evidence | Detection code exists; never run on a real sample |
 
 The 8 / 3 / 55 `not-an-import` slots are **not** failures. They hold bare RVAs
@@ -50,6 +52,52 @@ shell expects the loader's `DLL_PROCESS_ATTACH` sequencing; the older "rewrite
 the DLL into a stub EXE" approach bypassed it and the shell died at
 `.winlice+0x33E22E`.
 
+### VMProtect — identification, static report, payload, runtime image dump
+
+A **different** packer with a different shape, so it is a separate branch rather
+than a Themida variant. It is **not a devirtualiser**: VMProtect's VM bytecode is
+randomised per build and recovering the original x86 from it is deliberately out
+of scope. What the branch does is everything deterministic — and none of it
+attaches a debugger, so unlike `/unpack` these commands run headless.
+
+| Capability | Command | Measured |
+|---|---|---|
+| Identify the packer, its mode, and the evidence | `/analyze` | `MEM_NOT_PAGED` on an executable section fires on both VMProtect samples and on **0 of 63** Themida samples |
+| Static structure report | `/analyze` | runtime section, packed sections, virtualised-function stubs, scrambled `.pdata`, relocated exception directory |
+| Extract a payload that is in the file | `/analyze --extract` | `伦伦软件.exe` → 16,102,969 B, sha256 `91d585e6…`, magic `XMP2QH_` |
+| Read a live image and rebase it flat | `/dump-image <pid> <out>` | 8/8 sections `PointerToRawData == VirtualAddress`; the dump's `.text` decodes 100.0%; 1,484 relocation slots applied |
+
+Two modes are measured, and they need different pipelines:
+
+| | `MinProtection` | `Packed` |
+|---|---|---|
+| sample | 19,005,952 B | 21,415,936 B |
+| `.text` | present, decodes 100% | **`SizeOfRawData == 0`** — not in the file |
+| entry point | inside `.text` | inside the runtime section |
+| runtime section | `.vmp0` | `.rdata2` |
+| payload | `RT_RCDATA` id 101, in the file | id 131, memory-only |
+| produce | payload bytes | flat image dump |
+
+Two things worth knowing before trusting a verdict:
+
+- **A name-based `.vmp0` check would miss `Packed` entirely** — its equivalent
+  section is called `.rdata2`.
+- Themida's own section heuristic (`raw_size == 0` + large virtual size) is
+  satisfied by `Packed`'s `.rdata0` **and** by 6 genuine Themida samples, so it
+  cannot be tightened into a VMProtect test. Before the packer gate existed,
+  `/unpack` printed `Themida version: V3` for a VMProtect target and ran the
+  whole Themida loop against it. The packer decision now runs first, carries its
+  evidence, and refuses.
+
+`/dump-image` deliberately attaches **no debugger**: measured, the same sample
+exits `0` bare and `0xDEADBEEF` under a debugger at about 7 s, with the debugger
+as the only changed variable.
+
+**Not claimed:** devirtualisation; and both measured VMProtect samples come from
+one vendor family (all carry `.fptable`), so the mode boundary rests on two
+samples rather than on a validated cross-section of VMProtect builds. The full
+measurement tables are in [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
+
 ## Features
 
 - **Runtime IAT reconstruction** — resolves imports via live memory tracing, with
@@ -60,6 +108,11 @@ the DLL into a stub EXE" approach bypassed it and the shell died at
 - **ScyllaHide integration** — bypasses anti-debugging on newer Themida builds
 - **PE rebuild** — import table, section table, exception table (`.pdata`), data
   directory repair, relocation table, ASLR
+- **Packer identification with evidence** — a packer-neutral `Detection` that
+  reports *why* a verdict was reached and records which markers were **absent**,
+  so `likely_themida: false` is diagnosable instead of useless
+- **VMProtect static branch** — mode classification, structure report,
+  in-file payload extraction, and a debugger-free runtime image dump
 - **Verify mode** — diff unpacked output against a known-good reference,
   section by section
 - **GUI** — graphical front-end (`mida-gui.exe`)
@@ -72,7 +125,7 @@ the DLL into a stub EXE" approach bypassed it and the shell died at
 | **Windows 10/11** | x64 host. The debugger core uses the Win32 Debug API; not cross-platform. |
 | **Rust toolchain** | stable GNU target (`x86_64-pc-windows-gnu`). Install via [rustup](https://rustup.rs). |
 | **ScyllaHide** (optional) | Required for Themida v3 targets with hardware-breakpoint detection. Download from [ScyllaHide Releases](https://github.com/x64dbg/ScyllaHide/releases). |
-| **Interactive desktop session** | `/unpack` injects ScyllaHide and the target creates its own windows. Headless CI can only use `verify` and `triage`. |
+| **Interactive desktop session** | Only `/unpack` needs it — it injects ScyllaHide and the target creates its own windows. `/analyze`, `/dump-image`, `/verify` and the MCP `triage` tool are headless. |
 
 ## Quick Start
 
@@ -106,9 +159,14 @@ cargo build --release --target i686-pc-windows-gnu
 
 ```
 mida-cli /unpack <filename> [options]
+mida-cli /analyze <filename> [--extract <dir>]
 mida-cli /dump-process <pid> <unpacked-file>
+mida-cli /dump-image <pid> <output-file>
 mida-cli /verify <unpacked-file> <reference-file>
 ```
+
+Only `/unpack` needs a desktop session. The other four read files or read a
+process's memory without attaching a debugger, so they run headless.
 
 ### `/unpack` — Unpack a Themida-protected executable
 
@@ -123,6 +181,7 @@ the import table.
 | `--shrink` | Remove Themida-specific sections (`.winlice` / `.boot` / `.themida`), compact VAs, clear dangling data directories, restore standard section names, build relocation table, and enable ASLR. **Enabled by default.** |
 | `--no-shrink` | Disable shrinking. Keeps Themida sections and disables ASLR/relocation. Use for debugging or when shrink causes issues. |
 | `-v` / `--verbose` | Enable debug-level logging. |
+| `--packer auto｜themida｜vmprotect` | Which packer branch to take. `auto` (default) detects and refuses what the Themida pipeline cannot unpack. `themida` forces it (diagnostic override, logged). `vmprotect` selects the VMProtect branch, which uses its own ScyllaHide profile but shares the one debug loop that exists — experimental. |
 
 **Examples:**
 
@@ -146,6 +205,47 @@ to a file.
 ```bash
 mida-cli.exe /dump-process 12345 unpacked_text.bin
 ```
+
+### `/analyze` — Identify the packer and report its structure
+
+Static analysis only: no debugger, no injection, no desktop session. Prints the
+packer, its mode, the evidence behind the verdict, and the structure report.
+
+```bash
+mida-cli.exe /analyze target.exe
+mida-cli.exe /analyze target.exe --extract payload_out/   # write in-file payloads
+```
+
+| Option | Description |
+|---|---|
+| `<filename>` | File to analyse. |
+| `-x <dir>` / `--extract <dir>` | Write every payload that is present in the file, named `<stem>.rcdata<id>.<ext>`. Fails when nothing is extractable rather than silently writing nothing. |
+| `-v` / `--verbose` | Enable debug-level logging. |
+
+It answers for both supported packers: for a Themida target it prints the
+Themida sections and points at `/unpack`; when nothing matches it names the
+markers it looked for.
+
+### `/dump-image` — Flatten a running process's loaded image
+
+For a `Packed` VMProtect target the original sections are not in the file at all
+(`SizeOfRawData == 0`), so the image has to be read from a live process. This
+reads it **without** attaching a debugger — measured, attaching one makes that
+sample exit `0xDEADBEEF` at about 7 s while a bare run exits `0`.
+
+```bash
+mida-cli.exe /dump-image 12345 image.exe
+```
+
+The output is a **flat image**: file offset equals RVA for every section, headers
+at offset 0. That is the shape a disassembler wants, and it keeps every
+data-directory RVA resolvable. ASLR is undone by default — the relocation table
+is walked and the load-base delta subtracted, so the image reads as if it had
+loaded at its preferred base.
+
+Residual differences from the on-disk file are expected, not defects: `.rdata`
+holds a *resolved* IAT in memory where the file holds on-disk thunks, and
+`.fptable` is written by VMProtect at run time.
 
 ### `/verify` — Compare against a reference
 
@@ -247,9 +347,13 @@ it is running without a debugger.
 2. Extract `HookLibraryx64.dll` and `InjectorCLIx64.exe` from the archive.
 3. Place both files in the same directory as `mida-cli.exe` (typically
    `target/release/`).
-4. Create a `scylla_hide.ini` config file in the same directory. The project
-   ships a default config — adjust profile settings if your target uses
-   non-standard anti-debug checks.
+4. Copy the profile file this project ships into the same directory:
+   `cp crates/cli/assets/scylla_hide.ini target/release/`. It carries three
+   profiles, and the packer selects one at run time by rewriting the
+   `CurrentProfile` key — the injector accepts **no ini argument**, so that key
+   is the only lever. Provenance, the deviations from ScyllaHide's own presets,
+   and the known gaps in the Themida profile are documented in
+   `crates/cli/assets/README.md`.
 5. When you run `mida-cli /unpack`, the packer crate automatically:
    - Verifies the SHA-256 hashes of `InjectorCLIx64.exe` and `HookLibraryx64.dll`
      against known-good values (see `crates/packers/themida/src/binaries.rs`).
@@ -277,10 +381,27 @@ user-downloaded and verified at runtime via SHA-256 checksums (see
 | **V2** | ❓ unverified | — | Detected by dual `0x1000`-sized stub sections; never run on a real sample. |
 | **V3** | ✅ **verified** | ✅ **verified** | x64 EXE, x64 DLL and x86 EXE are all gated. Requires ScyllaHide. |
 
+| VMProtect | Status | Notes |
+|---|---|---|
+| **`MinProtection`** | ⚠️ static only | Identified, structure reported, in-file payload extracted. **No unpacking pipeline.** |
+| **`Packed`** | ⚠️ static + runtime dump | Original sections are not in the file; `/dump-image` reads them from a live process. **No unpacking pipeline.** |
+| **devirtualisation** | ❌ not attempted | Deliberately out of scope; not claimed. |
+
 **Known limitations:**
 
-- **Sample coverage is narrow.** Three protected inputs, all built with Themida
-  v3. V1/V2 detection exists but has never been exercised on a real sample.
+- **Sample coverage is narrow.** Five protected inputs: three built with Themida
+  v3, two with VMProtect (both from the same vendor family, all carrying
+  `.fptable`). Themida V1/V2 detection exists but has never been exercised on a
+  real sample.
+- **The VMProtect branch cannot unpack.** It identifies, reports and extracts —
+  and for `Packed` it returns a flat image dump rather than a rebuilt PE. The
+  payload of a `Packed` sample exists only in memory, so it cannot be recovered
+  from the file at all.
+- **The VMProtect verdict is a measured heuristic, not a proof.** The
+  discriminator (`MEM_NOT_PAGED` on an executable section) scored 0 false
+  positives against 63 Themida samples and fired on both VMProtect ones; a
+  format reusing that section shape without being VMProtect would break it.
+  Every verdict carries its evidence, and records which markers were absent.
 - Themida v3 with heavy VM obfuscation may require runtime heuristics that static
   analysis alone cannot resolve (`ThemidaVersion::Unknown`).
 - Import resolution for a fully virtualized IAT (v3 VM-strong) may produce
@@ -309,8 +430,9 @@ user-downloaded and verified at runtime via SHA-256 checksums (see
 
 | File | Contents |
 |---|---|
-| [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | Toolchain setup, test order, gates, building x86 samples |
+| [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | Toolchain setup, test order, gates, building x86 samples, the VMProtect measurement tables |
 | [`docs/POSTMORTEMS.md`](docs/POSTMORTEMS.md) | Every fixed defect, with the measurement that located it |
+| [`crates/cli/assets/README.md`](crates/cli/assets/README.md) | ScyllaHide profiles: provenance, deviations from ScyllaHide's own presets, known gaps |
 | [`CHANGELOG.md`](CHANGELOG.md) | Release history |
 
 ## Acknowledgements

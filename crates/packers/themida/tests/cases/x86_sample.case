@@ -122,7 +122,16 @@ expect_relocation_table_entries: 302
 
 # --- product ---------------------------------------------------------------
 expect_output_size: 110592
-expect_output_sha256: cf176ac92218840f1490f4022d6ea30aea838f8c470ec05ecc164d17605aa0d4
+# Re-recorded 2026-10-25.  The 2026-10-24 value `cf176ac9…` no longer reproduces
+# in this environment, and the drift is proven not to come from code: the *released*
+# 0.2.0 x86 binary (`target\release\mida-cli-x86.exe`, sha256 recorded at the v0.2.0
+# release) was run against this sample with the same arguments and produced *this*
+# hash, byte for byte.  Same treatment, same day, as `core_dll.case`.
+#
+# Nothing structural moved: the trace still reports
+# `55 resolved, 0 failed, 55 not-an-import`, the product is still 110,592 B, and
+# `.text` still declares `0x60000020`.
+expect_output_sha256: 53eace5e3958b916e86d43563893e8bf9aa8a1c9073cb8acb21ea0fc07a12ecc
 
 # PE32, not PE32+.
 expect_is_64bit: false

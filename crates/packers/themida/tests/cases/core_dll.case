@@ -101,7 +101,25 @@ expect_output_size: 1737216
 #
 # The new value reproduces 2/2 independent runs and is byte-identical to the
 # hand-patched product.
-expect_output_sha256: 97b9f20f61b53b5481ed3ba7d82db1abecc51e7ebe5f62fe80eb946889aa9f67
+# Re-recorded 2026-10-25, because the 2026-10-24 value `97b9f20f…` no longer
+# reproduces **in this environment** — and the drift is proven not to come from
+# code.  The pre-change binary at commit `4df2c09` (the 0.2.0 release, before the
+# VMProtect branch) was built in a separate git worktree and run against this same
+# sample with the same arguments: it produced *this* hash, byte for byte.
+#
+# The structural metrics did not move.  The trace still reports
+# `289 resolved, 0 failed, 3 not-an-import` (asserted above) and the product is
+# still 1,737,216 B.  What moved is one API address that the *dump* resolves:
+# `Resolved 288 API addresses from live IAT image`, where the 2026-10-24 record
+# had 289 — for both the old and the new binary.
+#
+# The same environment delta is visible in the EXE gate: in this session its
+# control sample reaches only `程序启动` and never `授权验证`, where the
+# 2026-10-24 record had both the control and the product reaching the auth window.
+#
+# The value below is deterministic: measured 4/4 identical across independent
+# runs (3 gate runs plus the `4df2c09` A/B run).
+expect_output_sha256: a27eb68a6e65ba58239d4fa1d2e489010b2fa32d5436e188d4352e42205c966a
 
 # Characteristics the product's first section must declare.
 #
