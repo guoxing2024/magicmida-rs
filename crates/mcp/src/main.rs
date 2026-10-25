@@ -44,6 +44,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
+use mida_packer_api::{Evidence, VmProtectMode};
 use serde_json::{json, Value};
 
 use mida_run::{kill_tree, Job, Phase, RunReport, RunState};
@@ -553,16 +554,29 @@ fn tool_verify(args: &Value) -> Result<Value> {
     }))
 }
 
-/// `triage` — PE facts without running anything.  Useful as the first call: it
-/// answers "is this even a packed target, and which architecture?" cheaply.
+/// `triage` — PE facts plus a packer verdict, without running anything.  Useful
+/// as the first call: it answers "which packer, which VMProtect mode, which
+/// architecture path?" cheaply, and carries the evidence behind the verdict so a
+/// surprising answer is diagnosable rather than a bare boolean.
 fn tool_triage(args: &Value) -> Result<Value> {
     let path = args
         .get("path")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("`path` is required"))?;
-    let pe = mida_pe::PeHeader::from_file(Path::new(path))
+    // Read once and parse from the bytes: the VMProtect detector inspects
+    // section *contents* (runtime section, scrambled `.pdata`), not just
+    // headers, so the file has to be in memory.
+    let image = std::fs::read(Path::new(path)).map_err(|e| anyhow!("cannot read {path}: {e}"))?;
+    let pe = mida_pe::PeHeader::from_bytes(&image)
         .map_err(|e| anyhow!("cannot parse {path}: {e}"))?;
+    Ok(triage_report(&pe, &image))
+}
 
+/// Build the triage report for an already-parsed image.
+///
+/// Split from [`tool_triage`] so the classification can be tested against
+/// synthesised headers instead of files on disk.
+fn triage_report(pe: &mida_pe::PeHeader, image: &[u8]) -> Value {
     let sections: Vec<Value> = pe
         .sections
         .iter()
@@ -579,9 +593,9 @@ fn tool_triage(args: &Value) -> Result<Value> {
         })
         .collect();
 
-    // The Themida markers this project keys on.  Reporting them here means an
-    // agent can decide whether `/unpack` is worth attempting before paying for
-    // a full run.
+    // The Themida markers this project keys on.  Reported here (and folded into
+    // the `packer` verdict below) so an agent can decide whether `/unpack` is
+    // worth attempting before paying for a run.
     let has_winlice = pe.sections.iter().any(|s| s.name.contains(".winlice"));
     let has_boot = pe.sections.iter().any(|s| s.name.contains(".boot"));
     let has_themida = pe.sections.iter().any(|s| s.name.contains(".themida"));
@@ -590,27 +604,117 @@ fn tool_triage(args: &Value) -> Result<Value> {
             && s.characteristics & 0x2000_0000 != 0
             && s.characteristics & 0x8000_0000 != 0
     });
+    let likely_themida = has_winlice || has_boot || has_themida || unnamed_exec_write;
 
-    Ok(json!({
+    // The packer gate, in the same order as `/analyze`: VMProtect's structured
+    // detection first, Themida's markers only when that says no.  The order is
+    // load-bearing — measured over 87 samples, Themida's `is_themida_section`
+    // shape also fires on a VMProtect `Packed` target, so the reverse order
+    // would mislabel that sample (see `mida-packer-api`'s crate docs).
+    let vmprotect = mida_packers_vmprotect::detect(pe, image);
+
+    let packer = if let Some(d) = &vmprotect {
+        json!({
+            "family": d.family().label(),
+            "mode": d.kind.vmprotect_mode().map(|m| m.label()),
+            "summary": d.summary(),
+            "evidence": evidence_list(&d.evidence),
+            "absent": evidence_list(&d.absent),
+        })
+    } else if likely_themida {
+        let mut ev: Vec<Value> = Vec::new();
+        if has_winlice {
+            ev.push(json!({
+                "code": "winlice-section",
+                "detail": "section `.winlice` present",
+            }));
+        }
+        if has_boot {
+            ev.push(json!({
+                "code": "boot-section",
+                "detail": "section `.boot` present",
+            }));
+        }
+        if has_themida {
+            ev.push(json!({
+                "code": "themida-section",
+                "detail": "section `.themida` present",
+            }));
+        }
+        if unnamed_exec_write {
+            ev.push(json!({
+                "code": "unnamed-exec-write-section",
+                "detail": "an unnamed section is executable and writable",
+            }));
+        }
+        json!({
+            "family": "Themida",
+            "mode": Value::Null,
+            "summary": "Themida",
+            "evidence": ev,
+            "absent": [],
+        })
+    } else {
+        json!({
+            "family": "unknown",
+            "mode": Value::Null,
+            "summary": "no recognised packer",
+            "evidence": [],
+            "absent": [],
+        })
+    };
+
+    // The hint names the pipeline that can actually produce a product for this
+    // verdict — the whole point of classifying in triage.
+    let hint = match vmprotect.as_ref().map(|d| d.kind) {
+        Some(mida_packer_api::PackerKind::VmProtect(VmProtectMode::Packed)) => {
+            "Packed: the code is not in the file. Run the target, then use /dump-image \
+             <pid> <out> --wait; the carved payload decodes to a runnable PE (README: \
+             'Worked example'). unpack_start is Themida-only and will refuse."
+        }
+        Some(mida_packer_api::PackerKind::VmProtect(VmProtectMode::MinProtection)) => {
+            "MinProtection: the code is in the file. /analyze <file> [--extract <dir>] \
+             reports the structure and extracts payloads with no desktop session."
+        }
+        Some(_) => "Themida: unpack_start + unpack_status; needs a desktop session.",
+        None if likely_themida => {
+            if pe.is_64bit {
+                "Themida x64: verified path (golden record exists). unpack_start + \
+                 unpack_status; needs an interactive desktop session."
+            } else {
+                "Themida x86: verified end to end (needs mida-cli-x86.exe beside \
+                 mida-mcp.exe); same desktop-session requirement."
+            }
+        }
+        _ => "No recognised packer: this build classifies Themida and VMProtect. \
+              There is nothing here for unpack_start.",
+    };
+
+    json!({
         "architecture": if pe.is_64bit { "x64" } else { "x86" },
         "image_base": format!("{:#x}", pe.image_base),
         "entry_point_rva": format!("{:#x}", pe.entry_point),
         "size_of_image": format!("{:#x}", pe.size_of_image()),
         "sections": sections,
+        // The verdict, with the evidence that produced it.
+        "packer": packer,
+        // Kept verbatim for callers of the first version of this tool.
         "themida_markers": {
             "winlice": has_winlice,
             "boot": has_boot,
             "themida": has_themida,
             "unnamed_exec_write": unnamed_exec_write,
         },
-        "likely_themida": has_winlice || has_boot || has_themida || unnamed_exec_write,
-        "hint": if pe.is_64bit {
-            "x64: verified path (golden record exists)"
-        } else {
-            "x86: pipeline runs end-to-end but the product's import wiring is not yet \
-             correct (measured: loader accepts the image, then ENTRYPOINT_NOT_FOUND)"
-        },
-    }))
+        "likely_themida": likely_themida,
+        "hint": hint,
+    })
+}
+
+/// Render evidence as `[{code, detail}]`, the shape the rest of the report uses.
+fn evidence_list(list: &[Evidence]) -> Vec<Value> {
+    list.iter()
+        .map(|e| json!({ "code": e.code, "detail": e.detail }))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -621,9 +725,11 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "triage",
-            "description": "Report PE facts and Themida markers for a binary without running it. \
-                            Call this first to decide whether unpacking is worthwhile and which \
-                            architecture path applies.",
+            "description": "Report PE facts and classify the packer without running anything: \
+                            family (Themida / VMProtect / unknown), the VMProtect mode \
+                            (min-protection or packed) when VMProtect, and the evidence behind \
+                            the verdict. Call this first to pick the pipeline and the \
+                            architecture path.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -820,11 +926,13 @@ fn handle_request(server: &Server, method: &str, params: &Value) -> Result<Value
             },
             // Server instructions are injected into the client's system prompt as
             // literal text, so keep them short and operational.
-            "instructions": "Themida unpacker. Call `triage` first to confirm the target is packed and \
-                             learn its architecture. Then `unpack_start` + `unpack_status`. \
-                             Unpacking needs an interactive desktop session (the target opens its own \
-                             window); it will not work headless. x64 is the verified path; x86 runs \
-                             but its product currently fails to resolve imports."
+            "instructions": "Call `triage` first: it names the packer — Themida, or VMProtect \
+                             with its min-protection/packed mode — and the evidence. Themida \
+                             targets: `unpack_start` + `unpack_status` (needs an interactive \
+                             desktop session; the target opens its own window). VMProtect \
+                             Packed: the code is not in the file, use the CLI's /dump-image \
+                             --wait on the running process; MinProtection: /analyze is enough \
+                             and works headless."
         })),
         "tools/list" => Ok(json!({ "tools": tool_definitions() })),
         "tools/call" => {
@@ -1193,6 +1301,189 @@ mod tests {
         let second = read_message(&mut r, &mut buf).unwrap().unwrap();
         assert_eq!(second.0, "ok");
         assert_eq!(second.1, "utf-8");
+    }
+
+    // -- triage classification ----------------------------------------------
+    //
+    // The fixture mirrors `mida_packers_vmprotect::test_support`, which is
+    // `pub(crate)` and therefore not reachable from here.  The section shapes
+    // are the measured ones used by the detector's own tests, so a verdict
+    // proven there must survive the trip through triage's JSON.
+
+    use mida_pe::{
+        ImageDataDirectory, ImageDosHeader, ImageFileHeader, ImageNtHeaders,
+        ImageOptionalHeader, ImageSectionHeader, PeHeader, PeSection,
+    };
+
+    fn fixture_pe(sections: Vec<PeSection>) -> PeHeader {
+        let n = sections.len() as u16;
+        PeHeader {
+            dos_header: ImageDosHeader { e_magic: 0x5a4d, e_lfanew: 0x80 },
+            nt_headers: ImageNtHeaders {
+                signature: 0x0000_4550,
+                file_header: ImageFileHeader {
+                    machine: 0x8664,
+                    number_of_sections: n,
+                    time_date_stamp: 0,
+                    size_of_optional_header: 0xf0,
+                    characteristics: 0x22,
+                },
+                optional_header: ImageOptionalHeader {
+                    magic: 0x20b,
+                    major_linker_version: 14,
+                    minor_linker_version: 44,
+                    size_of_code: 0,
+                    size_of_initialized_data: 0,
+                    size_of_uninitialized_data: 0,
+                    address_of_entry_point: 0,
+                    base_of_code: 0,
+                    base_of_data: None,
+                    image_base: 0x1_4000_0000,
+                    section_alignment: 0x1000,
+                    file_alignment: 0x200,
+                    major_operating_system_version: 6,
+                    minor_operating_system_version: 0,
+                    major_image_version: 0,
+                    minor_image_version: 0,
+                    major_subsystem_version: 6,
+                    minor_subsystem_version: 0,
+                    win32_version_value: 0,
+                    size_of_image: 0,
+                    size_of_headers: 0x400,
+                    check_sum: 0,
+                    subsystem: 2,
+                    dll_characteristics: 0x8160,
+                    size_of_stack_reserve: 0,
+                    size_of_stack_commit: 0,
+                    size_of_heap_reserve: 0,
+                    size_of_heap_commit: 0,
+                    loader_flags: 0,
+                    number_of_rva_and_sizes: 16,
+                    data_directory: [ImageDataDirectory::default(); 16],
+                },
+            },
+            sections,
+            image_base: 0x1_4000_0000,
+            entry_point: 0,
+            is_64bit: true,
+            file_alignment: 0x200,
+            section_alignment: 0x1000,
+        }
+    }
+
+    fn fixture_sec(
+        name: &str,
+        raw_size: u32,
+        virtual_size: u32,
+        chars: u32,
+        raw_offset: u32,
+    ) -> PeSection {
+        PeSection {
+            header: ImageSectionHeader {
+                name: [0; 8],
+                virtual_size,
+                virtual_address: 0,
+                size_of_raw_data: raw_size,
+                pointer_to_raw_data: raw_offset,
+                pointer_to_relocations: 0,
+                pointer_to_linenumbers: 0,
+                number_of_relocations: 0,
+                number_of_linenumbers: 0,
+                characteristics: chars,
+            },
+            name: name.to_string(),
+            virtual_address: 0,
+            virtual_size,
+            raw_offset,
+            raw_size,
+            characteristics: chars,
+            extra_data: None,
+        }
+    }
+
+    fn evidence_codes(v: &Value, key: &str) -> Vec<String> {
+        v["packer"][key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["code"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn triage_names_the_vmprotect_mode_and_the_evidence() {
+        // The 伦伦 MinProtection shape from the detector's own tests.
+        let img = vec![0u8; 0x1000];
+        let pe = fixture_pe(vec![
+            fixture_sec(".text", 0x400, 0x400, 0x6000_0020, 0x0),
+            fixture_sec(".fptable", 0x200, 0x100, 0xc000_0040, 0x0),
+            fixture_sec(".vmp0", 0x400, 0x400, 0x6800_0060, 0x400),
+        ]);
+        let r = triage_report(&pe, &img);
+        assert_eq!(r["packer"]["family"], "VMProtect");
+        assert_eq!(r["packer"]["mode"], "min-protection");
+        assert_eq!(r["packer"]["summary"], "VMProtect (min-protection)");
+        let codes = evidence_codes(&r, "evidence");
+        assert!(codes.contains(&"vmp-section".to_string()));
+        assert!(codes.contains(&"notpaged-executable-section".to_string()));
+        assert!(codes.contains(&"fptable-section".to_string()));
+        assert!(codes.contains(&"runtime-section".to_string()));
+        assert_eq!(r["packer"]["absent"], json!([]));
+        assert_eq!(r["likely_themida"], false);
+        assert!(r["hint"].as_str().unwrap().contains("/analyze"));
+    }
+
+    #[test]
+    fn triage_names_the_packed_mode_and_points_at_the_live_pipeline() {
+        // The zz_test Packed shape: `.text` has no file bytes, the VM code
+        // lives in `.rdata2`.
+        let img = vec![0u8; 0x1000];
+        let pe = fixture_pe(vec![
+            fixture_sec(".text", 0, 0x12b05c, 0x6000_0020, 0),
+            fixture_sec(".fptable", 0, 0x100, 0xc000_0040, 0),
+            fixture_sec(".rdata2", 0x400, 0x400, 0x6800_0060, 0x400),
+        ]);
+        let r = triage_report(&pe, &img);
+        assert_eq!(r["packer"]["family"], "VMProtect");
+        assert_eq!(r["packer"]["mode"], "packed");
+        // The name marker is absent and the verdict says so instead of
+        // silently omitting it — the same contract the CLI's /analyze keeps.
+        assert!(evidence_codes(&r, "absent").contains(&"vmp-section".to_string()));
+        assert!(r["hint"].as_str().unwrap().contains("/dump-image"));
+        assert!(r["hint"].as_str().unwrap().contains("will refuse"));
+    }
+
+    #[test]
+    fn triage_keeps_themida_as_a_verdict_with_marker_evidence() {
+        let img = vec![0u8; 0x1000];
+        let pe = fixture_pe(vec![
+            fixture_sec("        ", 0x4c600, 0xdd9a0, 0x6000_0020, 0),
+            fixture_sec(".winlice", 0, 0x6d6000, 0xe000_0060, 0),
+            fixture_sec(".boot", 0x4e8800, 0x4e8800, 0x6000_0060, 0),
+        ]);
+        let r = triage_report(&pe, &img);
+        assert_eq!(r["packer"]["family"], "Themida");
+        assert_eq!(r["packer"]["mode"], Value::Null);
+        let codes = evidence_codes(&r, "evidence");
+        assert!(codes.contains(&"winlice-section".to_string()));
+        assert!(codes.contains(&"boot-section".to_string()));
+        // Compatibility fields survive for the tool's first callers.
+        assert_eq!(r["themida_markers"]["winlice"], true);
+        assert_eq!(r["themida_markers"]["boot"], true);
+        assert_eq!(r["likely_themida"], true);
+        assert!(r["hint"].as_str().unwrap().contains("unpack_start"));
+    }
+
+    #[test]
+    fn triage_reports_unknown_for_an_ordinary_pe() {
+        let img = vec![0u8; 0x1000];
+        let pe = fixture_pe(vec![fixture_sec(".text", 0x200, 0x200, 0x6000_0020, 0x200)]);
+        let r = triage_report(&pe, &img);
+        assert_eq!(r["packer"]["family"], "unknown");
+        assert_eq!(r["packer"]["mode"], Value::Null);
+        assert_eq!(r["packer"]["evidence"], json!([]));
+        assert_eq!(r["likely_themida"], false);
+        assert!(r["hint"].as_str().unwrap().contains("No recognised packer"));
     }
 }
 

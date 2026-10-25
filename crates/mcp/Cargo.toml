@@ -14,6 +14,8 @@ path = "src/main.rs"
 [dependencies]
 mida-run = { path = "../run" }
 mida-pe = { path = "../pe" }
+mida-packer-api = { path = "../packers/api" }
+mida-packers-vmprotect = { path = "../packers/vmprotect" }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

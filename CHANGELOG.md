@@ -5,10 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — becomes 0.3.0
+## [Unreleased]
 
-**Not released.** The version in `Cargo.toml` is `0.3.0` and this section is
-written, but no tag and no release exist. `0.2.0` remains the latest release.
+### Added
+- **MCP `triage` classifies the packer** — the tool now answers with a `packer`
+  object: `family` (`Themida` / `VMProtect` / `unknown`), the VMProtect `mode`
+  (`min-protection` / `packed`), and the `evidence` / `absent` lists behind the
+  verdict, so a model can pick the pipeline before paying for a run. The gate
+  order matches `/analyze`: VMProtect's structured detection first, Themida's
+  markers only when that says no. The `themida_markers` block and
+  `likely_themida` are kept for compatibility. Also corrected while there: the
+  x86 `hint` still described the pre-2026-10-24 state ("import wiring not yet
+  correct"); x86 has been a verified end-to-end path since then.
+
+## [0.3.0] — 2026-10-26
+
+Released: tag `v0.3.0` → commit `1bb1931`; GitHub Release with four assets,
+each verified by size + sha256 after download.
 
 The branch now turns a measured VMProtect target into a product: it identifies
 the packer and its mode, reports the structure, extracts payloads that are in the
@@ -16,10 +29,10 @@ file, captures a live image for targets whose code is not, and decodes the
 payload to a runnable PE. The measurement tables are in
 [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
 
-Before releasing, the honest boundary to state: the payload decode is a
-**per-family measured key**, not a cipher break, and it was validated on one
-vendor family. Two `Packed` samples and 14 `MinProtection` samples exist here;
-`FullVirtualize` was not exercised and x86 VMProtect targets are unmeasured.
+The honest boundary: the payload decode is a **per-family measured key**, not a
+cipher break, and it was validated on one vendor family. Two `Packed` samples
+and 14 `MinProtection` samples exist here; `FullVirtualize` was not exercised
+and x86 VMProtect targets are unmeasured.
 
 ### Added
 - **`mida-packer-api`** — the workspace's first real packer abstraction:

@@ -1638,6 +1638,8 @@ name = "mida-mcp"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "mida-packer-api",
+ "mida-packers-vmprotect",
  "mida-pe",
  "mida-run",
  "serde",

@@ -376,7 +376,7 @@ the Model Context Protocol. Five tools:
 
 | Tool | Behaviour |
 |---|---|
-| `triage` | Synchronous. Reports PE facts without running anything. |
+| `triage` | Synchronous. Reports PE facts **and the packer verdict** — family (Themida / VMProtect / unknown), the VMProtect mode (`min-protection` / `packed`), and the evidence behind it — without running anything. |
 | `unpack_start` | Returns a `job_id` immediately. |
 | `unpack_status` | Long-polls up to 45 s; returns phase and metrics. |
 | `unpack_cancel` | `taskkill /T`, taking the debuggee with it. |
