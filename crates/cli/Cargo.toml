@@ -12,6 +12,7 @@ mida-core = { path = "../core" }
 mida-pe = { path = "../pe" }
 mida-packer-api = { path = "../packers/api" }
 mida-packers-themida = { path = "../packers/themida" }
+mida-packers-upx = { path = "../packers/upx" }
 mida-packers-vmprotect = { path = "../packers/vmprotect" }
 anyhow = { workspace = true }
 tracing = { workspace = true }

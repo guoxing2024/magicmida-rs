@@ -44,6 +44,8 @@ pub enum Family {
     Themida,
     /// VMProtect (any 2.x/3.x build).
     VmProtect,
+    /// UPX (the NRV/LZMA packer; static layout, no runtime secret).
+    Upx,
     /// No packer we recognise.
     Unknown,
 }
@@ -54,6 +56,7 @@ impl Family {
         match self {
             Family::Themida => "Themida",
             Family::VmProtect => "VMProtect",
+            Family::Upx => "UPX",
             Family::Unknown => "unknown",
         }
     }
@@ -97,6 +100,7 @@ impl VmProtectMode {
 pub enum PackerKind {
     Themida,
     VmProtect(VmProtectMode),
+    Upx,
     Unknown,
 }
 
@@ -106,6 +110,7 @@ impl PackerKind {
         match self {
             PackerKind::Themida => Family::Themida,
             PackerKind::VmProtect(_) => Family::VmProtect,
+            PackerKind::Upx => Family::Upx,
             PackerKind::Unknown => Family::Unknown,
         }
     }
@@ -136,6 +141,9 @@ impl PackerKind {
         match self {
             PackerKind::Themida => "Magicmida",
             PackerKind::VmProtect(_) => "VMProtect x86/x64",
+            // UPX does no anti-debug work at all; and it currently has no live
+            // pipeline in this project, so no injector is ever started for it.
+            PackerKind::Upx => "Disabled",
             PackerKind::Unknown => "Disabled",
         }
     }
@@ -206,6 +214,11 @@ impl Detection {
         matches!(self.kind, PackerKind::VmProtect(_))
     }
 
+    /// `true` for any UPX verdict.
+    pub fn is_upx(&self) -> bool {
+        matches!(self.kind, PackerKind::Upx)
+    }
+
     /// `true` when nothing matched.
     pub fn is_unknown(&self) -> bool {
         matches!(self.kind, PackerKind::Unknown)
@@ -216,6 +229,7 @@ impl Detection {
         match self.kind {
             PackerKind::Themida => "Themida".to_string(),
             PackerKind::VmProtect(m) => format!("VMProtect ({})", m.label()),
+            PackerKind::Upx => "UPX".to_string(),
             PackerKind::Unknown => "no recognised packer".to_string(),
         }
     }
@@ -264,6 +278,10 @@ mod tests {
         assert_eq!(k.vmprotect_mode(), Some(VmProtectMode::Packed));
         assert_eq!(k.family().label(), "VMProtect");
         assert_eq!(VmProtectMode::Packed.label(), "packed");
+        assert_eq!(PackerKind::Themida.family(), Family::Themida);
+        assert_eq!(PackerKind::Upx.family(), Family::Upx);
+        assert_eq!(PackerKind::Upx.family().label(), "UPX");
+        assert_eq!(PackerKind::Upx.vmprotect_mode(), None);
         assert_eq!(PackerKind::Themida.family(), Family::Themida);
         assert_eq!(PackerKind::Unknown.family(), Family::Unknown);
         assert_eq!(PackerKind::Themida.vmprotect_mode(), None);

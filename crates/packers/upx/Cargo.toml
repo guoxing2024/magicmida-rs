@@ -1,0 +1,17 @@
+[package]
+name = "mida-packers-upx"
+version.workspace = true
+edition.workspace = true
+description = "UPX detection, pack-header parsing and static structure report"
+repository.workspace = true
+license.workspace = true
+readme.workspace = true
+
+[dependencies]
+mida-pe = { path = "../../pe" }
+mida-packer-api = { path = "../api" }
+
+[dev-dependencies]
+# The gate documents why /unpack's gate order is load-bearing: UPX0 fires
+# Themida's own section heuristic, measured on the real sections.
+mida-packers-themida = { path = "../themida" }

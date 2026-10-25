@@ -28,6 +28,11 @@ pub enum PackerChoice {
     /// Select the VMProtect branch — its own ScyllaHide profile, sharing the
     /// single debug loop that exists.  Experimental.
     VmProtect,
+    /// UPX has no live pipeline in this project: its whole original image is
+    /// one statically-decodable stream, so there is nothing for a debugger to
+    /// do.  `/analyze` reports the layout; the static unpacker is the next
+    /// increment.
+    Upx,
 }
 
 impl PackerChoice {
@@ -37,8 +42,9 @@ impl PackerChoice {
             "auto" => Ok(PackerChoice::Auto),
             "themida" => Ok(PackerChoice::Themida),
             "vmprotect" | "vmp" => Ok(PackerChoice::VmProtect),
+            "upx" => Ok(PackerChoice::Upx),
             other => Err(format!(
-                "Unknown --packer value '{other}'. Use auto, themida, or vmprotect."
+                "Unknown --packer value '{other}'. Use auto, themida, vmprotect, or upx."
             )),
         }
     }

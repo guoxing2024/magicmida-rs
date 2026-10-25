@@ -92,6 +92,11 @@ struct LoopState {
 // ---------------------------------------------------------------------------
 
 /// Print a packer verdict, its evidence, and the static structure report.
+///
+/// The structure report is the VMProtect one and only runs for a VMProtect
+/// verdict — the gate used to attach it to *any* detection, which printed a
+/// meaningless "large resources: none" VMProtect report under a UPX verdict
+/// (measured the moment UPX entered the gate chain).
 fn log_detection(detection: &mida_packer_api::Detection, pe: &PeHeader, image: &[u8]) {
     log::log(
         LogType::Info,
@@ -100,13 +105,15 @@ fn log_detection(detection: &mida_packer_api::Detection, pe: &PeHeader, image: &
     for line in detection.render_evidence() {
         log::log(LogType::Info, &format!("  {line}"));
     }
-    log::log(
-        LogType::Info,
-        &format!(
-            "Static report:\n{}",
-            mida_packers_vmprotect::analyze(pe, image)
-        ),
-    );
+    if detection.is_vmprotect() {
+        log::log(
+            LogType::Info,
+            &format!(
+                "Static report:\n{}",
+                mida_packers_vmprotect::analyze(pe, image)
+            ),
+        );
+    }
 }
 
 /// Unpack a Themida-protected executable.
@@ -171,12 +178,26 @@ pub fn unpack(
     let image = fs::read(input)
         .map_err(|e| anyhow!("Failed to read input for packer detection: {e}"))?;
 
-    let detection = mida_packers_vmprotect::detect(&pe, &image);
+    // The packer gate, in the same order as `/analyze`: the structured
+    // detectors first (VMProtect, then UPX), and the Themida heuristic only
+    // when neither fires.  The order is load-bearing twice over — UPX's
+    // `UPX0` section is an executable `raw_size == 0` section with a large
+    // virtual size, which is exactly what `is_themida_section` keys on
+    // (measured on real UPX output, see the upx crate's gate).
+    let detection = mida_packers_vmprotect::detect(&pe, &image)
+        .or_else(|| mida_packers_upx::detect(&pe, &image));
 
     // The packer choice is an explicit, logged decision rather than a silent
     // fall-through, because the `Auto` refusal is the only thing standing
-    // between a VMProtect target and the Themida loop.
+    // between a non-Themida target and the Themida loop.
     let packer_kind = match (packer, detection.as_ref()) {
+        (PackerChoice::Upx, _) => {
+            return Err(anyhow!(
+                "UPX target — its whole original image is one statically-decodable \
+                 stream in the file, so the debugger pipeline has nothing to do; \
+                 /analyze reports the layout, and a static unpacker is the next increment"
+            ));
+        }
         (PackerChoice::Auto, Some(d)) => {
             log_detection(d, &pe, &image);
             return Err(anyhow!(

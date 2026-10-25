@@ -8,15 +8,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **UPX as the third packer (`mida-packers-upx`)** — measured against UPX 5.2.1
+  output and cross-checked with UPX's own source at tag v5.2.1: the 32-byte
+  `PackHeader` (version 13; PE32 = 9, PE32+/AMD64 = 36; method 8 = NRV2E_LE32
+  by default, 14 = LZMA; header checksum `sum(bytes[+4..+32]) mod 251`), the
+  **single-block** compressed stream (no `b_info` chain in the PE format),
+  `c_adler` = standard Adler-32 seeded 1 (4/4 samples), the
+  ident-inside-`UPX1` placement rule, and the structural invariant
+  `UPX1_raw + align_up(ic + c_len, 16) == entry-point file offset` (4/4).
+  Detection requires a valid header **and** UPX-named sections; `/analyze`
+  prints the full layout and verifies the invariant per file. This round
+  delivers detection + parse + report only — the static unpacker (NRV/LZMA
+  decode, filter undo, PE rebuild, diffed against `upx -d`) is the next
+  increment and is not claimed anywhere. `--packer upx` parses and refuses
+  with that exact answer. `l_info`/`p_info` do not appear in UPX 5.2.1 PE
+  output — measured, not assumed.
 - **MCP `triage` classifies the packer** — the tool now answers with a `packer`
-  object: `family` (`Themida` / `VMProtect` / `unknown`), the VMProtect `mode`
-  (`min-protection` / `packed`), and the `evidence` / `absent` lists behind the
-  verdict, so a model can pick the pipeline before paying for a run. The gate
-  order matches `/analyze`: VMProtect's structured detection first, Themida's
-  markers only when that says no. The `themida_markers` block and
+  object: `family` (`Themida` / `VMProtect` / `UPX` / `unknown`), the VMProtect
+  `mode` (`min-protection` / `packed`), and the `evidence` / `absent` lists
+  behind the verdict, so a model can pick the pipeline before paying for a
+  run. The gate order matches `/analyze`: structured detection first, Themida's
+  markers only when both say no. The `themida_markers` block and
   `likely_themida` are kept for compatibility. Also corrected while there: the
   x86 `hint` still described the pre-2026-10-24 state ("import wiring not yet
   correct"); x86 has been a verified end-to-end path since then.
+
+### Fixed
+- **`/unpack auto` would have run the Themida loop on a UPX target** — `UPX0`
+  is an executable section with `raw_size == 0` and a large virtual size,
+  exactly the shape `is_themida_section` keys on (measured on the real
+  sections, pinned in the upx crate's gate). The gate now runs
+  VMProtect → UPX → Themida in that order, before any process is created.
+- The gate's log no longer attaches the VMProtect structure report to
+  non-VMProtect verdicts (measured: a UPX verdict printed a meaningless
+  "large resources: none" VMProtect report above it).
 
 ## [0.3.0] — 2026-10-26
 

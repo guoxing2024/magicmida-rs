@@ -63,6 +63,9 @@ pub fn analyze_file(opts: &AnalyzeOptions<'_>) -> Result<(), anyhow::Error> {
     );
 
     let Some(detection) = detect(&pe, &image) else {
+        if let Some(upx) = mida_packers_upx::detect(&pe, &image) {
+            return analyze_upx(&pe, &image, opts, &upx);
+        }
         return analyze_themida_or_fail(&pe, opts);
     };
 
@@ -80,6 +83,38 @@ pub fn analyze_file(opts: &AnalyzeOptions<'_>) -> Result<(), anyhow::Error> {
         Some(dir) => extract_payloads(opts.input, &image, &report, dir),
         None => Ok(()),
     }
+}
+
+/// `/analyze` answers for UPX too: the whole layout is static, so the report
+/// is complete without a debugger — but the decode itself is not implemented
+/// yet, and the report says so instead of pretending.
+///
+/// `--extract` is a deliberate failure here: the only payload UPX carries is
+/// the compressed stream, and it is useless until the NRV/LZMA decoder lands.
+fn analyze_upx(
+    pe: &PeHeader,
+    image: &[u8],
+    opts: &AnalyzeOptions<'_>,
+    detection: &mida_packer_api::Detection,
+) -> Result<(), anyhow::Error> {
+    log::log(LogType::Good, &format!("Packer: {}", detection.summary()));
+    for line in detection.render_evidence() {
+        log::log(LogType::Info, &format!("  {line}"));
+    }
+    let report = mida_packers_upx::analyze(pe, image).ok_or_else(|| {
+        anyhow!(
+            "UPX evidence found but no PackHeader in {} — this should be impossible",
+            opts.input.display()
+        )
+    })?;
+    print!("{report}");
+    if opts.extract_to.is_some() {
+        return Err(anyhow!(
+            "--extract is not implemented for UPX yet: the compressed stream is \
+             not usable until the NRV/LZMA decoder lands"
+        ));
+    }
+    Ok(())
 }
 
 /// `/analyze` answers for Themida too.

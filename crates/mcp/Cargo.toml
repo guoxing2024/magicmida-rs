@@ -15,6 +15,7 @@ path = "src/main.rs"
 mida-run = { path = "../run" }
 mida-pe = { path = "../pe" }
 mida-packer-api = { path = "../packers/api" }
+mida-packers-upx = { path = "../packers/upx" }
 mida-packers-vmprotect = { path = "../packers/vmprotect" }
 anyhow = { workspace = true }
 tracing = { workspace = true }

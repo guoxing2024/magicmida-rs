@@ -607,16 +607,30 @@ fn triage_report(pe: &mida_pe::PeHeader, image: &[u8]) -> Value {
     let likely_themida = has_winlice || has_boot || has_themida || unnamed_exec_write;
 
     // The packer gate, in the same order as `/analyze`: VMProtect's structured
-    // detection first, Themida's markers only when that says no.  The order is
-    // load-bearing — measured over 87 samples, Themida's `is_themida_section`
-    // shape also fires on a VMProtect `Packed` target, so the reverse order
-    // would mislabel that sample (see `mida-packer-api`'s crate docs).
+    // detection first, then UPX's, Themida's markers only when neither says
+    // yes.  The order is load-bearing — measured over 87 samples, Themida's
+    // `is_themida_section` shape also fires on a VMProtect `Packed` target AND
+    // on UPX's `UPX0` section, so the reverse order would mislabel both (see
+    // `mida-packer-api`'s crate docs and the upx crate's gate).
     let vmprotect = mida_packers_vmprotect::detect(pe, image);
+    let upx = if vmprotect.is_none() {
+        mida_packers_upx::detect(pe, image)
+    } else {
+        None
+    };
 
     let packer = if let Some(d) = &vmprotect {
         json!({
             "family": d.family().label(),
             "mode": d.kind.vmprotect_mode().map(|m| m.label()),
+            "summary": d.summary(),
+            "evidence": evidence_list(&d.evidence),
+            "absent": evidence_list(&d.absent),
+        })
+    } else if let Some(d) = &upx {
+        json!({
+            "family": d.family().label(),
+            "mode": Value::Null,
             "summary": d.summary(),
             "evidence": evidence_list(&d.evidence),
             "absent": evidence_list(&d.absent),
@@ -666,28 +680,35 @@ fn triage_report(pe: &mida_pe::PeHeader, image: &[u8]) -> Value {
 
     // The hint names the pipeline that can actually produce a product for this
     // verdict — the whole point of classifying in triage.
-    let hint = match vmprotect.as_ref().map(|d| d.kind) {
-        Some(mida_packer_api::PackerKind::VmProtect(VmProtectMode::Packed)) => {
-            "Packed: the code is not in the file. Run the target, then use /dump-image \
-             <pid> <out> --wait; the carved payload decodes to a runnable PE (README: \
-             'Worked example'). unpack_start is Themida-only and will refuse."
-        }
-        Some(mida_packer_api::PackerKind::VmProtect(VmProtectMode::MinProtection)) => {
-            "MinProtection: the code is in the file. /analyze <file> [--extract <dir>] \
-             reports the structure and extracts payloads with no desktop session."
-        }
-        Some(_) => "Themida: unpack_start + unpack_status; needs a desktop session.",
-        None if likely_themida => {
-            if pe.is_64bit {
-                "Themida x64: verified path (golden record exists). unpack_start + \
-                 unpack_status; needs an interactive desktop session."
-            } else {
-                "Themida x86: verified end to end (needs mida-cli-x86.exe beside \
-                 mida-mcp.exe); same desktop-session requirement."
+    let hint = if let Some(d) = &vmprotect {
+        match d.kind.vmprotect_mode() {
+            Some(VmProtectMode::Packed) => {
+                "Packed: the code is not in the file. Run the target, then use /dump-image \
+                 <pid> <out> --wait; the carved payload decodes to a runnable PE (README: \
+                 'Worked example'). unpack_start is Themida-only and will refuse."
             }
+            Some(VmProtectMode::MinProtection) => {
+                "MinProtection: the code is in the file. /analyze <file> [--extract <dir>] \
+                 reports the structure and extracts payloads with no desktop session."
+            }
+            None => "VMProtect: unpack_start is Themida-only and will refuse.",
         }
-        _ => "No recognised packer: this build classifies Themida and VMProtect. \
-              There is nothing here for unpack_start.",
+    } else if upx.is_some() {
+        "UPX: the whole original image is one statically-decodable stream in the file, \
+         so no desktop session is involved at all. /analyze <file> reports the layout; \
+         a static unpacker is the next increment (upx -d restores the original meanwhile). \
+         unpack_start is Themida-only and will refuse."
+    } else if likely_themida {
+        if pe.is_64bit {
+            "Themida x64: verified path (golden record exists). unpack_start + \
+             unpack_status; needs an interactive desktop session."
+        } else {
+            "Themida x86: verified end to end (needs mida-cli-x86.exe beside \
+             mida-mcp.exe); same desktop-session requirement."
+        }
+    } else {
+        "No recognised packer: this build classifies Themida, VMProtect and UPX. \
+         There is nothing here for unpack_start."
     };
 
     json!({
@@ -726,7 +747,7 @@ fn tool_definitions() -> Value {
         {
             "name": "triage",
             "description": "Report PE facts and classify the packer without running anything: \
-                            family (Themida / VMProtect / unknown), the VMProtect mode \
+                            family (Themida / VMProtect / UPX / unknown), the VMProtect mode \
                             (min-protection or packed) when VMProtect, and the evidence behind \
                             the verdict. Call this first to pick the pipeline and the \
                             architecture path.",
@@ -926,13 +947,14 @@ fn handle_request(server: &Server, method: &str, params: &Value) -> Result<Value
             },
             // Server instructions are injected into the client's system prompt as
             // literal text, so keep them short and operational.
-            "instructions": "Call `triage` first: it names the packer — Themida, or VMProtect \
-                             with its min-protection/packed mode — and the evidence. Themida \
+            "instructions": "Call `triage` first: it names the packer — Themida, VMProtect \
+                             (min-protection/packed mode), or UPX — and the evidence. Themida \
                              targets: `unpack_start` + `unpack_status` (needs an interactive \
                              desktop session; the target opens its own window). VMProtect \
                              Packed: the code is not in the file, use the CLI's /dump-image \
                              --wait on the running process; MinProtection: /analyze is enough \
-                             and works headless."
+                             and works headless. UPX: fully static, /analyze reports the \
+                             layout; no unpack_start."
         })),
         "tools/list" => Ok(json!({ "tools": tool_definitions() })),
         "tools/call" => {
@@ -1484,6 +1506,51 @@ mod tests {
         assert_eq!(r["packer"]["evidence"], json!([]));
         assert_eq!(r["likely_themida"], false);
         assert!(r["hint"].as_str().unwrap().contains("No recognised packer"));
+    }
+
+    #[test]
+    fn triage_classifies_upx_and_points_at_the_static_pipeline() {
+        // A synthetic UPX image: the same shape the upx crate's own tests use,
+        // with a checksum-valid PackHeader (built with UPX's own rule).
+        let mut img = vec![0u8; 0x1000];
+        let mut header = vec![0u8; 32];
+        header[0..4].copy_from_slice(b"UPX!");
+        header[4] = 13; // version
+        header[5] = 36; // format: PE32+/AMD64
+        header[6] = 8; // method: NRV2E_LE32
+        header[7] = 7; // level
+        header[8..12].copy_from_slice(&0xC6_4A_16_1Fu32.to_le_bytes()); // u_adler
+        header[12..16].copy_from_slice(&0u32.to_le_bytes()); // c_adler (zeros below)
+        header[16..20].copy_from_slice(&1_000_000u32.to_le_bytes()); // u_len
+        header[20..24].copy_from_slice(&100_000u32.to_le_bytes()); // c_len
+        header[24..28].copy_from_slice(&2_000_000u32.to_le_bytes()); // u_file_size
+        header[28] = 73; // filter
+        header[29] = 55; // filter_cto
+        header[30] = 0; // n_mru
+        let sum: u32 = header[4..31].iter().map(|&b| b as u32).sum();
+        header[31] = (sum % 251) as u8;
+        img[0x200..0x205].copy_from_slice(b"5.21\0");
+        img[0x205..0x225].copy_from_slice(&header);
+
+        let pe = fixture_pe(vec![
+            fixture_sec("UPX0", 0, 0x2d6000, 0xe000_0080, 0),
+            fixture_sec("UPX1", 0x14fc00, 0x150000, 0xe000_0040, 0x200),
+        ]);
+        let r = triage_report(&pe, &img);
+        assert_eq!(r["packer"]["family"], "UPX");
+        assert_eq!(r["packer"]["mode"], Value::Null);
+        let codes: Vec<String> = r["packer"]["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["code"].as_str().unwrap().to_string())
+            .collect();
+        assert!(codes.contains(&"upx-packheader".to_string()));
+        assert!(codes.contains(&"upx-sections".to_string()));
+        // UPX0 has exactly the shape is_themida_section keys on, so the gate
+        // order must have kept it out of the Themida verdict.
+        assert_eq!(r["likely_themida"], false);
+        assert!(r["hint"].as_str().unwrap().contains("statically-decodable"));
     }
 }
 

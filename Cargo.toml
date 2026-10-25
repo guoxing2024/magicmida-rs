@@ -5,6 +5,7 @@ members = [
     "crates/disasm",
     "crates/packers/api",
     "crates/packers/themida",
+    "crates/packers/upx",
     "crates/packers/vmprotect",
     "crates/cli",
     "crates/run",

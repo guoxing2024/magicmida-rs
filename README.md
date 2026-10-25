@@ -141,6 +141,13 @@ The full measurement tables are in [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
 - **VMProtect branch** — mode classification, structure report, in-file payload
   extraction, a debugger-free live image capture, and a measured payload decode
   to a runnable PE. Backed by a CI gate over 14 third-party samples
+- **UPX branch** — detection, `PackHeader` parsing (version/format/method/level/
+  filter/checksum) and a static layout report, measured against UPX 5.2.1
+  output and cross-checked against UPX's own source. The whole original image
+  is one statically-decodable stream, so no desktop session is involved; the
+  static unpacker (NRV/LZMA + filter undo) is the next increment and is not
+  claimed yet. Also fixes a real trap: UPX's `UPX0` section would otherwise
+  fire the Themida heuristic and hand a UPX file to the Themida debugger loop
 - **Verify mode** — diff unpacked output against a known-good reference,
   section by section
 - **GUI** — graphical front-end (`mida-gui.exe`)
@@ -376,7 +383,7 @@ the Model Context Protocol. Five tools:
 
 | Tool | Behaviour |
 |---|---|
-| `triage` | Synchronous. Reports PE facts **and the packer verdict** — family (Themida / VMProtect / unknown), the VMProtect mode (`min-protection` / `packed`), and the evidence behind it — without running anything. |
+| `triage` | Synchronous. Reports PE facts **and the packer verdict** — family (Themida / VMProtect / UPX / unknown), the VMProtect mode (`min-protection` / `packed`), and the evidence behind it — without running anything. |
 | `unpack_start` | Returns a `job_id` immediately. |
 | `unpack_status` | Long-polls up to 45 s; returns phase and metrics. |
 | `unpack_cancel` | `taskkill /T`, taking the debuggee with it. |
