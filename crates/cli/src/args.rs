@@ -101,7 +101,7 @@ pub enum Command {
     /// code section — the image only exists in memory, and this reads it out
     /// without attaching a debugger.
     ///
-    /// Usage: `magicmida /dump-image <pid> <output-file>`
+    /// Usage: `magicmida /dump-image <pid> <output-file> [--wait]`
     DumpImage {
         /// PID of the running target.
         pid: u32,

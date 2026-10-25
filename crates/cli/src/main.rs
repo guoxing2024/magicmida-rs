@@ -25,7 +25,7 @@ fn main() {
             eprintln!("  mida-cli /unpack <filename> [--data-sections] [--shrink] [-v]");
             eprintln!("  mida-cli /analyze <filename> [--extract <dir>] [-v]");
             eprintln!("  mida-cli /dump-process <pid> <unpacked-file>");
-            eprintln!("  mida-cli /dump-image <pid> <output-file>");
+            eprintln!("  mida-cli /dump-image <pid> <output-file> [--wait]");
             eprintln!("  mida-cli /verify <unpacked-file> <reference-file>");
             std::process::exit(1);
         }
