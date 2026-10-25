@@ -87,6 +87,84 @@ profile 文件在 `crates\cli\assets\scylla_hide.ini`（已跟踪），部署时
 `DEBUG: ApplyNtdllHook -> Hooking <名>` 就是实际挂上的钩子；值为 `0` 的键只会出现在
 `_Nt…` 地址表里，不会出现在 `Hooking` 行 —— **所以钩子集合可以直接断言，不用假设**。
 
+## `Packed` VMProtect：从活体抓产物（2026-10-25 打通）
+
+`Packed` 的原始段 `SizeOfRawData == 0`，文件里**没有代码**，只能从运行中的进程读。
+
+```powershell
+# 必须 --wait：载荷是原地解密的，抓早了就是半成品
+.\target\release\mida-cli.exe /dump-image <pid> OUT\image.exe --wait
+# 产物：OUT\image.exe（43,315,200 B、9 段、摊平）
+#       OUT\image.rcdata131.bin（12,782,080 B，自动 carve）
+```
+
+### 提升陷阱（不写清一定会被当成工具缺陷）
+
+这个样本家族**会给自己注册 `RUNASADMIN` 层标记**：
+
+```
+HKCU\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers
+  D:\Projects\zz_test.exe                              -> ~ RUNASADMIN
+  E:\Download\启动器10.9\启动器10.9.exe                -> ~ RUNASADMIN
+  <你复制出来的任何新路径>                              -> ~ RUNASADMIN   ← 跑过一次就会被加上
+```
+
+三份清单里**都没有** `requestedExecutionLevel`（pefile 静态确认），所以提升不是二进制要的，
+是它装上去的。后果：**同一个路径第二次跑就是提升进程，未提升会话读它 → `拒绝访问
+(0x80070005)`**。所以每次测量都要**换新路径并删掉那条标记**：
+
+```powershell
+reg delete "HKCU\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers" /v "<完整路径>" /f
+```
+
+gate 里就是这么做的（`clear_runasadmin_layer`）。
+
+### 捕获点：不能靠时间，也不能只靠"两帧一致"
+
+实测（每 100 ms 采一次，载荷区 12,782,080 B）：
+
+| t(s) | 载荷 sha256 前 16 位 | 说明 |
+|---|---|---|
+| 0.02 | `db4c050e…` | 还是全零 |
+| 0.73 | `b8991af0…` | 开始变 |
+| 0.84–1.53 | `3e6f024f` `4aa50cf5` `2fd77393` `36fb4454` `0a6a75e1` `73bafb30` `8f4c94ab` | 约 8 帧中间态 |
+| **1.65** | **`14596cbd…`** | **终态，之后不再变** |
+| 6.61 | — | 进程退出 |
+
+两个坑：
+
+1. **"连续两帧相同"不够** —— 前两帧可能都还是**未动过的文件字节**，于是判据在解密开始前
+   就满足了。实测因此产出 `fcee1cb1…` 或根本没有载荷文件。
+2. **终态与样本自身可推**：把输入文件的 `.rsrc` 按 RVA 映射出来读一遍（缺的部分按 0 补），
+   那就是"壳动它之前"的样子；**镜像里的资源区只要不等于它，就说明壳动过了**。现在要求
+   「已变化 + 连续两帧一致」两个条件同时成立，不依赖时间、不依赖对密码的任何假设。
+
+### 两个哈希不是一回事（别记错）
+
+| 值 | 尺寸 | 是什么 |
+|---|---|---|
+| `14596cbd…` | 12,782,080 B | 资源区在这个进程里的**终态**，也是参考镜像 `main.exe` 里那份 |
+| `e7004e89…` | 12,782,080 B | **进一步解出来的合法 PE**（`MZ`、`e_lfanew 0x80`、`machine 0x8664`、9 段） |
+
+**`e7004e89…` 不在这个进程里发生** —— 资源区到 1.65 s 定格后直到退出都没再变。
+所以它是**下一阶段**（换密钥/换载体）的产物，不是 `/dump-image` 能拿到的。
+gate 钉的是 `14596cbd…`，因为它可复现且与参考镜像一致。
+
+### 整镜像哈希**不是** golden
+
+三次捕获三个值（`a68874e3…` / `28668aa3…` / `1963ed17…`），因为活体镜像带运行期状态
+（已解析指针、`__security_cookie`、计时器）。**稳定的是形状**：43,315,200 B / 9 段，
+与参考镜像相同。gate 就按形状 + 载荷哈希两条断言，不钉整文件哈希。
+
+### gate
+
+```powershell
+cargo test --release -p mida-cli --test vmprotect_packed_gate -- --ignored --nocapture
+```
+
+`#[ignore]`（要真进程 + 桌面会话）。三条：捕获+carve（5/5 通过）、
+输入文件仍必须拒绝提取、以及一条**不需要样本**的常量自检（参考镜像仍是 9 段 / 43,315,200 B）。
+
 ## x86 编译（2026-10-23 打通）
 
 ```powershell

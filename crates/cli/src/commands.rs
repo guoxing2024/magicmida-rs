@@ -35,7 +35,13 @@ pub fn run_command(cmd: Command) -> Result<(), anyhow::Error> {
             pid,
             unpacked_file,
         } => crate::unpacker::dump_process_code(pid, &unpacked_file),
-        Command::DumpImage { pid, output } => crate::dump_image::dump_image(pid, &output),
+        Command::DumpImage { pid, output, wait } => {
+            if wait {
+                crate::dump_image::dump_image_stable(pid, &output)
+            } else {
+                crate::dump_image::dump_image(pid, &output)
+            }
+        }
         Command::Verify {
             unpacked,
             reference,

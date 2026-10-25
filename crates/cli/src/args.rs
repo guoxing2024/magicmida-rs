@@ -107,6 +107,8 @@ pub enum Command {
         pid: u32,
         /// Path to write the flat image to.
         output: PathBuf,
+        /// Keep sampling until two consecutive reads are identical.
+        wait: bool,
     },
 
     /// Verify an unpacked file against a reference.
@@ -309,14 +311,16 @@ fn parse_dump_process(args: &[String]) -> Result<Command, String> {
 
 fn parse_dump_image(args: &[String]) -> Result<Command, String> {
     if args.len() < 4 {
-        return Err("Usage: magicmida /dump-image <pid> <output-file>".into());
+        return Err("Usage: magicmida /dump-image <pid> <output-file> [--wait]".into());
     }
     let pid: u32 = args[2]
         .parse()
         .map_err(|e| format!("Invalid PID '{}': {}", args[2], e))?;
+    let wait = args[4..].iter().any(|a| a == "--wait" || a == "-w");
     Ok(Command::DumpImage {
         pid,
         output: PathBuf::from(&args[3]),
+        wait,
     })
 }
 
@@ -629,11 +633,22 @@ mod tests {
             "img.bin".into(),
         ];
         match parse_dump_image(&args).unwrap() {
-            Command::DumpImage { pid, output } => {
+            Command::DumpImage { pid, output, wait } => {
                 assert_eq!(pid, 4321);
                 assert_eq!(output, PathBuf::from("img.bin"));
+                assert!(!wait, "wait must default to off");
             }
             other => panic!("expected DumpImage, got {other:?}"),
+        }
+
+        // `--wait` is opt-in and recognised in any trailing position.
+        for extra in [vec!["--wait"], vec!["-w"], vec!["-v", "--wait"]] {
+            let mut a = args.clone();
+            a.extend(extra.iter().map(|s| s.to_string()));
+            match parse_dump_image(&a).unwrap() {
+                Command::DumpImage { wait, .. } => assert!(wait, "for {extra:?}"),
+                other => panic!("expected DumpImage, got {other:?}"),
+            }
         }
 
         assert!(parse_dump_image(&["prog".into(), "/dump-image".into()])

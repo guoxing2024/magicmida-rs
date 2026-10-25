@@ -229,24 +229,47 @@ fn align_up(value: u32, alignment: u32) -> u32 {
     value.div_ceil(alignment) * alignment
 }
 
-/// Flatten the loaded image of `pid` into `output`.
+/// Flatten the loaded image of `pid` into `output` **once**, immediately.
 ///
-/// # Errors
-///
-/// Returns an error when the process cannot be opened, its image path cannot
-/// be determined, the module cannot be found in the target's module list, the
-/// PE cannot be parsed, or the output cannot be written.
+/// Kept for callers that know the image is already settled.  Prefer
+/// [`dump_image_stable`] for a `Packed` target, whose payload is decrypted in
+/// place after start-up.
 pub fn dump_image(pid: u32, output: &Path) -> Result<(), anyhow::Error> {
     // SAFETY: pid is a valid OS process id; the handle is closed before return.
     let h = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) }
         .map_err(|e| anyhow!("Cannot open process {pid}: {e}"))?;
-    let result = dump_image_inner(h, pid, output);
+    let result = read_image(h, pid).and_then(|image| write_image(&image, output));
     // SAFETY: the handle was opened by this function and is no longer needed.
     let _ = unsafe { CloseHandle(h) };
     result
 }
 
-fn dump_image_inner(h: HANDLE, pid: u32, output: &Path) -> Result<(), anyhow::Error> {
+/// The full path of the executable image behind `h`.
+fn process_image_path(h: HANDLE) -> Option<std::path::PathBuf> {
+    let mut path_buf: Vec<u16> = vec![0u16; 512];
+    let mut len = path_buf.len() as u32;
+    // SAFETY: h is valid; path_buf is valid and sized.
+    let ok = unsafe {
+        QueryFullProcessImageNameW(
+            h,
+            PROCESS_NAME_FORMAT(0),
+            windows::core::PWSTR(path_buf.as_mut_ptr()),
+            &mut len,
+        )
+    };
+    if ok.is_err() || len == 0 {
+        return None;
+    }
+    Some(std::path::PathBuf::from(String::from_utf16_lossy(
+        &path_buf[..len as usize],
+    )))
+}
+
+/// Read, rebase and flatten the loaded image of `pid` into memory.
+///
+/// Split from writing so a caller can sample it repeatedly and decide *when*
+/// the image is worth keeping — see [`dump_image_stable`].
+fn read_image(h: HANDLE, pid: u32) -> Result<Vec<u8>, anyhow::Error> {
     let mut path_buf: Vec<u16> = vec![0u16; 512];
     let mut len = path_buf.len() as u32;
     // SAFETY: h is valid; path_buf is valid and sized.
@@ -383,18 +406,310 @@ fn dump_image_inner(h: HANDLE, pid: u32, output: &Path) -> Result<(), anyhow::Er
         out[base + 20..base + 24].copy_from_slice(&s.virtual_address.to_le_bytes()); // PointerToRawData
     }
 
-    std::fs::write(output, &out)
+    log::log(
+        LogType::Info,
+        &format!(
+            "Flattened {total} bytes: {nsec} section(s), {unreadable_total} unreadable page(s)",
+            nsec = pe.sections.len()
+        ),
+    );
+    Ok(out)
+}
+
+/// Write an already-flattened image, then carve its payloads.
+fn write_image(out: &[u8], output: &Path) -> Result<(), anyhow::Error> {
+    let total = out.len();
+    std::fs::write(output, out)
         .map_err(|e| anyhow!("Failed to write '{}': {e}", output.display()))?;
 
     log::log(
         LogType::Good,
-        &format!(
-            "Wrote {total} bytes to {} ({} section(s), {unreadable_total} unreadable page(s))",
-            output.display(),
-            pe.sections.len()
-        ),
+        &format!("Wrote {total} bytes to {}", output.display()),
     );
+
+    // Carve the embedded payloads out of the *dumped image*.
+    //
+    // In a flat image `file offset == RVA`, so a resource that the packer only
+    // materialises at run time becomes extractable with the same code that
+    // reads a file.  Measured on the `Packed` sample: the input file has
+    // `0/12782080` bytes of `RT_RCDATA` id 131, while the dumped image yields
+    // all 12,782,080 B — byte-identical (`14596cbd…`) to the payload inside the
+    // reference image this project was given.
+    carve_payloads(out, output);
     Ok(())
+}
+
+/// The old single-shot tail: read, then write.
+
+/// Extract every large resource present in `image` next to `output`.
+///
+/// Failures are reported and swallowed: the image dump itself already
+/// succeeded, and turning a carve failure into a non-zero exit would make a
+/// usable product look like a failed run.
+fn carve_payloads(image: &[u8], output: &Path) {
+    use mida_packers_vmprotect::resources::large_resources;
+
+    let pe = match PeHeader::from_bytes(image) {
+        Ok(pe) => pe,
+        Err(e) => {
+            log::log(
+                LogType::Info,
+                &format!("No payload carve: the dumped image does not parse ({e})"),
+            );
+            return;
+        }
+    };
+
+    let resources = large_resources(&pe, image);
+    if resources.is_empty() {
+        return;
+    }
+
+    let dir = output.parent().unwrap_or_else(|| Path::new("."));
+    let stem = output
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "dump".to_string());
+
+    for r in &resources {
+        let Some(bytes) = r.bytes(image) else {
+            log::log(
+                LogType::Info,
+                &format!(
+                    "Payload {} is not fully inside the dumped image ({}/{} B) — skipped",
+                    describe(r),
+                    r.bytes_in_file,
+                    r.size
+                ),
+            );
+            continue;
+        };
+        let path = dir.join(payload_name(&stem, r));
+        match std::fs::write(&path, bytes) {
+            Ok(()) => log::log(
+                LogType::Good,
+                &format!(
+                    "Carved payload {} to {} ({} B, sha256 {})",
+                    describe(r),
+                    path.display(),
+                    bytes.len(),
+                    r.sha256.as_deref().unwrap_or("?")
+                ),
+            ),
+            Err(e) => log::log(
+                LogType::Warn,
+                &format!("Cannot write {}: {e}", path.display()),
+            ),
+        }
+    }
+}
+
+fn describe(r: &mida_packers_vmprotect::resources::LargeResource) -> String {
+    match (r.type_id, r.name_id) {
+        (Some(t), Some(id)) => format!("type {t} id {id}"),
+        (Some(t), None) => format!("type {t}"),
+        _ => "resource".to_string(),
+    }
+}
+
+/// `<stem>.rcdata<id>.<ext>`, with `.exe` when the payload is a PE image.
+fn payload_name(stem: &str, r: &mida_packers_vmprotect::resources::LargeResource) -> String {
+    let id = r
+        .name_id
+        .map(|i| i.to_string())
+        .unwrap_or_else(|| "named".to_string());
+    let ext = if r.looks_like_pe { "exe" } else { "bin" };
+    format!("{stem}.rcdata{id}.{ext}")
+}
+
+/// How long to keep sampling for a stable image before giving up.
+const STABLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How often to re-read the image while waiting for it to settle.
+const STABLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Consecutive identical samples required before the image is accepted.
+const STABLE_SAMPLES: usize = 2;
+
+/// Read the loaded image of `pid` repeatedly until the payloads it carries have
+/// stopped changing, then flatten that.
+///
+/// ## Why a fixed delay does not work
+///
+/// The `Packed` sample rewrites its 12,782,080 B payload **in place** after it
+/// starts.  Measured, sampling every 100 ms: `db4c050e…` (still zero-filled) at
+/// t=0.02 s, then `b8991af0…`, `3e6f024f…`, `4aa50cf5…`, `2fd77393…`,
+/// `36fb4454…`, `0a6a75e1…`, `73bafb30…`, `8f4c94ab…`, and finally `14596cbd…`
+/// at t≈1.65 s — after which it does not change again before the process exits
+/// at t≈6.6 s.  A dump at the wrong moment captures one of the intermediate
+/// values and looks entirely plausible.
+///
+/// ## Why "two identical samples" alone is not enough
+///
+/// The first two samples can both be the *untouched* file bytes, so a naive
+/// stability check succeeds before decryption has even started.  Measured: that
+/// produced payload hashes `fcee1cb1…` and "no payload at all" across runs.
+///
+/// The fix is to derive, from the input file itself, what the payload looks like
+/// **before** the packer touches it, and require the image's copy to differ from
+/// that — plus stability.  It needs no knowledge of the cipher and no clock.
+pub fn dump_image_stable(pid: u32, output: &Path) -> Result<(), anyhow::Error> {
+    let h = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) }
+        .map_err(|e| anyhow!("Cannot open process {pid}: {e}"))?;
+    let result = dump_stable_inner(h, pid, output);
+    let _ = unsafe { CloseHandle(h) };
+    result
+}
+
+/// Bytes of the input file as they would appear at each payload's RVA.
+///
+/// A payload's `data_rva` is an RVA into the *image*; the file only holds the
+/// part of that range that a section's raw data covers.  Everything else reads
+/// as zero, which is exactly what the loader would have produced.
+fn pre_decryption_payloads(pe: &PeHeader, file: &[u8]) -> Vec<(u32, Vec<u8>)> {
+    use mida_packers_vmprotect::resources::large_resources;
+
+    large_resources(pe, file)
+        .into_iter()
+        .filter_map(|r| {
+            let start = r.data_rva as usize;
+            let end = start.checked_add(r.size as usize)?;
+            let mut buf = vec![0u8; r.size as usize];
+            for s in pe.sections.iter() {
+                let s_va = s.virtual_address as usize;
+                let s_end = s_va.checked_add(s.virtual_size.max(s.raw_size) as usize)?;
+                let lo = start.max(s_va);
+                let hi = end.min(s_end);
+                if lo >= hi || s.raw_size == 0 {
+                    continue;
+                }
+                // Only the part covered by raw data exists in the file.
+                let raw_end = s_va + s.raw_size as usize;
+                let hi = hi.min(raw_end);
+                if lo >= hi {
+                    continue;
+                }
+                let from = s.raw_offset as usize + (lo - s_va);
+                let to = from + (hi - lo);
+                if to > file.len() {
+                    continue;
+                }
+                buf[lo - start..hi - start].copy_from_slice(&file[from..to]);
+            }
+            Some((r.data_rva, buf))
+        })
+        .collect()
+}
+
+/// `true` when every payload in `image` differs from its pre-decryption form.
+fn payloads_moved(image: &[u8], expected: &[(u32, Vec<u8>)]) -> bool {
+    if expected.is_empty() {
+        return true;
+    }
+    expected.iter().all(|(rva, before)| {
+        let start = *rva as usize;
+        match image.get(start..start + before.len()) {
+            Some(now) => now != before.as_slice(),
+            None => false,
+        }
+    })
+}
+
+fn dump_stable_inner(h: HANDLE, pid: u32, output: &Path) -> Result<(), anyhow::Error> {
+    use std::time::Instant;
+
+    let started = Instant::now();
+    let mut previous: Option<Vec<u8>> = None;
+    let mut same = 0usize;
+    let mut attempt = 0usize;
+    let mut expected: Option<Vec<(u32, Vec<u8>)>> = None;
+
+    loop {
+        attempt += 1;
+        match read_image(h, pid) {
+            Ok(image) => {
+                // The input file is read once, lazily: it is only needed to tell
+                // "the packer has touched this" from "this is still the file".
+                if expected.is_none() {
+                    expected = Some(match process_image_path(h) {
+                        Some(p) => match (PeHeader::from_file(&p), std::fs::read(&p)) {
+                            (Ok(pe), Ok(file)) => pre_decryption_payloads(&pe, &file),
+                            _ => Vec::new(),
+                        },
+                        None => Vec::new(),
+                    });
+                }
+                let expected_ref = expected.as_deref().unwrap_or(&[]);
+                let moved = payloads_moved(&image, expected_ref);
+
+                let digest = sha256_hex(&image);
+                if let Some(prev) = &previous {
+                    if *prev == image {
+                        same += 1;
+                    } else {
+                        same = 0;
+                    }
+                }
+                previous = Some(image);
+
+                let elapsed = started.elapsed();
+                if moved && same + 1 >= STABLE_SAMPLES {
+                    log::log(
+                        LogType::Info,
+                        &format!(
+                            "Image settled after {attempt} sample(s) in {:.2}s (sha256 {digest})",
+                            elapsed.as_secs_f32()
+                        ),
+                    );
+                    break;
+                }
+                if elapsed >= STABLE_TIMEOUT {
+                    log::log(
+                        LogType::Warn,
+                        &format!(
+                            "Image still changing after {:.0}s ({attempt} samples, last sha256 \
+                             {digest}, payloads {}); dumping it anyway — the payload may be \
+                             mid-decryption",
+                            elapsed.as_secs_f32(),
+                            if moved { "have changed" } else { "are still the file's bytes" }
+                        ),
+                    );
+                    break;
+                }
+                std::thread::sleep(STABLE_INTERVAL);
+            }
+            Err(e) => {
+                // A sample already in hand beats no product at all.  Measured:
+                // this sample family exits a couple of seconds after start-up,
+                // and the first version of this loop turned "the process went
+                // away between samples" into a fatal error that discarded a
+                // perfectly good 43,315,200-byte image.
+                if previous.is_some() {
+                    log::log(
+                        LogType::Warn,
+                        &format!(
+                            "The process went away between samples ({e}); writing the last \
+                             complete image instead"
+                        ),
+                    );
+                    break;
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    let image = previous.expect("the loop always assigns at least one sample");
+    write_image(&image, output)
+}
+
+/// SHA-256 of `bytes`, lowercase hex.  Small local helper so this module does
+/// not need a dependency the rest of the CLI does not use.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
 }
 
 #[cfg(test)]

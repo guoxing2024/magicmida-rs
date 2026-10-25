@@ -16,4 +16,5 @@ mida-packers-vmprotect = { path = "../packers/vmprotect" }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha2 = "0.10"
 windows = { workspace = true }
