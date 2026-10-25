@@ -11,6 +11,7 @@ readme.workspace = true
 mida-core = { path = "../core" }
 mida-pe = { path = "../pe" }
 mida-packers-themida = { path = "../packers/themida" }
+mida-packers-vmprotect = { path = "../packers/vmprotect" }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

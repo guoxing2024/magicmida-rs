@@ -1,0 +1,14 @@
+[package]
+name = "mida-packers-vmprotect"
+version.workspace = true
+edition.workspace = true
+description = "VMProtect detection, mode classification and static structure report"
+repository.workspace = true
+license.workspace = true
+readme.workspace = true
+
+[dependencies]
+mida-pe = { path = "../../pe" }
+mida-packer-api = { path = "../api" }
+iced-x86 = { workspace = true }
+sha2 = "0.10"

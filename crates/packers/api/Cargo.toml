@@ -1,0 +1,11 @@
+[package]
+name = "mida-packer-api"
+version.workspace = true
+edition.workspace = true
+description = "Packer-neutral detection vocabulary shared by every packer front-end"
+repository.workspace = true
+license.workspace = true
+readme.workspace = true
+
+[dependencies]
+mida-pe = { path = "../../pe" }

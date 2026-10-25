@@ -1594,6 +1594,7 @@ dependencies = [
  "anyhow",
  "mida-core",
  "mida-packers-themida",
+ "mida-packers-vmprotect",
  "mida-pe",
  "tracing",
  "tracing-subscriber",
@@ -1644,6 +1645,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mida-packer-api"
+version = "0.2.0"
+dependencies = [
+ "mida-pe",
+]
+
+[[package]]
 name = "mida-packers-themida"
 version = "0.2.0"
 dependencies = [
@@ -1655,6 +1663,16 @@ dependencies = [
  "thiserror 1.0.69",
  "tracing",
  "windows",
+]
+
+[[package]]
+name = "mida-packers-vmprotect"
+version = "0.2.0"
+dependencies = [
+ "iced-x86",
+ "mida-packer-api",
+ "mida-pe",
+ "sha2",
 ]
 
 [[package]]

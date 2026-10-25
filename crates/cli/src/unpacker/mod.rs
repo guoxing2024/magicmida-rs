@@ -137,15 +137,43 @@ pub fn unpack(
     let is_64bit = pe.is_64bit;
     debug!(is_64bit, "PE architecture");
 
+    // ---- step 2b: identify the packer BEFORE any per-packer heuristic ----
+    //
+    // Themida's `is_themida_section` keys on an executable section with
+    // `raw_size == 0` and a large virtual size.  Measured over 87 protected
+    // samples on this machine, that shape occurs in 6 genuine Themida samples
+    // *and* in the VMProtect `Packed` sample `D:\Projects\zz_test.exe`
+    // (section `.rdata0`).  So the heuristic is correct for Themida and
+    // **cannot** be tightened into rejecting VMProtect: before this gate,
+    // `/unpack zz_test.exe` logged `Themida version: V3`, created the
+    // debuggee and ran the whole Themida loop against a VMProtect target.
+    // The packer decision therefore has to be made here, first, with evidence.
+    let image = fs::read(input)
+        .map_err(|e| anyhow!("Failed to read input for packer detection: {e}"))?;
+
+    if let Some(detection) = mida_packers_vmprotect::detect(&pe, &image) {
+        let report = mida_packers_vmprotect::analyze(&pe, &image);
+        log::log(
+            LogType::Info,
+            &format!("Packer detection: {}", detection.summary()),
+        );
+        for line in detection.render_evidence() {
+            log::log(LogType::Info, &format!("  {line}"));
+        }
+        log::log(LogType::Info, &format!("Static report:\n{report}"));
+        return Err(anyhow!(
+            "{} target — the Themida pipeline cannot unpack it; \
+             the static structure report is above",
+            detection.summary()
+        ));
+    }
+
     // ---- step 3: detect Themida ----
     // Read entry-point bytes for virtualised OEP detection.
     let ep_offset_val = pe.rva_to_offset(pe.entry_point).unwrap_or(0) as usize;
-    let entry_bytes = fs::read(input)
-        .ok()
-        .and_then(|data| {
-            data.get(ep_offset_val..ep_offset_val.saturating_add(8))
-                .map(|b| b.to_vec())
-        });
+    let entry_bytes = image
+        .get(ep_offset_val..ep_offset_val.saturating_add(8))
+        .map(|b| b.to_vec());
     if let Some(ref bytes) = entry_bytes {
         log::log(
             LogType::Info,
