@@ -35,6 +35,7 @@ pub fn run_command(cmd: Command) -> Result<(), anyhow::Error> {
             pid,
             unpacked_file,
         } => crate::unpacker::dump_process_code(pid, &unpacked_file),
+        Command::DumpImage { pid, output } => crate::dump_image::dump_image(pid, &output),
         Command::Verify {
             unpacked,
             reference,
@@ -51,6 +52,7 @@ pub fn run_command(cmd: Command) -> Result<(), anyhow::Error> {
             println!("  mida-cli /unpack <filename> [--packer auto|themida|vmprotect] [--data-sections] [--shrink] [-v]");
             println!("  mida-cli /analyze <filename> [--extract <dir>] [-v]");
             println!("  mida-cli /dump-process <pid> <unpacked-file>");
+            println!("  mida-cli /dump-image <pid> <output-file>");
             println!("  mida-cli /verify <unpacked-file> <reference-file>");
             println!("  mida-cli /version | /help");
             Ok(())

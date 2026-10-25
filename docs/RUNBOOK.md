@@ -5,6 +5,88 @@
 > 缺陷复盘在 [`POSTMORTEMS.md`](POSTMORTEMS.md)，黄金值与已验证能力在
 > [`README.md`](../README.md)。
 
+## VMProtect：识别 / 静态报告 / 载荷提取 / 内存镜像 dump（2026-10-25）
+
+四个命令，**都不需要注入 ScyllaHide**：
+
+```powershell
+# 1) 纯静态：识别 packer + mode、打印结构报告、可选提取文件内的载荷
+.\target\release\mida-cli.exe /analyze TARGET.exe
+.\target\release\mida-cli.exe /analyze TARGET.exe --extract OUT\payload
+
+# 2) 运行中的进程 -> 摊平镜像（每个段 offset == RVA），默认 rebase 回首选基址
+.\target\release\mida-cli.exe /dump-image <pid> OUT\image.exe
+
+# 3) 强制分支（诊断用；覆盖会被记录）
+.\target\release\mida-cli.exe /unpack TARGET.exe --packer auto|themida|vmprotect
+```
+
+**三个命令只读文件或读目标内存，没有一条挂调试器** —— 所以它们都能进 CI，
+而 `/unpack` 不能（要注入 + 目标要弹窗）。
+
+### 两个已实测的 mode（判据量出来的，不是猜的）
+
+| | `MinProtection` | `Packed` |
+|---|---|---|
+| 样本 | `lunlun\伦伦软件.exe` 19,005,952 B | `zz_test.exe` 21,415,936 B |
+| DIE | `VMProtect 2.XX-3.XX [Min protection]` | `VMProtect 2.XX-3.XX` |
+| `.text` | raw `0x72400`，解码 100% | **raw 0** —— 不在文件里 |
+| EP | `0x4b274` in `.text` | `0x130bbfb` in `.rdata2` |
+| 运行时大段 | `.vmp0` raw `0x217e00` ch `0x68000060` | `.rdata2` raw `0x1466400` ch `0x68000060` |
+| 异常目录 | 在 `.vmp0` 内，triples 64/64 | 在 `.rdata2` 内，triples 64/64 |
+| `.pdata` | raw `0x4e00`，triples **0/64** | raw 0 |
+| RCDATA | id 101，16,102,969 B **在文件里**，sha256 `91d585e6…`，magic `XMP2QH_` | id 131，12,782,080 B **只在内存** |
+
+判别规则在 **87 个受保护样本**上量过误报率：`MEM_NOT_PAGED` + 可执行段在两个
+VMProtect 样本上都成立，在 **63 个 Themida 样本上 0 命中**。
+**按 `.vmp0` 名字判会全漏 `Packed`** —— 它的等价段叫 `.rdata2`；
+而 `is_themida_section` 的 `raw_size == 0` + 大 vsize 条件在 `Packed` 的 `.rdata0`
+上**会误报**，也同时命中 6 个真 Themida 样本，所以那个误判无法靠收紧它自己修掉，
+只能靠前置的 packer 闸。
+
+### `/dump-image` 的实测（2026-10-25）
+
+`Packed` 的原始段只在内存里，这是唯一能取到它们的方式。**故意不挂调试器**：同一个
+`zz_test.exe` 裸跑退出码 `0`，挂上调试器后约 7 秒自退 `0xDEADBEEF`（`3735929054`），
+唯一变量是调试器。
+
+实测（`伦伦软件.exe`，ASLR 落在 `0x7ff789eb0000`，首选 `0x140000000`）：
+
+| 段 | flat | rebase 前 / 后 与文件差异 |
+|---|---|---|
+| `.text` | ✓ | 0 / **0** |
+| `.pdata` | ✓ | 0 / **0** |
+| `.reloc` | ✓ | 0 / **0** |
+| `.rsrc` | ✓ | 0 / **0** |
+| `.vmp0` | ✓ | 80 / **0** |
+| `.rdata` | ✓ | 7479 / 1975 |
+| `.data` | ✓ | 789 / 445 |
+| `.fptable` | ✓ | 72 / 72 |
+
+**8 段全部 `praw == va`**（摊平不变式），dump 的 `.text` 解码 **100.0%**（140,220 条指令）。
+rebase 应用 **1484 个重定位槽**，与静态量出的 `.reloc` 绝对重定位条数一致
+（`.rdata` 1376 + `.data` 88 + `.vmp0` 20）。
+
+**残差不是缺陷**：`.rdata` 的 IAT 在文件里是盘上 thunk 形态、在内存里是**已解析的
+绝对地址**（IAT 目录 rva `0x74000` 正是 `.rdata` 起点），再加上 cookie / `InitOnce`
+这类运行期写入；`.fptable` 那 72 字节是 VMProtect 运行期才写进去的。
+
+参考产物（已给的，同一命令应产出同一种形状）：`qidongqi\out\ida\main.exe`，
+43,315,200 B，sha256 `b6355439…`，9 段全部 `praw == va`，`.text` 解码 99.8%。
+
+### ScyllaHide profile 按 packer 切
+
+injector 的调用是 `InjectorCLIx64.exe pid:<pid> <HookLibraryx64.dll> nowait` ——
+**没有 ini 参数**，所以 profile 只能靠改 injector 旁边那份 ini 里的 `CurrentProfile`
+（`select_profile`，只改那一行，保留 CRLF 与手改内容）。
+profile 文件在 `crates\cli\assets\scylla_hide.ini`（已跟踪），部署时复制到
+`target\release\` 与 `target\debug\`；逐个键的来源与**未改动的缺口**见
+`crates\cli\assets\README.md`。
+
+**验 profile 是否真生效**：hook library 会在自己旁边写 `scylla_hide.log`，
+`DEBUG: ApplyNtdllHook -> Hooking <名>` 就是实际挂上的钩子；值为 `0` 的键只会出现在
+`_Nt…` 地址表里，不会出现在 `Hooking` 行 —— **所以钩子集合可以直接断言，不用假设**。
+
 ## x86 编译（2026-10-23 打通）
 
 ```powershell

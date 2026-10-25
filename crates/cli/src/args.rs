@@ -94,6 +94,21 @@ pub enum Command {
         unpacked_file: PathBuf,
     },
 
+    /// Flatten a running process's loaded image into a file.
+    ///
+    /// For samples whose original sections are absent from the file — a
+    /// `Packed` VMProtect target has `SizeOfRawData == 0` on every original
+    /// code section — the image only exists in memory, and this reads it out
+    /// without attaching a debugger.
+    ///
+    /// Usage: `magicmida /dump-image <pid> <output-file>`
+    DumpImage {
+        /// PID of the running target.
+        pid: u32,
+        /// Path to write the flat image to.
+        output: PathBuf,
+    },
+
     /// Verify an unpacked file against a reference.
     ///
     /// Compares the PE structure (sections, imports, entry point) of an
@@ -135,11 +150,12 @@ pub fn parse_args() -> Result<Command, String> {
         "/unpack" | "--unpack" | "unpack" => parse_unpack(&args),
         "/analyze" | "--analyze" | "analyze" => parse_analyze(&args),
         "/dump-process" | "--dump-process" | "dump-process" => parse_dump_process(&args),
+        "/dump-image" | "--dump-image" | "dump-image" => parse_dump_image(&args),
         "/verify" | "--verify" | "verify" => parse_verify(&args),
         "/version" | "--version" | "-V" => Ok(Command::Version),
         "/help" | "--help" | "-h" | "/?" => Ok(Command::Help),
         other => Err(format!(
-            "Unknown command '{}'. Use /unpack, /analyze, /dump-process, or /verify.",
+            "Unknown command '{}'. Use /unpack, /analyze, /dump-process, /dump-image, or /verify.",
             other
         )),
     }
@@ -291,6 +307,19 @@ fn parse_dump_process(args: &[String]) -> Result<Command, String> {
     })
 }
 
+fn parse_dump_image(args: &[String]) -> Result<Command, String> {
+    if args.len() < 4 {
+        return Err("Usage: magicmida /dump-image <pid> <output-file>".into());
+    }
+    let pid: u32 = args[2]
+        .parse()
+        .map_err(|e| format!("Invalid PID '{}': {}", args[2], e))?;
+    Ok(Command::DumpImage {
+        pid,
+        output: PathBuf::from(&args[3]),
+    })
+}
+
 fn parse_verify(args: &[String]) -> Result<Command, String> {
     if args.len() < 4 {
         return Err(
@@ -334,6 +363,7 @@ mod tests {
             "/unpack" | "--unpack" | "unpack" => Err("would parse unpack".into()),
             "/analyze" | "--analyze" | "analyze" => Err("would parse analyze".into()),
             "/dump-process" | "--dump-process" | "dump-process" => Err("would parse dump".into()),
+            "/dump-image" | "--dump-image" | "dump-image" => Err("would parse dump-image".into()),
             "/verify" | "--verify" | "verify" => Err("would parse verify".into()),
             "/version" | "--version" | "-V" => Ok(Command::Version),
             "/help" | "--help" | "-h" | "/?" => Ok(Command::Help),
@@ -581,6 +611,39 @@ mod tests {
         ];
         let err = parse_dump_process(&args).unwrap_err();
         assert!(err.contains("Invalid PID"), "got: {err}");
+    }
+
+    #[test]
+    fn dump_image_spellings_resolve_and_arguments_are_validated() {
+        for a in ["/dump-image", "--dump-image", "dump-image"] {
+            assert!(
+                dispatch_first_arg(a).unwrap_err().contains("dump-image"),
+                "for {a}"
+            );
+        }
+
+        let args = vec![
+            "prog".into(),
+            "/dump-image".into(),
+            "4321".into(),
+            "img.bin".into(),
+        ];
+        match parse_dump_image(&args).unwrap() {
+            Command::DumpImage { pid, output } => {
+                assert_eq!(pid, 4321);
+                assert_eq!(output, PathBuf::from("img.bin"));
+            }
+            other => panic!("expected DumpImage, got {other:?}"),
+        }
+
+        assert!(parse_dump_image(&["prog".into(), "/dump-image".into()])
+            .unwrap_err()
+            .contains("Usage"));
+        assert!(
+            parse_dump_image(&["prog".into(), "/dump-image".into(), "x".into(), "o".into()])
+                .unwrap_err()
+                .contains("Invalid PID")
+        );
     }
 
     #[test]
