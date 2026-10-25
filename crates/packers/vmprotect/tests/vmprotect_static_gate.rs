@@ -27,7 +27,9 @@
 use std::path::{Path, PathBuf};
 
 use mida_packer_api::VmProtectMode;
-use mida_packers_vmprotect::{analyze, detect, section_name, RT_RCDATA};
+use mida_packers_vmprotect::{
+    analyze, body_lost_sections, classify_mode, detect, is_executable, section_name, RT_RCDATA,
+};
 use mida_pe::PeHeader;
 
 /// Golden values for `D:\Projects\lunlun\伦伦软件.exe` (`MinProtection`).
@@ -247,5 +249,106 @@ fn themida_sample_is_never_claimed_as_vmprotect() {
     assert!(
         names.iter().any(|n| *n == ".winlice"),
         "expected a Themida sample; sections were {names:?}"
+    );
+}
+
+/// Every sample in the VMProtect 3 corpus must be classified, and every one of
+/// them is `MinProtection`.
+///
+/// # Why a corpus test and not another single sample
+///
+/// The classifier was built against one sample per mode, and both happened to
+/// lack an ambiguous shape that turned out to be common.  Measured: of the 15
+/// samples in `D:\Tools\RE\VirtualizationObfuscatorAnalysis\VMProtect 3`, **12
+/// carry an empty, executable `.textbss`** — an uninitialised section, exactly
+/// what `.bss` looks like in any ordinary build.  A rule of the form "is any
+/// executable section empty?" called them `Packed`, because `.textbss` is.  The
+/// rule is only correct once a section that never had a body is excluded.
+///
+/// A single sample per mode cannot catch that.  This test walks whatever corpus
+/// is present and requires each file to be (a) recognised and (b) either
+/// `MinProtection` with a body-bearing code section, or `Packed` with none — the
+/// two states must stay distinguishable on real samples.
+#[test]
+fn every_corpus_sample_classifies_and_the_modes_stay_distinguishable() {
+    let dir = std::env::var_os("MIDA_VMPROTECT_CORPUS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(
+                r"D:\Tools\RE\VirtualizationObfuscatorAnalysis\VMProtect 3",
+            )
+        });
+    if !dir.exists() {
+        println!(
+            "SKIP: no VMProtect corpus at {} — set MIDA_VMPROTECT_CORPUS",
+            dir.display()
+        );
+        return;
+    }
+
+    let mut checked = 0usize;
+    let mut min = 0usize;
+    let mut packed = 0usize;
+    let mut unrecognised: Vec<String> = Vec::new();
+
+    let entries = std::fs::read_dir(&dir).expect("read the corpus directory");
+    for e in entries.flatten() {
+        let path = e.path();
+        let name = e.file_name().to_string_lossy().into_owned();
+        // Only the protected builds; the directory also holds unprotected inputs.
+        if !name.contains(".vmp") || !name.ends_with(".exe") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(pe) = PeHeader::from_bytes(&bytes) else {
+            unrecognised.push(format!("{name}: does not parse"));
+            continue;
+        };
+        if detect(&pe, &bytes).is_none() {
+            unrecognised.push(format!("{name}: not recognised as VMProtect"));
+            continue;
+        }
+
+        checked += 1;
+        let mode = classify_mode(&pe);
+        let lost = body_lost_sections(&pe);
+        match mode {
+            VmProtectMode::MinProtection => {
+                min += 1;
+                // MinProtection means the original code is still here, so at
+                // least one executable section must carry file bytes.
+                let has_code = pe
+                    .sections
+                    .iter()
+                    .any(|s| is_executable(s) && s.raw_size > 0);
+                assert!(
+                    has_code,
+                    "{name} is MinProtection but no executable section has file bytes"
+                );
+            }
+            VmProtectMode::Packed => {
+                packed += 1;
+                assert!(
+                    !lost.is_empty(),
+                    "{name} is Packed but no body-bearing section lost its body"
+                );
+            }
+        }
+    }
+
+    println!("corpus: {checked} recognised ({min} min-protection, {packed} packed)");
+    assert!(
+        unrecognised.is_empty(),
+        "these corpus samples were not recognised: {unrecognised:?}"
+    );
+    assert!(
+        checked >= 10,
+        "expected a corpus of at least 10 protected samples, saw {checked}"
+    );
+    assert!(
+        min > 0,
+        "the corpus is supposed to contain MinProtection samples"
     );
 }
