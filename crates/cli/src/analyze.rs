@@ -178,7 +178,8 @@ fn extract_payloads(
         let why = if report.requires_runtime_dump() {
             format!(
                 "{} — this mode reconstructs the image at runtime, so use \
-                 /dump-process <pid> against a running instance instead",
+                 /dump-image <pid> <out> against a running instance instead \
+                 (/dump-process only writes one section and is Themida-specific)",
                 detail
             )
         } else {
