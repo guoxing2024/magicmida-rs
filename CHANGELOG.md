@@ -5,21 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — becomes 0.3.0 when the VMProtect unpacking path lands
+## [Unreleased] — becomes 0.3.0
 
 **Not released.** The version in `Cargo.toml` is `0.3.0` and this section is
-written, but no tag and no release exist. The branch identifies a VMProtect
-target, reports its structure, extracts payloads that are in the file, and dumps
-a live image — but it does **not** yet turn a VMProtect target into an unpacked
-product. Shipping it as a second unpacking capability before that would be
-advertising a reconnaissance tool as an unpacker. `0.2.0` remains the latest
-release.
+written, but no tag and no release exist. `0.2.0` remains the latest release.
 
-Adds a second packer branch. It is **not** a Themida variant and **not** a
-devirtualiser: VMProtect identification, mode classification, a static structure
-report, in-file payload extraction, and a debugger-free runtime image dump.
-Every capability below is measured; the measurement tables are in
+The branch now turns a measured VMProtect target into a product: it identifies
+the packer and its mode, reports the structure, extracts payloads that are in the
+file, captures a live image for targets whose code is not, and decodes the
+payload to a runnable PE. The measurement tables are in
 [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
+
+Before releasing, the honest boundary to state: the payload decode is a
+**per-family measured key**, not a cipher break, and it was validated on one
+vendor family. Two `Packed` samples and 14 `MinProtection` samples exist here;
+`FullVirtualize` was not exercised and x86 VMProtect targets are unmeasured.
 
 ### Added
 - **`mida-packer-api`** — the workspace's first real packer abstraction:
@@ -36,10 +36,25 @@ Every capability below is measured; the measurement tables are in
   `/unpack` and reading the resulting error, which is not a usable entry point
   for a documented capability. It answers for Themida as well, and names the
   markers it looked for when nothing matches.
-- **`/dump-image <pid> <out>`** — flatten a running process's loaded image into a
+- **`/dump-image <pid> <out> [--wait]`** — flatten a running process's loaded image into a
   file, reading memory through `OpenProcess` + `ReadProcessMemory` and never
   attaching a debugger. Output is a flat image (`file offset == RVA`), and ASLR
-  is undone by walking `.reloc` and subtracting the load-base delta.
+  is undone by walking `.reloc` and subtracting the load-base delta. With
+  `--wait`, it keeps sampling until the image stops changing — required for a
+  `Packed` target, whose payload is rewritten in place after start-up, and it
+  keeps a sample already read even if the process exits mid-loop. Payloads are
+  carved out of the image afterwards.
+- **Payload decode to a runnable PE** — the carved container decodes to a valid
+  PE32+ x64 image. The key is recorded per `(resource type, resource id)` in
+  `crates/packers/vmprotect/src/payload_xor.rs`, derived from two independent
+  artefacts (a single 32-byte repeating XOR: `K[i] == K[i-32]` holds across all
+  12,782,080 bytes with one distinct block and only 31 distinct byte values).
+  Acceptance is structural — the result must parse as a PE — so a wrong key is
+  rejected rather than producing plausible garbage.
+- **A corpus gate over third-party samples** — the static gate walks every
+  `*.vmp*.exe` in a sample directory and requires each to be recognised and
+  classified, with the two modes staying distinguishable on real files.
+  Measured: 14 recognised, all `MinProtection`, 0.03 s, no desktop session.
 - **`--packer auto|themida|vmprotect`** for `/unpack` — `auto` keeps the refusal;
   the other two make a heuristic verdict overridable for diagnostics, with the
   override logged.
@@ -54,6 +69,15 @@ Every capability below is measured; the measurement tables are in
   than failing, and includes a Themida negative control.
 
 ### Fixed
+- **An uninitialised section was classified as a packed one** (`vmprotect`).
+  The rule asked "is any executable section empty?", and an ordinary `.bss` — or
+  VMProtect's own `.textbss`, `raw_size 0`, `virtual_size 0x10000`, executable —
+  satisfies it. **12 of the 14 corpus samples have that shape**, so a
+  MinProtection sample reported as `Packed` while `.text` still held real code
+  and the entry point sat inside it. The criterion is now which sections *lost a
+  body they would normally have* (`.text`/`.rdata`/`.data`/`.pdata`/`.idata`/
+  `.reloc`/`.rsrc`/`.tls`). Found the moment the branch met samples it did not
+  author — the argument for a corpus gate over two hand-picked samples.
 - **A VMProtect target was classified as Themida and driven as one.** `/unpack`
   on the `Packed` sample printed `Themida version: V3`, created the debuggee and
   ran the entire Themida loop against it, ending in `OEP not found` after 8 s.
@@ -82,16 +106,23 @@ Every capability below is measured; the measurement tables are in
 ### Not verified
 - **`/dump-image`'s read path cannot be exercised in CI** — it needs a live
   process. The relocation walk it depends on has unit tests, and the read was
-  measured end to end (8/8 sections flat, `.text` decodes 100.0 %, 1,484
-  relocation slots applied), but reproducing the given reference artefact
-  (`b6355439…`) needs an elevated session: that sample's path carries a
-  `RUNASADMIN` compatibility flag, and creating it un-elevated fails with
-  `ERROR_ELEVATION_REQUIRED`.
+  measured end to end (9/9 sections flat, the payload carves and decodes
+  byte-exactly), but reproducing the given reference artefact (`b6355439…`)
+  needs an elevated session: that sample family registers a `RUNASADMIN`
+  compatibility layer for its own path, and an elevated target cannot be opened
+  with `PROCESS_VM_READ` from an unelevated one.
 - **The ScyllaHide profile's hook set was not observed on a live target**, for
   the same reason.
 - **devirtualisation** is not attempted and not claimed.
-- **The mode boundary rests on two samples from one vendor family** (all carry
-  `.fptable`), not on a validated cross-section of VMProtect builds.
+- **The payload decode is one measured key, not a cipher break.** It covers the
+  one family it was derived from; another VMProtect build needs its own
+  measurement.
+- **`FullVirtualize` was not exercised** — it is a per-function option and
+  producing such a sample needs VMProtect's project file, whose schema was not
+  recovered. Both binaries of the installed VMProtect Demo 3.11 are themselves
+  VMProtect-packed, so the schema cannot be read out of them statically.
+- **x86 VMProtect targets are unmeasured.** The detector is not
+  architecture-specific, but no x86 target has been run.
 
 ## [0.2.0] — 2026-10-25
 

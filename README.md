@@ -26,8 +26,9 @@ SHA-256 recorded in `crates/packers/themida/tests/cases/`.
 | **Themida v3, x64, EXE** | ✅ Works | 186 resolved imports / 0 failed / 8 `not-an-import`; product launches to its `授权验证` window. Gate: `e2e_gate.rs` |
 | **Themida v3, x64, DLL** | ✅ Works | 289 resolved / 0 failed / 3 `not-an-import`; product loads through a real `LoadLibraryW`, `GetAppVersion()` returns `"1.1"`, `Run()` reaches `PigToGoLicenseDialog`. Gate: `dll_e2e_gate.rs` |
 | **Themida v3, x86, EXE** | ✅ Works | 55 resolved / 0 failed / 55 `not-an-import`; product's `MidaX86Sample` window appears in ~24 ms. Gate: `x86_e2e_gate.rs` |
-| **VMProtect 3.x, x64, `MinProtection`** | ⚠️ Static only | Identified with evidence; structure reported; in-file payload extracted byte-exactly (`91d585e6…`). There is **no** VMProtect unpacking pipeline — see below. |
-| **VMProtect 3.x, x64, `Packed`** | ⚠️ Runtime image dump | Identified with evidence. Original sections are absent from the file, so `/dump-image` reads them from a live process and rebases the image flat. |
+| **VMProtect 3.x, x64, `MinProtection`** | ✅ Works | Identified with evidence; structure reported; payload extracted byte-exactly (`91d585e6…`) and decoded onward to a runnable PE (`e7004e89…`). At this mode the original code is already in the file, so there is nothing to rebuild. |
+| **VMProtect 3.x, x64, `Packed`** | ✅ Works | Identified with evidence. Original sections are absent from the file, so `/dump-image --wait` captures them from a live process, flattens the image, and decodes the payload to a runnable PE (`e7004e89…`). |
+| **VMProtect 3.x, x86** | ❓ No evidence | The detector is not architecture-specific, but only x64 targets have been measured. |
 | Themida **v1 / v2** | ❓ No evidence | Detection code exists; never run on a real sample |
 
 The 8 / 3 / 55 `not-an-import` slots are **not** failures. They hold bare RVAs
@@ -52,7 +53,7 @@ shell expects the loader's `DLL_PROCESS_ATTACH` sequencing; the older "rewrite
 the DLL into a stub EXE" approach bypassed it and the shell died at
 `.winlice+0x33E22E`.
 
-### VMProtect — identification, static report, payload, runtime image dump
+### VMProtect — identification, structure, live capture, payload decode
 
 A **different** packer with a different shape, so it is a separate branch rather
 than a Themida variant. It is **not a devirtualiser**: VMProtect's VM bytecode is
@@ -62,10 +63,11 @@ attaches a debugger, so unlike `/unpack` these commands run headless.
 
 | Capability | Command | Measured |
 |---|---|---|
-| Identify the packer, its mode, and the evidence | `/analyze` | `MEM_NOT_PAGED` on an executable section fires on both VMProtect samples and on **0 of 63** Themida samples |
-| Static structure report | `/analyze` | runtime section, packed sections, virtualised-function stubs, scrambled `.pdata`, relocated exception directory |
+| Identify the packer, its mode, and the evidence | `/analyze` | `MEM_NOT_PAGED` on an executable section fires on the VMProtect samples and on **0 of 63** Themida samples, and **14 of 14** corpus samples classify correctly |
+| Structure report | `/analyze` | runtime section, packed sections, virtualised-function stubs, scrambled `.pdata`, relocated exception directory |
 | Extract a payload that is in the file | `/analyze --extract` | `伦伦软件.exe` → 16,102,969 B, sha256 `91d585e6…`, magic `XMP2QH_` |
-| Read a live image and rebase it flat | `/dump-image <pid> <out>` | 8/8 sections `PointerToRawData == VirtualAddress`; the dump's `.text` decodes 100.0%; 1,484 relocation slots applied |
+| Capture a live image, flattened | `/dump-image <pid> <out> --wait` | 43,315,200 B, 9 sections all `PointerToRawData == VirtualAddress`; the dump's `.text` decodes 100.0% |
+| Decode the payload to a runnable PE | both of the above | `14596cbd…` → `e7004e89…`, PE32+ x64, 9 sections, byte-exact |
 
 Two modes are measured, and they need different pipelines:
 
@@ -76,9 +78,13 @@ Two modes are measured, and they need different pipelines:
 | entry point | inside `.text` | inside the runtime section |
 | runtime section | `.vmp0` | `.rdata2` |
 | payload | `RT_RCDATA` id 101, in the file | id 131, memory-only |
-| produce | payload bytes | flat image dump |
+| produce | decoded payload | live capture → flat image → decoded payload |
 
-Two things worth knowing before trusting a verdict:
+Both states are backed by samples: the `Packed` state comes from a capture and
+from a run of VMProtect's own packer, and the `MinProtection` state from **14
+samples** built by a third party, which the CI gate walks on every run.
+
+Three things worth knowing before trusting a verdict:
 
 - **A name-based `.vmp0` check would miss `Packed` entirely** — its equivalent
   section is called `.rdata2`.
@@ -88,15 +94,36 @@ Two things worth knowing before trusting a verdict:
   `/unpack` printed `Themida version: V3` for a VMProtect target and ran the
   whole Themida loop against it. The packer decision now runs first, carries its
   evidence, and refuses.
+- **"Is any executable section empty?" is not the right question.** An
+  uninitialised section (`.bss`, and VMProtect's own `.textbss`) is `raw_size 0`
+  and executable in an entirely ordinary build; **12 of the 14 corpus samples
+  have that shape**. The criterion is which sections *lost a body they would
+  normally have*, and asking the wrong question classified a MinProtection
+  sample as `Packed` until the corpus gate caught it.
 
 `/dump-image` deliberately attaches **no debugger**: measured, the same sample
 exits `0` bare and `0xDEADBEEF` under a debugger at about 7 s, with the debugger
-as the only changed variable.
+as the only changed variable. It also samples until the payload stops changing,
+because the container is rewritten in place after start-up — a dump taken too
+early captures an intermediate state that looks plausible.
 
-**Not claimed:** devirtualisation; and both measured VMProtect samples come from
-one vendor family (all carry `.fptable`), so the mode boundary rests on two
-samples rather than on a validated cross-section of VMProtect builds. The full
-measurement tables are in [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
+**Not claimed:**
+
+- **Devirtualisation.** Not attempted; the VM bytecode is randomised per build.
+- **The payload decode is per-family, not general.** `14596cbd…` → `e7004e89…` is
+  a 32-byte repeating XOR recorded in an explicit table keyed by resource
+  identity, derived from two independent artefacts. It is not a cipher break and
+  it does not generalise to other VMProtect builds. The table's acceptance test
+  is structural — the result must parse as a PE — so a wrong key is rejected
+  rather than silently producing garbage.
+- **The mode boundary rests on two shapes, not on a survey.** One vendor family
+  plus a third-party corpus of 14 samples. The 14 are all `MinProtection`; only
+  two `Packed` samples exist here.
+- **`FullVirtualize` was not exercised.** It is a per-function option; producing
+  such a sample needs VMProtect's project file, whose schema was not recovered.
+- **x86 VMProtect targets are unmeasured.**
+
+The full measurement tables are in [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
 
 ## Features
 
@@ -111,8 +138,9 @@ measurement tables are in [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
 - **Packer identification with evidence** — a packer-neutral `Detection` that
   reports *why* a verdict was reached and records which markers were **absent**,
   so `likely_themida: false` is diagnosable instead of useless
-- **VMProtect static branch** — mode classification, structure report,
-  in-file payload extraction, and a debugger-free runtime image dump
+- **VMProtect branch** — mode classification, structure report, in-file payload
+  extraction, a debugger-free live image capture, and a measured payload decode
+  to a runnable PE. Backed by a CI gate over 14 third-party samples
 - **Verify mode** — diff unpacked output against a known-good reference,
   section by section
 - **GUI** — graphical front-end (`mida-gui.exe`)
@@ -161,7 +189,7 @@ cargo build --release --target i686-pc-windows-gnu
 mida-cli /unpack <filename> [options]
 mida-cli /analyze <filename> [--extract <dir>]
 mida-cli /dump-process <pid> <unpacked-file>
-mida-cli /dump-image <pid> <output-file>
+mida-cli /dump-image <pid> <output-file> [--wait]
 mida-cli /verify <unpacked-file> <reference-file>
 ```
 
@@ -198,9 +226,10 @@ mida-cli.exe /unpack target.exe -o clean.exe -v
 
 ### `/dump-process` — Dump `.text` from a running process
 
-For targets that have already been unpacked in memory (manually or by another
-tool). Reads the decrypted `.text` section from the live process and writes it
-to a file.
+A Themida-specific helper: reads the decrypted `.text` section from a live
+process and writes it to a file. For a VMProtect target use `/dump-image`
+instead — it captures the whole image and carves the payload, and `.text` is not
+the interesting section there.
 
 ```bash
 mida-cli.exe /dump-process 12345 unpacked_text.bin
@@ -219,7 +248,7 @@ mida-cli.exe /analyze target.exe --extract payload_out/   # write in-file payloa
 | Option | Description |
 |---|---|
 | `<filename>` | File to analyse. |
-| `-x <dir>` / `--extract <dir>` | Write every payload that is present in the file, named `<stem>.rcdata<id>.<ext>`. Fails when nothing is extractable rather than silently writing nothing. |
+| `-x <dir>` / `--extract <dir>` | Write every payload that is present in the file, named `<stem>.rcdata<id>.<ext>`, plus `<stem>.rcdata<id>.decoded.exe` when a measured decode exists for that resource. Fails when nothing is extractable rather than silently writing nothing. |
 | `-v` / `--verbose` | Enable debug-level logging. |
 
 It answers for both supported packers: for a Themida target it prints the
@@ -234,8 +263,14 @@ reads it **without** attaching a debugger — measured, attaching one makes that
 sample exit `0xDEADBEEF` at about 7 s while a bare run exits `0`.
 
 ```bash
-mida-cli.exe /dump-image 12345 image.exe
+mida-cli.exe /dump-image 12345 image.exe --wait
 ```
+
+| Option | Description |
+|---|---|
+| `<pid>` | PID of a running instance of the target. |
+| `<output>` | Where to write the flat image. |
+| `-w` / `--wait` | Keep sampling until the image stops changing, then write it. **Recommended for `Packed` targets:** their payload is rewritten in place after start-up, so a single immediate read can capture a half-decoded intermediate. Measured, the resource region passes through about ten distinct states before settling at t≈1.65 s. |
 
 The output is a **flat image**: file offset equals RVA for every section, headers
 at offset 0. That is the shape a disassembler wants, and it keeps every
@@ -243,9 +278,14 @@ data-directory RVA resolvable. ASLR is undone by default — the relocation tabl
 is walked and the load-base delta subtracted, so the image reads as if it had
 loaded at its preferred base.
 
+Payloads are then carved out of the image: the same `RT_RCDATA` that is absent
+from the input file is present in a captured one, and a measured decode turns it
+into a runnable PE beside it.
+
 Residual differences from the on-disk file are expected, not defects: `.rdata`
 holds a *resolved* IAT in memory where the file holds on-disk thunks, and
-`.fptable` is written by VMProtect at run time.
+`.fptable` is written by VMProtect at run time. The whole-image hash is therefore
+**not** stable and must not be used as a golden; the payload hash is.
 
 ### `/verify` — Compare against a reference
 
@@ -383,25 +423,34 @@ user-downloaded and verified at runtime via SHA-256 checksums (see
 
 | VMProtect | Status | Notes |
 |---|---|---|
-| **`MinProtection`** | ⚠️ static only | Identified, structure reported, in-file payload extracted. **No unpacking pipeline.** |
-| **`Packed`** | ⚠️ static + runtime dump | Original sections are not in the file; `/dump-image` reads them from a live process. **No unpacking pipeline.** |
+| **`MinProtection`** | ✅ verified | Identified, structure reported, payload extracted and decoded. 14 corpus samples gated in CI. |
+| **`Packed`** | ✅ verified | Original sections are not in the file; `/dump-image --wait` captures them from a live process and the payload decodes to a runnable PE. |
+| **x86** | ❓ unverified | Detector is not architecture-specific, but no x86 VMProtect target has been measured. |
+| **`FullVirtualize`** | ❓ not exercised | A per-function option; no sample produced. |
 | **devirtualisation** | ❌ not attempted | Deliberately out of scope; not claimed. |
 
 **Known limitations:**
 
-- **Sample coverage is narrow.** Five protected inputs: three built with Themida
-  v3, two with VMProtect (both from the same vendor family, all carrying
-  `.fptable`). Themida V1/V2 detection exists but has never been exercised on a
-  real sample.
-- **The VMProtect branch cannot unpack.** It identifies, reports and extracts —
-  and for `Packed` it returns a flat image dump rather than a rebuilt PE. The
-  payload of a `Packed` sample exists only in memory, so it cannot be recovered
-  from the file at all.
+- **Sample coverage is narrow.** Three Themida v3 inputs; two VMProtect inputs
+  from one vendor family (all carrying `.fptable`); and a third-party corpus of 14
+  VMProtect samples — all of which are `MinProtection`, so only two `Packed`
+  samples exist here. Themida V1/V2 detection exists but has never been exercised
+  on a real sample.
+- **The VMProtect branch rebuilds no PE.** At `MinProtection` the original code is
+  already in the file, so there is nothing to rebuild and the product is the
+  decoded payload. At `Packed` the product is a flattened live image plus the
+  decoded payload — not a rebuilt, shrinkable PE with a new import table.
+- **The payload decode is recorded per family, not derived.** A 32-byte repeating
+  XOR keyed by `(resource type, resource id)`, recovered from two independent
+  artefacts. Another VMProtect build would need its own measurement. This is the
+  honest boundary: the key is measured, not computed.
 - **The VMProtect verdict is a measured heuristic, not a proof.** The
   discriminator (`MEM_NOT_PAGED` on an executable section) scored 0 false
-  positives against 63 Themida samples and fired on both VMProtect ones; a
+  positives against 63 Themida samples and fires on the measured VMProtect ones; a
   format reusing that section shape without being VMProtect would break it.
-  Every verdict carries its evidence, and records which markers were absent.
+  Every verdict carries its evidence, and records which markers were absent. The
+  corpus gate caught one real misclassification in this rule already, which is
+  the argument for keeping the corpus rather than trusting two samples.
 - Themida v3 with heavy VM obfuscation may require runtime heuristics that static
   analysis alone cannot resolve (`ThemidaVersion::Unknown`).
 - Import resolution for a fully virtualized IAT (v3 VM-strong) may produce
