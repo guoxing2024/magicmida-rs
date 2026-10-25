@@ -15,7 +15,22 @@ pub fn run_command(cmd: Command) -> Result<(), anyhow::Error> {
             create_data_sections,
             shrink,
             verbose: _,
-        } => crate::unpacker::unpack(&input, output.as_deref(), create_data_sections, shrink),
+            packer,
+        } => crate::unpacker::unpack(
+            &input,
+            output.as_deref(),
+            create_data_sections,
+            shrink,
+            packer,
+        ),
+        Command::Analyze {
+            input,
+            extract_to,
+            verbose: _,
+        } => crate::analyze::analyze_file(&crate::analyze::AnalyzeOptions {
+            input: &input,
+            extract_to: extract_to.as_deref(),
+        }),
         Command::DumpProcess {
             pid,
             unpacked_file,
@@ -30,10 +45,11 @@ pub fn run_command(cmd: Command) -> Result<(), anyhow::Error> {
         }
         Command::Help => {
             println!("Magicmida-RS {}", env!("CARGO_PKG_VERSION"));
-            println!("Themida automatic unpacker.");
+            println!("Themida unpacker and static packer analysis.");
             println!();
             println!("Usage:");
-            println!("  mida-cli /unpack <filename> [--data-sections] [--shrink] [-v]");
+            println!("  mida-cli /unpack <filename> [--packer auto|themida|vmprotect] [--data-sections] [--shrink] [-v]");
+            println!("  mida-cli /analyze <filename> [--extract <dir>] [-v]");
             println!("  mida-cli /dump-process <pid> <unpacked-file>");
             println!("  mida-cli /verify <unpacked-file> <reference-file>");
             println!("  mida-cli /version | /help");

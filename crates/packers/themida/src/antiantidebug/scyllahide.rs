@@ -44,15 +44,117 @@ use crate::error::ThemidaError;
 /// else
 ///   raise Exception.Create('ScyllaHide is mandatory for Themida64 ...');
 /// ```
+/// ## There is deliberately no ini path here
+///
+/// An earlier revision carried `ini_path: Option<String>`.  It was **inert**:
+/// the argument list actually handed to the child is
+///
+/// ```text
+/// InjectorCLIx64.exe pid:<pid> <HookLibraryx64.dll> nowait
+/// ```
+///
+/// with no ini argument at all, and nothing ever read the field — both call
+/// sites set it to `None`.  A field that claims to choose a configuration and
+/// cannot is worse than no field, so it is gone; [`select_profile`] is the
+/// real mechanism.
 #[derive(Debug, Clone)]
 pub struct ScyllaHideConfig {
     /// Path to the `InjectorCLIx86.exe` or `InjectorCLIx64.exe` executable.
     pub injector_cli_path: String,
     /// Path to the `HookLibraryx86.dll` or `HookLibraryx64.dll` library.
     pub hook_library_path: String,
-    /// Path to `scylla_hide.ini` (optional — if absent, the injector uses
-    /// its own defaults).
-    pub ini_path: Option<String>,
+}
+
+/// Point the ScyllaHide ini at `profile`.
+///
+/// ## Why this rewrites a file
+///
+/// The injector takes no ini argument (see [`ScyllaHideConfig`]), so the only
+/// lever is the `CurrentProfile` key inside the `scylla_hide.ini` the injector
+/// finds beside itself.  Selecting a per-packer profile therefore has to be a
+/// rewrite of that one key.
+///
+/// Only the `CurrentProfile=` line is replaced; every other byte survives, so
+/// a profile file a user has hand-edited keeps its edits.  GNU/CRLF
+/// terminators are preserved.
+///
+/// # Errors
+///
+/// Returns [`ThemidaError::ScyllaHide`] when the ini cannot be read or written,
+/// or when it contains no `CurrentProfile=` line to rewrite — silently
+/// injecting with the wrong profile would be exactly the kind of
+/// "looks like it worked" failure this project keeps getting bitten by.
+pub fn select_profile(
+    ini_path: &std::path::Path,
+    profile: &str,
+) -> Result<(), ThemidaError> {
+    let text = std::fs::read_to_string(ini_path).map_err(|e| {
+        ThemidaError::ScyllaHide(format!("Failed to read '{}': {e}", ini_path.display()))
+    })?;
+
+    let updated = replace_current_profile(&text, profile).ok_or_else(|| {
+        ThemidaError::ScyllaHide(format!(
+            "'{}' has no CurrentProfile= line — cannot select profile '{}'; \
+             injecting would use whatever profile the file already names",
+            ini_path.display(),
+            profile
+        ))
+    })?;
+
+    if updated != text {
+        std::fs::write(ini_path, updated).map_err(|e| {
+            ThemidaError::ScyllaHide(format!("Failed to write '{}': {e}", ini_path.display()))
+        })?;
+    }
+    Ok(())
+}
+
+/// Pure text transform behind [`select_profile`], so it can be tested without
+/// touching the filesystem.
+///
+/// Returns `None` when there is no `CurrentProfile=` line to replace.
+pub fn replace_current_profile(text: &str, profile: &str) -> Option<String> {
+    let mut out = String::with_capacity(text.len() + profile.len());
+    let mut replaced = false;
+
+    for line in text.split_inclusive('\n') {
+        // Split the terminator off first: leaving the `\r` in `body` and then
+        // re-appending `"\r\n"` compounds it into `\r\r\n`.
+        let (body, terminator) = if let Some(b) = line.strip_suffix("\r\n") {
+            (b, "\r\n")
+        } else if let Some(b) = line.strip_suffix('\n') {
+            (b, "\n")
+        } else {
+            (line, "")
+        };
+
+        if is_current_profile_key(body) {
+            out.push_str("CurrentProfile=");
+            out.push_str(profile);
+            out.push_str(terminator);
+            replaced = true;
+        } else {
+            out.push_str(body);
+            out.push_str(terminator);
+        }
+    }
+
+    if replaced {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// `true` for a `CurrentProfile` key, tolerating case and spaces around `=`.
+///
+/// INI files in the wild vary; being lenient here costs nothing and means a
+/// hand-edited profile file is not silently ignored.
+fn is_current_profile_key(body: &str) -> bool {
+    match body.trim_start().split_once('=') {
+        Some((key, _)) => key.trim().eq_ignore_ascii_case("currentprofile"),
+        None => false,
+    }
 }
 
 /// Launch the ScyllaHide injector as a detached child process.

@@ -84,6 +84,19 @@ impl LargeResource {
         self.file_offset.is_some() && self.bytes_in_file == self.size as usize
     }
 
+    /// The payload bytes, or `None` when the whole declared `size` is not
+    /// present in the file.
+    ///
+    /// Deliberately all-or-nothing.  Returning a short slice would invite a
+    /// caller to hash or write a truncated file — which is exactly how a wrong
+    /// SHA-256 (`fcb2e125…` instead of `91d585e6…`) was produced during this
+    /// crate's investigation.
+    pub fn bytes<'a>(&self, image: &'a [u8]) -> Option<&'a [u8]> {
+        let off = self.file_offset? as usize;
+        let end = off.checked_add(self.size as usize)?;
+        image.get(off..end)
+    }
+
     /// One-line summary for a report.
     pub fn one_line(&self) -> String {
         let what = match (self.type_id, &self.name_id, &self.name) {
@@ -444,6 +457,38 @@ mod tests {
         // Nothing readable in the file -> no bytes, no entropy, no hash.
         let res = large_resources(&pe, &image);
         assert!(res.is_empty(), "1 MiB filter drops it before the read");
+    }
+
+    #[test]
+    fn bytes_is_all_or_nothing() {
+        fn lr(size: u32, file_offset: Option<u32>, bytes_in_file: usize) -> LargeResource {
+            LargeResource {
+                type_id: Some(RT_RCDATA),
+                type_name: None,
+                name_id: Some(101),
+                name: None,
+                lang: 0x409,
+                data_rva: 0x200,
+                size,
+                file_offset,
+                bytes_in_file,
+                entropy: None,
+                sha256: None,
+                magic: None,
+                looks_like_pe: false,
+            }
+        }
+        let image = vec![7u8; 0x100];
+
+        // Fully present: the bytes come back.
+        assert_eq!(lr(0x10, Some(0x20), 0x10).bytes(&image).map(<[u8]>::len), Some(0x10));
+        // Not in the file at all — the measured `Packed` payload.
+        assert!(lr(0x10, None, 0).bytes(&image).is_none());
+        // Declared larger than the file: `None`, never a short slice.  This is
+        // the guard against hashing or writing a truncated payload.
+        assert!(lr(0x1000, Some(0x20), 0xE0).bytes(&image).is_none());
+        // An offset past EOF.
+        assert!(lr(0x10, Some(0x1000), 0).bytes(&image).is_none());
     }
 
     #[test]

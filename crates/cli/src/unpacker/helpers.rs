@@ -24,6 +24,10 @@ const SCYLLA_HOOK_NAME: &str = "HookLibraryx64.dll";
 #[cfg(target_arch = "x86")]
 const SCYLLA_HOOK_NAME: &str = "HookLibraryx86.dll";
 
+/// Profile file name.  One file for all packers; the profile is selected by
+/// the `CurrentProfile` key inside it, not by the file name.
+const SCYLLA_INI_NAME: &str = "scylla_hide.ini";
+
 /// Resolve the absolute path to the ScyllaHide injector binary.
 pub(super) fn scylla_injector_path() -> PathBuf {
     exe_dir().join(SCYLLA_INJECTOR_NAME)
@@ -32,6 +36,16 @@ pub(super) fn scylla_injector_path() -> PathBuf {
 /// Resolve the absolute path to the ScyllaHide hook library DLL.
 pub(super) fn scylla_hook_path() -> PathBuf {
     exe_dir().join(SCYLLA_HOOK_NAME)
+}
+
+/// Resolve the absolute path to the ScyllaHide profile file.
+///
+/// The injector takes **no ini argument** (measured: `InjectorCLIx64.exe
+/// pid:<pid> <HookLibraryx64.dll> nowait`), so it reads `scylla_hide.ini` from
+/// the directory it lives in — which is where the profile has to be rewritten
+/// for per-packer selection.
+pub(super) fn scylla_ini_path() -> PathBuf {
+    exe_dir().join(SCYLLA_INI_NAME)
 }
 
 /// Directory containing the CLI executable.

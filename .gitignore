@@ -39,5 +39,9 @@ build.bat
 .hermes-tmp.*
 CLAUDE.md
 scylla_hide.ini
+# ...except the profile file this project authors and ships as an asset.  The
+# bare pattern above matches at any depth, which swallowed it too — the intent
+# was only to keep the user-downloaded copy out of the tree.
+!crates/cli/assets/scylla_hide.ini
 run_unpack.bat
 unpack_*.log

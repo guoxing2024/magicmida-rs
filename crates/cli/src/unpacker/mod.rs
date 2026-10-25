@@ -46,8 +46,9 @@ use mida_packers_themida::{
     CompilerHint, IatFixStrategy, ScyllaHideConfig, ThemidaState,
     create_data_sections, determine_iat_address, fix_iat,
     fixup_api_call_sites, handle_nt_set_information_thread, init_pe_details,
-    inject_scylla_hide, install_anti_dump_fix, shrink_pe,
+    inject_scylla_hide, install_anti_dump_fix, select_profile, shrink_pe,
 };
+use crate::args::PackerChoice;
 use crate::log::{self, LogType};
 
 use session::ProcessSession;
@@ -55,7 +56,7 @@ use oep_scan::scan_live_memory_for_real_oep;
 use helpers::{
     live_data_nonzero,
     read_tls_callback_oep,
-    scylla_injector_path, scylla_hook_path, resolve_output_path, resolve_api_addrs,
+    scylla_ini_path, scylla_injector_path, scylla_hook_path, resolve_output_path, resolve_api_addrs,
     resolve_host_api, compute_data_section_bounds, detect_packed_dll, pe_section_name_remote_rva,
     dotnet_dump_and_dump_output, handle_hw_breakpoint, section_table,
 };
@@ -90,6 +91,24 @@ struct LoopState {
 // Unpack
 // ---------------------------------------------------------------------------
 
+/// Print a packer verdict, its evidence, and the static structure report.
+fn log_detection(detection: &mida_packer_api::Detection, pe: &PeHeader, image: &[u8]) {
+    log::log(
+        LogType::Info,
+        &format!("Packer detection: {}", detection.summary()),
+    );
+    for line in detection.render_evidence() {
+        log::log(LogType::Info, &format!("  {line}"));
+    }
+    log::log(
+        LogType::Info,
+        &format!(
+            "Static report:\n{}",
+            mida_packers_vmprotect::analyze(pe, image)
+        ),
+    );
+}
+
 /// Unpack a Themida-protected executable.
 ///
 /// This is the main entry point for the `/unpack` command. It orchestrates the
@@ -112,6 +131,7 @@ pub fn unpack(
     output: Option<&Path>,
     do_data_sections: bool,
     shrink: bool,
+    packer: PackerChoice,
 ) -> Result<(), anyhow::Error> {
     // ---- step 1: resolve output path ----
     let output_path = resolve_output_path(input, output);
@@ -151,21 +171,86 @@ pub fn unpack(
     let image = fs::read(input)
         .map_err(|e| anyhow!("Failed to read input for packer detection: {e}"))?;
 
-    if let Some(detection) = mida_packers_vmprotect::detect(&pe, &image) {
-        let report = mida_packers_vmprotect::analyze(&pe, &image);
+    let detection = mida_packers_vmprotect::detect(&pe, &image);
+
+    // The packer choice is an explicit, logged decision rather than a silent
+    // fall-through, because the `Auto` refusal is the only thing standing
+    // between a VMProtect target and the Themida loop.
+    let packer_kind = match (packer, detection.as_ref()) {
+        (PackerChoice::Auto, Some(d)) => {
+            log_detection(d, &pe, &image);
+            return Err(anyhow!(
+                "{} target — the Themida pipeline cannot unpack it; \
+                 the static structure report is above",
+                d.summary()
+            ));
+        }
+        (PackerChoice::Auto, None) => mida_packer_api::PackerKind::Themida,
+
+        (PackerChoice::Themida, Some(d)) => {
+            log::log(
+                LogType::Info,
+                &format!(
+                    "Overriding detection: forcing the Themida branch for a {} target",
+                    d.summary()
+                ),
+            );
+            log_detection(d, &pe, &image);
+            mida_packer_api::PackerKind::Themida
+        }
+        (PackerChoice::Themida, None) => mida_packer_api::PackerKind::Themida,
+
+        (PackerChoice::VmProtect, Some(d)) => {
+            log::log(
+                LogType::Info,
+                &format!(
+                    "Selecting the experimental VMProtect branch for a {} target \
+                     (shares the one debug loop that exists)",
+                    d.summary()
+                ),
+            );
+            log_detection(d, &pe, &image);
+            d.kind
+        }
+        (PackerChoice::VmProtect, None) => {
+            return Err(anyhow!(
+                "--packer vmprotect was requested but no VMProtect evidence was \
+                 found in {}; use /analyze to see what it is",
+                input.display()
+            ));
+        }
+    };
+
+    // ScyllaHide profile for whichever packer we are about to run.  The
+    // injector takes no ini argument, so this is applied by rewriting
+    // `CurrentProfile` in the ini beside the injector — see
+    // `mida_packers_themida::select_profile`.
+    //
+    // This is done here, in pre-flight, rather than in the CREATE_PROCESS
+    // handler where the profile is *used*: the choice is a per-run decision
+    // with no dependency on the debuggee existing, and keeping it late meant a
+    // run that could not create its process (measured: `ERROR_ELEVATION_REQUIRED`
+    // when a `RUNASADMIN` AppCompat layer flag is registered for the target)
+    // silently never applied the profile at all.
+    let scylla_profile = packer_kind.scylla_profile();
+    let scylla_ini = scylla_ini_path();
+    if scylla_ini.exists() {
+        match select_profile(&scylla_ini, scylla_profile) {
+            Ok(()) => log::log(
+                LogType::Info,
+                &format!("ScyllaHide profile: {scylla_profile}"),
+            ),
+            Err(e) => warn!("Could not select ScyllaHide profile '{scylla_profile}': {e}"),
+        }
+    } else {
         log::log(
             LogType::Info,
-            &format!("Packer detection: {}", detection.summary()),
+            &format!(
+                "No scylla_hide.ini at '{}' — the injector will use whatever profile \
+                 it finds by itself",
+                scylla_ini.display()
+            ),
         );
-        for line in detection.render_evidence() {
-            log::log(LogType::Info, &format!("  {line}"));
-        }
-        log::log(LogType::Info, &format!("Static report:\n{report}"));
-        return Err(anyhow!(
-            "{} target — the Themida pipeline cannot unpack it; \
-             the static structure report is above",
-            detection.summary()
-        ));
     }
 
     // ---- step 3: detect Themida ----
@@ -376,7 +461,6 @@ pub fn unpack(
                 let scylla_config = ScyllaHideConfig {
                     injector_cli_path: injector_path.display().to_string(),
                     hook_library_path: scylla_hook_path().display().to_string(),
-                    ini_path: None,
                 };
                 if let Err(e) = inject_scylla_hide(pid, &scylla_config) {
                     warn!("ScyllaHide injection failed (non-fatal): {e}");

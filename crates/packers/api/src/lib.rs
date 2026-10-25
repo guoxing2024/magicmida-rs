@@ -117,6 +117,28 @@ impl PackerKind {
             _ => None,
         }
     }
+
+    /// Name of the ScyllaHide profile to use for this packer.
+    ///
+    /// The injector takes **no ini argument** — measured:
+    /// `InjectorCLIx64.exe pid:<pid> <HookLibraryx64.dll> nowait`.  The only
+    /// way to select a profile is the `CurrentProfile` key inside the
+    /// `scylla_hide.ini` the injector finds beside itself, so profile
+    /// selection is a property of the packer rather than of the injector
+    /// command line.
+    ///
+    /// `"Magicmida"` is the historical hand-written Themida profile and is
+    /// kept verbatim so the three existing e2e golden gates keep producing
+    /// the same bytes.  `"VMProtect x86/x64"` is the preset ScyllaHide itself
+    /// ships (`D:\Tools\ScyllaHide\scylla_hide.ini`), used verbatim rather
+    /// than invented, because its option set is the vendor's, not a guess.
+    pub fn scylla_profile(self) -> &'static str {
+        match self {
+            PackerKind::Themida => "Magicmida",
+            PackerKind::VmProtect(_) => "VMProtect x86/x64",
+            PackerKind::Unknown => "Disabled",
+        }
+    }
 }
 
 /// One machine-checkable reason behind a verdict.
@@ -261,6 +283,23 @@ mod tests {
         assert!(!d.is_themida());
         assert!(!d.is_unknown());
         assert_eq!(d.render_evidence(), vec!["+ vmp-section: sections [\".vmp0\"]"]);
+    }
+
+    #[test]
+    fn scylla_profile_is_per_packer_and_names_the_shipped_ones() {
+        // The injector has no ini argument, so this name is the only lever.
+        assert_eq!(PackerKind::Themida.scylla_profile(), "Magicmida");
+        assert_eq!(
+            PackerKind::VmProtect(VmProtectMode::MinProtection).scylla_profile(),
+            "VMProtect x86/x64"
+        );
+        // Both modes share the profile: the mode changes the *pipeline*, not
+        // the anti-anti-debug option set.
+        assert_eq!(
+            PackerKind::VmProtect(VmProtectMode::Packed).scylla_profile(),
+            PackerKind::VmProtect(VmProtectMode::MinProtection).scylla_profile()
+        );
+        assert_eq!(PackerKind::Unknown.scylla_profile(), "Disabled");
     }
 
     #[test]

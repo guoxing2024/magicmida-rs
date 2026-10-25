@@ -4,9 +4,11 @@
 //!
 //! ```text
 //! mida-cli /unpack <filename> [--data-sections] [--shrink] [-v]
+//! mida-cli /analyze <filename> [--extract <dir>] [-v]
 //! mida-cli /dump-process <pid> <unpacked-file>
 //! ```
 
+mod analyze;
 mod args;
 mod commands;
 mod log;
@@ -20,6 +22,7 @@ fn main() {
             eprintln!();
             eprintln!("Usage:");
             eprintln!("  mida-cli /unpack <filename> [--data-sections] [--shrink] [-v]");
+            eprintln!("  mida-cli /analyze <filename> [--extract <dir>] [-v]");
             eprintln!("  mida-cli /dump-process <pid> <unpacked-file>");
             eprintln!("  mida-cli /verify <unpacked-file> <reference-file>");
             std::process::exit(1);
@@ -27,7 +30,10 @@ fn main() {
     };
 
     // Initialise logging — verbose mode enables debug-level output.
-    let verbose = matches!(cmd, args::Command::Unpack { verbose: true, .. });
+    let verbose = matches!(
+        cmd,
+        args::Command::Unpack { verbose: true, .. } | args::Command::Analyze { verbose: true, .. }
+    );
     log::init_logging(verbose);
 
     // Dispatch.

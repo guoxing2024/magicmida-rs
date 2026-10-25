@@ -40,7 +40,10 @@ mod tests;
 
 // Re-export the public API so `crate::antiantidebug::*` works unchanged.
 pub use handlers::handle_nt_set_information_thread;
-pub use scyllahide::{inject_scylla_hide, reap_hung_injector, ScyllaHideConfig};
+pub use scyllahide::{
+    inject_scylla_hide, reap_hung_injector, replace_current_profile, select_profile,
+    ScyllaHideConfig,
+};
 
 // ---------------------------------------------------------------------------
 // Constants

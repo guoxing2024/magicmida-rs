@@ -34,8 +34,8 @@ pub mod version;
 
 // Re-export the primary types so callers can do `use mida_packers_themida::…`
 pub use antiantidebug::{
-    handle_nt_set_information_thread, inject_scylla_hide,
-    ScyllaHideConfig,
+    handle_nt_set_information_thread, inject_scylla_hide, reap_hung_injector,
+    replace_current_profile, select_profile, ScyllaHideConfig,
 };
 pub use binaries::{expected_hook_hash, expected_injector_hash, verify_sha256};
 pub use common::ThemidaState;

@@ -9,6 +9,41 @@ use std::path::PathBuf;
 // Command enum
 // ---------------------------------------------------------------------------
 
+/// Which packer branch `/unpack` should take.
+///
+/// `Auto` is the default and refuses anything the Themida pipeline cannot
+/// handle.  That refusal is what stops a VMProtect target from being handed to
+/// the Themida loop — measured before this gate existed: `Themida version:
+/// V3`, a created debuggee, and 8 s of work on a VMProtect binary.
+///
+/// The other two values make the decision **overridable for diagnostics**,
+/// with the override logged, because a packer verdict is a heuristic and a
+/// wrong one must be resolvable without recompiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackerChoice {
+    /// Detect the packer and refuse what the Themida pipeline cannot unpack.
+    Auto,
+    /// Force the Themida branch even when VMProtect evidence is present.
+    Themida,
+    /// Select the VMProtect branch — its own ScyllaHide profile, sharing the
+    /// single debug loop that exists.  Experimental.
+    VmProtect,
+}
+
+impl PackerChoice {
+    /// Parse the value of `--packer`.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.to_ascii_lowercase().as_str() {
+            "auto" => Ok(PackerChoice::Auto),
+            "themida" => Ok(PackerChoice::Themida),
+            "vmprotect" | "vmp" => Ok(PackerChoice::VmProtect),
+            other => Err(format!(
+                "Unknown --packer value '{other}'. Use auto, themida, or vmprotect."
+            )),
+        }
+    }
+}
+
 /// CLI command parsed from the program arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -26,6 +61,25 @@ pub enum Command {
         create_data_sections: bool,
         /// Remove Themida-specific sections from the output (`--shrink`).
         shrink: bool,
+        /// Enable verbose (debug-level) logging (`-v`).
+        verbose: bool,
+        /// Which packer branch to take (`--packer`).
+        packer: PackerChoice,
+    },
+
+    /// Analyse a protected binary statically.
+    ///
+    /// Identifies the packer and its mode, prints the static structure report,
+    /// and optionally extracts payloads that are present in the file.  Unlike
+    /// [`Command::Unpack`] this needs no debugger and no interactive desktop
+    /// session, so it runs headless and in CI.
+    ///
+    /// Usage: `magicmida /analyze <filename> [--extract <dir>] [-v]`
+    Analyze {
+        /// Path to the file to analyse.
+        input: PathBuf,
+        /// Directory to write extractable payloads into (`--extract`).
+        extract_to: Option<PathBuf>,
         /// Enable verbose (debug-level) logging (`-v`).
         verbose: bool,
     },
@@ -79,12 +133,13 @@ pub fn parse_args() -> Result<Command, String> {
 
     match args[1].as_str() {
         "/unpack" | "--unpack" | "unpack" => parse_unpack(&args),
+        "/analyze" | "--analyze" | "analyze" => parse_analyze(&args),
         "/dump-process" | "--dump-process" | "dump-process" => parse_dump_process(&args),
         "/verify" | "--verify" | "verify" => parse_verify(&args),
         "/version" | "--version" | "-V" => Ok(Command::Version),
         "/help" | "--help" | "-h" | "/?" => Ok(Command::Help),
         other => Err(format!(
-            "Unknown command '{}'. Use /unpack, /dump-process, or /verify.",
+            "Unknown command '{}'. Use /unpack, /analyze, /dump-process, or /verify.",
             other
         )),
     }
@@ -96,7 +151,11 @@ pub fn parse_args() -> Result<Command, String> {
 
 fn parse_unpack(args: &[String]) -> Result<Command, String> {
     if args.len() < 3 {
-        return Err("Usage: magicmida /unpack <filename> [--data-sections] [--shrink] [-v]".into());
+        return Err(
+            "Usage: magicmida /unpack <filename> [--packer auto|themida|vmprotect] \
+             [--data-sections] [--shrink] [-v]"
+                .into(),
+        );
     }
 
     let input = PathBuf::from(&args[2]);
@@ -114,6 +173,7 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
     let mut create_data_sections = false;
     let mut shrink = true; // Default: shrink Themida sections (surpasses Pascal)
     let mut verbose = false;
+    let mut packer = PackerChoice::Auto;
 
     let mut i = 3;
     while i < args.len() {
@@ -124,6 +184,13 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
                     return Err("Missing output path after -o/--output.".into());
                 }
                 output = Some(PathBuf::from(&args[i]));
+            }
+            "--packer" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Missing value after --packer.".into());
+                }
+                packer = PackerChoice::parse(&args[i])?;
             }
             "--data-sections" | "--create-data-sections" => {
                 create_data_sections = true;
@@ -157,6 +224,50 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
         output,
         create_data_sections,
         shrink,
+        verbose,
+        packer,
+    })
+}
+
+fn parse_analyze(args: &[String]) -> Result<Command, String> {
+    if args.len() < 3 {
+        return Err("Usage: magicmida /analyze <filename> [--extract <dir>] [-v]".into());
+    }
+
+    let input = PathBuf::from(&args[2]);
+    if !input.exists() {
+        return Err(format!("File not found: {}", input.display()));
+    }
+    if !input.is_file() {
+        return Err(format!("Not a file: {}", input.display()));
+    }
+
+    let mut extract_to: Option<PathBuf> = None;
+    let mut verbose = false;
+
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-x" | "--extract" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Missing directory after -x/--extract.".into());
+                }
+                extract_to = Some(PathBuf::from(&args[i]));
+            }
+            "-v" | "--verbose" => {
+                verbose = true;
+            }
+            other => {
+                return Err(format!("Unknown option: {}", other));
+            }
+        }
+        i += 1;
+    }
+
+    Ok(Command::Analyze {
+        input,
+        extract_to,
         verbose,
     })
 }
@@ -221,12 +332,79 @@ mod tests {
     fn dispatch_first_arg(arg: &str) -> Result<Command, String> {
         match arg {
             "/unpack" | "--unpack" | "unpack" => Err("would parse unpack".into()),
+            "/analyze" | "--analyze" | "analyze" => Err("would parse analyze".into()),
             "/dump-process" | "--dump-process" | "dump-process" => Err("would parse dump".into()),
             "/verify" | "--verify" | "verify" => Err("would parse verify".into()),
             "/version" | "--version" | "-V" => Ok(Command::Version),
             "/help" | "--help" | "-h" | "/?" => Ok(Command::Help),
             other => Err(format!("Unknown command '{}'", other)),
         }
+    }
+
+    #[test]
+    fn analyze_spellings_all_resolve() {
+        for a in ["/analyze", "--analyze", "analyze"] {
+            assert!(
+                dispatch_first_arg(a).unwrap_err().contains("analyze"),
+                "for {a}"
+            );
+        }
+    }
+
+    #[test]
+    fn analyze_requires_a_file_that_exists() {
+        let args = vec!["prog".into(), "/analyze".into()];
+        assert!(parse_analyze(&args).unwrap_err().contains("Usage"));
+
+        let args = vec!["prog".into(), "/analyze".into(), "no-such-file-xyz".into()];
+        let err = parse_analyze(&args).unwrap_err();
+        assert!(err.contains("File not found"), "got: {err}");
+    }
+
+    #[test]
+    fn analyze_parses_the_extract_flag_and_rejects_unknown_ones() {
+        // `Cargo.toml` exists relative to the crate root, so it passes the
+        // existence check without depending on a sample.
+        let args = vec![
+            "prog".into(),
+            "/analyze".into(),
+            "Cargo.toml".into(),
+            "--extract".into(),
+            "out-dir".into(),
+            "-v".into(),
+        ];
+        match parse_analyze(&args).unwrap() {
+            Command::Analyze {
+                input,
+                extract_to,
+                verbose,
+            } => {
+                assert!(input.ends_with("Cargo.toml"));
+                assert_eq!(extract_to, Some(PathBuf::from("out-dir")));
+                assert!(verbose);
+            }
+            other => panic!("expected Analyze, got {other:?}"),
+        }
+
+        let args = vec![
+            "prog".into(),
+            "/analyze".into(),
+            "Cargo.toml".into(),
+            "--extract".into(),
+        ];
+        assert!(parse_analyze(&args)
+            .unwrap_err()
+            .contains("Missing directory"));
+
+        let args = vec![
+            "prog".into(),
+            "/analyze".into(),
+            "Cargo.toml".into(),
+            "--bogus".into(),
+        ];
+        assert!(parse_analyze(&args)
+            .unwrap_err()
+            .contains("Unknown option"));
     }
 
     #[test]
@@ -281,15 +459,61 @@ mod tests {
                 create_data_sections,
                 shrink,
                 verbose,
+                packer,
             } => {
                 assert!(input.ends_with("Cargo.toml"));
                 assert!(output.is_none());
                 assert!(create_data_sections);
                 assert!(shrink);
                 assert!(verbose);
+                assert_eq!(packer, PackerChoice::Auto, "the default must be auto");
             }
             _ => panic!("expected Unpack, got {cmd:?}"),
         }
+    }
+
+    #[test]
+    fn unpack_packer_flag_parses_all_three_values_and_rejects_junk() {
+        for (value, expected) in [
+            ("auto", PackerChoice::Auto),
+            ("themida", PackerChoice::Themida),
+            ("vmprotect", PackerChoice::VmProtect),
+            ("VMProtect", PackerChoice::VmProtect),
+            ("vmp", PackerChoice::VmProtect),
+        ] {
+            let args = vec![
+                "prog".into(),
+                "/unpack".into(),
+                "Cargo.toml".into(),
+                "--packer".into(),
+                value.into(),
+            ];
+            match parse_unpack(&args).unwrap() {
+                Command::Unpack { packer, .. } => assert_eq!(packer, expected, "for {value}"),
+                other => panic!("expected Unpack, got {other:?}"),
+            }
+        }
+
+        let args = vec![
+            "prog".into(),
+            "/unpack".into(),
+            "Cargo.toml".into(),
+            "--packer".into(),
+            "enigma".into(),
+        ];
+        assert!(parse_unpack(&args)
+            .unwrap_err()
+            .contains("Unknown --packer value"));
+
+        let args = vec![
+            "prog".into(),
+            "/unpack".into(),
+            "Cargo.toml".into(),
+            "--packer".into(),
+        ];
+        assert!(parse_unpack(&args)
+            .unwrap_err()
+            .contains("Missing value after --packer"));
     }
 
     #[test]

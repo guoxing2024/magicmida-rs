@@ -1593,6 +1593,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "mida-core",
+ "mida-packer-api",
  "mida-packers-themida",
  "mida-packers-vmprotect",
  "mida-pe",

@@ -158,7 +158,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .join("HookLibraryx64.dll")
                         .display()
                         .to_string(),
-                    ini_path: None,
                 };
                 // Spawn the injector and get straight back to WaitForDebugEvent:
                 // blocking here would freeze the target (pending debug event)
