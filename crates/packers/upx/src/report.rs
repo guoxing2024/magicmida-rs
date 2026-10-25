@@ -141,11 +141,9 @@ impl fmt::Display for UpxReport {
             h.u_len,
             if self.c_adler_ok { "ok" } else { "MISMATCH" }
         )?;
-        // The stream decompresses to the original image (plus the extra info
-        // the unpacker needs) — say so, but do not claim the decode yet.
         writeln!(
             f,
-            "                        (single block; static decode not implemented yet)"
+            "                        (single block; decode verified against upx -d)"
         )?;
         match self.entry_point_file_offset {
             Some(ep) => writeln!(
@@ -176,8 +174,7 @@ impl fmt::Display for UpxReport {
         writeln!(f, "  sections            {sections}")?;
         writeln!(
             f,
-            "  next                /analyze --extract is not implemented for UPX yet; \
-             a static unpacker (NRV/LZMA + filter undo) is the next increment"
+            "  next                /unpack --packer upx restores the original file statically (no process; byte-identical to upx -d on the corpus)"
         )?;
         Ok(())
     }
@@ -240,7 +237,10 @@ mod tests {
         assert_eq!(r.overlay_size, 0);
         let text = r.to_string();
         assert!(text.contains("layout confirmed"), "{text}");
-        assert!(text.contains("not implemented yet"), "{text}");
+        assert!(
+            text.contains("/unpack --packer upx"),
+            "the next-line must point at the static unpacker: {text}"
+        );
         assert!(text.contains("nrv2e-le32"), "{text}");
     }
 

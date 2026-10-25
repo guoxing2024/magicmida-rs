@@ -8,8 +8,10 @@ license.workspace = true
 readme.workspace = true
 
 [dependencies]
+lzma-rs = "0.3"
 mida-pe = { path = "../../pe" }
 mida-packer-api = { path = "../api" }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 # The gate documents why /unpack's gate order is load-bearing: UPX0 fires

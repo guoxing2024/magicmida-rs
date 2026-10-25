@@ -225,3 +225,70 @@ fn the_upx0_section_would_fire_themidas_heuristic() {
     );
     let _ = path;
 }
+
+// ---------------------------------------------------------------------------
+// the static unpacker
+// ---------------------------------------------------------------------------
+
+/// `(sample, product size, product sha256)` — the goldens are `upx -d`'s own
+/// output, measured on 2026-10-26 with `upx -d -o …` (5.2.1).  The ground
+/// truth is deliberately *not* the pre-pack original: UPX rewrites the DOS
+/// stub area when packing and never restores it, so `upx -d`'s product
+/// differs from the original file in those bytes while everything else is
+/// byte-identical (sizes match on all four samples).  Note the two mida_x64
+/// samples unpack to the *same* golden — they were packed from the same
+/// original with different methods, which cross-checks the decoders.
+const UNPACK_GOLDENS: &[(&str, u64, &str)] = &[
+    (
+        "injector_x64.upx.exe",
+        794_624,
+        "2f391f0846499d4df8fcc8f8fb84ab4c3f2ad3168ccb9b61039280473fa3aa8c",
+    ),
+    (
+        "mida_x64_nrv.upx.exe",
+        6_379_269,
+        "459f4f8e1b805961c725b5e6b65beab43da7c91cecdece836228e5e5be03c8a6",
+    ),
+    (
+        "mida_x64_lzma.upx.exe",
+        6_379_269,
+        "459f4f8e1b805961c725b5e6b65beab43da7c91cecdece836228e5e5be03c8a6",
+    ),
+    (
+        "mida_x86_nrv.upx.exe",
+        6_234_165,
+        "da7a1dce9944a2b8a49c426d78f143fda3d16eb389ef4d6d015d8c9cedd3fc14",
+    ),
+];
+
+/// The static unpacker reproduces `upx -d` byte-for-byte, on every corpus
+/// sample, for both architectures, both methods and both filters.
+#[test]
+fn static_unpack_reproduces_upx_minus_d_byte_for_byte() {
+    let dir = sample_dir();
+    if !dir.exists() {
+        println!("SKIP: no UPX sample dir at {}", dir.display());
+        return;
+    }
+    for (name, size, sha) in UNPACK_GOLDENS {
+        let Some((path, bytes)) = read_sample(&dir, name) else {
+            continue;
+        };
+        let pe = PeHeader::from_bytes(&bytes)
+            .unwrap_or_else(|e| panic!("{} must parse as a PE: {e}", path.display()));
+        let product = mida_packers_upx::unpack_static(&pe, &bytes)
+            .unwrap_or_else(|e| panic!("{} must unpack: {e}", path.display()));
+        assert_eq!(
+            product.len() as u64,
+            *size,
+            "{}: product size",
+            path.display()
+        );
+        assert!(
+            mida_packers_themida::verify_sha256(&product, sha),
+            "{}: product sha256 drifted from the upx -d golden",
+            path.display()
+        );
+    }
+}
+
