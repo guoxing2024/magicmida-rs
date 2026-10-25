@@ -448,6 +448,7 @@ fn write_image(out: &[u8], output: &Path) -> Result<(), anyhow::Error> {
 /// usable product look like a failed run.
 fn carve_payloads(image: &[u8], output: &Path) {
     use mida_packers_vmprotect::resources::large_resources;
+    use mida_packers_vmprotect::{looks_like_pe_image, transform_for};
 
     let pe = match PeHeader::from_bytes(image) {
         Ok(pe) => pe,
@@ -501,7 +502,54 @@ fn carve_payloads(image: &[u8], output: &Path) {
                 &format!("Cannot write {}: {e}", path.display()),
             ),
         }
+
+        // A container is not a product.  When a measured transform exists for
+        // this resource, apply it and accept the result only if it is a valid
+        // PE image — a wrong key must be rejected by the data, not trusted.
+        let Some(t) = transform_for(r.type_id, r.name_id) else {
+            continue;
+        };
+        let decoded = t.apply(bytes);
+        if !looks_like_pe_image(&decoded) {
+            log::log(
+                LogType::Warn,
+                &format!(
+                    "Transform for {} did not produce a PE image; keeping the container only. \
+                     Key provenance: {}",
+                    describe(r),
+                    t.provenance
+                ),
+            );
+            continue;
+        }
+        let decoded_path = dir.join(decoded_name(&stem, r));
+        match std::fs::write(&decoded_path, &decoded) {
+            Ok(()) => log::log(
+                LogType::Good,
+                &format!(
+                    "Decoded payload {} to {} ({} B, sha256 {})",
+                    describe(r),
+                    decoded_path.display(),
+                    decoded.len(),
+                    sha256_hex(&decoded)
+                ),
+            ),
+            Err(e) => log::log(
+                LogType::Warn,
+                &format!("Cannot write {}: {e}", decoded_path.display()),
+            ),
+        }
     }
+}
+
+/// `<stem>.rcdata<id>.decoded.exe` — the decoded form, kept beside the container
+/// so the two can be compared byte for byte.
+fn decoded_name(stem: &str, r: &mida_packers_vmprotect::resources::LargeResource) -> String {
+    let id = r
+        .name_id
+        .map(|i| i.to_string())
+        .unwrap_or_else(|| "named".to_string());
+    format!("{stem}.rcdata{id}.decoded.exe")
 }
 
 fn describe(r: &mida_packers_vmprotect::resources::LargeResource) -> String {

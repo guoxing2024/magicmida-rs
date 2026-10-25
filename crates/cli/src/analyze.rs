@@ -157,6 +157,40 @@ fn extract_payloads(
                     ),
                 );
                 written += 1;
+
+                // A carved container is not a product.  When a measured
+                // transform exists for this resource, apply it — and accept the
+                // result only if it is a structurally valid PE image, so a wrong
+                // key is rejected by the data rather than trusted.
+                if let Some(t) = mida_packers_vmprotect::transform_for(resource.type_id, resource.name_id)
+                {
+                    let decoded = t.apply(bytes);
+                    if mida_packers_vmprotect::looks_like_pe_image(&decoded) {
+                        let dpath = dir.join(decoded_file_name(input, resource));
+                        std::fs::write(&dpath, &decoded).with_context(|| {
+                            format!("Failed to write {}", dpath.display())
+                        })?;
+                        log::log(
+                            LogType::Good,
+                            &format!(
+                                "Decoded {} B to {} (sha256 {})",
+                                decoded.len(),
+                                dpath.display(),
+                                sha256_hex(&decoded)
+                            ),
+                        );
+                    } else {
+                        log::log(
+                            LogType::Warn,
+                            &format!(
+                                "A transform is known for {} but did not produce a PE image; \
+                                 keeping the container only. Key provenance: {}",
+                                describe(resource),
+                                t.provenance
+                            ),
+                        );
+                    }
+                }
             }
             None => {
                 skipped.push(format!(
@@ -213,4 +247,28 @@ fn describe(resource: &LargeResource) -> String {
         (Some(t), None) => format!("type {t}"),
         _ => "resource".to_string(),
     }
+}
+
+/// `stem.rcdata<id>.decoded.exe` — the decoded form of a carved container, kept
+/// beside it so the two can be compared byte for byte.
+fn decoded_file_name(input: &Path, resource: &LargeResource) -> String {
+    let stem = input
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "payload".to_string());
+    let id = match (resource.name_id, &resource.name) {
+        (Some(id), _) => id.to_string(),
+        (None, Some(name)) => name.clone(),
+        (None, None) => "unknown".to_string(),
+    };
+    format!("{stem}.rcdata{id}.decoded.exe")
+}
+
+/// Lowercase hex SHA-256, so the log line can be checked against a hash the user
+/// already has.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
 }

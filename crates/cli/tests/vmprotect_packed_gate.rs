@@ -219,6 +219,73 @@ fn the_input_file_still_yields_nothing() {
     );
 }
 
+/// The decoded payload must be reproducible **offline**, from a captured image
+/// alone — no live process, no retry, no luck.
+///
+/// This is the assertion that turns "the sample happens to write the file" into
+/// "the pipeline produces it".  Measured transform: a single 32-byte repeating
+/// XOR key, `K[i] == K[i-32]` holding across all 12,782,080 bytes with exactly
+/// one distinct 32-byte block and only 31 distinct byte values.
+///
+/// It also checks the negative direction: the same key applied to a *different*
+/// resource must not be accepted as a PE, which is what stops the transform
+/// table from turning into blind decryption.
+#[test]
+fn the_decoded_payload_is_reproducible_from_a_captured_image_alone() {
+    // Any captured image of this sample carries the container at the same RVA,
+    // because the container lives in `.rsrc`.
+    let reference = PathBuf::from(r"D:\Projects\qidongqi\out\ida\main.exe");
+    if !reference.exists() {
+        println!("SKIP: no reference image at {}", reference.display());
+        return;
+    }
+    let image = std::fs::read(&reference).expect("read the reference image");
+    let pe = mida_pe::PeHeader::from_bytes(&image).expect("parse the reference image");
+    let resources = mida_packers_vmprotect::large_resources(&pe, &image);
+    let container = resources
+        .iter()
+        .find(|r| r.name_id == Some(131))
+        .expect("the reference image must carry RT_RCDATA id 131");
+
+    let bytes = container
+        .bytes(&image)
+        .expect("the container must be fully present in a captured image");
+
+    let transform = mida_packers_vmprotect::transform_for(container.type_id, container.name_id)
+        .expect("a measured transform must exist for this resource");
+    let decoded = transform.apply(bytes);
+
+    assert!(
+        mida_packers_vmprotect::looks_like_pe_image(&decoded),
+        "the transform must yield a structurally valid PE image"
+    );
+    assert_eq!(
+        sha256_hex(&decoded),
+        "e7004e8901a640e9e1f254582df3ecbfc9300a7c2df3e46094922d86e8d64710",
+        "the decoded payload drifted from the measured value"
+    );
+
+    // A wrong key must be rejected by the data, not by trusting the table.
+    let mut wrong = transform.xor_key.to_vec();
+    wrong[0] ^= 0xff;
+    let garbage: Vec<u8> = bytes
+        .iter()
+        .enumerate()
+        .map(|(i, b)| b ^ wrong[i % wrong.len()])
+        .collect();
+    assert!(
+        !mida_packers_vmprotect::looks_like_pe_image(&garbage),
+        "a corrupted key must not be accepted as producing a PE image"
+    );
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
+}
+
 /// Cheap guard on the constants above: the section count is part of the shape
 /// assertion, and it must match what the reference image actually has.
 #[test]
@@ -239,4 +306,118 @@ fn the_expected_section_count_matches_the_reference() {
         EXPECT_IMAGE_SIZE,
         "the reference image size changed"
     );
+}
+
+/// The payload **decoded to a real PE** is produced by the application, not by
+/// the packer — and it is written to `%TEMP%\<guid>.log`.
+///
+/// # What was measured
+///
+/// The resource region freezes at `14596cbd…` (encrypted) and never changes
+/// again before the process exits; watching every region in the address space
+/// whose size is near 12,782,080 B for 22 s found no `MZ` anywhere, and no child
+/// process is created.  So VMProtect's own output stops at `14596cbd…`.
+///
+/// The decoded PE (`e7004e89…`, `MZ`, `e_lfanew 0x80`, `machine 0x8664`,
+/// 9 sections) appears instead as a `%TEMP%\<guid>.log` file, written while the
+/// sample runs.  Measured across four controlled runs: **two wrote it and two
+/// did not**, the writes landing at t≈3.55 s with the process exiting earlier
+/// (4.4 s) than in the runs that did not write (6.5–6.8 s).  So it is a
+/// branch-dependent side effect, and a single run is not enough — hence the
+/// retry loop below.
+///
+/// This test is therefore allowed to skip when no run produces the file: it
+/// asserts the *relationship* (if the file appears, it is exactly that PE), not
+/// that it must appear on any given run.
+#[test]
+#[ignore = "needs the Packed VMProtect sample, a desktop session, and several launches"]
+fn the_decoded_payload_is_a_pe_that_the_sample_writes_to_temp() {
+    let sample = sample();
+    if !sample.exists() {
+        println!("SKIP: no Packed VMProtect sample at {}", sample.display());
+        return;
+    }
+    let temp = std::env::temp_dir();
+    let size_of_interest = EXPECT_PAYLOAD_SIZE;
+
+    // Files that already exist are other runs' leftovers.
+    let before: std::collections::HashSet<String> = std::fs::read_dir(&temp)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| {
+            e.metadata()
+                .map(|m| m.is_file() && m.len() == size_of_interest)
+                .unwrap_or(false)
+        })
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+
+    let mut found: Option<PathBuf> = None;
+    for attempt in 1..=6 {
+        let work = temp.join(format!(
+            "mida-vmp-decode-{}-{attempt}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&work).expect("create work dir");
+        let copy = work.join("target.exe");
+        std::fs::copy(&sample, &copy).expect("copy the sample");
+        clear_runasadmin_layer(&copy);
+
+        let mut child = Command::new(&copy)
+            .current_dir(&work)
+            .spawn()
+            .unwrap_or_else(|e| panic!("cannot launch {}: {e}", copy.display()));
+
+        // Poll for up to 12 s; the write lands at about 3.5 s when it happens.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+        while std::time::Instant::now() < deadline {
+            if let Ok(dir) = std::fs::read_dir(&temp) {
+                for e in dir.flatten() {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if before.contains(&name) {
+                        continue;
+                    }
+                    if e.metadata().map(|m| m.len()).ok() == Some(size_of_interest) {
+                        found = Some(e.path());
+                        break;
+                    }
+                }
+            }
+            if found.is_some() || child.try_wait().map(|s| s.is_some()).unwrap_or(false) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+        let _ = child.kill();
+        if found.is_some() {
+            println!("the decoded PE appeared on attempt {attempt}");
+            break;
+        }
+        println!("attempt {attempt}: no decoded payload written");
+    }
+
+    let Some(path) = found else {
+        println!(
+            "SKIP: no run wrote the decoded payload; measured to happen on roughly half of \
+             launches, so this is not a failure"
+        );
+        return;
+    };
+
+    assert_eq!(
+        sha256_file(&path),
+        "e7004e8901a640e9e1f254582df3ecbfc9300a7c2df3e46094922d86e8d64710",
+        "the written payload is not the measured decoded PE"
+    );
+
+    let pe = mida_pe::PeHeader::from_file(&path).expect("the decoded payload must parse as a PE");
+    assert!(pe.is_64bit, "the decoded payload should be PE32+");
+    assert_eq!(
+        pe.sections.len(),
+        9,
+        "the decoded payload should have 9 sections"
+    );
+
+    let _ = std::fs::remove_file(&path);
 }

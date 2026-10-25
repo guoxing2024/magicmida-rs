@@ -37,6 +37,7 @@
 //! **0 of the 63** Themida samples.  See [`detect`] for how it is used.
 
 pub mod detect;
+pub mod payload_xor;
 pub mod report;
 pub mod resources;
 
@@ -55,3 +56,6 @@ pub use report::{
     VmProtectReport,
 };
 pub use resources::{large_resources, walk_resources, LargeResource, ResourceEntry, LARGE_RESOURCE_MIN, RT_RCDATA};
+pub use payload_xor::{
+    looks_like_pe_image, transform_for, PayloadTransform, KNOWN_TRANSFORMS,
+};
