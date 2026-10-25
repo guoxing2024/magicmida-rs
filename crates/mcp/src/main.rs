@@ -694,10 +694,10 @@ fn triage_report(pe: &mida_pe::PeHeader, image: &[u8]) -> Value {
             None => "VMProtect: unpack_start is Themida-only and will refuse.",
         }
     } else if upx.is_some() {
-        "UPX: the whole original image is one statically-decodable stream in the file, \
-         so no desktop session is involved at all. /analyze <file> reports the layout; \
-         a static unpacker is the next increment (upx -d restores the original meanwhile). \
-         unpack_start is Themida-only and will refuse."
+        "UPX: the whole original image is one statically-decodable stream in the file, 
+         so no desktop session is involved at all. The CLI's /unpack <file> --packer upx 
+         restores the original statically (byte-identical to upx -d); /analyze <file> 
+         reports the layout. unpack_start is Themida-only and will refuse."
     } else if likely_themida {
         if pe.is_64bit {
             "Themida x64: verified path (golden record exists). unpack_start + \
@@ -953,8 +953,9 @@ fn handle_request(server: &Server, method: &str, params: &Value) -> Result<Value
                              desktop session; the target opens its own window). VMProtect \
                              Packed: the code is not in the file, use the CLI's /dump-image \
                              --wait on the running process; MinProtection: /analyze is enough \
-                             and works headless. UPX: fully static, /analyze reports the \
-                             layout; no unpack_start."
+                             and works headless. UPX: fully static — the CLI's /unpack 
+                             --packer upx restores the original with no process; 
+                             /analyze reports the layout; no unpack_start."
         })),
         "tools/list" => Ok(json!({ "tools": tool_definitions() })),
         "tools/call" => {
