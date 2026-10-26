@@ -47,8 +47,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `likely_themida` are kept for compatibility. Also corrected while there: the
   x86 `hint` still described the pre-2026-10-24 state ("import wiring not yet
   correct"); x86 has been a verified end-to-end path since then.
+- **Guided mode for beginners** — running `mida-cli` with **no arguments** no
+  longer errors out; it starts a three-step wizard: pick a file → static
+  recognition (same gate order as `/analyze`: VMProtect → UPX → Themida) →
+  one suggested command with the reasoning printed, confirmed before it runs.
+  Explicit spellings (`interactive` / `-i`) run the wizard even with piped
+  stdin, which is how it is smoke-tested (a real UPX sample driven through
+  the wizard produces the golden product hash `459f4f8e…`); a bare no-args
+  invocation with a non-terminal stdin prints the friendly help instead of
+  blocking on a prompt nobody can answer. Mistyped commands now get a
+  "did you mean" suggestion (bounded edit distance ≤ 2 or a ≥3-char prefix),
+  and `--help` is rewritten: grouped by intent, with the guided mode and the
+  desktop-session requirement stated up front.
+- **GUI beginner surfaces** — drag-and-drop now reacts *while* the drag is
+  over the window (the empty state's drop box highlights and re-labels to
+  「松开鼠标载入文件」); a 流程·三步 strip (选择文件 → 开始脱壳 → 验证产物)
+  sits under the drop box; a successful run gains a one-click
+  「打开产物位置」 button (Explorer `/select` on the product); and the
+  开始脱壳 button explains the target-windows-will-appear surprise in its
+  tooltip before it happens.
 
 ### Fixed
+- **`mida-run` parser missed the non-Themida product lines** — `RunState
+  .output_path` / `output_size` were only filled from `Unpacked: <path>`
+  (Themida) and `Dump written successfully path=…` (/dump-image), so a fully
+  successful UPX run showed 产物 `—` and never enabled the GUI's follow-up
+  button (measured on 2026-10-26 in the GUI acceptance pass). The parser now
+  also reads `Wrote <path> (<n> bytes), …` (UPX static unpacker) and
+  `Wrote <n> bytes to <path>` (/dump-image), pinned by two unit tests.
 - **`/unpack auto` would have run the Themida loop on a UPX target** — `UPX0`
   is an executable section with `raw_size == 0` and a large virtual size,
   exactly the shape `is_themida_section` keys on (measured on the real

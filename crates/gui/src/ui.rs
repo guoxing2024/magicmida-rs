@@ -37,6 +37,12 @@ pub struct App {
     /// right labels *before* a run starts — the file picker is the first place
     /// a user learns that DLLs are supported at all.
     kind: TargetKind,
+    /// The product path of the last successful run, when it is still on disk.
+    ///
+    /// Feeds the "打开产物位置" button: after a run the single most common
+    /// next step is looking at the file, and making the user hunt for it in
+    /// Explorer by hand undoes the goodwill the finishing status earned.
+    last_product: Option<PathBuf>,
     /// Whether the one-shot "fit the window to the monitor" pass has run.
     ///
     /// The preferred size in `main.rs` is a guess.  On a 1600x900 desktop a
@@ -78,6 +84,7 @@ impl App {
             auto_scroll: true,
             elapsed: 0.0,
             kind: TargetKind::Exe,
+            last_product: None,
             fitted: false,
         };
         if let Some(p) = preset {
@@ -153,7 +160,7 @@ impl App {
         // `Done.` is logged to stderr while the final `[GOOD] Unpacked:` line may
         // race on stdout, so the parser flag alone is not authoritative.  Trust
         // the exit code, and corroborate with a product on disk.
-        let (parsed_ok, product, kind) = st
+        let (parsed_ok, product, kind, product_path) = st
             .lock()
             .map(|s| {
                 (
@@ -163,11 +170,15 @@ impl App {
                         .map(|p| Path::new(p).is_file())
                         .unwrap_or(false),
                     s.kind,
+                    s.output_path.clone().map(PathBuf::from),
                 )
             })
-            .unwrap_or((false, false, TargetKind::Exe));
+            .unwrap_or((false, false, TargetKind::Exe, None));
 
         let ok = code == 0 && (parsed_ok || product);
+        // Only a product that is really on disk gets the follow-up button; a
+        // claimed-but-absent path would open an empty Explorer window.
+        self.last_product = if ok && product { product_path } else { None };
         self.status = match (ok, kind) {
             // An EXE product is accepted by launching it: still alive after a
             // few seconds means the dump is usable.
@@ -219,6 +230,19 @@ impl eframe::App for App {
             }
         }
 
+        // A drag *in progress* — before the release — gets its own feedback:
+        // without it the window is dead-looking for the whole duration of the
+        // drag, and the user cannot tell whether the drop will land anywhere.
+        let dragging = ctx.input(|i| {
+            !i.raw.hovered_files.is_empty()
+                && i.raw.hovered_files.iter().any(|f| {
+                    f.path
+                        .as_deref()
+                        .map(is_supported)
+                        .unwrap_or(true) // path unknown (shell restrictions): stay inviting
+                })
+        });
+
         self.title_bar(ctx);
         self.rail(ctx);
 
@@ -234,7 +258,7 @@ impl eframe::App for App {
                     .and_then(|s| s.lock().ok().map(|g| Snapshot::from(&*g)));
                 match snap {
                     Some(s) => self.canvas_run(ui, &s),
-                    None => self.canvas_empty(ui),
+                    None => self.canvas_empty(ui, dragging),
                 }
             });
     }
@@ -446,8 +470,18 @@ impl App {
                     if big_button(ui, "取消", theme::FATAL).clicked() {
                         self.cancel();
                     }
-                } else if big_button_enabled(ui, "开始脱壳", can, theme::ACCENT).clicked() {
-                    self.start();
+                } else {
+                    let resp = big_button_enabled(ui, "开始脱壳", can, theme::ACCENT);
+                    if resp.clicked() {
+                        self.start();
+                    }
+                    if can {
+                        // The most common first-run surprise is the target's
+                        // own windows appearing; say so before it happens.
+                        resp.on_hover_text(
+                            "将运行 mida-cli /unpack：目标自己的窗口会真实弹出，属正常现象，不要关闭它们",
+                        );
+                    }
                 }
 
                 if self.cli.is_none() {
@@ -461,6 +495,25 @@ impl App {
                     Status::Running => status_box(ui, theme::ACCENT, "运行中…"),
                     Status::Ok(t) => status_box(ui, theme::GOOD, t),
                     Status::Failed(t) => status_box(ui, theme::FATAL, t),
+                }
+
+                // The one-click follow-up after a good run: reveal the product
+                // in Explorer instead of making the user find it by hand.
+                if matches!(self.status, Status::Ok(_)) {
+                    if let Some(p) = &self.last_product {
+                        ui.add_space(6.0);
+                        if ui
+                            .add(
+                                egui::Button::new("打开产物位置")
+                                    .min_size(Vec2::new(0.0, 26.0)),
+                            )
+                            .clicked()
+                        {
+                            if let Err(e) = reveal_in_explorer(p) {
+                                self.status = Status::Failed(format!("打开失败：{e}"));
+                            }
+                        }
+                    }
                 }
 
                 ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
@@ -480,19 +533,22 @@ impl App {
 // ---------------------------------------------------------------------------
 
 impl App {
-    fn canvas_empty(&mut self, ui: &mut Ui) {
+    fn canvas_empty(&mut self, ui: &mut Ui, dragging: bool) {
         let avail = ui.available_rect_before_wrap();
         ui.allocate_ui_with_layout(avail.size(), Layout::top_down(Align::Center), |ui| {
-            ui.add_space((avail.height() * 0.12).max(24.0));
+            ui.add_space((avail.height() * 0.08).max(16.0));
 
             let size = Vec2::new(avail.width().min(520.0), 132.0);
             let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
-            let hot = resp.hovered();
+            // Highlight while the mouse is over the box, but also while a drag
+            // is anywhere over the window: the drag is the moment feedback
+            // matters most, and it starts well before the cursor reaches us.
+            let hot = resp.hovered() || dragging;
             let stroke_col = if hot { theme::ACCENT } else { theme::BORDER };
             ui.painter().rect_stroke(
                 rect,
                 CornerRadius::same(12),
-                Stroke::new(1.5_f32, stroke_col),
+                Stroke::new(if dragging { 2.5_f32 } else { 1.5_f32 }, stroke_col),
                 StrokeKind::Inside,
             );
 
@@ -500,9 +556,13 @@ impl App {
                 ui.vertical_centered(|ui| {
                     ui.add_space(28.0);
                     ui.label(
-                        RichText::new("把 EXE 或 DLL 拖到这里")
-                            .size(17.0)
-                            .color(if hot { theme::ACCENT } else { theme::TEXT }),
+                        RichText::new(if dragging {
+                            "松开鼠标载入文件"
+                        } else {
+                            "把 EXE 或 DLL 拖到这里"
+                        })
+                        .size(17.0)
+                        .color(if hot { theme::ACCENT } else { theme::TEXT }),
                     );
                     ui.add_space(6.0);
                     ui.label(
@@ -516,6 +576,21 @@ impl App {
             // Give the drop target room before the capability strip; the
             // previous spacing let the strip collide with the dashed box.
             ui.add_space(30.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new("流程 · 三步").size(10.5).color(theme::MUTED));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let total = 3.0 * 146.0 + 2.0 * 8.0;
+                    ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
+                    cap(ui, "① 选择文件", "拖入或「浏览…」", theme::TEXT);
+                    ui.add_space(8.0);
+                    cap(ui, "② 开始脱壳", "目标窗口会弹出", theme::TEXT);
+                    ui.add_space(8.0);
+                    cap(ui, "③ 验证产物", "mida-cli /verify", theme::MUTED);
+                });
+            });
+
+            ui.add_space(16.0);
             ui.vertical_centered(|ui| {
                 ui.label(RichText::new("已验证能力").size(10.5).color(theme::MUTED));
                 ui.add_space(8.0);
@@ -1033,6 +1108,30 @@ fn default_output(input: &Path) -> PathBuf {
     let ext = input.extension().and_then(|s| s.to_str()).unwrap_or("exe");
     let parent = input.parent().unwrap_or_else(|| Path::new("."));
     parent.join(format!("{stem}U.{ext}"))
+}
+
+/// Reveal `p` in the platform file manager.
+///
+/// Windows: `explorer /select,<path>` opens the containing folder with the
+/// file already highlighted — one step better than opening the folder and
+/// making the user spot the newest file in it.  The spawn is fire-and-forget:
+/// Explorer keeps running after the spawned handle returns.
+fn reveal_in_explorer(p: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{}", p.display()))
+            .spawn()
+            .map(|_| ())
+    }
+    #[cfg(not(windows))]
+    {
+        let dir = p.parent().unwrap_or_else(|| Path::new("."));
+        std::process::Command::new("xdg-open")
+            .arg(dir)
+            .spawn()
+            .map(|_| ())
+    }
 }
 
 /// Extensions the CLI accepts as unpack targets.

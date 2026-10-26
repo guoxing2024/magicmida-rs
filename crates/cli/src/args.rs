@@ -135,6 +135,86 @@ pub enum Command {
 
     /// Print the usage summary and exit (`--help`).
     Help,
+
+    /// Run the guided interactive mode for first-time users.
+    ///
+    /// Reached two ways: explicitly (`mida-cli interactive` / `-i`), or by
+    /// running `mida-cli` with no arguments at all — the old behaviour there
+    /// was an error exit, which is the worst possible welcome for a beginner.
+    ///
+    /// `forced` records whether the user typed the command.  When it is
+    /// `false` (no arguments given) and stdin is not a terminal — a headless
+    /// spawn, a script, a service — the wizard refuses to start instead of
+    /// blocking forever on a prompt nobody can answer, and prints the friendly
+    /// help.  An explicit `interactive` spelling runs the wizard regardless,
+    /// so piped answers (`printf 'path\n\nY\n' | mida-cli interactive`) drive
+    /// it end to end — which is also how its smoke test works.
+    Interactive {
+        /// `true` when the user spelled the command, `false` for no-args.
+        forced: bool,
+    },
+}
+
+/// Every command spelling the parser knows, longest first.
+///
+/// Used by [`did_you_mean`] so a typo (`unpak`, `analze`) gets a concrete
+/// suggestion instead of a bare "unknown command" that forces the user to
+/// re-read the help text to find their own spelling mistake.
+const KNOWN_COMMANDS: &[&str] = &[
+    "unpack",
+    "analyze",
+    "dump-process",
+    "dump-image",
+    "verify",
+    "interactive",
+    "version",
+    "help",
+];
+
+/// Bounded edit distance (Levenshtein, capped): `> cap` short-circuits to
+/// `cap + 1` without building the full row set.
+fn edit_distance_capped(a: &str, b: &str, cap: usize) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.len().abs_diff(b.len()) > cap {
+        return cap + 1;
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let sub = prev[j] + usize::from(ca != cb);
+            cur[j + 1] = sub.min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// The closest known command for a mistyped one, or `None` when nothing is
+/// close enough to be worth suggesting.
+///
+/// A prefix of a real command also counts (`analze` → analyze via distance 2;
+/// `unp` → unpack via prefix), because beginners truncate more often than they
+/// transpose.
+pub fn did_you_mean(input: &str) -> Option<&'static str> {
+    let needle = input.trim_start_matches(['/', '-']).to_ascii_lowercase();
+    if needle.is_empty() {
+        return None;
+    }
+    let mut best: Option<(&'static str, usize)> = None;
+    for &cmd in KNOWN_COMMANDS {
+        let score = if cmd.starts_with(&needle) && needle.len() >= 3 {
+            1
+        } else {
+            edit_distance_capped(&needle, cmd, 2)
+        };
+        if score <= 2 && best.is_none_or(|(_, s)| score < s) {
+            best = Some((cmd, score));
+        }
+    }
+    best.map(|(cmd, _)| cmd)
 }
 
 // ---------------------------------------------------------------------------
@@ -149,9 +229,17 @@ pub enum Command {
 /// malformed.
 pub fn parse_args() -> Result<Command, String> {
     let args: Vec<String> = std::env::args().collect();
+    parse_from(&args)
+}
 
+/// Parse an argument vector — the testable core of [`parse_args`].
+///
+/// Running with **no arguments** starts the guided interactive mode rather
+/// than erroring out: a beginner who double-clicks the binary or runs it bare
+/// gets a walkthrough, not an error and a usage blob they did not ask for.
+pub fn parse_from(args: &[String]) -> Result<Command, String> {
     if args.len() < 2 {
-        return Err("No command specified. Use /unpack or /dump-process.".into());
+        return Ok(Command::Interactive { forced: false });
     }
 
     match args[1].as_str() {
@@ -160,12 +248,21 @@ pub fn parse_args() -> Result<Command, String> {
         "/dump-process" | "--dump-process" | "dump-process" => parse_dump_process(&args),
         "/dump-image" | "--dump-image" | "dump-image" => parse_dump_image(&args),
         "/verify" | "--verify" | "verify" => parse_verify(&args),
+        "/interactive" | "--interactive" | "interactive" | "-i" => {
+            Ok(Command::Interactive { forced: true })
+        }
         "/version" | "--version" | "-V" => Ok(Command::Version),
         "/help" | "--help" | "-h" | "/?" => Ok(Command::Help),
-        other => Err(format!(
-            "Unknown command '{}'. Use /unpack, /analyze, /dump-process, /dump-image, or /verify.",
-            other
-        )),
+        other => {
+            let suggestion = did_you_mean(other)
+                .map(|c| format!("Did you mean '{c}'?\n"))
+                .unwrap_or_default();
+            Err(format!(
+                "{suggestion}Unknown command '{}'.\n\
+                 Run with no arguments for a guided mode, or see: mida-cli --help",
+                other
+            ))
+        }
     }
 }
 
@@ -364,10 +461,11 @@ mod tests {
     // These tests directly call the sub-parsers rather than `parse_args` so
     // they are independent of the actual process command line.
 
-    /// `parse_args` reads the real process command line, so the version/help
+    /// `parse_args` reads the real process command line, so the command
     /// spellings are exercised through a tiny local re-implementation of just
     /// that match arm.  Keeping it in the test means the spellings are pinned
-    /// without needing to spawn a process.
+    /// without needing to spawn a process.  It must be updated together with
+    /// `parse_from` — that duplication is the point.
     fn dispatch_first_arg(arg: &str) -> Result<Command, String> {
         match arg {
             "/unpack" | "--unpack" | "unpack" => Err("would parse unpack".into()),
@@ -375,10 +473,58 @@ mod tests {
             "/dump-process" | "--dump-process" | "dump-process" => Err("would parse dump".into()),
             "/dump-image" | "--dump-image" | "dump-image" => Err("would parse dump-image".into()),
             "/verify" | "--verify" | "verify" => Err("would parse verify".into()),
+            "/interactive" | "--interactive" | "interactive" | "-i" => {
+                Ok(Command::Interactive { forced: true })
+            }
             "/version" | "--version" | "-V" => Ok(Command::Version),
             "/help" | "--help" | "-h" | "/?" => Ok(Command::Help),
             other => Err(format!("Unknown command '{}'", other)),
         }
+    }
+
+    #[test]
+    fn interactive_spellings_all_resolve_and_are_forced() {
+        for a in ["/interactive", "--interactive", "interactive", "-i"] {
+            assert_eq!(
+                dispatch_first_arg(a),
+                Ok(Command::Interactive { forced: true }),
+                "for {a}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_arguments_start_the_guided_mode_instead_of_erroring() {
+        // The old behaviour here was Err("No command specified…") — an error
+        // exit as the first thing a beginner ever sees.  The bare invocation
+        // is exactly the audience the wizard exists for.
+        let args = vec!["mida-cli".into()];
+        assert_eq!(parse_from(&args), Ok(Command::Interactive { forced: false }));
+    }
+
+    #[test]
+    fn unknown_commands_get_a_did_you_mean_suggestion() {
+        let err = parse_from(&["mida-cli".into(), "unpak".into()]).unwrap_err();
+        assert!(err.contains("Did you mean 'unpack'"), "got: {err}");
+
+        let err = parse_from(&["mida-cli".into(), "analze".into()]).unwrap_err();
+        assert!(err.contains("Did you mean 'analyze'"), "got: {err}");
+
+        // Prefix truncation, the other common beginner typo.
+        let err = parse_from(&["mida-cli".into(), "unp".into()]).unwrap_err();
+        assert!(err.contains("Did you mean 'unpack'"), "got: {err}");
+
+        // Every suggestion also names the two ways out.
+        assert!(err.contains("no arguments"), "got: {err}");
+        assert!(err.contains("--help"), "got: {err}");
+    }
+
+    #[test]
+    fn gibberish_gets_no_false_suggestion() {
+        assert_eq!(did_you_mean("zzzzzzzz"), None);
+        assert_eq!(did_you_mean(""), None);
+        // Close-but-wrong commands must not shadow the real ones.
+        assert_eq!(did_you_mean("unpackk"), Some("unpack"));
     }
 
     #[test]

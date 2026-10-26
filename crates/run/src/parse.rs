@@ -482,6 +482,19 @@ impl RunState {
             self.output_path = Some(v.trim().to_string());
             milestone = true;
         }
+        // "Wrote <path> (<size> bytes), decoded with …"  (UPX static unpacker)
+        // "Wrote <size> bytes to <path>"                  (/dump-image)
+        // — the product lines of the non-Themida branches.  Without this rule
+        // the GUI's follow-up button and the 产物 metric stayed empty on a
+        // fully successful UPX run (measured on 2026-10-26: status 完成, log
+        // showing "Wrote …", and yet no product path in the state).
+        if let Some(v) = after(&message, "Wrote ") {
+            if let Some((path, size)) = parse_wrote_product(v) {
+                self.output_path = Some(path.to_string());
+                self.metrics.output_size = Some(size);
+                milestone = true;
+            }
+        }
 
         // ---- terminal states ---------------------------------------------
         if message == "Done." {
@@ -655,6 +668,30 @@ fn after<'a>(haystack: &'a str, needle: &str) -> Option<&'a str> {
     haystack.split_once(needle).map(|(_, rest)| rest)
 }
 
+/// Split a `Wrote …` product line's remainder into `(path, size)`.
+///
+/// Handles both shapes the CLI emits:
+/// - `<path> (<n> bytes), …` — the UPX static unpacker
+/// - `<n> bytes to <path>`   — `/dump-image`
+///
+/// A path containing ` (` defeats shape 1 and then fails shape 2's leading
+/// number, so such a line yields `None` — the same heuristic class as the
+/// rest of this parser, and only cosmetic there.
+fn parse_wrote_product(v: &str) -> Option<(&str, u64)> {
+    if let Some((path, rest)) = v.split_once(" (") {
+        let size = rest.split(" bytes").next()?;
+        if let Ok(n) = size.parse::<u64>() {
+            return Some((path.trim_end(), n));
+        }
+    }
+    let size = v.split_whitespace().next()?;
+    if let Ok(n) = size.parse::<u64>() {
+        let path = after(v, " bytes to ")?;
+        return Some((path.trim(), n));
+    }
+    None
+}
+
 fn parse_hex_prefix(s: &str) -> Option<u64> {
     let tok: String = s
         .trim_start()
@@ -731,6 +768,29 @@ mod tests {
         assert_eq!(s.finished, Some(true));
         assert!(s.error.is_none());
         assert_eq!(s.phase, Some(Phase::Done));
+    }
+
+    #[test]
+    fn the_upx_product_line_fills_output_path_and_size() {
+        // Literal shape from a real UPX static-unpack run (2026-10-26): the
+        // GOOD "Wrote …" line was the only product record, and without the
+        // rule the GUI's follow-up button never appeared.
+        let s = run(
+            "[2026-10-26T03:41:23.189539Z] [INFO] UPX target — running the static unpacker (no process is created)\n\
+             [2026-10-26T03:41:23.231393Z] [GOOD] Wrote D:\\out\\targetU.exe (6379269 bytes), decoded with method nrv2e-le32 / filter 0x49\n\
+             [2026-10-26T03:41:23.231407Z] [GOOD] Done.",
+        );
+        assert_eq!(s.output_path.as_deref(), Some("D:\\out\\targetU.exe"));
+        assert_eq!(s.metrics.output_size, Some(6_379_269));
+        assert_eq!(s.finished, Some(true));
+    }
+
+    #[test]
+    fn the_dump_image_product_line_fills_output_path_and_size() {
+        // /dump-image's terminal line: size first, " bytes to " separator.
+        let s = run("[2026-10-26T03:41:23Z] [INFO] Wrote 123456 bytes to D:\\out\\img.bin");
+        assert_eq!(s.output_path.as_deref(), Some("D:\\out\\img.bin"));
+        assert_eq!(s.metrics.output_size, Some(123_456));
     }
 
     #[test]

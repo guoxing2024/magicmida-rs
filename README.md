@@ -150,7 +150,12 @@ The full measurement tables are in [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
   fire the Themida heuristic and hand a UPX file to the Themida debugger loop
 - **Verify mode** — diff unpacked output against a known-good reference,
   section by section
-- **GUI** — graphical front-end (`mida-gui.exe`)
+- **Guided mode** — running `mida-cli` with no arguments starts a beginner
+  wizard (detect → explain → suggest one command → confirm → run), with
+  "did you mean" suggestions on mistyped commands
+- **GUI** — graphical front-end (`mida-gui.exe`): drag-and-drop with in-drag
+  feedback, a beginner steps strip on the empty state, and a one-click
+  打开产物位置 follow-up after a successful run
 - **MCP server** — drive the pipeline from an AI client (`mida-mcp.exe`)
 
 ## Prerequisites
@@ -163,6 +168,27 @@ The full measurement tables are in [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
 | **Interactive desktop session** | Only `/unpack` needs it — it injects ScyllaHide and the target creates its own windows. `/analyze`, `/dump-image`, `/verify` and the MCP `triage` tool are headless. |
 
 ## Quick Start
+
+**New to unpacking? Just run the binary with no arguments:**
+
+```bash
+target/release/mida-cli.exe
+```
+
+That starts a **guided mode**: pick a file, the tool recognises the packer
+(Themida / VMProtect / UPX), explains what it suggests and why, and runs one
+command after your confirmation. A typo'd command gets a "did you mean" hint.
+The wizard works piped as well, which is how it is smoke-tested:
+
+```bash
+printf 'protected.exe\n\nY\nn\n' | target/release/mida-cli.exe interactive
+```
+
+The GUI (`mida-gui.exe`) is the other beginner surface: drag an EXE/DLL onto
+the window (the drop box reacts while you drag), press 开始脱壳, and a
+打开产物位置 button appears next to the finishing status.
+
+**Manual path:**
 
 ```bash
 # 1. Build
@@ -183,6 +209,39 @@ target/release/mida-cli.exe /unpack "protected.exe"
 
 # 4b. VMProtect target → see "Worked example" below
 ```
+
+### Beginner FAQ
+
+**The target's own windows just opened — is that a leak?**
+No. `/unpack` on a live target runs the target under a debugger with
+ScyllaHide injected; its windows are supposed to appear. Closing them aborts
+the run. Only the Themida branch behaves this way — `/analyze` and the UPX
+static unpack create no process at all.
+
+**What do `resolved / failed / not-an-import` in the log mean?**
+`resolved` slots now hold real imports; `failed` would be a problem;
+`not-an-import` slots are *not* failures — they hold bare RVAs into read-only
+data, exactly what the real Windows loader sees. They are classified
+separately so a genuine failure cannot hide inside "data".
+
+**Is the product byte-identical to the original file?**
+For UPX: yes, against what `upx -d` produces (UPX rewrites the DOS-stub area
+when packing and never restores it, so the pre-pack original is not a
+meaningful ground truth). For Themida: the product is a reproducible golden
+with behaviour gates (window appears, imports resolve), not a byte-equality
+claim against the pre-pack file. See "Verified capability" above for the
+evidence per target.
+
+**Which packers are supported?**
+Themida v3 (x64 EXE/DLL and x86 EXE, all gate-tested), VMProtect 3.x x64
+(`MinProtection` and `Packed` modes), and UPX (static). Themida v1/v2 and
+x86 VMProtect have no samples — detection code exists but nothing is claimed.
+
+**The unpacked program starts but can't reach its server / licence check.**
+Some targets validate against a remote module server; when that server is
+unavailable, even the original protected sample fails the same way. Compare
+against the original's behaviour before assuming the dump is broken.
+
 
 ### Building the x86 target
 
@@ -266,6 +325,7 @@ Three traps this workflow has already paid for:
 ## Usage
 
 ```
+mida-cli                                  # guided mode (beginner-friendly)
 mida-cli /unpack <filename> [options]
 mida-cli /analyze <filename> [--extract <dir>]
 mida-cli /dump-process <pid> <unpacked-file>
@@ -273,8 +333,10 @@ mida-cli /dump-image <pid> <output-file> [--wait]
 mida-cli /verify <unpacked-file> <reference-file>
 ```
 
-Only `/unpack` needs a desktop session. The other four read files or read a
-process's memory without attaching a debugger, so they run headless.
+Only the Themida `/unpack` branch needs a desktop session. The other commands
+read files or read a process's memory without attaching a debugger, so they
+run headless — and `/unpack --packer upx` is fully static: no process, no
+window, no desktop.
 
 ### `/unpack` — Unpack a Themida-protected executable
 
@@ -289,7 +351,7 @@ the import table.
 | `--shrink` | Remove Themida-specific sections (`.winlice` / `.boot` / `.themida`), compact VAs, clear dangling data directories, restore standard section names, build relocation table, and enable ASLR. **Enabled by default.** |
 | `--no-shrink` | Disable shrinking. Keeps Themida sections and disables ASLR/relocation. Use for debugging or when shrink causes issues. |
 | `-v` / `--verbose` | Enable debug-level logging. |
-| `--packer auto｜themida｜vmprotect` | Which packer branch to take. `auto` (default) detects and refuses what the Themida pipeline cannot unpack. `themida` forces it (diagnostic override, logged). `vmprotect` selects the VMProtect branch, which uses its own ScyllaHide profile but shares the one debug loop that exists — experimental. |
+| `--packer auto｜themida｜vmprotect｜upx` | Which packer branch to take. `auto` (default) detects and refuses what the Themida pipeline cannot unpack. `themida` forces it (diagnostic override, logged). `vmprotect` selects the VMProtect branch, which uses its own ScyllaHide profile but shares the one debug loop that exists — experimental. `upx` runs the static unpacker (no process created). |
 
 **Examples:**
 
