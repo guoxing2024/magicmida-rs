@@ -244,7 +244,8 @@ fn themida_bounds(state: &ThemidaState, image_base: usize) -> (usize, usize) {
 ///
 /// Returns `AvAction::Break` when the debug loop should exit (OEP found and
 /// IAT ready, or the target is stuck), or `AvAction::Continue` otherwise.
-pub(super) fn handle_access_violation(
+pub(super) 
+fn handle_access_violation(
     ls: &mut LoopState,
     dbg: &mut ProcessSession,
     state: &mut ThemidaState,
@@ -282,7 +283,16 @@ pub(super) fn handle_access_violation(
         ));
     }
 
-    log::log(LogType::Info, &format!("Access violation: exc={exception_addr:#x}, target={target_address:#x}, thread={thread_id}"));
+    // Per-fault logging is a log bomb under the classic flow (the shell's
+    // decompression stage faults hundreds of thousands of times; measured
+    // 4.4 GB in minutes at INFO).  The storm watchdog and the branch
+    // decisions carry the diagnostics; DEBUG keeps the detail available.
+    debug!(
+        exc = %format!("{exception_addr:#x}"),
+        target = %format!("{target_address:#x}"),
+        thread = thread_id,
+        "Access violation"
+    );
 
     if !ls.guard_installed {
         dbg.continue_event(thread_id, ContinueStatus::Continue)?;
@@ -354,6 +364,59 @@ pub(super) fn handle_access_violation(
             return Ok(AvAction::Break);
         }
         GuardAccessResult::PossibleOEP { address } => {
+            let classic_stub = matches!(
+                state.pe_info.themida_version,
+                mida_packers_themida::ThemidaVersion::V1
+                    | mida_packers_themida::ThemidaVersion::Ancient
+            );
+
+            // ---- non-execute faults here are shell work, not a transition --
+            //
+            // Branch 6 only checked the fault's *location* (inside `.text`).
+            // The classic shell's decompression stage LIVES in `.text` and
+            // writes through it: measured on Themida 1.9.1.0, arming on write
+            // faults loops forever (the stage at `0x4271e0` writing
+            // `0x45e634` re-faults on every re-arm).  Only an **execute**
+            // fault can be an OEP transition; writes and reads are
+            // decompression work — record and single-step past them, exactly
+            // like branch 3 does for writes from the protector's own section.
+            // v3 targets keep their existing handling unconditionally.
+            if classic_stub && exc_type != 8 {
+                state.guard_addrs.push(target_address as usize);
+                state.guard_stepping = true;
+                let mut ctx = dbg
+                    .get_thread_context_control(thread_id)
+                    .map_err(|e| anyhow!("get_thread_context_control: {e}"))?;
+                ctx.EFlags |= 0x100;
+                super::session::set_thread_context_control(dbg, thread_id, &ctx)?;
+                dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+                return Ok(AvAction::Continue);
+            }
+
+            // A verification is already running (the guard is open and the
+            // stepping thread's TF is armed): any fault here is ordinary work
+            // mid-verification — answer it and let the stepping continue.
+            // Re-arming the guard here would re-fault the very next
+            // instruction and loop forever (measured 2026-10-27).
+            if classic_stub && state.classic_verify.is_some() {
+                dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+                return Ok(AvAction::Continue);
+            }
+
+            // The stepping verification already rejected this exact address:
+            // the shell calls its stage in a loop.  Re-arm the guard, let the
+            // instruction run once, and wait for a fresh candidate.
+            if classic_stub && state.classic_rejected.contains(&(address as usize)) {
+                state.guard_stepping = true;
+                let mut ctx = dbg
+                    .get_thread_context_control(thread_id)
+                    .map_err(|e| anyhow!("get_thread_context_control: {e}"))?;
+                ctx.EFlags |= 0x100;
+                super::session::set_thread_context_control(dbg, thread_id, &ctx)?;
+                dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+                return Ok(AvAction::Continue);
+            }
+
             log::log(LogType::Info, &format!("Possible OEP at {:#x}", address));
 
             let mut direct_oep_accepted = false;
@@ -396,67 +459,140 @@ pub(super) fn handle_access_violation(
                     // candidate's return address; if it fires during the
                     // execution window below, the candidate was a helper and
                     // the hunt continues at the tail of this handler.
-                    let mut classic_verifying = false;
                     if classic_stub {
-                        // The classic shell rebuilds the original PE header in
-                        // place before transferring control, so the *live*
-                        // header's entry point is the ground truth for the
-                        // OEP — log it against the fault candidate.
-                        let read_u32_at = |va: usize| -> Option<u32> {
-                            let mut b = [0u8; 4];
-                            dbg.read_memory(va, &mut b).ok()?;
-                            Some(u32::from_le_bytes(b))
-                        };
-                        if let Some(e_lfanew) = read_u32_at(dbg.image_base() as usize + 0x3C) {
-                            let opt = dbg.image_base() as usize + e_lfanew as usize + 24;
-                            if let Some(live_ep) = read_u32_at(opt + 16) {
+                        // The verification window: `.text` comes down, the
+                        // protector's home section (the section holding the
+                        // packed EP) goes to PAGE_NOACCESS.  A shell helper
+                        // faults the moment it returns home; the real OEP
+                        // never touches the protector.
+                        let ep = state.pe_info.packed_entry_point;
+                        let mut home = (0u32, 0u32);
+                        for sec in &state.pe_info.pe_sections {
+                            let va = sec.virtual_address;
+                            if ep >= va && ep < va.saturating_add(sec.virtual_size) {
+                                home = (va, va.saturating_add(sec.virtual_size));
+                            }
+                        }
+                        let (home_va, home_end) = home;
+                        log::log(
+                            LogType::Info,
+                            &format!(
+                                "classic OEP candidate {address:#x} (rva {:#x}) - verifying: \
+                                 protector home {home_va:#x}..{home_end:#x} goes NOACCESS",
+                                address.wrapping_sub(dbg.image_base() as usize)
+                            ),
+                        );
+                        remove_code_section_guard(
+                            h_process,
+                            text_start,
+                            text_end.saturating_sub(text_start),
+                        )?;
+                        let mut old_prot = windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS::default();
+                        // SAFETY: h_process is a valid process handle; the home
+                        // section range is a valid mapped region.
+                        unsafe {
+                            windows::Win32::System::Memory::VirtualProtectEx(
+                                h_process,
+                                (dbg.image_base() as usize + home_va as usize)
+                                    as *const std::ffi::c_void,
+                                (home_end - home_va) as usize,
+                                windows::Win32::System::Memory::PAGE_NOACCESS,
+                                &mut old_prot,
+                            )
+                        }
+                        .map_err(|e| anyhow!("VirtualProtectEx (home guard): {e}"))?;
+                        state.classic_verify = Some((address, std::time::Instant::now()));
+
+                        // ---- the verification window (handler-owned) ----
+                        let deadline = std::time::Duration::from_secs(12);
+                        let started = std::time::Instant::now();
+                        loop {
+                            if started.elapsed() > deadline {
+                                // Quiet window: the candidate never returned
+                                // home - it is the OEP.
+                                let mut old_prot = windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS::default();
+                                // SAFETY: as above.
+                                unsafe {
+                                    windows::Win32::System::Memory::VirtualProtectEx(
+                                        h_process,
+                                        (dbg.image_base() as usize + home_va as usize)
+                                            as *const std::ffi::c_void,
+                                        (home_end - home_va) as usize,
+                                        windows::Win32::System::Memory::PAGE_EXECUTE_READWRITE,
+                                        &mut old_prot,
+                                    )
+                                }
+                                .map_err(|e| anyhow!("VirtualProtectEx (home unguard): {e}"))?;
+                                state.classic_verify = None;
                                 log::log(
                                     LogType::Info,
                                     &format!(
-                                        "classic OEP candidate {address:#x}: live header EP =                                          {live_ep:#x} (packed EP {:#x})",
-                                        state.pe_info.packed_entry_point
+                                        "classic OEP VERIFIED at {address:#x}: the program \
+                                         never touched the protector's home section"
                                     ),
                                 );
+                                break;
                             }
-                        }
-                        let probe_fail = |why: &str| {
-                            log::log(
-                                LogType::Info,
-                                &format!("classic OEP probe not armed: {why}"),
-                            );
-                        };
-                        if let Ok(ctx) = dbg.get_thread_context_control(thread_id) {
-                            let sp = ctx_sp(&ctx);
-                            let mut ret_bytes = [0u8; 8];
-                            if dbg.read_memory(sp, &mut ret_bytes).is_ok() {
-                                let ret = u64::from_le_bytes(ret_bytes) as usize;
-                                let (tm_start, tm_end) =
-                                    themida_bounds(state, dbg.image_base() as usize);
-                                if tm_start < tm_end && ret >= tm_start && ret < tm_end {
-                                    dbg.clear_hw_breakpoint(0)?;
-                                    dbg.set_hw_breakpoint(
-                                        0,
-                                        ret,
-                                        mida_core::HwbpType::Execute,
-                                    )?;
-                                    state.classic_pending_ret = Some(ret);
-                                    classic_verifying = true;
-                                    log::log(
-                                        LogType::Info,
-                                        &format!(
-                                            "classic OEP candidate {address:#x}: verifying —                                              return address {ret:#x} armed as execute breakpoint"
-                                        ),
-                                    );
-                                } else {
-                                    probe_fail(&format!(
-                                        "return address {ret:#x} outside the protector bounds                                          {tm_start:#x}..{tm_end:#x}"
-                                    ));
+                            match dbg.wait_event_timeout(200) {
+                                Ok(ev) => {
+                                    let ev_tid = settle_thread_id_of(&ev);
+                                    // Rejection: the candidate's execution
+                                    // came home.
+                                    if let DebugEvent::AccessViolation { address: exc, .. } = &ev {
+                                        let exc = *exc as usize;
+                                        let home_base =
+                                            dbg.image_base() as usize + home_va as usize;
+                                        let home_top =
+                                            dbg.image_base() as usize + home_end as usize;
+                                        if exc >= home_base && exc < home_top {
+                                            let mut old_prot = windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS::default();
+                                            // SAFETY: as above.
+                                            unsafe {
+                                                windows::Win32::System::Memory::VirtualProtectEx(
+                                                    h_process,
+                                                    home_base as *const std::ffi::c_void,
+                                                    (home_end - home_va) as usize,
+                                                    windows::Win32::System::Memory::PAGE_EXECUTE_READWRITE,
+                                                    &mut old_prot,
+                                                )
+                                            }
+                                            .map_err(|e| {
+                                                anyhow!("VirtualProtectEx (home unguard): {e}")
+                                            })?;
+                                            state.classic_verify = None;
+                                            install_code_section_guard(
+                                                h_process,
+                                                text_start,
+                                                text_end.saturating_sub(text_start),
+                                                guard_protection,
+                                            )?;
+                                            log::log(
+                                                LogType::Info,
+                                                &format!(
+                                                    "classic OEP candidate {address:#x} REJECTED \
+                                                     - execution returned home at {exc:#x}"
+                                                ),
+                                            );
+                                            dbg.continue_event(ev_tid, ContinueStatus::Continue)?;
+                                            return Ok(AvAction::Continue);
+                                        }
+                                    }
+                                    if let DebugEvent::ExitProcess { .. } = &ev {
+                                        state.classic_verify = None;
+                                        log::log(
+                                            LogType::Info,
+                                            "Target exited during OEP verification",
+                                        );
+                                        return Ok(AvAction::Break);
+                                    }
+                                    dbg.continue_event(ev_tid, ContinueStatus::Continue)?;
                                 }
-                            } else {
-                                probe_fail("stack top unreadable at the candidate");
+                                Err(mida_core::CoreError::Timeout) => {}
+                                Err(e) => {
+                                    warn!("verification window: debug event error: {e}");
+                                    break;
+                                }
                             }
-                        } else {
-                            probe_fail("thread context unavailable at the candidate");
                         }
                     }
                     ls.oep = Some(address);
@@ -469,9 +605,8 @@ pub(super) fn handle_access_violation(
                     log::log(
                         LogType::Info,
                         &format!(
-                            "{target_kind} OEP accepted at {address:#x} (rva {:#x}) — real                              decrypted code, not a protector trampoline{}",
-                            address.wrapping_sub(dbg.image_base() as usize),
-                            if classic_verifying { " (verification armed)" } else { "" }
+                            "{target_kind} OEP accepted at {address:#x} (rva {:#x}) — real                              decrypted code, not a protector trampoline",
+                            address.wrapping_sub(dbg.image_base() as usize)
                         ),
                     );
                     // Skip the EXE-oriented virtualised-OEP heuristics entirely
@@ -1144,40 +1279,6 @@ pub(super) fn handle_access_violation(
             .filter(|&&v| (v as u64) > 0x10000 && (v as u64) < 0x7FFF_FFFF_FFFFu64)
             .count();
         info!(api_like = api_like_count, total = actual_slots, "IAT analysis after execution");
-
-        // ---- classic OEP verification verdict -------------------------------
-        //
-        // The candidate was accepted provisionally; the return-address probe
-        // decides.  A fired probe means the candidate was a shell helper: it
-        // returned to the protector after doing its work.  Reject it, re-arm
-        // the `.text` guard, and let the debug loop bring the next execute
-        // fault — the hunt continues until a candidate that never returns.
-        if let Some(ret) = state.classic_pending_ret.take() {
-            if state.classic_ret_hit {
-                state.classic_ret_hit = false;
-                ls.oep = None;
-                ls.iat_monitoring_done = false;
-                install_code_section_guard(
-                    h_process,
-                    text_start,
-                    text_end.saturating_sub(text_start),
-                    guard_protection,
-                )?;
-                log::log(
-                    LogType::Info,
-                    &format!(
-                        "classic OEP candidate rejected: execution returned to the                          protector at {ret:#x} — keeping the guard and hunting on"
-                    ),
-                );
-                dbg.continue_event(thread_id, ContinueStatus::Continue)?;
-                return Ok(AvAction::Continue);
-            }
-            let _ = dbg.clear_hw_breakpoint(0);
-            log::log(
-                LogType::Info,
-                "classic OEP verified: the candidate never returned to the protector",
-            );
-        }
 
         ls.iat_monitoring_done = true;
         return Ok(AvAction::Break);

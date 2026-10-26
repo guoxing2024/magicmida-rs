@@ -8,47 +8,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **The classic (v1-generation) unpack pipeline groundwork** — `/unpack` now
-  routes V1/Ancient targets through a measured branch: at the shell's first
-  `CloseHandle` the `.text` guard is installed directly (the v3 write-BP
-  staging never fires for them), `IatFixStrategy::V1` handles the IAT, and the
-  product's `.reloc` reservation is sized from a scan of the dumped image
-  (gated on the dump having no `.reloc` of its own, so the v3 byte-goldens are
-  untouched). Measured end-to-end on Themida 1.9.1.0 (version ladder): the
-  full chain completes — guard → 222,985 recorded decompression-write faults →
-  one `.text` execute candidate → IAT located (2,316 slots / 90 blocks) → 4
-  entries repaired → imports rebuilt (74 thunks) → 2.77 MB product written,
-  exit 0. The product loads and initialises but does not reach the unpackme's
-  own UI (the packed control does) — dump quality is the remaining gap, and
-  **"v1 unpacking works" is not claimed**. Two more measured shapes bound the
-  claim: the 1.1.1 shell materialises the original via a file mapping
-  elsewhere (zero in-place `.text` activity) and defeats the guard approach
-  entirely; the first `.text` execute candidate cannot be verified by its
-  return address (this shell's transfer leaves data, not a return, on the
-  stack — the implemented verification probe logs why it did not arm).
-  Companion fixes: `base_of_data` for classic targets comes from the first
-  section's own span (the packed header's value is garbage — the guard used to
-  cover half the code, OEP outside it, zero faults), `Ancient` maps to the V1
-  IAT strategy, and `fix_iat_v1` leaves unreadable jumper slots untouched
-  instead of aborting the unpack. The three e2e gates' log scrapers now strip
-  the ANSI wrapping tracing puts around structured field names (a latent
-  false-red: `module_count=` assertions could not match the wrapped form).
-- **Themida/WinLicense version fingerprints for 1.x and 2.x** — measured on a
-  76-sample version ladder (Themida 1.1.1.0–1.9.1.0, WinLicense 1.1.1.0–2.0.8.0,
-  each labelled by its exact packer version, fetched from the archived Tuts 4 You
-  Collection 2011; see RUNBOOK for the reproducible range-download recipe).
-  `/analyze` now reports the generation: `Ancient` = `"Themida "` section name
-  (1.1.1–1.8.2), `V1` = the classic import pair (exactly kernel32+comctl32,
-  ≤ 4 functions — covers 1.9.1 whose section name the packer's user renamed),
-  `V2` = the SecureEngine single-kernel32 import surface (function randomised
-  per build) or the Pascal dual-`0x1000` stub rule. Measured corollaries, all
-  pinned: section names are unreliable below 3.x; `is_themida_section` was
-  blind to WinLicense 1.x's truncated `WinLicen` section name (19 samples
-  missed — now routed); unlicense's 2.x section-start byte patterns score 0
-  on this ladder and were deliberately not ported. WinLicense 2.0.8 shares the
-  classic V1 surface — recorded as a documented ambiguity. The 2005-era stubs
-  run on modern Windows; `/unpack` on 1.x/2.x is **not** claimed — a measured
-  run ends `OEP not found` because the OEP pipeline is v3-shaped.
+- **The classic (v1-generation) unpack pipeline: OEP verified end-to-end** —
+  `/unpack` routes V1/Ancient targets through a measured branch: at the shell's
+  first `CloseHandle` the `.text` guard is installed directly (the v3 write-BP
+  staging never fires for them; the shell decompresses in place AFTER that
+  point — 222,985 recorded write faults on the ladder's 1.9.1 sample), and the
+  first `.text` execute candidate is **verified by a home-guard window**: the
+  `.text` guard comes down and the section holding the packed entry point goes
+  `PAGE_NOACCESS` — a shell helper faults the moment it returns home
+  (rejected, guard re-armed, next candidate); the real OEP never touches the
+  protector and is accepted after a 12-second quiet window (`classic OEP
+  VERIFIED`).  Two verification designs were measured to fail first and are
+  pinned in comments: single-stepping dies at the stage's own `pushfd`/`popfd`
+  (the trap flag is overwritten after two instructions), and keying "shell"
+  on `is_themida_section` rejects every instruction of the program (that
+  crate's large-vsize signal matches the classic target's first section — the
+  decompressed original itself).  The chain then completes: IAT located
+  (2,316 slots / 90 blocks), `fix_iat_v1` repairs 4 entries, imports rebuilt
+  (74 thunks), `.reloc` sized by a scan of the dumped image (19,784 B; gated
+  on the dump having no `.reloc` of its own so the v3 byte-goldens are
+  untouched), product written, exit 0.  **The product still dies at load with
+  STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139)** — precisely diagnosed: 2 slots
+  inside the IAT span have no resolution candidate, so the rebuild skips them
+  and they keep the shell session's live API addresses, which the loader then
+  walks as hint/name RVAs.  That serializer fix is the next increment; **"v1
+  unpacking works" is not claimed**.  Measured boundary: the 1.1.1 shell
+  materialises the original via a file mapping elsewhere (zero in-place
+  `.text` activity) and is invisible to this approach.  Companion fixes:
+  `base_of_data` for classic targets comes from the first section's own span
+  (the packed header's value is garbage — the guard used to cover half the
+  code, OEP outside it, zero faults), `Ancient` maps to the V1 IAT strategy,
+  `fix_iat_v1` leaves unreadable jumper slots untouched instead of aborting,
+  the per-fault access-violation log line is demoted to DEBUG (measured:
+  4.4 GB of log in minutes at INFO), and the three e2e gates' log scrapers
+  strip the ANSI wrapping tracing puts around structured field names (a
+  latent false-red: `module_count=` assertions could not match the wrapped
+  form).  The import-regroup validation pass is gated on a `classic_imports`
+  flag: its address-based first draft re-homed valid (kernel32, name) pairs
+  that the shell's session had resolved via kernelbase, moving the v3 x64 and
+  x86 byte-goldens (measured, A/B-proven); the shipped form validates by NAME
+  and only for classic targets.
 - **A version-ladder corpus gate** (`themida_ladder_gate`, runs by default,
   SKIPs when the corpus is absent like the VMProtect corpus gate): every
   ladder sample must classify by its labelled generation (76/76 measured) and

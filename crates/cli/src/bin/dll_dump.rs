@@ -149,6 +149,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         executable_path: Some(dll.into()),
         iat_location: Some((dll_base as usize + iat_rva as usize, iat_size as usize)),
         additional_iat_locations: Vec::new(),
+        classic_imports: false,
     };
     mida_pe::dump_process(&mut ro, &opts)?;
     println!("dumped to {out}");

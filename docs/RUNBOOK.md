@@ -304,45 +304,42 @@ Themida 1.1.1.0、1.9.1.0、WinLicense 2.0.1.0 的加壳样本**都能直接运�
 （2005 年的 32 位壳在 WoW64 下活着；1.1.1 弹 `Themida - http://www.oreans.com`
 试用窗口）。WinLicense 2.0.8.0 因原始程序要缺版 SxS 运行库起不来（环境问题，非壳问题）。
 
-### 版本判定 + 1.x 流水线雏形（2026-10-26 第二轮，如实）
+### 版本判定 + 1.x 流水线（2026-10-26/27 两轮，如实）
 
 `/analyze` 输出版本行（`Ancient|V1|V2|V3|unknown statically`）。`/unpack` 的 classic
-（V1/Ancient）分支已落地并跑通一条端到端：
+（V1/Ancient）分支已落地，**OEP 已可验证**，产物仍死在加载期——分层如实：
 
-**Themida 1.9.1.0（`OUT1v2\sweep\s4`）全程完成**：CloseHandle 命中 → classic 分支
-直接装 `.text` 守护页 → 222,985 个写页故障（壳从栈上执行的代码原地解压 .text，~34 s）
-→ 1 个 .text 执行候选 → IAT 定位（2,316 槽 / 90 块）→ `fix_iat_v1` 修复 4 项
-（垃圾槽跳过不再致命）→ 导入重建 74 thunk → 产物 2.77 MB 写出（exit 0）。
-产物**能加载、能初始化（4 线程）**，但**没到 unpackme 自己的 UI**（对照：加壳原件
-到 `http://www.tuts4you.com/` 窗口、28 线程）——dump 质量（导入覆盖/数据态）是
-剩余缺口。**不宣称"1.x 脱壳可用"**。
+**已打通（实测 Themida 1.9.1.0）**：CloseHandle 命中 → classic 分支直接装 `.text`
+守护页（222,985 个写页故障 = 壳从栈代码原地解压）→ 首个 .text 执行候选 →
+**"守护壳的家的节"验证窗口**：`.text` 守护撤下、packed EP 所在节上 NOACCESS——
+壳的收尾阶段一返回就撞壳区=拒绝，真 OEP 永远不碰壳区=12 秒静默窗口后接受
+（`classic OEP VERIFIED at 0x4271dc`）→ IAT 定位（2,316 槽/90 块）→ `fix_iat_v1`
+修 4 项 → 导入重建 74 thunk → 产物写出（exit 0）。
 
-同轮实测的三个关键形状：
-1. **1.9.1 是"就地解压"**：CloseHandle 命中后壳还在写 .text——直接装守护页正确
-   （v3 的三级 staging 在这里永远走不完，写页 BP 永不触发是 1.1.1 的形状）。
-2. **1.1.1 是"映射副本"**：CloseHandle 后 .text 零写入、零执行（守护页装了也白装），
-   原件经文件映射（`MEM_MAPPED`，`0x4E00000`，ep 字段为 0）在别处运行。2005 年的
-   壳在 Win11 上行为分叉，**一套流程覆盖不了整个 1.x**。
-3. **候选验证探针被传输方式挫败**：首个 .text 执行候选的 `[esp]` 是数据
-   （`0xfffd3d0c`）不是返回地址——壳用 jmp 式传输，"候选必须不返回"的验证机制
-   （探针已实现：返回地址武装执行断点 + 窗口内命中即拒绝）在这只壳上武装不了。
-   live 头部 EP = packed EP（0x6a014），头部重建路线也不成立。
+**验证机制的两次失败也被记录**（都钉在代码注释里）：单步验证被壳 stage 的
+`pushfd/popfd` 摧毁（TF 被覆盖，两条指令后步进静默死亡）；"壳区"判定不能用
+`is_themida_section`——它的大虚拟尺寸信号把 classic 的第一节（解压后的原始程序
+本身）也判成壳，175 个候选全被误拒。
 
-配套修复（全部有实测背书）：`base_of_data` 对 classic 取第一节虚拟跨度
-（packed 头里是垃圾 `0x1000`，守护页因此只盖住一半——OEP 落在界外，零故障）；
-`IatFixStrategy` Ancient→V1；`.reloc` 预留量按 dump 自身扫描定尺（1.9.1 需
-19,784 B，固定 0x2000 直接弃写）——**只在 dump 段表没有 `.reloc` 时启用**
-（v3 加壳输入全保留 `.reloc`，产物是字节 golden，预留量一动字节就动；
-实测 x86 gate 因此红过一次，已按 A/B 证明 + 重录处置，见 manifest 注释）。
-同轮修真缺陷：三个 e2e gate 的日志刮刀对 tracing 结构化字段的 ANSI 包装
-（`[3mname[0m[2m=`）不免疫——`module_count=` 断言因此假红；
-刮刀统一先剥 ANSI（mida-run 的 GUI 解析器本来就有 strip，gate 层漏了）。
+**仍死在加载期（下一个增量的确切输入）**：产物 `0xC0000139
+（STATUS_ENTRYPOINT_NOT_FOUND）`。定位：IAT 跨度内有 **2 个无候选槽**
+（combase 第 11 项、ole32 第 2 项）——pass2 跳过它们不写 thunk，但加载器线性走
+整个 FirstThunk 数组，跳过的槽保留壳会话的 live API 指针被当名字 RVA 读。
+修法方向：无候选槽必须终止该模块的 thunk 数组（写终结符、起新组）或写入
+load-valid 的占位。配套已落地：`validate_and_regroup`（按名字校验 (模块,函数)
+对——**按地址校验是错的**：壳会话经 kernelbase 解析的地址物理上不在 kernel32，
+会把合法对搬家、v3 字节 golden 跟着动，x64 gate 实测红过）+ `classic_imports`
+标志（regroup 只对 classic 跑，v3 产物是字节 golden 永不参与）+
+`base_of_data` classic 取第一节跨度 + `Ancient→V1` 策略 + 垃圾槽跳过不再致命 +
+每故障 AV 日志降级（INFO 一条 4.4 GB 的教训）。
 
-gate：`cargo test -p mida-packers-themida --test themida_ladder_gate`（默认跑，
-语料缺目录显式 SKIP；`MIDA_THEMIDA_LADDER` 可换路径）。单测用手工导入目录
-fixture（真实字节布局），无语料也全绿。
+**1.1.1 的形状仍未覆盖**：原件经文件映射（`MEM_MAPPED`，ep 字段 0）在别处运行，
+`.text` 零活动——守护页方案看不到它。**"v1 脱壳可用"不宣称。**
 
-## x86 编译（2026-10-23 打通）
+gate：`themida_ladder_gate`（默认跑、缺语料 SKIP）76/76 + 手工导入 fixture 单测。
+三 e2e gate 的日志刮刀已剥 ANSI（tracing 结构化字段包装使断言假红）。
+
+## x86 编译（2026-10-23 打通）## x86 编译（2026-10-23 打通）
 
 ```powershell
 $env:CARGO_HOME="D:\Tools\cargo"; $env:RUSTUP_HOME="D:\Tools\rustup"

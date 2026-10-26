@@ -131,6 +131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         executable_path: orig_dll.as_deref().map(Path::new).map(|p| p.to_path_buf()),
         iat_location: Some((base as usize + iat_rva as usize, iat_size as usize)),
         additional_iat_locations: Vec::new(),
+        classic_imports: false,
     };
     mida_pe::dump_process(&mut fb, &opts)?;
     println!("written to {out} ({} bytes)", std::fs::metadata(out)?.len());

@@ -69,6 +69,22 @@ pub struct ThemidaState {
     /// Set when the armed return-address breakpoint fired: the candidate
     /// returned to the protector, so it was a shell helper, not the OEP.
     pub classic_ret_hit: bool,
+    /// Classic OEP verification by guarding the protector's home section:
+    /// `Some((candidate, armed_at))` while the candidate is being proven.
+    /// The `.text` guard comes DOWN and the section holding the packed entry
+    /// point goes to `PAGE_NOACCESS` — the shell's final-stage helper faults
+    /// the moment it returns home (rejected), while the real OEP never
+    /// touches the protector and is accepted after a quiet window.  A
+    /// single-stepping variant was measured to fail: the stage's own
+    /// pushfd/popfd overwrites the trap flag and stepping dies silently
+    /// after two instructions (2026-10-27).
+    pub classic_verify: Option<(usize, std::time::Instant)>,
+    /// Candidate addresses already rejected by the stepping verification —
+    /// the shell's decompression stage is called in a loop, so the same
+    /// `.text` address faults again and again; a repeated candidate is
+    /// dismissed without re-running the stepping dance (measured: the stage
+    /// at `0x4271dc` is entered thousands of times).
+    pub classic_rejected: Vec<usize>,
 }
 
 impl ThemidaState {
@@ -110,6 +126,8 @@ impl ThemidaState {
             tm_return_int3: None,
             classic_pending_ret: None,
             classic_ret_hit: false,
+            classic_verify: None,
+            classic_rejected: Vec::new(),
         }
     }
 }

@@ -34,6 +34,12 @@ pub struct DumpOptions {
     /// strip or obfuscate the PE header's IAT directory.
     pub iat_location: Option<(usize, usize)>,
 
+    /// Classic (v1-generation) target: enables the import-regroup validation
+    /// pass.  v3 products are byte-golden — their import tables were already
+    /// load-valid, and the regroup moves bytes — so the pass must stay off
+    /// for them (measured: the x64 EXE gate's golden moved when it ran).
+    pub classic_imports: bool,
+
     /// Additional IAT locations (virtual addresses) referenced by code.
     /// These will be filled with the same Hint/Name RVAs as the primary IAT.
     /// Used to fix the "dual IAT" problem where code uses mov+call pattern.

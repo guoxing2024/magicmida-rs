@@ -126,7 +126,7 @@ pub fn dump_process(
 
     // 2. Rebuild import table if requested
     let (iat_image, _iat_image_size, mut import_builder) = if opts.fix_imports {
-        rebuild_import_table_complete(debugger, &mut pe, opts.image_base, is_64bit, opts.iat_location)?
+        rebuild_import_table_complete(debugger, &mut pe, opts.image_base, is_64bit, opts.iat_location, opts.classic_imports)?
     } else {
         (Vec::new(), 0usize, None)
     };

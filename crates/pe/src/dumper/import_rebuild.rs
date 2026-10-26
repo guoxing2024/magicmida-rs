@@ -33,6 +33,7 @@ pub(crate) fn rebuild_import_table_complete(
     image_base: u64,
     is_64bit: bool,
     iat_override: Option<(usize, usize)>,
+    classic_imports: bool,
 ) -> Result<(Vec<u8>, usize, Option<ImportTableBuilder>), PeError> {
     // Find IAT location — either from the PE header or from the override.
     let (iat_address, iat_size) = if let Some((addr, size)) = iat_override {
@@ -98,6 +99,7 @@ pub(crate) fn rebuild_import_table_complete(
         image_base,
         is_64bit,
         None,
+        classic_imports,
     )
 }
 
@@ -106,6 +108,165 @@ pub(crate) fn rebuild_import_table_complete(
 // -----------------------------------------------------------------------
 
 /// Shared inner implementation of the two-pass algorithm.
+/// Post-validation for the two-pass rebuild: move every thunk whose
+/// (module, function) pair the named module does not actually export to the
+/// module that does export the slot's live address, and drop modules left
+/// without thunks.
+///
+/// The loader's contract is only "the named DLL exports the named function";
+/// which DLL the address physically lives in today (forwards!) is not the
+/// program's business.  Measured defect: `user32!NtUserRedrawWindow` -
+/// `NtUserRedrawWindow` is win32u.dll's export, so the pair failed
+/// `0xC0000139` at load.
+fn validate_and_regroup(
+    builder: &mut ImportTableBuilder,
+    iat_data: &[u8],
+    iat_base_rva: u32,
+    modules: &[RemoteModule],
+    is_64bit: bool,
+) {
+    let ptr_size = if is_64bit { 8 } else { 4 };
+    let resolve = |addr: u64| -> Option<(usize, String)> {
+        for (mi, m) in modules.iter().enumerate() {
+            if let Some(name) = m.exports.get(&addr) {
+                return Some((mi, name.clone()));
+            }
+        }
+        None
+    };
+
+    // Regrouped output keyed by lowercase module name.
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: std::collections::HashMap<String, Vec<ImportThunk>> =
+        std::collections::HashMap::new();
+    let mut moved = 0usize;
+    let mut dropped_thunks = 0usize;
+
+    for module in builder.modules.drain(..) {
+        for thunk in module.thunks {
+            let off = (thunk.iat_address - iat_base_rva) as usize;
+            let live = if off + ptr_size <= iat_data.len() {
+                let b = &iat_data[off..off + ptr_size];
+                if is_64bit {
+                    u64::from_le_bytes(b.try_into().unwrap_or([0; 8]))
+                } else {
+                    u32::from_le_bytes(b.try_into().unwrap_or([0; 4])) as u64
+                }
+            } else {
+                0
+            };
+
+            // A thunk with NEITHER a name NOR an ordinal serialises as a raw
+            // value in the ILT - the loader reads it as a hint/name RVA,
+            // finds it unmapped, and kills the process with
+            // STATUS_ENTRYPOINT_NOT_FOUND before its first instruction
+            // (measured: 2 of the 74 thunks on the classic ladder's 1.9.1
+            // unpackme, in combase/ole32).  Resolve the name from the slot's
+            // live address, or drop the thunk.
+            if thunk.function_name.is_none() && thunk.ordinal.is_none() {
+                match resolve(live) {
+                    Some((mi, name)) => {
+                        let target = modules[mi].name.clone();
+                        let mut fixed = thunk.clone();
+                        fixed.function_name = Some(name);
+                        fixed.ordinal = None;
+                        moved += 1;
+                        let entry = if let Some(g) = groups.get_mut(&target) {
+                            g
+                        } else {
+                            order.push(target.clone());
+                            groups.entry(target).or_default()
+                        };
+                        entry.push(fixed);
+                    }
+                    None => {
+                        dropped_thunks += 1;
+                    }
+                }
+                continue;
+            }
+
+            // Does the thunk's current module export the thunk's NAME?  The
+            // loader's contract is name-based: it never sees the address the
+            // shell's session resolved to, so an address test here would
+            // re-home perfectly valid pairs (measured on the x86 v3 gate:
+            // a kernel32 thunk resolved via kernelbase got moved to a new
+            // kernelbase descriptor and the whole .import layout shifted -
+            // the byte golden moved with it).  A name test is also what
+            // makes a live-snapshot "valid" verdict match the loader's.
+            let current_valid = match thunk.function_name.as_ref() {
+                Some(fname) => modules.iter().any(|m| {
+                    m.name == module.name
+                        && m.exports.values().any(|n| n == fname)
+                }),
+                None => false,
+            };
+
+            if current_valid {
+                let entry = if let Some(g) = groups.get_mut(&module.name) {
+                    g
+                } else {
+                    order.push(module.name.clone());
+                    groups.entry(module.name.clone()).or_default()
+                };
+                entry.push(thunk);
+                continue;
+            }
+
+            // Re-resolve: which module really exports the live address?
+            match resolve(live) {
+                Some((mi, name)) => {
+                    let target = modules[mi].name.clone();
+                    let mut fixed = thunk.clone();
+                    fixed.function_name = Some(name);
+                    fixed.ordinal = None;
+                    moved += 1;
+                    let entry = if let Some(g) = groups.get_mut(&target) {
+                        g
+                    } else {
+                        order.push(target.clone());
+                        groups.entry(target).or_default()
+                    };
+                    entry.push(fixed);
+                }
+                None => {
+                    // The slot's live address matches no export: keep the
+                    // thunk where the vote put it (best effort) - a dropped
+                    // thunk would break the code that calls through it.
+                    let entry = if let Some(g) = groups.get_mut(&module.name) {
+                        g
+                    } else {
+                        order.push(module.name.clone());
+                        groups.entry(module.name.clone()).or_default()
+                    };
+                    entry.push(thunk);
+                    dropped_thunks += 1;
+                }
+            }
+        }
+    }
+
+    info!(
+        moved,
+        kept_unresolvable = dropped_thunks,
+        total_modules = order.len(),
+        "Import regroup: thunks re-homed to the module that really exports them"
+    );
+
+    builder.modules = order
+        .into_iter()
+        .filter_map(|name| {
+            let thunks = groups.remove(&name)?;
+            if thunks.is_empty() {
+                None // measured: winmm.dll / oledlg.dll came out empty
+            } else {
+                Some(ImportModule { name, thunks })
+            }
+        })
+        .collect();
+}
+
+
 fn rebuild_import_table_inner(
     debugger: &mut dyn mida_core::DebuggerCore,
     iat_address: u64,
@@ -113,6 +274,7 @@ fn rebuild_import_table_inner(
     image_base: u64,
     is_64bit: bool,
     _original_imports: Option<&[String]>,
+    classic_imports: bool,
 ) -> Result<(Vec<u8>, usize, Option<ImportTableBuilder>), PeError> {
     let ptr_size = iat_slot_size(is_64bit);
 
@@ -202,7 +364,22 @@ fn rebuild_import_table_inner(
     // ============================================================
     // PASS 2: Vote on best module per zero-delimited group
     // ============================================================
-    let builder = pass2_vote(&mut slots, &modules, &mut iat_data, iat_address, image_base, is_64bit, ptr_size, slot_count, &forward_map);
+    let mut builder = pass2_vote(&mut slots, &modules, &mut iat_data, iat_address, image_base, is_64bit, ptr_size, slot_count, &forward_map);
+
+    // ---- post-validation: every (module, function) pair must exist -------
+    //
+    // Measured on the classic ladder's 1.9.1 unpackme (2026-10-27): pass 2's
+    // group vote pairs a slot's resolved NAME with a neighbouring slot's
+    // MODULE when Windows forwards the export (user32!RedrawWindow lives in
+    // win32u.dll today), producing `user32!NtUserRedrawWindow` - a pair the
+    // loader refuses with STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139), and the
+    // product dies before its first instruction.  Re-resolve every thunk
+    // from its slot's live address and regroup; the loader only requires
+    // that the named module actually exports the named function.
+    let iat_base_rva = (iat_address - image_base) as u32;
+    if classic_imports {
+        validate_and_regroup(&mut builder, &iat_data, iat_base_rva, &modules, is_64bit);
+    }
 
     Ok((iat_data, iat_size, Some(builder)))
 }

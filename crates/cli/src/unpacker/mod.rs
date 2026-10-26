@@ -1339,10 +1339,15 @@ fn run_post_loop_phases(
         state.pe_info.major_linker_version,
     )? {
         if real_oep != oep_addr {
+            // The scan is informational: a classic candidate that reaches this
+            // point has already been VERIFIED by single-stepping (it never
+            // returned to the shell), and a v3 guard OEP carries the VM
+            // machinery's proof.  The scan alone is not evidence strong
+            // enough to override either.
             info!(
                 guard_oep = %format!("{oep_addr:#x}"),
                 scan_oep = %format!("{real_oep:#x}"),
-                "Live-memory scan found different OEP — using guard-detected OEP"
+                "Live-memory scan found different OEP — using the verified/guard-detected OEP"
             );
         }
     }
@@ -1421,6 +1426,11 @@ fn run_post_loop_phases(
         executable_path: Some(input.to_path_buf()),
         iat_location: Some((iat.address, iat.size)),
         additional_iat_locations: Vec::new(),
+        classic_imports: matches!(
+            state.pe_info.themida_version,
+            mida_packers_themida::ThemidaVersion::V1
+                | mida_packers_themida::ThemidaVersion::Ancient
+        ),
     };
 
     mida_pe::dump_process(dbg, &dump_opts)
