@@ -103,17 +103,31 @@ impl ImportTableBuilder {
     /// an ordered list of thunk slot values (hint/name RVAs) to write into
     /// the original IAT the protector filled at runtime.
     ///
+    /// `ft_from_records` selects where each descriptor's `FirstThunk` comes
+    /// from:
+    ///
+    /// - `false` (v3 path, byte-golden): a *dense* running offset from
+    ///   `original_iat_rva`, valid because v3 buckets are address-contiguous
+    ///   and back-to-back in the located IAT region.
+    /// - `true` (classic path): the module's own minimum recorded
+    ///   `iat_address`.  Classic normalization emits one module per
+    ///   address-contiguous run (`normalize_module_runs`), and the loader's
+    ///   array walk starts at `FirstThunk` — any other start would read
+    ///   neighbouring modules' slots under this descriptor's DLL name.
+    ///
     /// Returns `(section_data, thunks)` where:
     /// - `section_data` is the `.import` section content (descriptors followed
-    ///   by hint/name strings; the descriptor's FirstThunks are set to 0 and
-    ///   must be patched in by the caller via `original_iat_rva`).
+    ///   by hint/name strings; in dense mode the descriptor's FirstThunks are
+    ///   dense offsets from `original_iat_rva`, in records mode they are the
+    ///   recorded run starts).
     /// - `thunks` is a flat vector of slot values (one u64 per name-hinted
     ///   import, plus a null terminator per module) to be written at
-    ///   `original_iat_rva` so the PE loader resolves them at load time.
+    ///   the recorded IAT slots so the PE loader resolves them at load time.
     pub fn build_import_section_no_iat(
         &self,
         section_va: u32,
         original_iat_rva: u32,
+        ft_from_records: bool,
     ) -> (Vec<u8>, Vec<u64>) {
         let ptr_size = iat_slot_size(self.is_64bit);
 
@@ -174,7 +188,15 @@ impl ImportTableBuilder {
             data_cursor += name_bytes.len() + 1; // +1 for null terminator
 
             let dll_name_rva = section_va + dll_name_offset_in_section as u32;
-            let module_ft_rva = original_iat_rva + iat_offset as u32;
+            let module_ft_rva = if ft_from_records {
+                m.thunks
+                    .iter()
+                    .map(|t| t.iat_address)
+                    .min()
+                    .unwrap_or(original_iat_rva)
+            } else {
+                original_iat_rva + iat_offset as u32
+            };
 
             // Write descriptor
             data[desc_offset..desc_offset + 4].copy_from_slice(&0u32.to_le_bytes()); // OFT = 0
@@ -496,5 +518,73 @@ mod tests {
     fn iat_slot_size_respects_arch() {
         assert_eq!(iat_slot_size(false), 4);
         assert_eq!(iat_slot_size(true), 8);
+    }
+
+    /// Records mode: a descriptor's FirstThunk is the module's own minimum
+    /// recorded slot, not a dense running offset.  Measured defect: the
+    /// classic 1.9.1 product's win32u descriptor pointed at user32's last two
+    /// slots because the dense offset ignored the run's real position.
+    #[test]
+    fn records_mode_ft_uses_recorded_addresses() {
+        let mut builder = ImportTableBuilder::new(false); // 32-bit
+        {
+            let a = builder.add_module("a.dll");
+            a.thunks.push(ImportThunk {
+                iat_address: 0x2000,
+                function_name: Some("A1".into()),
+                ordinal: None,
+                is_64bit: false,
+            });
+            a.thunks.push(ImportThunk {
+                iat_address: 0x2004,
+                function_name: Some("A2".into()),
+                ordinal: None,
+                is_64bit: false,
+            });
+            // b's run starts right after a's — the dense guess (0x200c) is
+            // wrong by exactly the gap this shape has in real dumps.
+            let b = builder.add_module("b.dll");
+            b.thunks.push(ImportThunk {
+                iat_address: 0x2008,
+                function_name: Some("B1".into()),
+                ordinal: None,
+                is_64bit: false,
+            });
+        }
+
+        let (data, _) = builder.build_import_section_no_iat(0x1000, 0x2000, true);
+        let ft_a = u32::from_le_bytes(data[16..20].try_into().unwrap());
+        let ft_b = u32::from_le_bytes(data[36..40].try_into().unwrap());
+        assert_eq!(ft_a, 0x2000);
+        assert_eq!(ft_b, 0x2008, "records mode must use the run's own start");
+    }
+
+    /// Dense mode (v3, byte-golden): FirstThunks keep the running-offset
+    /// layout the recorded goldens were produced with.
+    #[test]
+    fn dense_mode_ft_keeps_running_offset() {
+        let mut builder = ImportTableBuilder::new(false); // 32-bit
+        {
+            let a = builder.add_module("a.dll");
+            a.thunks.push(ImportThunk {
+                iat_address: 0x2000,
+                function_name: Some("A1".into()),
+                ordinal: None,
+                is_64bit: false,
+            });
+            let b = builder.add_module("b.dll");
+            b.thunks.push(ImportThunk {
+                iat_address: 0x2008,
+                function_name: Some("B1".into()),
+                ordinal: None,
+                is_64bit: false,
+            });
+        }
+
+        let (data, _) = builder.build_import_section_no_iat(0x1000, 0x2000, false);
+        let ft_a = u32::from_le_bytes(data[16..20].try_into().unwrap());
+        let ft_b = u32::from_le_bytes(data[36..40].try_into().unwrap());
+        assert_eq!(ft_a, 0x2000);
+        assert_eq!(ft_b, 0x2000 + 2 * 4, "dense mode: thunk + terminator per module");
     }
 }

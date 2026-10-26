@@ -266,6 +266,186 @@ fn validate_and_regroup(
         .collect();
 }
 
+// -----------------------------------------------------------------------
+// normalize_module_runs (classic path)
+// -----------------------------------------------------------------------
+
+/// Split the regrouped per-name buckets into address-contiguous descriptors.
+///
+/// The PE loader's contract is a parallel array per descriptor: it walks
+/// `FirstThunk` slot by slot until the first zero and resolves **every**
+/// entry it passes under that descriptor's DLL name.  Pass 2 buckets thunks
+/// by the module each slot actually resolved to — correct per (module, name)
+/// pair, but on classic (Themida 1.x) targets the shell rebuilds the whole
+/// IAT region as one flat array, so one original array's slots contribute to
+/// SEVERAL buckets, interleaved by address.  Measured on the ladder's 1.9.1
+/// unpackme (2026-10-27):
+///
+/// ```text
+/// user32  array slots 0..39, but slots 7,8,21 resolved to win32u!NtUser*
+/// combase array slots .., with OleInitialize/OleFlushClipboard resolved to
+///         ole32 (a genuine ole32 export) interleaved in between
+/// ```
+///
+/// Serialising one descriptor per bucket then breaks the walk twice over:
+/// the loader reads win32u's hint entries as user32 entries
+/// (`user32!NtUserRedrawWindow` — a pair user32's name table does not have,
+/// `STATUS_ENTRYPOINT_NOT_FOUND` before the first instruction), and an
+/// unowned gap slot keeps its dumped live API address, which the loader
+/// misreads as a hint/name RVA — the same failure.
+///
+/// One descriptor per maximal address-contiguous run makes every walked
+/// array contain exactly its own thunks.  Runs of *different* modules that
+/// sit directly adjacent cannot both be expressed (the first run's terminator
+/// would clobber the second run's first thunk), so adjacent runs are merged
+/// into clusters and each cluster is covered by the first module under which
+/// **every** name is valid.  A forwarded name is valid under the forwarding
+/// module: its string sits in that module's export name table (the RVA merely
+/// points into the export directory), and the loader resolves the forwarder
+/// chain to the very address the slot already held — measured:
+/// `ole32!CLSIDFromString` → `api-ms-win-core-com-l1-1-0` → combase, all
+/// names of the mixed combase/ole32 region are ole32-valid, so that whole
+/// region becomes one ole32 descriptor and loads portably.
+///
+/// A cluster with no such module (the user32/win32u one: user32's name table
+/// has no `NtUser*`, win32u's has none of the surrounding user32 names) is
+/// left **undescribed**: its slots keep the dumped live addresses, no
+/// descriptor walks them, and the loader never touches them.  The OEP code's
+/// calls through those slots keep working for as long as the system DLL
+/// bases match the dump session (same boot) — recorded as the classic line's
+/// portability gap, not claimed as loader-resolved.
+pub(crate) fn normalize_module_runs(builder: &mut ImportTableBuilder, snapshot: &[RemoteModule]) {
+    let ptr = iat_slot_size(builder.is_64bit) as u32;
+
+    let name_valid_under = |module_name: &str, fname: &str| -> bool {
+        snapshot.iter().any(|m| {
+            m.name == module_name && m.exports.values().any(|n| n == fname)
+        })
+    };
+
+    // Flatten and sort by recorded IAT slot.  Addresses are unique across the
+    // builder (one thunk per traced slot); a duplicate would mean a pass-2 or
+    // regroup defect — keep the first, count the rest.
+    let mut all: Vec<(String, ImportThunk)> = Vec::new();
+    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut duplicates = 0usize;
+    for module in &builder.modules {
+        for thunk in &module.thunks {
+            if seen.insert(thunk.iat_address) {
+                all.push((module.name.clone(), thunk.clone()));
+            } else {
+                duplicates += 1;
+            }
+        }
+    }
+    all.sort_by_key(|(_, t)| t.iat_address);
+
+    // Maximal same-module, address-contiguous runs.
+    let mut runs: Vec<(String, Vec<ImportThunk>)> = Vec::new();
+    for (name, thunk) in all {
+        match runs.last_mut() {
+            Some((n, list))
+                if *n == name
+                    && list.last().unwrap().iat_address + ptr == thunk.iat_address =>
+            {
+                list.push(thunk);
+            }
+            _ => runs.push((name, vec![thunk])),
+        }
+    }
+
+    // Clusters: transitively merge runs whose terminator position would land
+    // on the next run's first slot.
+    let mut clusters: Vec<Vec<(String, Vec<ImportThunk>)>> = Vec::new();
+    for run in runs {
+        match clusters.last_mut() {
+            Some(cluster) => {
+                let prev_end = cluster.last().unwrap().1.last().unwrap().iat_address;
+                if prev_end + ptr == run.1[0].iat_address {
+                    cluster.push(run);
+                    continue;
+                }
+                clusters.push(vec![run]);
+            }
+            None => clusters.push(vec![run]),
+        }
+    }
+
+    // Emit: single-run clusters under their own module; multi-run clusters
+    // under the first candidate module that exports every name; else undescribed.
+    let mut out: Vec<ImportModule> = Vec::new();
+    let mut merged_clusters = 0usize;
+    let mut uncovered_slots = 0usize;
+    let mut uncovered_modules: Vec<String> = Vec::new();
+    for mut cluster in clusters {
+        if cluster.len() == 1 {
+            let (name, thunks) = cluster.pop().unwrap();
+            out.push(ImportModule { name, thunks });
+            continue;
+        }
+
+        let slot_count: usize = cluster.iter().map(|(_, t)| t.len()).sum();
+        let mut candidates: Vec<String> = Vec::new();
+        for (name, _) in &cluster {
+            if !candidates.iter().any(|c| c == name) {
+                candidates.push(name.clone());
+            }
+        }
+        let chosen = candidates.iter().find(|cand| {
+            let cand: &String = cand;
+            cluster.iter().all(|(_, thunks)| {
+                thunks.iter().all(|t| match t.function_name.as_ref() {
+                    // An ordinal only resolves under its own module.
+                    Some(fname) => name_valid_under(cand, fname),
+                    None => t.ordinal.is_some() && *cand == candidate_self_module(&cluster, t),
+                })
+            })
+        });
+        match chosen {
+            Some(module_name) => {
+                merged_clusters += 1;
+                let mut thunks: Vec<ImportThunk> = Vec::new();
+                for (_, list) in &cluster {
+                    thunks.extend(list.iter().cloned());
+                }
+                out.push(ImportModule {
+                    name: module_name.clone(),
+                    thunks,
+                });
+            }
+            None => {
+                uncovered_slots += slot_count;
+                for (name, _) in &cluster {
+                    if !uncovered_modules.iter().any(|m| m == name) {
+                        uncovered_modules.push(name.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    info!(
+        descriptors = out.len(),
+        merged_clusters,
+        uncovered_slots,
+        duplicate_slots = duplicates,
+        uncovered_modules = ?uncovered_modules,
+        "Classic IAT normalized to address-contiguous descriptors"
+    );
+
+    builder.modules = out;
+}
+
+/// The (unique) module name of the cluster member holding `thunk`.
+fn candidate_self_module(cluster: &[(String, Vec<ImportThunk>)], thunk: &ImportThunk) -> String {
+    for (name, list) in cluster {
+        if list.iter().any(|t| t.iat_address == thunk.iat_address) {
+            return name.clone();
+        }
+    }
+    String::new()
+}
+
 
 fn rebuild_import_table_inner(
     debugger: &mut dyn mida_core::DebuggerCore,
@@ -379,6 +559,7 @@ fn rebuild_import_table_inner(
     let iat_base_rva = (iat_address - image_base) as u32;
     if classic_imports {
         validate_and_regroup(&mut builder, &iat_data, iat_base_rva, &modules, is_64bit);
+        normalize_module_runs(&mut builder, &modules);
     }
 
     Ok((iat_data, iat_size, Some(builder)))
@@ -669,4 +850,175 @@ fn pass2_vote(
     );
 
     builder
+}
+
+// -----------------------------------------------------------------------
+// Tests — normalize_module_runs
+// -----------------------------------------------------------------------
+
+#[cfg(test)]
+mod normalize_tests {
+    use super::*;
+    use crate::import_table::ImportThunk;
+
+    fn thunk(rva: u32, name: &str) -> ImportThunk {
+        ImportThunk {
+            iat_address: rva,
+            function_name: Some(name.to_string()),
+            ordinal: None,
+            is_64bit: false,
+        }
+    }
+
+    fn module_with_thunks(name: &str, thunks: Vec<ImportThunk>) -> ImportModule {
+        ImportModule {
+            name: name.to_string(),
+            thunks,
+        }
+    }
+
+    fn snapshot_module(name: &str, exports: &[&str]) -> RemoteModule {
+        let mut map = std::collections::HashMap::new();
+        for (i, n) in exports.iter().enumerate() {
+            // Forwarder-style entries carry a bogus address (inside the export
+            // directory); the NAME is what normalize_module_runs matches on.
+            map.insert(0x7f000000 + 0x1000 * i as u64, n.to_string());
+        }
+        RemoteModule {
+            base: 0x7f000000,
+            end_off: 0x7f100000,
+            name: name.to_string(),
+            exports: map,
+            forwards: Vec::new(),
+        }
+    }
+
+    /// The measured combase/ole32 shape: interleaved buckets whose every name
+    /// is valid under ole32 (forwarders) collapse into ONE ole32 descriptor
+    /// covering the whole cluster, thunks in position order.
+    #[test]
+    fn adjacent_cluster_merges_under_the_module_that_exports_every_name() {
+        let mut builder = ImportTableBuilder::new(false);
+        // Positions: 0x1000..0x100c combase, 0x100c..0x1014 ole32, 0x1014 combase
+        builder.modules.push(module_with_thunks("combase.dll", vec![
+            thunk(0x1000, "CLSIDFromString"),
+            thunk(0x1004, "CLSIDFromProgID"),
+            thunk(0x1008, "CoTaskMemFree"),
+            thunk(0x1014, "CoRevokeClassObject"),
+        ]));
+        builder.modules.push(module_with_thunks("ole32.dll", vec![
+            thunk(0x100c, "OleInitialize"),
+            thunk(0x1010, "OleUninitialize"),
+        ]));
+        let snapshot = vec![
+            snapshot_module("combase.dll", &["CLSIDFromString", "CLSIDFromProgID", "CoTaskMemFree", "CoRevokeClassObject"]),
+            // ole32 carries every name via forwarder name entries.
+            snapshot_module("ole32.dll", &["CLSIDFromString", "CLSIDFromProgID", "CoTaskMemFree",
+                "CoRevokeClassObject", "OleInitialize", "OleUninitialize"]),
+        ];
+
+        normalize_module_runs(&mut builder, &snapshot);
+
+        assert_eq!(builder.modules.len(), 1, "one cluster -> one descriptor");
+        let m = &builder.modules[0];
+        assert_eq!(m.name, "ole32.dll", "first candidate under which every name is valid");
+        let rvas: Vec<u32> = m.thunks.iter().map(|t| t.iat_address).collect();
+        assert_eq!(rvas, vec![0x1000, 0x1004, 0x1008, 0x100c, 0x1010, 0x1014],
+            "thunks stay in slot-position order");
+    }
+
+    /// The measured user32/win32u shape: no candidate module exports every
+    /// name, so the cluster is left undescribed and the slots keep their
+    /// dumped live addresses.
+    #[test]
+    fn unmergeable_cluster_is_left_undescribed() {
+        let mut builder = ImportTableBuilder::new(false);
+        builder.modules.push(module_with_thunks("user32.dll", vec![
+            thunk(0x2000, "MessageBoxA"),
+            thunk(0x2004, "LoadIconA"),
+            thunk(0x200c, "GetDC"),
+        ]));
+        builder.modules.push(module_with_thunks("win32u.dll", vec![
+            thunk(0x2008, "NtUserRedrawWindow"),
+        ]));
+        let snapshot = vec![
+            // user32 does NOT export NtUserRedrawWindow; win32u does not
+            // export MessageBoxA — exactly the measured name tables.
+            snapshot_module("user32.dll", &["MessageBoxA", "LoadIconA", "GetDC"]),
+            snapshot_module("win32u.dll", &["NtUserRedrawWindow"]),
+        ];
+
+        normalize_module_runs(&mut builder, &snapshot);
+
+        assert!(builder.modules.is_empty(), "no coverable cluster -> no descriptor");
+    }
+
+    /// A standalone run with a free slot after it keeps its own module and is
+    /// covered by its own descriptor.
+    #[test]
+    fn standalone_run_keeps_its_own_module() {
+        let mut builder = ImportTableBuilder::new(false);
+        builder.modules.push(module_with_thunks("winspool.drv", vec![
+            thunk(0x3000, "OpenPrinterA"),
+            thunk(0x3004, "ClosePrinter"),
+        ]));
+        builder.modules.push(module_with_thunks("comdlg32.dll", vec![
+            thunk(0x300c, "FindTextA"),
+        ]));
+        let snapshot = vec![
+            snapshot_module("winspool.drv", &["OpenPrinterA", "ClosePrinter"]),
+            snapshot_module("comdlg32.dll", &["FindTextA"]),
+        ];
+
+        normalize_module_runs(&mut builder, &snapshot);
+
+        assert_eq!(builder.modules.len(), 2);
+        assert_eq!(builder.modules[0].name, "winspool.drv");
+        assert_eq!(builder.modules[1].name, "comdlg32.dll");
+        assert_eq!(builder.modules[1].thunks[0].iat_address, 0x300c);
+    }
+
+    /// Runs are split on ANY address gap, even inside one bucket: the loader
+    /// must not walk a gap slot as this module's entry.
+    #[test]
+    fn bucket_split_on_interior_gap() {
+        let mut builder = ImportTableBuilder::new(false);
+        builder.modules.push(module_with_thunks("combase.dll", vec![
+            thunk(0x4000, "CoTaskMemFree"),
+            // gap at 0x4004 (the measured 0x761b0a0d slot)
+            thunk(0x4008, "CoGetClassObject"),
+        ]));
+        let snapshot = vec![snapshot_module("combase.dll", &["CoTaskMemFree", "CoGetClassObject"])];
+
+        normalize_module_runs(&mut builder, &snapshot);
+
+        assert_eq!(builder.modules.len(), 2, "gap splits the bucket into two runs");
+        assert_eq!(builder.modules[0].thunks[0].iat_address, 0x4000);
+        assert_eq!(builder.modules[1].thunks[0].iat_address, 0x4008);
+    }
+
+    /// An ordinal thunk inside a merged cluster is only accepted under its
+    /// own module.
+    #[test]
+    fn ordinal_thunk_blocks_foreign_merge() {
+        let mut builder = ImportTableBuilder::new(false);
+        builder.modules.push(module_with_thunks("a.dll", vec![thunk(0x5000, "A1")]));
+        let mut ord = thunk(0x5004, "");
+        ord.function_name = None;
+        ord.ordinal = Some(7);
+        builder.modules.push(module_with_thunks("b.dll", vec![ord]));
+        let snapshot = vec![
+            // a.dll exports A1 but nothing else; b.dll only has the ordinal.
+            snapshot_module("a.dll", &["A1"]),
+            snapshot_module("b.dll", &[]),
+        ];
+
+        normalize_module_runs(&mut builder, &snapshot);
+
+        // The two runs are adjacent, so they form ONE cluster: covering a.dll
+        // alone would write its terminator over the ordinal's live slot.  No
+        // candidate module expresses both, so the whole cluster stays
+        // undescribed and both slots keep their dumped live addresses.
+        assert!(builder.modules.is_empty());
+    }
 }

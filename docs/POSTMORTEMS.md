@@ -784,3 +784,92 @@ golden 锁的是"会话指纹"，跨会话不复现属于已记录的常态，�
    10-25 那次，解释不了这次；环境的 dial 数量只能多不能少。
 3. **对照轮是"手工复测"的脚本化**：把教训 3 的动作固化进 gate，检查项既不丢、
    也不再依赖有人在旁边手工判断。
+
+## classic IAT 交错桶 vs loader 的并行数组契约（2026-10-27 修掉）
+
+上轮"仍死在加载期"的 0xC0000139 修掉之后，真实缺陷比当时定位的深一层。
+
+### 上轮定位只对了一半
+
+当时：2 个无候选槽（combase#11/ole32#2，live 地址 `0x761b0a0d`）被 loader 当
+名字 RVA 读。**这是真缺陷但不是主缺陷**。用 walk 脚本模拟 loader 走查
+（`OUT/v1v2/walk_loader.py`），产物里全部 8 个描述符都在跨桶：
+
+- user32 描述符（FT=0x60de8）的走查读到第 7/8/21 项是 **win32u 的
+  `NtUserRedrawWindow/InvalidateRect/SetActiveWindow`**——user32 名字表里没有
+  这三个名字（pefile 验过）→ `0xC0000139`，且排在一切之前；
+- win32u 描述符的 FT（密集偏移算出 0x60e80）落在 user32 数组内部，读到的
+  `GetSysColor/GetWindowTextLengthA` win32u 不导出；
+- combase/ole32 同形：ole32 真名（OleInitialize 等）散在 combase 的走查里，
+  combase 真名（CLSIDFromString 等）散在 ole32 的走查里。
+
+关键澄清：**pass2 的名字/模块配对与 regroup 校验都没有失效**（moved=0 是对的，
+每个 (模块,名字) 对单独看都合法）——错的是**序列化器的契约**：
+`build_import_section_no_iat` 按"每桶一段连续数组"假设写描述符（密集 FT + 组尾
+终止符），而 loader 从 FT **线性走到第一个 0**，跨桶读到的每个槽都按描述符自己的
+DLL 名解释。桶按名字分组（正确）+ 槽按地址记录（正确）= 数组按地址交错（不可避免）。
+三处事实互相矛盾：**builder 对、槽值对、数组边界错**。
+
+### 修法：run 归一化 + 簇收编 + 不可表达就整簇不描述
+
+`normalize_module_runs`（classic 门控，v3 密集路径逐字节不动）：
+
+1. 全部 thunk 按记录地址排序，切成**极大同模块连续 run**（任何地址间隙都断开——
+   间隙槽就是 loader 的天然终止符位置）；
+2. 相邻 run（前 run 的终止位 = 后 run 的首槽）**成簇**——两个描述符不可能共享
+   一个终止槽，硬写会砸掉后者的第一个 thunk；
+3. 簇内找一个"所有名字都有效"的模块整簇收编。**转发器名字串是关键**：
+   `ole32!CLSIDFromString` 的名字串在 ole32 的导出表里（RVA 指向导出目录内的
+   转发串 `api-ms-win-core-com-l1-1-0.CLSIDFromString`），pefile 验证
+   combase/ole32 混合区的全部 12 个名字都在 ole32 名字表内——整簇写成一个
+   ole32 描述符，loader 沿转发链解到**与壳会话相同的活体地址**，可移植；
+4. 无公共模块的簇（user32/win32u：`NtUser*` 不在 user32 名字表、user32 名不在
+   win32u 名字表——**两边都收编不了**）整簇**不描述**：槽保留壳会话 live 地址，
+   无描述符走查它们，loader 不碰；OEP 代码的调用同 boot 直达。
+
+配套两处：描述符 FT 改用记录地址（`ft_from_records`，v3 走密集分支）；
+写入器对覆盖簇跨度内的**无主槽清零**（簇内间隙 = 前一段的终止符）。
+
+### 实测（1.9.1 样本，8 桶 74 thunk）
+
+| 项 | 修复前 | 修复后 |
+|---|---|---|
+| 描述符 | 8（全部跨桶/重叠） | 6（winmm/winspool/comdlg32/ole32×2/oledlg） |
+| loader 走查 | user32 数组含 3 个无效名对；combase#11、ole32#2 live 槽 | 每数组只含自己的有效项，逐一对系统 DLL 验证 **NONE invalid** |
+| 加载 | `0xC0000139`，未过解析期 | 通过解析期 |
+| 收编 | — | 2 簇收编（ole32 系）；40 槽（user32/win32u 簇）留 live 同 boot |
+
+测试钉子：`normalize_tests` 5 条（簇收编/不可收编留活/独立 run/间隙断桶/序数
+只在自家模块下收编）+ `classic_iat_tests::loader_walk_never_crosses_buckets_
+or_gap_slots`（合成实测形态，模拟 loader 走查断言永不跨桶/永不读到 live 槽/
+不可收编簇的 live 地址原样保留）。
+
+### 宣称边界
+
+**"v1 产物可运行"成立**（对照法：窗口标题同加壳对照，线程 28→4，两次可复现），
+**"v1 产物可移植"不宣称**——40/74 槽依赖同 boot 的系统 DLL 基址。跨 boot 需要
+从 user32 的 RX stub 反汇编推回原始导入名（`NtUserRedrawWindow` ↔
+`RedrawWindow`），是下一个增量的输入，本轮不做。
+
+## classic 首段的 RWX 位：live 头与输入声明不一致（2026-10-27 修掉）
+
+导入修完，产物死在 `0xC0000005`，事件日志给出错偏移 `0x271e0` = **OEP RVA
+(0x271dc) + 4**。反汇编：`33 d2 | 8a d4 | 89 15 34 e6 45 00`——第四条
+`mov [0x45e634], edx`（原程序存全局量）访问违例。**0x5e634 在 .text 跨度内**。
+
+三层事实：
+
+| 来源 | 首段特性 |
+|---|---|
+| 加壳输入的段表 | `0xe0000040`（RWX + 初始化数据）——壳自己的解压工作区 |
+| live 头（dump 读到的） | `0x60000020`——壳运行时改写了自己的段表，丢掉 W，INIT→CODE |
+| live 内存实际 | RWX——home-guard 验证窗口里同样的 store 成功过 |
+
+`sanitize()` 的 merge 规则（CODE 且 INIT 才给 W）不触发——live 头既没有 INIT
+也没有 W。修法：classic 门控下把**输入文件首段的声明并回** dump 模型
+（`validate_and_patch_pe_header`，输入已在手）：实测产物首段
+`0xe0000060`，OEP 四条 store 全过。v3 走 live 头原样（字节 golden）。
+
+教训与 x64 `.text` 保真度那轮（2026-10-24）同源但方向相反：那次是"别把壳的
+签名当目标"，这次是"别把壳运行时改写的头当权威"——**声明以输入文件为准，
+行为以实测为准，golden 只属于 v3**。关联小节：「classic IAT 交错桶」。

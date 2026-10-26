@@ -124,6 +124,12 @@ pub(crate) fn write_resolved_addresses_to_iat(
 /// Create the .import section, write IAT lookup values, and set data
 /// directory entries.
 ///
+/// `classic_iat` selects the classic-serialization contract (see
+/// `normalize_module_runs`): descriptor FirstThunks come from the recorded
+/// run starts and every unowned slot inside a descriptor's walked span is
+/// zeroed.  The v3 path keeps the dense layout its byte-golden products
+/// were recorded with.
+///
 /// Returns the list of import thunk RVAs (for later IAT writes) and the
 /// section index.
 pub(crate) fn create_import_section(
@@ -132,6 +138,7 @@ pub(crate) fn create_import_section(
     original_iat_rva: u32,
     dump_buf: &mut [u8],
     is_64bit: bool,
+    classic_iat: bool,
 ) -> (Vec<u64>, Option<usize>) {
     let import_thunks: Vec<u64>;
     let section_size_init = 3400u32;
@@ -149,7 +156,7 @@ pub(crate) fn create_import_section(
     debug!("[import_builder] local section_va={:#x}", section_va);
 
     let (section_data, thunks) =
-        builder.build_import_section_no_iat(section_va, original_iat_rva);
+        builder.build_import_section_no_iat(section_va, original_iat_rva, classic_iat);
     import_thunks = thunks;
 
     let section_data_len = section_data.len();
@@ -193,6 +200,7 @@ pub(crate) fn create_import_section(
         &import_thunks,
         original_iat_rva,
         is_64bit,
+        classic_iat,
     );
 
     let lookup_iat_rva = original_iat_rva;
@@ -232,19 +240,39 @@ pub(crate) fn create_import_section(
 }
 
 /// Write Hint/Name RVAs into the dump buffer at each thunk's IAT address.
+///
+/// With `classic_iat`, every slot inside a descriptor's walked span that no
+/// thunk owns is zeroed: merged clusters have interior gaps (other buckets'
+/// original positions, one of which held a live API address measured as
+/// `0x761b0a0d` on the 1.9.1 unpackme), and the loader reads any non-zero
+/// slot it passes as a hint/name RVA.
 fn write_iat_lookup_to_dump_buf(
     dump_buf: &mut [u8],
     builder: &ImportTableBuilder,
     import_thunks: &[u64],
     original_iat_rva: u32,
     _is_64bit: bool,
+    classic_iat: bool,
 ) {
     let ptr_size = std::mem::size_of::<usize>();
     let mut max_iat_rva = original_iat_rva;
     let mut thunk_idx = 0;
 
+    // Recorded slot addresses across the whole builder — unique after
+    // normalization; used to tell owned slots from interior gaps.
+    let owned: std::collections::HashSet<u32> = if classic_iat {
+        builder
+            .modules
+            .iter()
+            .flat_map(|m| m.thunks.iter().map(|t| t.iat_address))
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
     for module in &builder.modules {
         let mut module_max_iat_rva = original_iat_rva;
+        let mut module_min_iat_rva = u32::MAX;
         debug!("Writing module '{}' with {} thunks", module.name, module.thunks.len());
 
         for (ti, thunk) in module.thunks.iter().enumerate() {
@@ -254,6 +282,7 @@ fn write_iat_lookup_to_dump_buf(
             }
             if iat_rva > max_iat_rva { max_iat_rva = iat_rva; }
             if iat_rva > module_max_iat_rva { module_max_iat_rva = iat_rva; }
+            if iat_rva < module_min_iat_rva { module_min_iat_rva = iat_rva; }
 
             let offset = iat_rva as usize;
             if offset + ptr_size <= dump_buf.len() {
@@ -277,6 +306,27 @@ fn write_iat_lookup_to_dump_buf(
                     dump_buf[offset..offset + 4].copy_from_slice(&bytes);
                 }
                 thunk_idx += 1;
+            }
+        }
+
+        // Zero every unowned slot inside the walked span.  The span starts at
+        // a thunk (the descriptor's FirstThunk) and ends at the last thunk;
+        // anything between that no thunk owns is an interior gap.
+        if classic_iat && module_min_iat_rva != u32::MAX {
+            let mut gap_rva = module_min_iat_rva;
+            while gap_rva < module_max_iat_rva {
+                if !owned.contains(&gap_rva) {
+                    let gap_offset = gap_rva as usize;
+                    if gap_offset + ptr_size <= dump_buf.len() {
+                        if ptr_size == 8 {
+                            dump_buf[gap_offset..gap_offset + 8].fill(0);
+                        } else {
+                            dump_buf[gap_offset..gap_offset + 4].fill(0);
+                        }
+                        debug!("Zeroed unowned gap slot at RVA {:#x}", gap_rva);
+                    }
+                }
+                gap_rva += ptr_size as u32;
             }
         }
 
@@ -482,5 +532,157 @@ pub(crate) fn fill_additional_iat_locations(
             "Filled {} additional IAT locations with Hint/Name RVAs (dual IAT fix)",
             filled_count
         );
+    }
+}
+
+// -----------------------------------------------------------------------
+// Tests — classic IAT serialization (loader-walk contract)
+// -----------------------------------------------------------------------
+
+#[cfg(test)]
+mod classic_iat_tests {
+    use super::*;
+    use crate::import_table::{ImportModule, ImportThunk};
+    use super::super::import_rebuild::normalize_module_runs;
+    use super::super::types::RemoteModule;
+
+    fn thunk(rva: u32, name: &str) -> ImportThunk {
+        ImportThunk {
+            iat_address: rva,
+            function_name: Some(name.to_string()),
+            ordinal: None,
+            is_64bit: false,
+        }
+    }
+
+    fn snapshot_module(name: &str, exports: &[&str]) -> RemoteModule {
+        let mut map = std::collections::HashMap::new();
+        for (i, n) in exports.iter().enumerate() {
+            map.insert(0x7f000000 + 0x1000 * i as u64, n.to_string());
+        }
+        RemoteModule {
+            base: 0x7f000000,
+            end_off: 0x7f100000,
+            name: name.to_string(),
+            exports: map,
+            forwards: Vec::new(),
+        }
+    }
+
+    /// The measured 1.9.1 shape, end to end: interleaved buckets, one
+    /// unmergeable cluster, one mergeable cluster with an interior gap slot
+    /// holding a dumped live API address.  After normalization +
+    /// serialization + the lookup write, a loader-style walk of every
+    /// descriptor's FirstThunk array must see only that descriptor's own
+    /// valid entries and a terminator — never a foreign hint RVA and never a
+    /// live address.
+    #[test]
+    fn loader_walk_never_crosses_buckets_or_gap_slots() {
+        const IAT: u32 = 0x1000;
+        const SEC_VA: u32 = 0x9000;
+
+        let mut builder = ImportTableBuilder::new(false);
+        // Cluster A: user32 run / win32u run / user32 run — adjacent, no
+        // common module (user32 lacks NtUser*, win32u lacks the rest) ->
+        // undescribed, slots stay live.
+        builder.modules.push(ImportModule {
+            name: "user32.dll".into(),
+            thunks: vec![thunk(0x1000, "MessageBoxA"), thunk(0x1004, "LoadIconA")],
+        });
+        builder.modules.push(ImportModule {
+            name: "win32u.dll".into(),
+            thunks: vec![thunk(0x1008, "NtUserRedrawWindow")],
+        });
+        // Cluster B: combase / ole32 / combase with a gap at 0x1018 — every
+        // name valid under ole32 (forwarders) -> one ole32 descriptor.
+        builder.modules.push(ImportModule {
+            name: "combase.dll".into(),
+            thunks: vec![
+                thunk(0x1010, "CLSIDFromString"),
+                thunk(0x1014, "CoTaskMemFree"),
+                thunk(0x101c, "CoGetClassObject"),
+            ],
+        });
+        builder.modules.push(ImportModule {
+            name: "ole32.dll".into(),
+            thunks: vec![thunk(0x1020, "OleInitialize")],
+        });
+        let snapshot = vec![
+            snapshot_module("user32.dll", &["MessageBoxA", "LoadIconA"]),
+            snapshot_module("win32u.dll", &["NtUserRedrawWindow"]),
+            snapshot_module("combase.dll", &["CLSIDFromString", "CoTaskMemFree", "CoGetClassObject"]),
+            snapshot_module("ole32.dll", &["CLSIDFromString", "CoTaskMemFree",
+                "CoGetClassObject", "OleInitialize"]),
+        ];
+
+        normalize_module_runs(&mut builder, &snapshot);
+        // Cluster A undescribed.  Cluster B's interior gap splits it: the
+        // first run keeps combase, the adjacent combase/ole32 pair merges
+        // under ole32 — two descriptors total, as on the measured sample.
+        assert_eq!(builder.modules.len(), 2);
+        assert_eq!(builder.modules[0].name, "combase.dll");
+        assert_eq!(builder.modules[1].name, "ole32.dll");
+
+        let (section, flat) = builder.build_import_section_no_iat(SEC_VA, IAT, true);
+
+        // Synthetic dump buffer covering the IAT region; the gap slot 0x1018
+        // and the live-looking slot 0x1024-after hold dumped API addresses.
+        let mut dump_buf = vec![0u8; 0x2000];
+        for rva in [0x1008usize, 0x1018] {
+            dump_buf[rva..rva + 4].copy_from_slice(&0x761b_0a0du32.to_le_bytes());
+        }
+
+        write_iat_lookup_to_dump_buf(&mut dump_buf, &builder, &flat, IAT, false, true);
+
+        // Walk every descriptor exactly like the loader: OFT == 0, so the
+        // lookup source is FirstThunk itself; stop at the first zero.
+        let desc_count = builder.module_count();
+        for d in 0..desc_count {
+            let base = d * 20;
+            let oft = u32::from_le_bytes(section[base..base + 4].try_into().unwrap());
+            let name_rva = u32::from_le_bytes(section[base + 12..base + 16].try_into().unwrap());
+            let ft = u32::from_le_bytes(section[base + 16..base + 20].try_into().unwrap());
+            assert_eq!(oft, 0);
+            let dll = {
+                let off = (name_rva - SEC_VA) as usize;
+                let end = section[off..].iter().position(|&b| b == 0).unwrap();
+                std::str::from_utf8(&section[off..off + end]).unwrap().to_string()
+            };
+
+            let mut k = 0;
+            loop {
+                let slot = ft + 4 * k;
+                assert!(k < 64, "{dll}: no terminator within 64 slots");
+                let v = u32::from_le_bytes(
+                    dump_buf[slot as usize..slot as usize + 4].try_into().unwrap(),
+                );
+                if v == 0 {
+                    break; // terminator reached — the array is self-contained
+                }
+                if v & 0x8000_0000 != 0 {
+                    k += 1;
+                    continue;
+                }
+                // The only legal non-zero entry is a hint/name RVA INTO the
+                // .import section.  Anything else (a dumped live address, an
+                // unmapped value) is the measured 0xC0000139 defect.
+                assert!(
+                    (SEC_VA..SEC_VA + section.len() as u32).contains(&v),
+                    "{dll}: walked slot {slot:#x} holds {v:#x} — not a hint/name RVA"
+                );
+                k += 1;
+            }
+        }
+
+        // The live address at the interior gap slot (inside the ole32
+        // cluster's span) must have been zeroed — it is the terminator of
+        // CLSIDFromString/CoTaskMemFree's walk.
+        let gap = u32::from_le_bytes(dump_buf[0x1018..0x101c].try_into().unwrap());
+        assert_eq!(gap, 0, "interior gap slot inside a covered cluster must be zeroed");
+
+        // The unmergeable cluster's live slots must be untouched: no
+        // descriptor covers them and the same-boot calls go through them.
+        let live = u32::from_le_bytes(dump_buf[0x1008..0x100c].try_into().unwrap());
+        assert_eq!(live, 0x761b_0a0d, "undescribed cluster keeps its live addresses");
     }
 }

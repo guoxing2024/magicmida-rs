@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Classic v1 product runs (control-verified)** — after the IAT
+  serialization fix and the first-section RWX restoration, the measured 1.9.1
+  unpackme's product loads past import resolution (was `0xC0000139`) and runs
+  to its main window (same title as the packed control, threads 28→4,
+  reproducible). `normalize_module_runs` splits interleaved per-name buckets
+  into address-contiguous descriptors (loader contract: one descriptor walks
+  `FirstThunk` until the first zero under ITS name only), merges adjacent-run
+  clusters under the first module that exports every name (ole32's forwarder
+  name entries cover the whole mixed combase/ole32 region), and leaves
+  unmergeable clusters undescribed (live addresses kept, same-boot).
+  Descriptor FirstThunks now come from the recorded run starts
+  (`ft_from_records`); the v3 dense path is byte-untouched (all three e2e
+  gates green). Classic first section regains its declared RWX
+  characteristics (the shell rewrites its own section table at runtime;
+  measured OEP+4 store fault without this).
 - **The classic (v1-generation) unpack pipeline: OEP verified end-to-end** —
   `/unpack` routes V1/Ancient targets through a measured branch: at the shell's
   first `CloseHandle` the `.text` guard is installed directly (the v3 write-BP

@@ -385,6 +385,7 @@ pub fn dump_process(
     if let Some(ref builder) = import_builder {
         let (thunks, _section_idx) = create_import_section(
             &mut pe, builder, original_iat_rva, &mut dump_buf, is_64bit,
+            opts.classic_imports,
         );
         import_thunks = thunks;
     }

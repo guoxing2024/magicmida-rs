@@ -526,7 +526,7 @@ impl PeHeader {
 
 impl PeSection {
     /// Sync public fields from the raw header after mutation.
-    fn update_from_header(&mut self) {
+    pub(crate) fn update_from_header(&mut self) {
         self.name = crate::header::decode_section_name(&self.header.name);
         self.virtual_address = self.header.virtual_address;
         self.virtual_size = self.header.virtual_size;

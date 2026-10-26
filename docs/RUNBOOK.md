@@ -321,17 +321,26 @@ Themida 1.1.1.0、1.9.1.0、WinLicense 2.0.1.0 的加壳样本**都能直接运�
 `is_themida_section`——它的大虚拟尺寸信号把 classic 的第一节（解压后的原始程序
 本身）也判成壳，175 个候选全被误拒。
 
-**仍死在加载期（下一个增量的确切输入）**：产物 `0xC0000139
-（STATUS_ENTRYPOINT_NOT_FOUND）`。定位：IAT 跨度内有 **2 个无候选槽**
-（combase 第 11 项、ole32 第 2 项）——pass2 跳过它们不写 thunk，但加载器线性走
-整个 FirstThunk 数组，跳过的槽保留壳会话的 live API 指针被当名字 RVA 读。
-修法方向：无候选槽必须终止该模块的 thunk 数组（写终结符、起新组）或写入
-load-valid 的占位。配套已落地：`validate_and_regroup`（按名字校验 (模块,函数)
-对——**按地址校验是错的**：壳会话经 kernelbase 解析的地址物理上不在 kernel32，
-会把合法对搬家、v3 字节 golden 跟着动，x64 gate 实测红过）+ `classic_imports`
-标志（regroup 只对 classic 跑，v3 产物是字节 golden 永不参与）+
-`base_of_data` classic 取第一节跨度 + `Ancient→V1` 策略 + 垃圾槽跳过不再致命 +
-每故障 AV 日志降级（INFO 一条 4.4 GB 的教训）。
+**产物已可运行（2026-10-27，对照法验收）**：修掉两个加载期/运行期缺陷后
+（复盘见 `POSTMORTEMS.md` 的「classic IAT 交错桶」与「classic 首段 RWX」），
+1.9.1 样本的产物**加载通过并跑到主窗口**（`http://www.tuts4you.com/`，
+与加壳对照同标题，线程 28（壳）→ 4（纯原程序），两次独立运行可复现）。
+宣称边界：74 个槽中 **34 个 loader 解析**（6 个描述符，逐一对真实系统 DLL
+导出表验证全有效）、**40 个槽保留壳会话的 live 地址同 boot 可用**
+（user32/win32u 交错簇，任何单一 DLL 名都无法表达——`NtUser*` 不在 user32
+名字表、user32 名不在 win32u 名字表；跨 boot 需 stub 反汇编推原名，未做）。
+配套已落地：`validate_and_regroup`（按名字校验 (模块,函数) 对——**按地址校验
+是错的**：壳会话经 kernelbase 解析的地址物理上不在 kernel32，会把合法对搬家、
+v3 字节 golden 跟着动，x64 gate 实测红过）+ `normalize_module_runs`
+（交错桶 → 地址连续 run/簇，ole32 簇按转发器名字串整簇收编）+
+`ft_from_records`（描述符 FirstThunk = 记录地址，v3 密集路径不动）+
+classic 首段 RWX 位从输入声明恢复 + `classic_imports` 标志（regroup/normalize
+只对 classic 跑，v3 产物是字节 golden 永不参与）+ `base_of_data` classic 取
+第一节跨度 + `Ancient→V1` 策略 + 垃圾槽跳过不再致命 + 每故障 AV 日志降级
+（INFO 一条 4.4 GB 的教训）。
+
+产物验证脚本：`OUT/v1v2/walk_loader.py <product>`（模拟 loader 走查导入表，
+报 LIVE-API 槽与未映射名字 RVA）。
 
 **1.1.1 的形状仍未覆盖**：原件经文件映射（`MEM_MAPPED`，ep 字段 0）在别处运行，
 `.text` 零活动——守护页方案看不到它。**"v1 脱壳可用"不宣称。**

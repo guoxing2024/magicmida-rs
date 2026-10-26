@@ -58,6 +58,41 @@ pub(crate) fn validate_and_patch_pe_header(
                 // 禁用 ASLR：程序加载到固定基址，不需要重定位表
                 pe.nt_headers.optional_header.dll_characteristics &=
                     !IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
+
+                // Classic: restore the first section's declared characteristics.
+                //
+                // Themida 1.x rewrites its own section table at runtime and
+                // drops the WRITE bit its decompression workspace needs:
+                // measured on the ladder's 1.9.1 unpackme (2026-10-27), the
+                // input declares the first section `0xe0000040` (RWX +
+                // initialised data) while the live header says `0x60000020`,
+                // and the unpacked OEP's fourth instruction
+                // (`mov [0x45e634], edx` — one of several globals the
+                // original program keeps in that region) faulted
+                // `0xC0000005` in the product.  The same store succeeds in
+                // the live process, so the memory is RWX and only the
+                // header field dropped the bit.  The input's declaration is
+                // the authority on what the unpacked code needs; union it
+                // into the dump's first section.  v3 targets keep the live
+                // header verbatim — their products are byte-golden.
+                if opts.classic_imports {
+                    const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
+                    const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
+                    const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+                    let needed = IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_EXECUTE;
+                    if let (Some(first), Some(disk_first)) =
+                        (pe.sections.first_mut(), disk_pe.sections.first())
+                    {
+                        if disk_first.header.characteristics & needed == needed {
+                            first.header.characteristics |= disk_first.header.characteristics;
+                            first.update_from_header();
+                            info!(
+                                chars = format!("{:#x}", first.header.characteristics),
+                                "Classic: restored the first section's declared characteristics from the input"
+                            );
+                        }
+                    }
+                }
                 info!("validated PE header fields");
             }
         }
