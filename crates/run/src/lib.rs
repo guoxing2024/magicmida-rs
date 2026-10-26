@@ -32,7 +32,7 @@
 pub mod job;
 pub mod parse;
 
-pub use job::{find_cli, kill_tree, Event, Job};
+pub use job::{find_cli, kill_tree, unpack_args, Event, Job, PackerChoice, SpawnOptions};
 pub use parse::{
     Level, LogLine, Metrics, Phase, RunState, TargetKind,
 };

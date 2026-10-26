@@ -186,7 +186,13 @@ printf 'protected.exe\n\nY\nn\n' | target/release/mida-cli.exe interactive
 
 The GUI (`mida-gui.exe`) is the other beginner surface: drag an EXE/DLL onto
 the window (the drop box reacts while you drag), press 开始脱壳, and a
-打开产物位置 button appears next to the finishing status.
+打开产物位置 button appears next to the finishing status. The rail exposes the
+CLI's real options — packer branch, `--data-sections`, `--shrink` — instead of
+hiding them behind the log:
+
+![GUI — target rail with the packer options](docs/img/gui_options.png)
+
+![GUI — a finished UPX run, product metric filled, follow-up button enabled](docs/img/gui_done.png)
 
 **Manual path:**
 

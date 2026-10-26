@@ -66,6 +66,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   「打开产物位置」 button (Explorer `/select` on the product); and the
   开始脱壳 button explains the target-windows-will-appear surprise in its
   tooltip before it happens.
+- **The GUI now exposes the CLI's unpack options** — `mida-run` grows
+  `PackerChoice` / `SpawnOptions` / `unpack_args` / `Job::spawn_with` (the
+  old `spawn` signature is kept and delegates with defaults, so the MCP
+  server is untouched), and the GUI's 选项 section gains a 壳类型 dropdown
+  (自动检测/Themida/VMProtect/UPX, each with a one-line hint), a
+  恢复数据段 (`--data-sections`) checkbox and a 收缩 Themida 段
+  (`--shrink`, default on like the CLI) checkbox — all disabled while a run
+  is in flight. The start button's tooltip adapts: on the UPX branch it
+  promises a static run instead of warning about target windows. A unit test
+  pins `unpack_args` to reproduce the old hand-built command line under
+  defaults, so the MCP path cannot drift.
+- **The guided mode gains a verify branch** — the wizard now opens with
+  要做什么 [1=脱壳/分析文件 2=验证产物]; branch 2 walks through `/verify`
+  (product path → reference path → confirm → run), the one advanced command
+  that is read-only and headless and therefore safe to hand a beginner.
+  Smoke-tested end to end through piped stdin against a real UPX product and
+  its `upx -d` reference (`Verification PASSED ✓`).
+- **README screenshots** — the GUI's option rail and a finished run are now
+  embedded in the Quick Start (`docs/img/`), captured with `PrintWindow` so
+  no input automation and no focus stealing is involved.
 
 ### Fixed
 - **`mida-run` parser missed the non-Themida product lines** — `RunState

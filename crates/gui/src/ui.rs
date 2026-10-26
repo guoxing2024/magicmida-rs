@@ -13,6 +13,7 @@ use eframe::egui::{
 };
 
 use mida_run::Job;
+use mida_run::{PackerChoice, SpawnOptions};
 use mida_run::{Level, LogLine, Metrics, Phase, RunState, TargetKind};
 use crate::theme;
 
@@ -24,6 +25,13 @@ pub struct App {
     input: String,
     output: String,
     verbose: bool,
+    /// Packer branch handed to the CLI (`--packer`); Auto lets the CLI decide.
+    packer: PackerChoice,
+    /// Restore `.rdata` / `.data` from the process (`--data-sections`).
+    data_sections: bool,
+    /// Drop Themida sections from the product (`--shrink`, default on —
+    /// same default as the CLI).
+    shrink: bool,
     job: Option<Job>,
     last: Option<Arc<Mutex<RunState>>>,
     status: Status,
@@ -76,6 +84,9 @@ impl App {
             input: String::new(),
             output: String::new(),
             verbose,
+            packer: PackerChoice::Auto,
+            data_sections: false,
+            shrink: true,
             job: None,
             last: None,
             status: Status::Idle,
@@ -135,7 +146,13 @@ impl App {
             PathBuf::from(self.output.trim())
         };
 
-        match Job::spawn(&cli, &input, &output, self.verbose) {
+        let opts = SpawnOptions {
+            verbose: self.verbose,
+            packer: self.packer,
+            data_sections: self.data_sections,
+            shrink: self.shrink,
+        };
+        match Job::spawn_with(&cli, &input, &output, opts) {
             Ok(job) => {
                 self.status = Status::Running;
                 self.elapsed = 0.0;
@@ -461,6 +478,41 @@ impl App {
                 ui.add_space(12.0);
                 section(ui, "选项");
                 ui.add_space(4.0);
+
+                // Packer branch — the CLI's --packer, surfaced so a beginner
+                // can see (and force) which pipeline will run instead of
+                // learning it from the log afterwards.
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("壳类型").size(12.0).color(theme::MUTED));
+                    ui.add_enabled_ui(!busy, |ui| {
+                        egui::ComboBox::from_id_salt("packer-choice")
+                            .selected_text(self.packer.label())
+                            .width(150.0)
+                            .show_ui(ui, |ui| {
+                                for p in PackerChoice::ALL {
+                                    ui.selectable_value(&mut self.packer, p, p.label());
+                                }
+                            });
+                    });
+                });
+                hint(
+                    ui,
+                    match self.packer {
+                        PackerChoice::Auto => "按文件特征自动选管线",
+                        PackerChoice::Themida => "强制 Themida 管线（诊断用）",
+                        PackerChoice::VmProtect => "实验性分支；建议先 /analyze 看结构",
+                        PackerChoice::Upx => "静态脱壳：不创建进程、不弹窗口",
+                    },
+                );
+
+                ui.add_space(4.0);
+                ui.add_enabled(
+                    !busy,
+                    egui::Checkbox::new(&mut self.data_sections, "恢复数据段"),
+                );
+                hint(ui, "--data-sections：从进程还原 .rdata/.data（MSVC TLS/全局量需要）");
+                ui.add_enabled(!busy, egui::Checkbox::new(&mut self.shrink, "收缩 Themida 段"));
+                hint(ui, "--shrink：去壳段、重建重定位（默认开）");
                 ui.checkbox(&mut self.verbose, "详细日志");
                 hint(ui, "记录每个调试事件，排查用");
 
@@ -477,10 +529,14 @@ impl App {
                     }
                     if can {
                         // The most common first-run surprise is the target's
-                        // own windows appearing; say so before it happens.
-                        resp.on_hover_text(
-                            "将运行 mida-cli /unpack：目标自己的窗口会真实弹出，属正常现象，不要关闭它们",
-                        );
+                        // own windows appearing; say so before it happens —
+                        // except on the UPX branch, where nothing runs.
+                        resp.on_hover_text(match self.packer {
+                            PackerChoice::Upx => {
+                                "静态脱壳：不创建进程、不弹窗口，产物与 upx -d 逐字节一致"
+                            }
+                            _ => "将运行 mida-cli /unpack：目标自己的窗口会真实弹出，属正常现象，不要关闭它们",
+                        });
                     }
                 }
 

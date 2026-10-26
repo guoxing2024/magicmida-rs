@@ -173,94 +173,26 @@ pub fn run(forced: bool) -> Result<(), anyhow::Error> {
     log::init_logging(false);
 
     loop {
-        // [1/3] the file, validated in a loop until it works or the user quits.
-        let input = loop {
-            let Some(raw) = prompt("[1/3] 文件路径（.exe / .dll）") else {
-                return Ok(());
-            };
-            if raw.trim().eq_ignore_ascii_case("q") {
+        let Some(mode) = prompt_default("要做什么 [1=脱壳/分析文件 2=验证产物]", "1") else {
+            return Ok(());
+        };
+        match mode.trim() {
+            "q" | "Q" => {
                 println!("已退出。");
                 return Ok(());
             }
-            match validate_path(&raw) {
-                Ok(p) => break p,
-                Err(msg) => println!("  ✗ {msg}（重试，或输入 q 退出）\n"),
-            }
-        };
-
-        // Verdict + advice, then the one suggested command.
-        let verdict = match detect_verdict(&input) {
-            Ok(v) => v,
-            Err(e) => {
-                println!("  ✗ {e:#}\n");
-                continue;
-            }
-        };
-        let (summary, advice, action) = plan_for(&verdict);
-        println!("\n  识别结果：{summary}");
-        println!("  {advice}");
-
-        // [2/3] the paths the chosen action needs.
-        let cmd = match action {
-            Action::AnalyzeExtract => {
-                let default_dir = default_output(&input)
-                    .with_extension("")
-                    .with_added_extension("payloads");
-                let Some(dir) = prompt_default("[2/3] 载荷提取目录", &default_dir.display().to_string())
-                else {
+            "2" => {
+                if !verify_flow() {
                     return Ok(());
-                };
-                let dir = if dir.trim().is_empty() { default_dir } else { PathBuf::from(dir.trim().trim_matches('"')) };
-                Command::Analyze {
-                    input: input.clone(),
-                    extract_to: Some(dir),
-                    verbose: false,
                 }
             }
-            Action::UnpackStatic | Action::UnpackLive => {
-                let default_out = default_output(&input);
-                let Some(out) = prompt_default("[2/3] 输出路径", &default_out.display().to_string())
-                else {
+            _ => {
+                if !unpack_flow() {
                     return Ok(());
-                };
-                let out = if out.trim().is_empty() {
-                    default_out
-                } else {
-                    PathBuf::from(out.trim().trim_matches('"'))
-                };
-                let packer = match action {
-                    Action::UnpackStatic => PackerChoice::Upx,
-                    _ => PackerChoice::Auto,
-                };
-                Command::Unpack {
-                    input: input.clone(),
-                    output: Some(out),
-                    create_data_sections: false,
-                    shrink: true,
-                    verbose: false,
-                    packer,
                 }
             }
-        };
-
-        // [3/3] confirm, showing exactly what will run.
-        println!("\n  将执行：{}", describe(&cmd));
-        let Some(go) = confirm("[3/3] 确认执行", true) else {
-            return Ok(());
-        };
-        if !go {
-            println!("已取消，未执行任何操作。\n");
-            continue;
         }
-
-        println!();
-        let started = std::time::Instant::now();
-        match crate::commands::run_command(cmd) {
-            Ok(()) => println!("\n✓ 完成（{:.1}s）。", started.elapsed().as_secs_f32()),
-            Err(e) => println!("\n✗ 失败：{e:#}"),
-        }
-
-        let Some(again) = confirm("\n再处理一个文件", false) else {
+        let Some(again) = confirm("\n再处理一个", false) else {
             return Ok(());
         };
         if !again {
@@ -268,6 +200,136 @@ pub fn run(forced: bool) -> Result<(), anyhow::Error> {
             return Ok(());
         }
         println!();
+    }
+}
+
+/// The unpack/analyse flow: pick a file, recognise it, confirm one command.
+///
+/// Returns `false` when the user quit (`q`) or input ended — the wizard exits;
+/// `true` means the flow concluded (ran, failed, or was cancelled) and the
+/// mode question should come back.
+fn unpack_flow() -> bool {
+    // [1/3] the file, validated in a loop until it works or the user quits.
+    let Some(input) = ask_path("[1/3] 文件路径（.exe / .dll）") else {
+        return false;
+    };
+
+    // Verdict + advice, then the one suggested command.
+    let verdict = match detect_verdict(&input) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("  ✗ {e:#}\n");
+            return true;
+        }
+    };
+    let (summary, advice, action) = plan_for(&verdict);
+    println!("\n  识别结果：{summary}");
+    println!("  {advice}");
+
+    // [2/3] the paths the chosen action needs.
+    let cmd = match action {
+        Action::AnalyzeExtract => {
+            let default_dir = default_output(&input)
+                .with_extension("")
+                .with_added_extension("payloads");
+            let Some(dir) = prompt_default("[2/3] 载荷提取目录", &default_dir.display().to_string())
+            else {
+                return false;
+            };
+            let dir = if dir.trim().is_empty() {
+                default_dir
+            } else {
+                PathBuf::from(dir.trim().trim_matches('"'))
+            };
+            Command::Analyze {
+                input,
+                extract_to: Some(dir),
+                verbose: false,
+            }
+        }
+        Action::UnpackStatic | Action::UnpackLive => {
+            let default_out = default_output(&input);
+            let Some(out) = prompt_default("[2/3] 输出路径", &default_out.display().to_string())
+            else {
+                return false;
+            };
+            let out = if out.trim().is_empty() {
+                default_out
+            } else {
+                PathBuf::from(out.trim().trim_matches('"'))
+            };
+            let packer = match action {
+                Action::UnpackStatic => PackerChoice::Upx,
+                _ => PackerChoice::Auto,
+            };
+            Command::Unpack {
+                input,
+                output: Some(out),
+                create_data_sections: false,
+                shrink: true,
+                verbose: false,
+                packer,
+            }
+        }
+    };
+
+    run_confirmed(&cmd, "[3/3] 确认执行")
+}
+
+/// The verify flow: compare an unpacked product against a known-good file.
+///
+/// `/verify` is read-only and headless, so this is the one advanced command
+/// that is safe to hand a beginner without any desktop-session caveats.
+fn verify_flow() -> bool {
+    let Some(unpacked) = ask_path("[1/2] 产物路径（脱壳输出的文件）") else {
+        return false;
+    };
+    let Some(reference) = ask_path("[2/2] 参考文件路径（已知-good 的对照）") else {
+        return false;
+    };
+    run_confirmed(
+        &Command::Verify {
+            unpacked,
+            reference,
+        },
+        "确认执行",
+    )
+}
+
+/// Show the command, ask for confirmation, run it, report the outcome.
+fn run_confirmed(cmd: &Command, label: &str) -> bool {
+    println!("\n  将执行：{}", describe(cmd));
+    let Some(go) = confirm(label, true) else {
+        return false;
+    };
+    if !go {
+        println!("已取消，未执行任何操作。\n");
+        return true;
+    }
+
+    println!();
+    let started = std::time::Instant::now();
+    match crate::commands::run_command(cmd.clone()) {
+        Ok(()) => println!("\n✓ 完成（{:.1}s）。", started.elapsed().as_secs_f32()),
+        Err(e) => println!("\n✗ 失败：{e:#}"),
+    }
+    true
+}
+
+/// Ask for a valid file path, re-prompting on bad input.
+///
+/// `None` means the user quit (`q`) or input ended — the wizard exits.
+fn ask_path(label: &str) -> Option<PathBuf> {
+    loop {
+        let raw = prompt(label)?;
+        if raw.trim().eq_ignore_ascii_case("q") {
+            println!("已退出。");
+            return None;
+        }
+        match validate_path(&raw) {
+            Ok(p) => return Some(p),
+            Err(msg) => println!("  ✗ {msg}（重试，或输入 q 退出）\n"),
+        }
     }
 }
 
@@ -293,6 +355,16 @@ fn describe(cmd: &Command) -> String {
                 .map(|d| format!(" --extract {}", d.display()))
                 .unwrap_or_default();
             format!("mida-cli /analyze {}{extract}", input.display())
+        }
+        Command::Verify {
+            unpacked,
+            reference,
+        } => {
+            format!(
+                "mida-cli /verify {} {}",
+                unpacked.display(),
+                reference.display()
+            )
         }
         other => format!("{other:?}"),
     }
@@ -534,5 +606,11 @@ mod tests {
             verbose: false,
         };
         assert_eq!(describe(&cmd), "mida-cli /analyze t.exe --extract out");
+
+        let cmd = Command::Verify {
+            unpacked: PathBuf::from("tU.exe"),
+            reference: PathBuf::from("t_ref.exe"),
+        };
+        assert_eq!(describe(&cmd), "mida-cli /verify tU.exe t_ref.exe");
     }
 }
