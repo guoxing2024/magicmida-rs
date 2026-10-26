@@ -137,6 +137,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   innocent (manifest and POSTMORTEMS carry the evidence).
 
 ### Fixed
+- **The decoded VMProtect payload was named and sold as an EXE** — the measured
+  `Packed`-line product `e7004e89…` carries `IMAGE_FILE_DLL` (file
+  characteristics `0x2022`), so `CreateProcess` refuses it with "is not a valid
+  application for this OS platform" and a user handed `…rcdata131.decoded.exe`
+  got exactly that. The launcher family (`zz_test.exe`, byte-identical to
+  `启动器10.9.exe`) loads it with `LoadLibrary`. Both carve paths
+  (`/analyze --extract`, `/dump-image`) now name the decoded output by what the
+  bytes declare (`is_dll_image`, unit-tested): `…rcdata131.decoded.dll`.
 - **`mida-run` parser missed the non-Themida product lines** — `RunState
   .output_path` / `output_size` were only filled from `Unpacked: <path>`
   (Themida) and `Dump written successfully path=…` (/dump-image), so a fully

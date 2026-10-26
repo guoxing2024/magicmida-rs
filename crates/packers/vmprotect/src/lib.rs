@@ -58,5 +58,5 @@ pub use report::{
 };
 pub use resources::{large_resources, walk_resources, LargeResource, ResourceEntry, LARGE_RESOURCE_MIN, RT_RCDATA};
 pub use payload_xor::{
-    looks_like_pe_image, transform_for, PayloadTransform, KNOWN_TRANSFORMS,
+    is_dll_image, looks_like_pe_image, transform_for, PayloadTransform, KNOWN_TRANSFORMS,
 };

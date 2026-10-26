@@ -26,8 +26,8 @@ SHA-256 recorded in `crates/packers/themida/tests/cases/`.
 | **Themida v3, x64, EXE** | ✅ Works | 186 resolved imports / 0 failed / 8 `not-an-import`; product launches to its `授权验证` window. Gate: `e2e_gate.rs` |
 | **Themida v3, x64, DLL** | ✅ Works | 289 resolved / 0 failed / 3 `not-an-import`; product loads through a real `LoadLibraryW`, `GetAppVersion()` returns `"1.1"`, `Run()` reaches `PigToGoLicenseDialog`. Gate: `dll_e2e_gate.rs` |
 | **Themida v3, x86, EXE** | ✅ Works | 55 resolved / 0 failed / 55 `not-an-import`; product's `MidaX86Sample` window appears in ~24 ms. Gate: `x86_e2e_gate.rs` |
-| **VMProtect 3.x, x64, `MinProtection`** | ✅ Works | Identified with evidence; structure reported; payload extracted byte-exactly (`91d585e6…`) and decoded onward to a runnable PE (`e7004e89…`). At this mode the original code is already in the file, so there is nothing to rebuild. |
-| **VMProtect 3.x, x64, `Packed`** | ✅ Works | Identified with evidence. Original sections are absent from the file, so `/dump-image --wait` captures them from a live process, flattens the image, and decodes the payload to a runnable PE (`e7004e89…`). |
+| **VMProtect 3.x, x64, `MinProtection`** | ✅ Works | Identified with evidence; structure reported; payload extracted byte-exactly (`91d585e6…`, magic `XMP2QH_`). At this mode the original code is already in the file, so there is nothing to rebuild. |
+| **VMProtect 3.x, x64, `Packed`** | ✅ Works | Identified with evidence. Original sections are absent from the file, so `/dump-image --wait` captures them from a live process, flattens the image, and decodes the embedded payload (`14596cbd…` → `e7004e89…`) — byte-reconciled against the file the packer family itself writes out at run time, and load-tested (`LoadLibrary` + `DllMain` + ordinal exports; it is a `IMAGE_FILE_DLL`, named `.decoded.dll`). |
 | **VMProtect 3.x, x86** | ❓ No evidence | The detector is not architecture-specific, but only x64 targets have been measured. |
 | Themida **v1 / v2** | ❓ No evidence | Detection code exists; never run on a real sample |
 
@@ -67,7 +67,7 @@ attaches a debugger, so unlike `/unpack` these commands run headless.
 | Structure report | `/analyze` | runtime section, packed sections, virtualised-function stubs, scrambled `.pdata`, relocated exception directory |
 | Extract a payload that is in the file | `/analyze --extract` | `伦伦软件.exe` → 16,102,969 B, sha256 `91d585e6…`, magic `XMP2QH_` |
 | Capture a live image, flattened | `/dump-image <pid> <out> --wait` | 43,315,200 B, 9 sections all `PointerToRawData == VirtualAddress`; the dump's `.text` decodes 100.0% |
-| Decode the payload to a runnable PE | both of the above | `14596cbd…` → `e7004e89…`, PE32+ x64, 9 sections, byte-exact |
+| Decode the embedded payload | both of the above | `14596cbd…` → `e7004e89…`: PE32+ x64, 9 sections, **`IMAGE_FILE_DLL`** (ordinal-only exports, 65,328 slots / 0 names) — named `.decoded.dll`, because `CreateProcess` refuses it and the family loads it with `LoadLibrary` |
 
 Two modes are measured, and they need different pipelines:
 
@@ -140,7 +140,9 @@ The full measurement tables are in [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
   so `likely_themida: false` is diagnosable instead of useless
 - **VMProtect branch** — mode classification, structure report, in-file payload
   extraction, a debugger-free live image capture, and a measured payload decode
-  to a runnable PE. Backed by a CI gate over 14 third-party samples
+  that is byte-reconciled against the packer family's own run-time output and
+  load-tested (`LoadLibrary` + `DllMain` + ordinal exports). Backed by a CI gate
+  over 14 third-party samples
 - **UPX branch** — detection, `PackHeader` parsing, a static layout report,
   and the **static unpacker**: `/unpack --packer upx` restores the original
   file with no process and no desktop session, byte-for-byte identical to
@@ -300,7 +302,7 @@ family self-terminate.
 [INFO] Image settled after 3 sample(s) in 2.83s
 [GOOD] Wrote 43315200 bytes to image.exe
 [GOOD] Carved payload type 10 id 131 to image.rcdata131.bin (12782080 B, sha256 14596cbd…)
-[GOOD] Decoded payload type 10 id 131 to image.rcdata131.decoded.exe (12782080 B, sha256 e7004e89…)
+[GOOD] Decoded payload type 10 id 131 to image.rcdata131.decoded.dll (12782080 B, sha256 e7004e89…)
 ```
 
 Three files come out:
@@ -309,14 +311,17 @@ Three files come out:
 |---|---|
 | `image.exe` | The flattened live image (offset == RVA for all 9 sections). Feed this to a disassembler. |
 | `image.rcdata131.bin` | The payload as the packer leaves it — still an encrypted container. |
-| `image.rcdata131.decoded.exe` | **The runnable product.** PE32+ x64, 9 sections. |
+| `image.rcdata131.decoded.dll` | **The payload program the family itself loads.** PE32+ x64, 9 sections, `IMAGE_FILE_DLL` — it loads with `LoadLibrary`, not `CreateProcess`, hence the name. |
 
 **Step 3 — verify what you got** (optional but cheap):
 
 ```text
-> mida-cli /analyze image.rcdata131.decoded.exe
-Architecture: x64, 9 sections … Packer: (none of the known packers)
+> mida-cli /analyze image.rcdata131.decoded.dll
+… Packer: VMProtect (min-protection)
 ```
+
+Re-classifying as `MinProtection` is the structural receipt that the original
+code is back in the file.
 
 Three traps this workflow has already paid for:
 
@@ -434,7 +439,8 @@ loaded at its preferred base.
 
 Payloads are then carved out of the image: the same `RT_RCDATA` that is absent
 from the input file is present in a captured one, and a measured decode turns it
-into a runnable PE beside it.
+into the payload program the family itself loads, named `.decoded.dll` or
+`.decoded.exe` by what the decoded bytes declare.
 
 Residual differences from the on-disk file are expected, not defects: `.rdata`
 holds a *resolved* IAT in memory where the file holds on-disk thunks, and
@@ -578,7 +584,7 @@ user-downloaded and verified at runtime via SHA-256 checksums (see
 | VMProtect | Status | Notes |
 |---|---|---|
 | **`MinProtection`** | ✅ verified | Identified, structure reported, payload extracted and decoded. 14 corpus samples gated in CI. |
-| **`Packed`** | ✅ verified | Original sections are not in the file; `/dump-image --wait` captures them from a live process and the payload decodes to a runnable PE. |
+| **`Packed`** | ✅ verified | Original sections are not in the file; `/dump-image --wait` captures them from a live process and the payload decodes to the family's own program (`e7004e89…`, a payload DLL), byte-reconciled against the family's own run-time output and load-tested. |
 | **x86** | ❓ unverified | Detector is not architecture-specific, but no x86 VMProtect target has been measured. |
 | **`FullVirtualize`** | ❓ not exercised | A per-function option; no sample produced. |
 | **devirtualisation** | ❌ not attempted | Deliberately out of scope; not claimed. |

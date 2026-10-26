@@ -96,6 +96,34 @@ pub fn looks_like_pe_image(bytes: &[u8]) -> bool {
     e >= 0x40 && e.checked_add(4).is_some_and(|end| end <= bytes.len()) && &bytes[e..e + 4] == b"PE\0\0"
 }
 
+/// `true` when the decoded image declares itself a DLL in its file header.
+///
+/// This decides the *file name* of the decoded product, not just cosmetics: the
+/// measured payload of the `Packed` launcher family carries
+/// `IMAGE_FILE_DLL`, and `CreateProcess` refuses such an image with
+/// "is not a valid application for this OS platform" — a user handed a
+/// `.decoded.exe` double-clicks it and gets exactly that error.  Naming it
+/// `.decoded.dll` states the fact the bytes carry.
+///
+/// Returns `false` for anything that does not parse down to the file-header
+/// characteristics; the caller is expected to have accepted the image as a PE
+/// already.
+pub fn is_dll_image(bytes: &[u8]) -> bool {
+    if !looks_like_pe_image(bytes) {
+        return false;
+    }
+    let e = u32::from_le_bytes([bytes[0x3c], bytes[0x3d], bytes[0x3e], bytes[0x3f]]) as usize;
+    let machine_and_more = e + 4;
+    // COFF File Header: Machine (2) + NumberOfSections (2) + TimeDateStamp (4)
+    // + PointerToSymbolTable (4) + NumberOfSymbols (4) + SizeOfOptionalHeader
+    // (2) + Characteristics (2) → offset 18 from the PE signature.
+    let chars_at = machine_and_more + 18;
+    let Some(chars) = bytes.get(chars_at..chars_at + 2) else {
+        return false;
+    };
+    u16::from_le_bytes([chars[0], chars[1]]) & 0x2000 != 0 // IMAGE_FILE_DLL
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +178,40 @@ mod tests {
         assert!(transform_for(Some(10), Some(132)).is_none());
         assert!(transform_for(Some(3), Some(131)).is_none());
         assert!(transform_for(None, Some(131)).is_none());
+    }
+
+    /// A minimal but field-exact PE head: DOS header with `e_lfanew 0x80`,
+    /// PE signature, and a COFF file header whose Characteristics the caller
+    /// sets.  Mirrors how the real payload head is shaped (`e_lfanew 0x80`).
+    /// Characteristics sit at `e_lfanew + 4 (signature) + 18 (COFF offset)`.
+    fn pe_head(characteristics: u16) -> Vec<u8> {
+        let mut b = vec![0u8; 0xa0];
+        b[0..2].copy_from_slice(b"MZ");
+        b[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        b[0x80..0x84].copy_from_slice(b"PE\0\0");
+        b[0x96..0x98].copy_from_slice(&characteristics.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn the_dll_bit_decides_the_extension() {
+        // The measured payload is an EXE-shaped head plus IMAGE_FILE_DLL.
+        assert!(is_dll_image(&pe_head(0x2022)), "0x2022 carries IMAGE_FILE_DLL");
+        assert!(is_dll_image(&pe_head(0x2100 | 0x2000 | 0x0002)));
+        // An ordinary EXE image must not be renamed.
+        assert!(!is_dll_image(&pe_head(0x0022)));
+        assert!(!is_dll_image(&pe_head(0x0106 | 0x0002)));
+    }
+
+    #[test]
+    fn is_dll_image_never_panics_on_truncated_input() {
+        assert!(!is_dll_image(b""));
+        assert!(!is_dll_image(b"MZ"));
+        // `looks_like_pe_image` accepts a head truncated inside the COFF
+        // header (it only reads the signature), so the DLL check must survive
+        // that shape on its own.
+        assert!(!is_dll_image(&pe_head(0x2022)[..0x96])); // cut before Characteristics
+        assert!(!is_dll_image(&pe_head(0x2022)[..0x97])); // one Characteristics byte
+        assert!(!is_dll_image(&pe_head(0x2022)[..0x80])); // cut before the signature
     }
 }

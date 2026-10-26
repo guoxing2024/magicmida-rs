@@ -40,7 +40,7 @@
 //! binary asks for; it is what this family installs.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Bytes of the reference image, which is the same shape a capture must have.
 const EXPECT_IMAGE_SIZE: u64 = 43_315_200;
@@ -227,6 +227,14 @@ fn the_input_file_still_yields_nothing() {
 /// XOR key, `K[i] == K[i-32]` holding across all 12,782,080 bytes with exactly
 /// one distinct 32-byte block and only 31 distinct byte values.
 ///
+/// The decoded product is then pinned to the **structural baseline**: the
+/// measured payload is not an EXE but a `IMAGE_FILE_DLL` PE32+ with 9
+/// sections, a self-consistent `SizeOfImage`, imports, and an ordinal-only
+/// export directory (65,328 slots, zero names — the suite calls it by
+/// ordinal), and it re-classifies as VMProtect `MinProtection` — original code
+/// back in the file, which is the structural definition of "recovered".  The
+/// behavioural half of the baseline lives in the `#[ignore]`d load test below.
+///
 /// It also checks the negative direction: the same key applied to a *different*
 /// resource must not be accepted as a PE, which is what stops the transform
 /// table from turning into blind decryption.
@@ -265,6 +273,73 @@ fn the_decoded_payload_is_reproducible_from_a_captured_image_alone() {
         "the decoded payload drifted from the measured value"
     );
 
+    // ---- the structural baseline of the decoded product -------------------
+    //
+    // "It looks like a PE" is not the claim; these are.  Measured 2026-10-26
+    // on the decoded product of the reference image, and re-confirmed by the
+    // behavioural load test: the product is a DLL the suite loads by
+    // LoadLibrary, not a program CreateProcess would start.
+    let dpe = mida_pe::PeHeader::from_bytes(&decoded)
+        .expect("the decoded payload must parse as a full PE header");
+    assert!(dpe.is_64bit, "the decoded payload should be PE32+");
+    assert_eq!(dpe.sections.len(), 9, "the decoded payload should have 9 sections");
+    assert!(
+        mida_packers_vmprotect::is_dll_image(&decoded),
+        "the decoded payload must carry IMAGE_FILE_DLL — naming it .exe \
+         makes the OS refuse it with 'not a valid application'"
+    );
+
+    // SizeOfImage must agree with what the section table describes, or the
+    // Windows loader maps the image wrong before any of our code runs.
+    let span = dpe
+        .sections
+        .iter()
+        .map(|s| s.virtual_address.saturating_add(s.virtual_size))
+        .max()
+        .expect("sections");
+    let aligned = span.div_ceil(dpe.section_alignment) * dpe.section_alignment;
+    assert_eq!(
+        aligned,
+        dpe.nt_headers.optional_header.size_of_image,
+        "SizeOfImage does not match the section table — the loader would \
+         refuse or mis-map this image"
+    );
+
+    // Import directory must be present and resolvable-shape; the export
+    // directory must be the measured ordinal-only form.
+    const IMPORT_DIR: usize = 1;
+    const EXPORT_DIR: usize = 0;
+    let imp = dpe.nt_headers.optional_header.data_directory[IMPORT_DIR];
+    assert_ne!(imp.virtual_address, 0, "no import directory — nothing could load this");
+    let exp = dpe.nt_headers.optional_header.data_directory[EXPORT_DIR];
+    assert_ne!(exp.virtual_address, 0, "no export directory — the suite could not call it");
+    let exp_bytes = read_rva(&dpe, &decoded, exp.virtual_address as usize, exp.size as usize)
+        .expect("export directory bytes must be inside the decoded image");
+    // NumberOfFunctions at +20, NumberOfNames at +24 (IMAGE_EXPORT_DIRECTORY).
+    let n_funcs = u32::from_le_bytes(exp_bytes[20..24].try_into().unwrap());
+    let n_names = u32::from_le_bytes(exp_bytes[24..28].try_into().unwrap());
+    assert_eq!(n_funcs, 65_328, "export slot count moved");
+    assert_eq!(n_names, 0, "measured ordinal-only exports; names appearing is a change");
+    assert!(
+        exp.size as usize >= 24 + n_funcs as usize * 4,
+        "export directory too small for its own function table"
+    );
+
+    // And the decisive classification: the product of the Packed line is a
+    // MinProtection target — original code back in the file, entry point
+    // present, nothing requiring a runtime dump.  That is the structural
+    // definition of "the original program was recovered".
+    let report = mida_packers_vmprotect::analyze(&dpe, &decoded);
+    assert_eq!(
+        report.mode,
+        mida_packer_api::VmProtectMode::MinProtection,
+        "the decoded payload must re-classify as MinProtection"
+    );
+    assert!(
+        !report.requires_runtime_dump(),
+        "a recovered program must not itself demand a runtime dump"
+    );
+
     // A wrong key must be rejected by the data, not by trusting the table.
     let mut wrong = transform.xor_key.to_vec();
     wrong[0] ^= 0xff;
@@ -277,6 +352,21 @@ fn the_decoded_payload_is_reproducible_from_a_captured_image_alone() {
         !mida_packers_vmprotect::looks_like_pe_image(&garbage),
         "a corrupted key must not be accepted as producing a PE image"
     );
+}
+
+/// Map an RVA inside `image` to a byte slice, using the section table of `pe`.
+fn read_rva<'a>(
+    pe: &mida_pe::PeHeader,
+    image: &'a [u8],
+    rva: usize,
+    size: usize,
+) -> Option<&'a [u8]> {
+    let s = pe.sections.iter().find(|s| {
+        let va = s.virtual_address as usize;
+        va <= rva && rva + size <= va + s.virtual_size.max(s.raw_size) as usize
+    })?;
+    let off = s.raw_offset as usize + (rva - s.virtual_address as usize);
+    image.get(off..off + size)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -420,4 +510,194 @@ fn the_decoded_payload_is_a_pe_that_the_sample_writes_to_temp() {
     );
 
     let _ = std::fs::remove_file(&path);
+}
+// ---------------------------------------------------------------------------
+// The behavioural half of the reconciliation baseline
+// ---------------------------------------------------------------------------
+
+/// Build the load probe (`tests/fixtures/vmp_load_probe.c`) with the same
+/// bare-`gcc` convention the Themida DLL gate uses for its harness.
+fn build_load_probe(out_dir: &Path) -> PathBuf {
+    let exe = out_dir.join("vmp_load_probe.exe");
+    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("vmp_load_probe.c");
+    assert!(src.exists(), "probe source missing at {}", src.display());
+    let output = Command::new("gcc")
+        .arg("-O2")
+        .arg("-o")
+        .arg(&exe)
+        .arg(&src)
+        .output()
+        .unwrap_or_else(|e| panic!("cannot run gcc to build the load probe: {e}"));
+    assert!(
+        output.status.success(),
+        "probe build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    exe
+}
+
+/// The decoded product must **load and initialise** the way the launcher
+/// family actually uses it.
+///
+/// # Why this exists, and why it says LoadLibrary
+///
+/// The product carries `IMAGE_FILE_DLL`; the family writes these exact bytes
+/// to `%TEMP%\<guid>.log` at run time (byte-reconciled by the test above) and
+/// loads them with `LoadLibrary`, not `CreateProcess`.  Measured 2026-10-26 on
+/// the reference decode:
+///
+///   LOADED=1, EXPORT_SLOTS=65328 NAMES=0 NONZERO=60 BASE=37,
+///   FIRST_EXPORT ordinal=66 resolves=1, THREADS=4, exit 0
+///
+/// So the behavioural baseline is not "a window appears" (there is none) and
+/// not "the process starts" (the OS refuses a DLL image: "is not a valid
+/// application for this OS platform").  It is: a host can map it, its
+/// `DllMain` completes and starts its worker threads, and the ordinal-only
+/// exports resolve.  A decode that is byte-wrong would fail somewhere in that
+/// chain — the imports are resolved, the relocations applied, the TLS
+/// initialisers run, `DllMain` executes — which is what makes this a real
+/// behavioural check rather than a structural one.
+///
+/// The probe runs in a **sacrificial child process** (the DLL is third-party
+/// and spawns threads; loading it into the test runner would leave the test
+/// process polluted and make a hang unrecoverable).  It is also why this test
+/// is `#[ignore]`d: it executes third-party code, which CI must not do.
+///
+/// # Measured discriminating power (2026-10-26)
+///
+/// One flipped byte inside `.text` — code `DllMain` never executes — still
+/// loads cleanly: this probe does **not** see dead-code corruption.  That is
+/// the byte golden's job (the SHA-256 assert above is exact).  One flipped
+/// byte inside `.rdata2` (the VM runtime section, executed during
+/// initialisation) crashes the host with an access violation, and the probe's
+/// non-zero exit turns this gate red.  So the split of duty is: the golden
+/// answers "are these the right bytes", this gate answers "does the product
+/// actually survive the loader and initialise".
+#[test]
+#[ignore = "LoadLibrary's a third-party payload DLL in a sacrificial process: needs a desktop session and gcc"]
+fn the_decoded_dll_loads_and_initializes() {
+    let reference = PathBuf::from(r"D:\Projects\qidongqi\out\ida\main.exe");
+    if !reference.exists() {
+        println!("SKIP: no reference image at {}", reference.display());
+        return;
+    }
+
+    // ---- decode exactly as the pipeline does ----
+    let image = std::fs::read(&reference).expect("read the reference image");
+    let pe = mida_pe::PeHeader::from_bytes(&image).expect("parse the reference image");
+    let container = mida_packers_vmprotect::large_resources(&pe, &image)
+        .into_iter()
+        .find(|r| r.name_id == Some(131))
+        .expect("the reference image must carry RT_RCDATA id 131");
+    let bytes = container.bytes(&image).expect("container must be in the image");
+    let transform = mida_packers_vmprotect::transform_for(container.type_id, container.name_id)
+        .expect("a measured transform must exist");
+    let decoded = transform.apply(bytes);
+    assert!(
+        mida_packers_vmprotect::is_dll_image(&decoded),
+        "the probe expects the measured DLL payload"
+    );
+
+    let work = std::env::temp_dir().join(format!("mida-vmp-load-{}", std::process::id()));
+    std::fs::create_dir_all(&work).expect("create work dir");
+    let product = work.join("product.dll");
+    std::fs::write(&product, &decoded).expect("write the decoded product");
+    let probe = build_load_probe(&work);
+
+    // ---- run the probe with a hard timeout ----
+    //
+    // If the product's DllMain deadlocks, LoadLibraryW never returns; the test
+    // must fail with the probe's partial output instead of hanging forever.
+    let mut child = Command::new(&probe)
+        .arg(&product)
+        .arg("6")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("cannot start the load probe: {e}"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        if let Some(s) = child.try_wait().expect("wait on probe") {
+            break s;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let out = child.wait_with_output().expect("collect after kill");
+            panic!(
+                "the load probe did not finish in 30 s — the product's DllMain \
+                 likely deadlocked. Partial output:\n{}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let out = child.wait_with_output().expect("collect probe output");
+    let log = String::from_utf8_lossy(&out.stdout).to_string()
+        + &String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        status.success(),
+        "the product did not load/initialise cleanly (probe exit {:?}):\n{log}",
+        status.code()
+    );
+
+    // ---- the baseline assertions ----
+    let field = |line_prefix: &str, key: &str| -> Option<String> {
+        log.lines()
+            .find(|l| l.starts_with(line_prefix))
+            .and_then(|l| {
+                l.split_whitespace()
+                    .find_map(|t| t.strip_prefix(&format!("{key}=")).map(str::to_string))
+            })
+    };
+
+    assert_eq!(
+        field("LOADED=", "LOADED").as_deref(),
+        Some("1"),
+        "LoadLibrary failed:\n{log}"
+    );
+
+    // Exports: the measured ordinal-only table, identical in the file and in
+    // the loaded image.
+    assert_eq!(
+        field("EXPORT_SLOTS=", "EXPORT_SLOTS").as_deref(),
+        Some("65328"),
+        "export slot count moved:\n{log}"
+    );
+    assert_eq!(
+        field("EXPORT_SLOTS=", "NAMES").as_deref(),
+        Some("0"),
+        "the suite calls this DLL by ordinal; named exports appearing is a change:\n{log}"
+    );
+    assert_eq!(
+        field("EXPORT_SLOTS=", "NONZERO").as_deref(),
+        Some("60"),
+        "non-empty export entries moved:\n{log}"
+    );
+    assert_eq!(
+        field("FIRST_EXPORT", "ordinal").as_deref(),
+        Some("66"),
+        "first exported ordinal moved:\n{log}"
+    );
+    assert_eq!(
+        field("FIRST_EXPORT", "resolves").as_deref(),
+        Some("1"),
+        "GetProcAddress by ordinal must resolve the first export:\n{log}"
+    );
+
+    // DllMain completed and started the measured worker threads (4 observed;
+    // >= 2 tolerates one thread exiting early without losing the signal).
+    let threads: u32 = field("THREADS=", "THREADS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("probe reported no thread count:\n{log}"));
+    assert!(
+        threads >= 2,
+        "DllMain started no worker threads (observed {threads}) — the payload \
+         did not initialise:\n{log}"
+    );
+
+    let _ = std::fs::remove_dir_all(&work);
 }

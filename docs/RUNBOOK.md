@@ -186,15 +186,51 @@ ab f0 ea 37 6e d4 22 7e 81 65 f7 d2 32 96 56 2f
 **接受条件由数据自己判**：变换后必须是结构合法的 PE，否则拒绝并保留容器 ——
 错误的密钥不能因为"表里有"就通过（gate 里有一条专门喂坏密钥的反向断言）。
 
-CLI 两个入口都输出两份文件：
+CLI 两个入口都输出两份文件（**解码产物按它自己声明的 `IMAGE_FILE_DLL` 命名**，
+不再一律 `.exe`，见下）：
 
 ```
-img.rcdata131.bin          容器（14596cbd…）
-img.rcdata131.decoded.exe  解完的 PE（e7004e89…）
+img.rcdata131.bin           容器（14596cbd…）
+img.rcdata131.decoded.dll   解完的载荷（e7004e89…）
 ```
 
 **别把它当通用解密**：这条密钥只对这一个家族、这一个资源成立。表里加条目的门槛是
 "从两份独立产物量出来"，猜的密钥比没有更糟 —— 它会产出看着很像的垃圾。
+
+### 对账基准（2026-10-26 定义，宣称"第二类脱壳"的前置）
+
+对账对象是**解码产物**（`e7004e89…`），不是整镜像。基准分三层，全部有 gate：
+
+**① 字节层 —— 对账到家族自己的运行期产物。**
+`zz_test.exe`（=`E:\Download\启动器10.9\启动器10.9.exe`，**逐字节同文件**，hash 同
+`804fd7c1…`）运行时自己把解完的载荷写到 `%TEMP%\<guid>.log`（约半数启动，t≈3.5 s，
+分支性行为）。这就是独立生产者 —— UPX 线的 `upx -d` 在这条线上的等价物。三份独立
+容器副本（资源 dump / 样本自带 ID131 / `/dump-image` carve）全部解出同一
+`e7004e89…`，launcher 自己写的文件也是它。gate：`the_decoded_payload_is_reproducible_
+from_a_captured_image_alone`（CI，对参考镜像）+ `the_decoded_payload_is_a_pe_that_
+the_sample_writes_to_temp`（活体，允许跳过 —— 写盘本身是分支性的）。
+
+**② 结构层 —— 解码产物本身是什么，一条条钉死（CI）。**
+`e7004e89…` 是 **PE32+ x64 / 9 段 / `IMAGE_FILE_DLL`**（file characteristics
+`0x2022` 含 DLL 位）—— 它是**给宿主装载的 DLL，不是 CreateProcess 起的程序**。
+`SizeOfImage` 与段表自洽（`0xc6b000`）；导入目录在（KERNEL32/USER32/GDI32/ADVAPI32/
+WINHTTP）；**导出目录是纯序号形态：65,328 槽 / 0 个名字 / base 0x25 / 60 个真导出**
+（套件按 ordinal 调它，名字被抹掉）；并且**重新分类为 VMProtect `MinProtection`**
+—— 原始代码回到文件里，这正是"原始程序被还原"的结构定义。CLI 两个入口的解码产物
+因此按字节自己声明命名 `.decoded.dll`（此前一律 `.exe`，用户双击就是 OS 的
+"不是有效的应用程序"，是产品缺陷）。
+
+**③ 行为层 —— 装载与初始化（`#[ignore]`，不进 CI）。**
+探针 `crates\cli\tests\fixtures\vmp_load_probe.c`（gate 现场用 gcc 编，牺牲子进程）
+`LoadLibraryW` 产物：LOADED=1、`DllMain` 跑完并起工作线程（实测 4 条）、
+`GetProcAddress(ordinal 66)` 解析成功、退出码 0。判别力实测（2026-10-26）：
+`.text` 里翻 1 字节（`DllMain` 不执行的死代码）**测不出** —— 那归字节 golden 管；
+`.rdata2`（装载期必执行的 VM runtime 段）翻 1 字节 → 宿主访问违例崩 → gate 红。
+分工：**golden 管"字节对不对"，行为 gate 管"能不能过 loader 并完成初始化"。**
+
+**宣称边界**：本线宣称的是 *容器 → 字节对账到家族自身运行期产物 + 可被宿主装载并
+完成初始化*。不宣称"完整功能跑起来"（那要套件按序号调用的上下文）、不宣称通用
+解密（密钥按家族记录）、不宣称 devirt。
 
 ### 整镜像哈希**不是** golden
 
@@ -208,8 +244,11 @@ img.rcdata131.decoded.exe  解完的 PE（e7004e89…）
 cargo test --release -p mida-cli --test vmprotect_packed_gate -- --ignored --nocapture
 ```
 
-`#[ignore]`（要真进程 + 桌面会话）。三条：捕获+carve（5/5 通过）、
-输入文件仍必须拒绝提取、以及一条**不需要样本**的常量自检（参考镜像仍是 9 段 / 43,315,200 B）。
+`#[ignore]`（要真进程 + 桌面会话）。活体五条：捕获+carve、输入文件仍必须拒绝提取、
+**解码产物装载与初始化（行为层，牺牲子进程 + gcc 现场编探针）**、launcher 自写载荷
+的哈希对账（允许跳过 —— 写盘是分支性的）、以及一条**不需要样本**的常量自检
+（参考镜像仍是 9 段 / 43,315,200 B）。CI 档两条：解码复现 + **结构基线**（DLL 位、
+SizeOfImage 自洽、序号导出 65328/0、重新分类 MinProtection）与常量自检。
 
 ## UPX：静态解包（2026-10-26 打通）
 

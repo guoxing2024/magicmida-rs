@@ -200,7 +200,7 @@ fn extract_payloads(
                 {
                     let decoded = t.apply(bytes);
                     if mida_packers_vmprotect::looks_like_pe_image(&decoded) {
-                        let dpath = dir.join(decoded_file_name(input, resource));
+                        let dpath = dir.join(decoded_file_name(input, resource, &decoded));
                         std::fs::write(&dpath, &decoded).with_context(|| {
                             format!("Failed to write {}", dpath.display())
                         })?;
@@ -283,9 +283,15 @@ fn describe(resource: &LargeResource) -> String {
     }
 }
 
-/// `stem.rcdata<id>.decoded.exe` — the decoded form of a carved container, kept
-/// beside it so the two can be compared byte for byte.
-fn decoded_file_name(input: &Path, resource: &LargeResource) -> String {
+/// `stem.rcdata<id>.decoded.<exe|dll>` — the decoded form of a carved container,
+/// kept beside it so the two can be compared byte for byte.
+///
+/// The extension follows what the decoded bytes declare, not an assumption:
+/// the measured launcher-family payload carries `IMAGE_FILE_DLL`, and handing
+/// a user a `.exe` that `CreateProcess` refuses ("is not a valid application
+/// for this OS platform") is a defect we shipped once — the name must not be
+/// the reason.
+fn decoded_file_name(input: &Path, resource: &LargeResource, decoded: &[u8]) -> String {
     let stem = input
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -295,7 +301,8 @@ fn decoded_file_name(input: &Path, resource: &LargeResource) -> String {
         (None, Some(name)) => name.clone(),
         (None, None) => "unknown".to_string(),
     };
-    format!("{stem}.rcdata{id}.decoded.exe")
+    let ext = if mida_packers_vmprotect::is_dll_image(decoded) { "dll" } else { "exe" };
+    format!("{stem}.rcdata{id}.decoded.{ext}")
 }
 
 /// Lowercase hex SHA-256, so the log line can be checked against a hash the user

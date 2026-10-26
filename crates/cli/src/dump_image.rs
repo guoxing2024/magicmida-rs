@@ -522,7 +522,7 @@ fn carve_payloads(image: &[u8], output: &Path) {
             );
             continue;
         }
-        let decoded_path = dir.join(decoded_name(&stem, r));
+        let decoded_path = dir.join(decoded_name(&stem, r, &decoded));
         match std::fs::write(&decoded_path, &decoded) {
             Ok(()) => log::log(
                 LogType::Good,
@@ -542,14 +542,21 @@ fn carve_payloads(image: &[u8], output: &Path) {
     }
 }
 
-/// `<stem>.rcdata<id>.decoded.exe` — the decoded form, kept beside the container
-/// so the two can be compared byte for byte.
-fn decoded_name(stem: &str, r: &mida_packers_vmprotect::resources::LargeResource) -> String {
+/// `<stem>.rcdata<id>.decoded.<exe|dll>` — the decoded form, kept beside the
+/// container so the two can be compared byte for byte.  The extension follows
+/// what the decoded bytes declare (`IMAGE_FILE_DLL` → `.dll`), same rule as
+/// `/analyze --extract`.
+fn decoded_name(
+    stem: &str,
+    r: &mida_packers_vmprotect::resources::LargeResource,
+    decoded: &[u8],
+) -> String {
     let id = r
         .name_id
         .map(|i| i.to_string())
         .unwrap_or_else(|| "named".to_string());
-    format!("{stem}.rcdata{id}.decoded.exe")
+    let ext = if mida_packers_vmprotect::is_dll_image(decoded) { "dll" } else { "exe" };
+    format!("{stem}.rcdata{id}.decoded.{ext}")
 }
 
 fn describe(r: &mida_packers_vmprotect::resources::LargeResource) -> String {
