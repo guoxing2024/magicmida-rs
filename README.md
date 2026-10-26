@@ -147,8 +147,13 @@ The full measurement tables are in [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
   `upx -d` on the corpus (NRV2B/NRV2D/NRV2E/LZMA decode through a shared
   UCL-core port, filter undo, full `unpack0` PE
   rebuild). Measured against UPX 5.2.1 output and cross-checked against UPX's
-  own source. Also fixes a real trap: UPX's `UPX0` section would otherwise
-  fire the Themida heuristic and hand a UPX file to the Themida debugger loop
+  own source. Two gates over a seven-sample corpus: the byte gate (products
+  equal `upx -d` exactly) and a **behaviour gate** — every product is run
+  and must answer `/version` exactly like its pre-pack control sample
+  (corrupting the entry point in a product makes the gate fail with
+  `0xC0000005`, so the assertion has teeth). Also fixes a real trap: UPX's
+  `UPX0` section would otherwise fire the Themida heuristic and hand a UPX
+  file to the Themida debugger loop
 - **Verify mode** — diff unpacked output against a known-good reference,
   section by section
 - **Guided mode** — running `mida-cli` with no arguments starts a beginner

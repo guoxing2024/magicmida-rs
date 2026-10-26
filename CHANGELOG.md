@@ -100,7 +100,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`459f4f8e…` / `da7a1dce…`) — three new gate entries, corpus now seven
   samples. The port bug this caught: B reads *two* fresh length bits, the
   first Rust draft consumed one and desynced — exactly what the vectors are
-  for.
+  for. 
+- **UPX behaviour gate** — the byte gate proved the products equal `upx -d`
+  but never ran one; the new `upx_behavior_gate` (runs by default, no
+  desktop session) unpacks all six `mida-cli`-derived corpus products and
+  probes each with `/version` against its **pre-pack original as the
+  control**: exit 0, stdout equal to the control's, and the control itself
+  must answer the version banner first (so both-sides-fail-identically
+  cannot pass). `injector_x64.upx.exe` is deliberately excluded — spawning
+  ScyllaHide's injector from a test is a side-effect risk the mida-cli
+  products (a full 6 MB rebuild exercising imports/relocs/TLS) don't need.
+  Discriminating power measured: corrupting a product's
+  `AddressOfEntryPoint` makes the probe die with `0xC0000005` and empty
+  stdout — exactly what the two assertions catch.
 
 ### Fixed
 - **`mida-run` parser missed the non-Themida product lines** — `RunState
