@@ -714,6 +714,28 @@ fn e2e_dll_case_matches_golden_record() {
 // ---------------------------------------------------------------------------
 
 /// `IAT trace complete: {resolved} resolved, {failed} failed`
+
+/// Tracing renders structured fields with ANSI word-wrapping
+/// (`[3mname[0m[2m=[0m`), which breaks plain-substring
+/// scraping of `key=value` lines.  Strip the escapes first — the logs are
+/// data here, not display.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '' {
+            for c2 in chars.by_ref() {
+                if c2.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn extract_trace_counts(log: &str) -> Option<(usize, usize)> {
     let line = log
         .lines()
@@ -733,7 +755,8 @@ fn extract_trace_counts(log: &str) -> Option<(usize, usize)> {
 
 /// `IAT trace complete: {r} resolved, {f} failed, {n} not-an-import`
 fn extract_not_import(log: &str) -> Option<usize> {
-    let line = log.lines().rev().find(|l| l.contains("IAT trace complete: "))?;
+    let clean = strip_ansi(log);
+    let line = clean.lines().rev().find(|l| l.contains("IAT trace complete: "))?;
     let rest = line.split_once("not-an-import")?.0;
     let tail = rest.rsplit_once("failed, ")?.1;
     tail.trim().parse().ok()
@@ -741,7 +764,8 @@ fn extract_not_import(log: &str) -> Option<usize> {
 
 /// `IAT boundaries: ... size=26264 (3283 slots), ...`
 fn extract_iat_slots(log: &str) -> Option<usize> {
-    let line = log.lines().rev().find(|l| l.contains("IAT boundaries:"))?;
+    let clean = strip_ansi(log);
+    let line = clean.lines().rev().find(|l| l.contains("IAT boundaries:"))?;
     let rest = line.split_once("slots)")?.0;
     let n = rest.rsplit_once('(')?.1;
     n.trim().parse().ok()

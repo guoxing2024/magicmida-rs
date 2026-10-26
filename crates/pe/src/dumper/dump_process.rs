@@ -352,7 +352,32 @@ pub fn dump_process(
                 info!("No exception table in the product (cleared Exception dir)");
             }
         }
-        create_reloc_section(&mut pe);
+        // Reservation: the relocation table this dump will generate is
+        // bounded by a sizing scan over the dumped image itself (same RVAs,
+        // fewer exclusions than the final generator — an upper bound).  The
+        // fixed 0x2000 reservation was sized on the v3 samples (~6 KB
+        // tables); a classic v1-generation product reproduces the original
+        // program's pointer table — measured 19,596 bytes on Themida
+        // 1.9.1.0 — which the fixed reservation could not hold, and the
+        // writer refuses to truncate (correctly: a clamped table crashes
+        // under ASLR).
+        //
+        // The sizing scan applies **only** when the dumped section table has
+        // no `.reloc` of its own: classic v1 packed files drop the section,
+        // while every measured v3 packed input keeps one — and for those the
+        // reservation must stay exactly what it was, because their products
+        // are byte-golden (a grown reservation moves `.import`'s VA and the
+        // bytes with it; measured on the x86 gate, 2026-10-26).
+        let dump_has_reloc = pe
+            .sections
+            .iter()
+            .any(|sec| sec.name.trim_end_matches(' ') == ".reloc");
+        let reloc_hint = if dump_has_reloc {
+            0
+        } else {
+            crate::postprocess::estimate_reloc_table_size(&dump_buf, is_64bit)
+        };
+        create_reloc_section(&mut pe, reloc_hint);
     }
 
     // 5. Build import section

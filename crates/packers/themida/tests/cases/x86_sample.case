@@ -131,7 +131,14 @@ expect_output_size: 110592
 # Nothing structural moved: the trace still reports
 # `55 resolved, 0 failed, 55 not-an-import`, the product is still 110,592 B, and
 # `.text` still declares `0x60000020`.
-expect_output_sha256: 53eace5e3958b916e86d43563893e8bf9aa8a1c9073cb8acb21ea0fc07a12ecc
+expect_output_sha256: 4761923dabe02b1b8fe2b6801a19d3f7eb1f7ff6c1f363650a6b191e2f7c6c7c
+
+# Golden re-record 2026-10-26 (fourth record; third environment-drift event).
+# The product bytes moved again on the SAME code: A/B with the c629368-era
+# binary (OUT1v2b_c629368_x86.exe, built from the tree with this round's
+# pipeline changes stashed) produced byte-identical 4761923d... — the code is
+# innocent, the session has another dial (see POSTMORTEMS「两条 golden 在同一台
+# 机器上不再复现」). Previous value 53eace5e... (recorded 2026-10-25).
 
 # PE32, not PE32+.
 expect_is_64bit: false

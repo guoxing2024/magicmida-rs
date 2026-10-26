@@ -62,6 +62,13 @@ pub struct ThemidaState {
     /// is patched with `int3` instead — a deterministic, DEP-independent trigger
     /// for the same transition.
     pub tm_return_int3: Option<(usize, u8)>,
+    /// Classic (v1-generation) OEP verification: the return address a
+    /// candidate OEP was called with, armed as an execute hardware breakpoint.
+    /// `None` while no candidate is being verified.
+    pub classic_pending_ret: Option<usize>,
+    /// Set when the armed return-address breakpoint fired: the candidate
+    /// returned to the protector, so it was a shell helper, not the OEP.
+    pub classic_ret_hit: bool,
 }
 
 impl ThemidaState {
@@ -101,6 +108,8 @@ impl ThemidaState {
             // threshold, the VM is likely stuck in a loop. Force ready.
             iat_timeout_threshold: 1_000,
             tm_return_int3: None,
+            classic_pending_ret: None,
+            classic_ret_hit: false,
         }
     }
 }
@@ -117,6 +126,7 @@ mod tests {
             base_of_data: 0x2000,
             pe_sections: Vec::new(),
             major_linker_version: 14,
+            packed_entry_point: 0,
             themida_version: ThemidaVersion::V3,
             is_vm_oep: false,
             themida_section: None,

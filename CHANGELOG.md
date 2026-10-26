@@ -8,6 +8,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **The classic (v1-generation) unpack pipeline groundwork** — `/unpack` now
+  routes V1/Ancient targets through a measured branch: at the shell's first
+  `CloseHandle` the `.text` guard is installed directly (the v3 write-BP
+  staging never fires for them), `IatFixStrategy::V1` handles the IAT, and the
+  product's `.reloc` reservation is sized from a scan of the dumped image
+  (gated on the dump having no `.reloc` of its own, so the v3 byte-goldens are
+  untouched). Measured end-to-end on Themida 1.9.1.0 (version ladder): the
+  full chain completes — guard → 222,985 recorded decompression-write faults →
+  one `.text` execute candidate → IAT located (2,316 slots / 90 blocks) → 4
+  entries repaired → imports rebuilt (74 thunks) → 2.77 MB product written,
+  exit 0. The product loads and initialises but does not reach the unpackme's
+  own UI (the packed control does) — dump quality is the remaining gap, and
+  **"v1 unpacking works" is not claimed**. Two more measured shapes bound the
+  claim: the 1.1.1 shell materialises the original via a file mapping
+  elsewhere (zero in-place `.text` activity) and defeats the guard approach
+  entirely; the first `.text` execute candidate cannot be verified by its
+  return address (this shell's transfer leaves data, not a return, on the
+  stack — the implemented verification probe logs why it did not arm).
+  Companion fixes: `base_of_data` for classic targets comes from the first
+  section's own span (the packed header's value is garbage — the guard used to
+  cover half the code, OEP outside it, zero faults), `Ancient` maps to the V1
+  IAT strategy, and `fix_iat_v1` leaves unreadable jumper slots untouched
+  instead of aborting the unpack. The three e2e gates' log scrapers now strip
+  the ANSI wrapping tracing puts around structured field names (a latent
+  false-red: `module_count=` assertions could not match the wrapped form).
 - **Themida/WinLicense version fingerprints for 1.x and 2.x** — measured on a
   76-sample version ladder (Themida 1.1.1.0–1.9.1.0, WinLicense 1.1.1.0–2.0.8.0,
   each labelled by its exact packer version, fetched from the archived Tuts 4 You

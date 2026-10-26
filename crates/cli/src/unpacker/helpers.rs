@@ -366,17 +366,54 @@ pub(super) fn handle_hw_breakpoint(
         let at_virtual_alloc = rip == apis.virtual_alloc || rip == apis.nt_allocate_virtual_memory;
 
         if at_close {
-            info!(
-                rip = %format_args!("{rip:#x}"),
-                is_nt_close = rip == apis.nt_close,
-                "CloseHandle/NtClose hit — switching to .text write BP",
+            // ---- classic (v1-generation) stubs: guard immediately ------------
+            //
+            // Measured on Themida 1.1.1.0 (`OUT\v1v2\unpack_t111.log`,
+            // 2026-10-26): the v1 shell's first CloseHandle lands **after**
+            // decompression is already complete — 13.5 s of silence, then the
+            // hit, then the original program running to exit 100 ms later.
+            // The v3 staging (`.text` write BP → VirtualAlloc BP → guard)
+            // therefore never advances past this point for v1: the write BP at
+            // `.text+0x1000` never fires because there are no more `.text`
+            // writes.  The right move is the era-script move: the shell is
+            // done, so protect `.text` right now — the stub's jump to the OEP
+            // becomes an execute fault and the OEP falls out of the
+            // first-fault rule.
+            let classic_stub = matches!(
+                state.pe_info.themida_version,
+                mida_packers_themida::ThemidaVersion::V1
+                    | mida_packers_themida::ThemidaVersion::Ancient
             );
-            dbg.clear_hw_breakpoint(0)?;
-            dbg.set_hw_breakpoint(
-                0,
-                image_base_usize + 0x1000,
-                mida_core::HwbpType::Write,
-            )?;
+            if classic_stub {
+                info!(
+                    rip = %format_args!("{rip:#x}"),
+                    version = ?state.pe_info.themida_version,
+                    "CloseHandle/NtClose hit — classic (v1-generation) stub: \
+                     installing the .text guard directly",
+                );
+                dbg.clear_hw_breakpoint(0)?;
+                install_code_section_guard(
+                    h_process,
+                    image_base_usize
+                        + state.pe_info.pe_sections[0].virtual_address as usize,
+                    state.pe_info.base_of_data as usize
+                        - state.pe_info.pe_sections[0].virtual_address as usize,
+                    guard_protection,
+                )?;
+                *guard_installed = true;
+            } else {
+                info!(
+                    rip = %format_args!("{rip:#x}"),
+                    is_nt_close = rip == apis.nt_close,
+                    "CloseHandle/NtClose hit — switching to .text write BP",
+                );
+                dbg.clear_hw_breakpoint(0)?;
+                dbg.set_hw_breakpoint(
+                    0,
+                    image_base_usize + 0x1000,
+                    mida_core::HwbpType::Write,
+                )?;
+            }
         } else if at_virtual_alloc {
             info!(
                 rip = %format_args!("{rip:#x}"),

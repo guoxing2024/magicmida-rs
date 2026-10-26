@@ -106,9 +106,12 @@ pub(super) fn resolve_v1_jumper(
     jumper_addr: usize,
 ) -> Result<Option<usize>, ThemidaError> {
     let mut code = [0u8; 8];
-    let n = debugger
-        .read_memory(jumper_addr, &mut code)
-        .map_err(|e| ThemidaError::Debugger(format!("resolve_v1_jumper read: {e}")))?;
+    // An unreadable jumper target is an unresolvable slot, not a failure: the
+    // multi-block IAT span the discovery step reports includes non-IAT data,
+    // and measured on Themida 1.9.1.0 (2026-10-26) those slots hold arbitrary
+    // values (e.g. `0x41fc91c5`) that must be left untouched — turning the
+    // read miss into a fatal error aborted an otherwise complete unpack.
+    let n = debugger.read_memory(jumper_addr, &mut code).unwrap_or(0);
 
     if n < 2 {
         return Ok(None);

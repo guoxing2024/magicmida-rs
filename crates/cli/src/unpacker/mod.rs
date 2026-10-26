@@ -1286,7 +1286,11 @@ fn run_post_loop_phases(
     );
 
     let strategy = match state.pe_info.themida_version {
-        mida_packers_themida::ThemidaVersion::V1 => IatFixStrategy::V1,
+        // The classic v1-generation stubs (including the `"Themida "`-named
+        // Ancient shape) use the Pascal classic IAT repair; only V3 has the
+        // trace-based machinery its own strategy expects.
+        mida_packers_themida::ThemidaVersion::V1
+        | mida_packers_themida::ThemidaVersion::Ancient => IatFixStrategy::V1,
         mida_packers_themida::ThemidaVersion::V2 => IatFixStrategy::V2,
         mida_packers_themida::ThemidaVersion::V3 => IatFixStrategy::V3,
         _ => IatFixStrategy::V3,

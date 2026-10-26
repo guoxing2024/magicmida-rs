@@ -220,10 +220,24 @@ fn themida_bounds(state: &ThemidaState, image_base: usize) -> (usize, usize) {
         }
     }
     if start < end {
-        (start, end)
-    } else {
-        (0, 0)
+        return (start, end);
     }
+
+    // Fallback: the section that holds the *packed* entry point.  The
+    // 1.9-generation shells let their user rename the section (`Tuts4You` in
+    // the version ladder), which defeats every name heuristic, but the shell's
+    // code still lives where the packed EP points — and that is the region the
+    // OEP-verification probe must recognise as "the protector".
+    let ep = state.pe_info.packed_entry_point;
+    for sec in &state.pe_info.pe_sections {
+        let va = sec.virtual_address;
+        if ep >= va && ep < va.saturating_add(sec.virtual_size) {
+            let s = image_base.wrapping_add(va as usize);
+            let e = s.wrapping_add(sec.virtual_size as usize);
+            return (s, e);
+        }
+    }
+    (0, 0)
 }
 
 /// Handle an AccessViolation event in the debug loop.
@@ -342,9 +356,9 @@ pub(super) fn handle_access_violation(
         GuardAccessResult::PossibleOEP { address } => {
             log::log(LogType::Info, &format!("Possible OEP at {:#x}", address));
 
-            let mut dll_oep_accepted = false;
+            let mut direct_oep_accepted = false;
 
-            // ---- DLL targets: the first execute fault into .text IS the OEP --
+            // ---- DLL targets and classic (v1-generation) stubs ---------------
             //
             // A packed DLL's `DllMain` is invoked by the shell, so a return
             // address sitting in `.winlice`/`.boot` is completely normal — it is
@@ -356,25 +370,108 @@ pub(super) fn handle_access_violation(
             // producing a dump whose entry point was the first decrypted
             // function rather than the DLL entry.
             //
-            // For a DLL we ask only the question that matters: is the
-            // instruction here a transfer into the VM?  If not, control has
-            // genuinely reached decrypted code and this is the OEP.
-            if is_dll_target {
+            // The same reasoning covers the classic v1-generation EXE stub
+            // (measured on Themida 1.1.1.0, 2026-10-26): the shell jumps to the
+            // OEP when it is done, and whatever is on the stack at that moment
+            // belongs to the shell's own call chain, so a Themida-section
+            // return address proves nothing.  For both targets the only
+            // question that matters: is the instruction here a transfer into
+            // the protector?  If not, control has genuinely reached decrypted
+            // code and this is the OEP.
+            let classic_stub = matches!(
+                state.pe_info.themida_version,
+                mida_packers_themida::ThemidaVersion::V1
+                    | mida_packers_themida::ThemidaVersion::Ancient
+            );
+            if is_dll_target || classic_stub {
                 let (tm_start, tm_end) = themida_bounds(state, dbg.image_base() as usize);
                 let virtualized = tm_start < tm_end && is_oep_virtualized(dbg, address, tm_start);
                 if !virtualized {
+                    // Classic (v1-generation) candidates must prove they never
+                    // return: the shell calls its own helpers inside `.text`
+                    // before the real jump to the OEP, and the first execute
+                    // fault is one of those helpers, not the entry (measured on
+                    // Themida 1.9.1.0, 2026-10-26: the first candidate was
+                    // mid-function code).  Arm an execute breakpoint on the
+                    // candidate's return address; if it fires during the
+                    // execution window below, the candidate was a helper and
+                    // the hunt continues at the tail of this handler.
+                    let mut classic_verifying = false;
+                    if classic_stub {
+                        // The classic shell rebuilds the original PE header in
+                        // place before transferring control, so the *live*
+                        // header's entry point is the ground truth for the
+                        // OEP — log it against the fault candidate.
+                        let read_u32_at = |va: usize| -> Option<u32> {
+                            let mut b = [0u8; 4];
+                            dbg.read_memory(va, &mut b).ok()?;
+                            Some(u32::from_le_bytes(b))
+                        };
+                        if let Some(e_lfanew) = read_u32_at(dbg.image_base() as usize + 0x3C) {
+                            let opt = dbg.image_base() as usize + e_lfanew as usize + 24;
+                            if let Some(live_ep) = read_u32_at(opt + 16) {
+                                log::log(
+                                    LogType::Info,
+                                    &format!(
+                                        "classic OEP candidate {address:#x}: live header EP =                                          {live_ep:#x} (packed EP {:#x})",
+                                        state.pe_info.packed_entry_point
+                                    ),
+                                );
+                            }
+                        }
+                        let probe_fail = |why: &str| {
+                            log::log(
+                                LogType::Info,
+                                &format!("classic OEP probe not armed: {why}"),
+                            );
+                        };
+                        if let Ok(ctx) = dbg.get_thread_context_control(thread_id) {
+                            let sp = ctx_sp(&ctx);
+                            let mut ret_bytes = [0u8; 8];
+                            if dbg.read_memory(sp, &mut ret_bytes).is_ok() {
+                                let ret = u64::from_le_bytes(ret_bytes) as usize;
+                                let (tm_start, tm_end) =
+                                    themida_bounds(state, dbg.image_base() as usize);
+                                if tm_start < tm_end && ret >= tm_start && ret < tm_end {
+                                    dbg.clear_hw_breakpoint(0)?;
+                                    dbg.set_hw_breakpoint(
+                                        0,
+                                        ret,
+                                        mida_core::HwbpType::Execute,
+                                    )?;
+                                    state.classic_pending_ret = Some(ret);
+                                    classic_verifying = true;
+                                    log::log(
+                                        LogType::Info,
+                                        &format!(
+                                            "classic OEP candidate {address:#x}: verifying —                                              return address {ret:#x} armed as execute breakpoint"
+                                        ),
+                                    );
+                                } else {
+                                    probe_fail(&format!(
+                                        "return address {ret:#x} outside the protector bounds                                          {tm_start:#x}..{tm_end:#x}"
+                                    ));
+                                }
+                            } else {
+                                probe_fail("stack top unreadable at the candidate");
+                            }
+                        } else {
+                            probe_fail("thread context unavailable at the candidate");
+                        }
+                    }
                     ls.oep = Some(address);
                     remove_code_section_guard(
                         h_process,
                         text_start,
                         text_end.saturating_sub(text_start),
                     )?;
+                    let target_kind = if is_dll_target { "DLL" } else { "classic" };
                     log::log(
                         LogType::Info,
                         &format!(
-                            "DLL OEP accepted at {address:#x} (rva {:#x}) — real decrypted code, \
-                             not a VM trampoline",
-                            address.wrapping_sub(dbg.image_base() as usize)
+                            "{target_kind} OEP accepted at {address:#x} (rva {:#x}) — real                              decrypted code, not a protector trampoline{}",
+                            address.wrapping_sub(dbg.image_base() as usize),
+                            if classic_verifying { " (verification armed)" } else { "" }
                         ),
                     );
                     // Skip the EXE-oriented virtualised-OEP heuristics entirely
@@ -382,16 +479,19 @@ pub(super) fn handle_access_violation(
                     // of this function.  Breaking here would dump the image
                     // before the shell finishes decrypting the import table:
                     // observed on core.dll, that yields 357 of 3282 slots.
-                    dll_oep_accepted = true;
+                    direct_oep_accepted = true;
                 } else {
+                    let target_kind = if is_dll_target { "DLL" } else { "classic" };
                     log::log(
                         LogType::Info,
-                        &format!("DLL OEP candidate {address:#x} is a VM trampoline — continuing"),
+                        &format!(
+                            "{target_kind} OEP candidate {address:#x} is a protector                              trampoline — continuing"
+                        ),
                     );
                 }
             }
 
-            if !dll_oep_accepted {
+            if !direct_oep_accepted {
             let tls_total = state.pe_info.tls_total;
             let tls_result = handle_tls_callbacks(
                 dbg,
@@ -749,10 +849,18 @@ pub(super) fn handle_access_violation(
             Ok(Some(iat)) => iat,
             Ok(None) => {
                 warn!("IAT not found — skipping IAT monitoring");
+                if state.classic_pending_ret.take().is_some() {
+                    state.classic_ret_hit = false;
+                    let _ = dbg.clear_hw_breakpoint(0);
+                }
                 return Ok(AvAction::Break);
             }
             Err(e) => {
                 warn!("IAT detection failed: {e} — skipping IAT monitoring");
+                if state.classic_pending_ret.take().is_some() {
+                    state.classic_ret_hit = false;
+                    let _ = dbg.clear_hw_breakpoint(0);
+                }
                 return Ok(AvAction::Break);
             }
         };
@@ -821,10 +929,23 @@ pub(super) fn handle_access_violation(
 
             info!("Letting program execute for 5 seconds to decrypt IAT...");
 
+        // Classic targets get a longer window: the shell's interlude between
+        // its last CloseHandle and the real OEP jump measured 37 s on Themida
+        // 1.9.1.0, and a helper candidate's return must be observable inside
+        // the window.  The window also ends early once the probe fires.
+        let classic_stub = matches!(
+            state.pe_info.themida_version,
+            mida_packers_themida::ThemidaVersion::V1
+                | mida_packers_themida::ThemidaVersion::Ancient
+        );
+        let timeout = std::time::Duration::from_secs(if classic_stub { 45 } else { 5 });
         let start_time = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(5);
 
         loop {
+            if state.classic_ret_hit {
+                info!("classic OEP probe fired inside the window — candidate rejected");
+                break;
+            }
             if start_time.elapsed() > timeout {
                 info!("IAT monitoring timeout reached ({} violations)", iat_violations);
                 break;
@@ -849,6 +970,14 @@ pub(super) fn handle_access_violation(
                                 // Do NOT log per-access: this window sees 150k+ IAT
                                 // touches on a real v3 target, which turned a -v run
                                 // into a 16 MB log.  Report the aggregate below.
+                            }
+                        }
+                        DebugEvent::SingleStep { address, .. } => {
+                            // The classic return-address probe: the candidate
+                            // returned to the protector.
+                            if state.classic_pending_ret == Some(address as usize) {
+                                state.classic_ret_hit = true;
+                                let _ = dbg.clear_hw_breakpoint(0);
                             }
                         }
                         DebugEvent::ExitProcess { .. } => {
@@ -1016,8 +1145,49 @@ pub(super) fn handle_access_violation(
             .count();
         info!(api_like = api_like_count, total = actual_slots, "IAT analysis after execution");
 
+        // ---- classic OEP verification verdict -------------------------------
+        //
+        // The candidate was accepted provisionally; the return-address probe
+        // decides.  A fired probe means the candidate was a shell helper: it
+        // returned to the protector after doing its work.  Reject it, re-arm
+        // the `.text` guard, and let the debug loop bring the next execute
+        // fault — the hunt continues until a candidate that never returns.
+        if let Some(ret) = state.classic_pending_ret.take() {
+            if state.classic_ret_hit {
+                state.classic_ret_hit = false;
+                ls.oep = None;
+                ls.iat_monitoring_done = false;
+                install_code_section_guard(
+                    h_process,
+                    text_start,
+                    text_end.saturating_sub(text_start),
+                    guard_protection,
+                )?;
+                log::log(
+                    LogType::Info,
+                    &format!(
+                        "classic OEP candidate rejected: execution returned to the                          protector at {ret:#x} — keeping the guard and hunting on"
+                    ),
+                );
+                dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+                return Ok(AvAction::Continue);
+            }
+            let _ = dbg.clear_hw_breakpoint(0);
+            log::log(
+                LogType::Info,
+                "classic OEP verified: the candidate never returned to the protector",
+            );
+        }
+
         ls.iat_monitoring_done = true;
         return Ok(AvAction::Break);
+    }
+
+    // Early exits above (IAT detection failures) must not leave a stale probe
+    // armed: the state would leak into the next candidate.
+    if state.classic_pending_ret.take().is_some() {
+        state.classic_ret_hit = false;
+        let _ = dbg.clear_hw_breakpoint(0);
     }
 
     dbg.continue_event(thread_id, ContinueStatus::Continue)?;

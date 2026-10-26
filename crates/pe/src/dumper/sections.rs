@@ -223,11 +223,21 @@ pub(crate) fn create_pdata_section(pe: &mut PeHeader, exc_data: &[u8]) -> bool {
 /// length (`0x1754` for the reference case) without moving later sections,
 /// which leaves address space between the aligned end of `.reloc` and the next
 /// section.  That is the shape the golden product itself has, and it loads.
-pub(crate) fn create_reloc_section(pe: &mut PeHeader) {
+pub(crate) fn create_reloc_section(pe: &mut PeHeader, min_vsize: u32) {
     let file_align = pe.nt_headers.optional_header.file_alignment;
     let section_align = pe.nt_headers.optional_header.section_alignment;
 
-    let reloc_vsize: u32 = section_align.max(0x2000);
+    // `min_vsize` carries what the dump itself knows about the relocation
+    // table it is about to generate: the live image's own BaseReloc size.
+    // The fixed 0x2000 reservation was sized on the v3 samples (~6 KB
+    // tables); a classic v1-generation product reproduces the original
+    // program's pointer table instead — measured 19,596 bytes on Themida
+    // 1.9.1.0 — and a too-small reservation aborts the dump (`.import`
+    // already occupies the VA range behind, so the table cannot grow
+    // in place; the writer refuses to truncate).
+    let reloc_vsize: u32 = section_align
+        .max(0x2000)
+        .max(crate::utils::align_up(min_vsize, section_align));
     let reloc_raw = crate::utils::align_up(reloc_vsize, file_align);
 
     let reloc_idx = pe.create_section_index(".reloc", reloc_vsize);

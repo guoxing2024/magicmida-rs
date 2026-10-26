@@ -786,7 +786,8 @@ fn e2e_reference_case_matches_golden_record() {
 
 /// `IAT trace complete: {resolved} resolved, {failed} failed`
 fn extract_usize(log: &str, marker: &str) -> Option<(usize, usize)> {
-    let line = log.lines().rev().find(|l| l.contains(marker))?;
+    let clean = strip_ansi(log);
+    let line = clean.lines().rev().find(|l| l.contains(marker))?;
     let rest = line.split_once(marker)?.1;
     let resolved: usize = rest.split_whitespace().next()?.parse().ok()?;
     let failed: usize = rest
@@ -800,8 +801,31 @@ fn extract_usize(log: &str, marker: &str) -> Option<(usize, usize)> {
 }
 
 /// `Import table reconstructed module_count={m} thunk_count={t}`
+
+/// Tracing renders structured fields with ANSI word-wrapping
+/// (`[3mname[0m[2m=[0m`), which breaks plain-substring
+/// scraping of `key=value` lines.  Strip the escapes first — the logs are
+/// data here, not display.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '' {
+            for c2 in chars.by_ref() {
+                if c2.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn extract_pair(log: &str, marker: &str) -> Option<(usize, usize)> {
-    let line = log.lines().rev().find(|l| l.contains(marker))?;
+    let clean = strip_ansi(log);
+    let line = clean.lines().rev().find(|l| l.contains(marker))?;
     let rest = line.split_once(marker)?.1;
     let modules: usize = rest.split_whitespace().next()?.parse().ok()?;
     let thunks: usize = rest
@@ -816,7 +840,8 @@ fn extract_pair(log: &str, marker: &str) -> Option<(usize, usize)> {
 
 /// `IAT boundaries: start=..., end=..., size=... ({slots} slots), blocks={n}`
 fn extract_iat_slots(log: &str) -> Option<usize> {
-    let line = log.lines().rev().find(|l| l.contains("IAT boundaries:"))?;
+    let clean = strip_ansi(log);
+    let line = clean.lines().rev().find(|l| l.contains("IAT boundaries:"))?;
     let tail = line.split_once('(')?.1; // "{slots} slots), blocks=..."
     tail.split_whitespace().next()?.parse().ok()
 }

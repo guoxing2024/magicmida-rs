@@ -374,12 +374,14 @@ fn import_metadata_ranges(pe: &PeHeader, data: &[u8], is_64bit: bool) -> Vec<(u3
 ///
 /// CRITICAL: Also refuses any entry that lands inside the import table's
 /// metadata — see [`import_metadata_ranges`] for why that rule exists.
-pub fn build_relocation_table(
-    out_data: &mut Vec<u8>,
-    _runtime_image_base: Option<u64>,
+/// Everything `build_relocation_table` needs in order to know *which* dwords
+/// to relocate, collected into a builder.  Split out so the `.reloc`
+/// reservation can be sized from the same scan before the section exists.
+fn collect_relocation_builder(
+    data: &[u8],
     is_64bit: bool,
-) -> Result<(), PeError> {
-    let pe = PeHeader::from_bytes(out_data)?;
+) -> Result<(PeHeader, RelocationTableBuilder), PeError> {
+    let pe = PeHeader::from_bytes(data)?;
     // Use the CURRENT image base from the file (after fix_hardcoded_addresses
     // has already patched all runtime addresses to this value)
     let image_base = pe.nt_headers.optional_header.image_base;
@@ -391,7 +393,7 @@ pub fn build_relocation_table(
     // the loader applies relocations before resolving imports, so an entry on a
     // name string adds the load delta to ASCII and the lookup dies with
     // 0xC0000139.  See `import_metadata_ranges` for the measured x86 case.
-    let metadata_ranges = import_metadata_ranges(&pe, out_data, is_64bit);
+    let metadata_ranges = import_metadata_ranges(&pe, data, is_64bit);
     let in_import_metadata = |rva: u32| -> bool {
         metadata_ranges
             .iter()
@@ -422,7 +424,7 @@ pub fn build_relocation_table(
             .map(|s| (s.virtual_address, s.raw_size, s.characteristics))
             .collect();
         let code_hits = crate::code_relocations::scan_code_relocations(
-            out_data,
+            data,
             image_base as u32,
             image_size,
             sections,
@@ -465,8 +467,8 @@ pub fn build_relocation_table(
         if is_uninitialized {
             let start = section.raw_offset as usize;
             let end = start.saturating_add(section.raw_size as usize);
-            let has_data = end <= out_data.len()
-                && out_data[start..end].iter().any(|&b| b != 0);
+            let has_data = end <= data.len()
+                && data[start..end].iter().any(|&b| b != 0);
             if !has_data {
                 continue;
             }
@@ -485,7 +487,7 @@ pub fn build_relocation_table(
         let section_size = section.raw_size as usize;
         let section_end = section_start + section_size;
 
-        if section_end > out_data.len() {
+        if section_end > data.len() {
             continue;
         }
 
@@ -497,9 +499,9 @@ pub fn build_relocation_table(
         for offset in (0..section_size.saturating_sub(ptr_size - 1)).step_by(ptr_size) {
             let file_off = section_start + offset;
             let addr = if is_64bit {
-                u64::from_le_bytes(out_data[file_off..file_off + 8].try_into().unwrap_or([0; 8]))
+                u64::from_le_bytes(data[file_off..file_off + 8].try_into().unwrap_or([0; 8]))
             } else {
-                u32::from_le_bytes(out_data[file_off..file_off + 4].try_into().unwrap_or([0; 4])) as u64
+                u32::from_le_bytes(data[file_off..file_off + 4].try_into().unwrap_or([0; 4])) as u64
             };
 
             if addr >= image_base && addr < image_end {
@@ -525,6 +527,28 @@ pub fn build_relocation_table(
         }
     }
 
+    Ok((pe, builder))
+}
+
+/// The size a relocation table generated from `data` would occupy — the
+/// lower bound for the `.reloc` section reservation.
+///
+/// The full generator runs later on the final file layout, where additional
+/// exclusions apply (the rebuilt import metadata) and compaction may have
+/// removed bytes, so this pass is an upper bound on the real table.
+pub fn estimate_reloc_table_size(data: &[u8], is_64bit: bool) -> u32 {
+    match collect_relocation_builder(data, is_64bit) {
+        Ok((_, builder)) => builder.build().len() as u32,
+        Err(_) => 0,
+    }
+}
+
+pub fn build_relocation_table(
+    out_data: &mut Vec<u8>,
+    _runtime_image_base: Option<u64>,
+    is_64bit: bool,
+) -> Result<(), PeError> {
+    let (pe, builder) = collect_relocation_builder(out_data, is_64bit)?;
     let reloc_count = builder.count();
     info!("Generated {} relocation entries", reloc_count);
 

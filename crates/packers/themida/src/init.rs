@@ -33,6 +33,9 @@ pub struct ThemidaPeInfo {
     /// The `MajorLinkerVersion` from the optional header.
     pub major_linker_version: u8,
     /// Identified Themida version (static detection).
+    /// The packed file's entry-point RVA — for generations whose section
+    /// names are user-renamed, this locates the protector's code section.
+    pub packed_entry_point: u32,
     pub themida_version: ThemidaVersion,
     /// Whether the OEP is virtualised (jumps directly into the Themida VM).
     pub is_vm_oep: bool,
@@ -100,11 +103,29 @@ pub fn init_pe_details(
     let image_base = pe.image_base;
     let image_boundary = image_base + u64::from(pe.size_of_image());
 
+    // Step 4: Detect Themida version.
+    let themida_version = version::detect_version_with_image(pe, is_64bit, image);
+
     // Step 3: Determine base_of_data.
     // For PE32, we use the BaseOfData field from the optional header.
     // For PE32+, we compute it as first_section.VirtualAddress + SizeOfCode
     // (matching Themida64.pas TMInit).
-    let base_of_data = if is_64bit {
+    //
+    // Classic v1-generation exception: the packed header's BaseOfData is
+    // garbage there (measured `0x1000` on Themida 1.1.1.0 while its first
+    // section spans `0x1000..0x63000`), and every consumer of this field —
+    // the `.text` guard range, the guard-fault routing, the data-region
+    // start for IAT discovery — derives the code span from it.  Give the
+    // classic generations the first section's own virtual span, or the OEP
+    // sits outside the guarded range and the run finds nothing (measured
+    // failure shape: guard `0x401000–0x44b000`, OEP beyond it, zero faults).
+    let base_of_data = if matches!(
+        themida_version,
+        ThemidaVersion::V1 | ThemidaVersion::Ancient
+    ) {
+        let first_section = &pe.sections[0];
+        u64::from(first_section.virtual_address) + u64::from(first_section.virtual_size)
+    } else if is_64bit {
         let first_section = &pe.sections[0];
         u64::from(first_section.virtual_address)
             + u64::from(pe.nt_headers.optional_header.size_of_code)
@@ -116,9 +137,6 @@ pub fn init_pe_details(
             .unwrap_or(0)
     };
 
-    // Step 4: Detect Themida version.
-    let themida_version = version::detect_version_with_image(pe, is_64bit, image);
-
     // Step 5: Locate the Themida section.
     let themida_section = locate_themida_section(pe);
 
@@ -126,6 +144,7 @@ pub fn init_pe_details(
     let is_vm_oep = entry_point_bytes
         .is_some_and(|bytes| version::check_virtualized_oep(pe, bytes));
 
+    let packed_entry_point = pe.entry_point;
     let pe_sections = pe.sections.clone();
 
     // Step 7: Resolve the number of TLS callbacks from the PE TLS directory
@@ -141,6 +160,7 @@ pub fn init_pe_details(
         base_of_data,
         pe_sections,
         major_linker_version: pe.nt_headers.optional_header.major_linker_version,
+        packed_entry_point,
         themida_version,
         is_vm_oep,
         themida_section,
