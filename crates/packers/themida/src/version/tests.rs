@@ -348,3 +348,160 @@ fn not_themida_section_bss_like() {
     };
     assert!(!is_themida_section(&section));
 }
+
+// -- measured import-surface fingerprints (2026-10-26 ladder) ----------------
+
+/// Build a minimal PE32 whose import directory really contains `dlls`
+/// (name → function names), so `read_import_surface` is exercised on the same
+/// byte layout a packer writes.  One section (`.idata`, RVA 0x1000) holds the
+/// descriptors, thunk arrays, hint/name entries and DLL names.
+fn pe_with_imports(dlls: &[(&str, &[&str])]) -> (PeHeader, Vec<u8>) {
+    let n = dlls.len();
+    let mut buf = vec![0u8; 0x2400];
+
+    // DOS + PE signature
+    buf[0] = b'M';
+    buf[1] = b'Z';
+    buf[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+    let nt = 0x40usize;
+    buf[nt..nt + 4].copy_from_slice(b"PE\0\0");
+
+    // COFF file header
+    let fh = nt + 4;
+    buf[fh..fh + 2].copy_from_slice(&0x14cu16.to_le_bytes()); // i386
+    buf[fh + 2..fh + 4].copy_from_slice(&1u16.to_le_bytes()); // 1 section
+    buf[fh + 16..fh + 18].copy_from_slice(&0xe0u16.to_le_bytes()); // opt size
+    buf[fh + 18..fh + 20].copy_from_slice(&0x0102u16.to_le_bytes());
+
+    // Optional header (PE32)
+    let oh = nt + 24;
+    buf[oh..oh + 2].copy_from_slice(&0x10bu16.to_le_bytes());
+    buf[oh + 16..oh + 20].copy_from_slice(&0x1500u32.to_le_bytes()); // EP
+    buf[oh + 20..oh + 24].copy_from_slice(&0x1000u32.to_le_bytes()); // BaseOfCode
+    buf[oh + 24..oh + 28].copy_from_slice(&0x2000u32.to_le_bytes()); // BaseOfData
+    buf[oh + 28..oh + 32].copy_from_slice(&0x400000u32.to_le_bytes()); // ImageBase
+    buf[oh + 32..oh + 36].copy_from_slice(&0x1000u32.to_le_bytes()); // SectionAlign
+    buf[oh + 36..oh + 40].copy_from_slice(&0x200u32.to_le_bytes()); // FileAlign
+    buf[oh + 56..oh + 60].copy_from_slice(&0x3000u32.to_le_bytes()); // SizeOfImage
+    buf[oh + 60..oh + 64].copy_from_slice(&0x400u32.to_le_bytes()); // SizeOfHeaders
+    buf[oh + 68..oh + 70].copy_from_slice(&2u16.to_le_bytes()); // Subsystem
+    buf[oh + 92..oh + 96].copy_from_slice(&16u32.to_le_bytes()); // NrvaAndSizes
+    // DataDirectory[1] = import directory at RVA 0x1000
+    let dd = oh + 96;
+    buf[dd + 8..dd + 12].copy_from_slice(&0x1000u32.to_le_bytes());
+    buf[dd + 12..dd + 16].copy_from_slice(&(20 * (n as u32 + 1)).to_le_bytes());
+
+    // Section header: .idata, RVA 0x1000, file 0x400
+    let sh = oh + 0xe0;
+    buf[sh..sh + 6].copy_from_slice(b".idata");
+    buf[sh + 8..sh + 12].copy_from_slice(&0x2000u32.to_le_bytes()); // VS
+    buf[sh + 12..sh + 16].copy_from_slice(&0x1000u32.to_le_bytes()); // VA
+    buf[sh + 16..sh + 20].copy_from_slice(&0x2000u32.to_le_bytes()); // RS
+    buf[sh + 20..sh + 24].copy_from_slice(&0x400u32.to_le_bytes()); // PR
+    buf[sh + 36..sh + 40].copy_from_slice(&0xc0000040u32.to_le_bytes());
+
+    // Body at RVA 0x1000 == file 0x400.
+    const BASE: usize = 0x400;
+    let mut cursor = BASE + 20 * (n + 1); // after descriptors + terminator
+    let mut descriptors = Vec::new();
+    for (dll, funcs) in dlls {
+        // thunk array: one RVA per function + terminator
+        let thunks_rva = 0x1000 + (cursor - BASE) as u32;
+        let thunk_count = funcs.len();
+        let names_start = cursor + 4 * (thunk_count + 1);
+        let mut p = names_start;
+        let mut thunk_values = Vec::new();
+        for f in *funcs {
+            thunk_values.push(0x1000u32 + (p - BASE) as u32);
+            buf[p..p + 2].copy_from_slice(&0u16.to_le_bytes()); // hint
+            buf[p + 2..p + 2 + f.len()].copy_from_slice(f.as_bytes());
+            p += 2 + f.len() + 1;
+        }
+        let dll_name_at = p;
+        buf[p..p + dll.len()].copy_from_slice(dll.as_bytes());
+        p += dll.len() + 1;
+        // write thunks
+        let mut t = cursor;
+        for v in &thunk_values {
+            buf[t..t + 4].copy_from_slice(&v.to_le_bytes());
+            t += 4;
+        }
+        // t..t+4 already zero (terminator)
+        descriptors.push((thunks_rva, 0x1000u32 + (dll_name_at - BASE) as u32, thunks_rva));
+        cursor = p;
+    }
+    // descriptors
+    for (i, (oft, name_rva, ft)) in descriptors.iter().enumerate() {
+        let d = BASE + 20 * i;
+        buf[d..d + 4].copy_from_slice(&oft.to_le_bytes());
+        buf[d + 12..d + 16].copy_from_slice(&name_rva.to_le_bytes());
+        buf[d + 16..d + 20].copy_from_slice(&ft.to_le_bytes());
+    }
+
+    let pe = PeHeader::from_bytes(&buf).expect("fixture must parse");
+    (pe, buf)
+}
+
+#[test]
+fn measured_classic_surface_is_v1() {
+    // Measured on Themida 1.1.1.0–1.9.1.0 and WinLicense 1.1.1.0–1.8.9.0.
+    let (pe, image) = pe_with_imports(&[
+        ("KERNEL32.dll", &["CreateFileA", "ExitProcess"]),
+        ("COMCTL32.dll", &["InitCommonControls"]),
+    ]);
+    assert_eq!(detect_version_with_image(&pe, false, &image), ThemidaVersion::V1);
+    // WinLicense 2.0.8.0 carries the same two-DLL shape (CreateFileA+lstrcpy).
+    let (pe2, image2) = pe_with_imports(&[
+        ("KERNEL32.dll", &["CreateFileA", "lstrcpy"]),
+        ("COMCTL32.dll", &["InitCommonControls"]),
+    ]);
+    assert_eq!(detect_version_with_image(&pe2, false, &image2), ThemidaVersion::V1);
+    // Without the image bytes the old behaviour is unchanged.
+    assert_eq!(detect_version(&pe, false), ThemidaVersion::Unknown);
+}
+
+#[test]
+fn measured_secureengine_surface_is_v2() {
+    // Measured on WinLicense 2.0.1.0 (SizeofResource) and the 2.0.6.5
+    // CISC/RISC examples (lstrlenW / GetProfileStringW).
+    for func in ["SizeofResource", "lstrlenW", "GetProfileStringW"] {
+        let (pe, image) = pe_with_imports(&[("kernel32.dll", &[func])]);
+        assert_eq!(
+            detect_version_with_image(&pe, false, &image),
+            ThemidaVersion::V2,
+            "single-kernel32 surface [{func}] must be V2"
+        );
+    }
+}
+
+#[test]
+fn the_v3_x86_shape_is_not_claimed_as_v1_or_v2() {
+    // The packed v3 x86 gate sample imports four DLLs with one function each
+    // (measured on OUT/x86/x86_c.exe); it must not match either rule.
+    let (pe, image) = pe_with_imports(&[
+        ("kernel32.dll", &["GetModuleHandleA"]),
+        ("GDI32.dll", &["GetDeviceCaps"]),
+        ("msvcrt.dll", &["__p__iob"]),
+        ("USER32.dll", &["CreateWindowExW"]),
+    ]);
+    let v = detect_version_with_image(&pe, false, &image);
+    assert!(
+        v != ThemidaVersion::V1 && v != ThemidaVersion::V2,
+        "v3-x86 shape must not match the 1.x/2.x fingerprints, got {v:?}"
+    );
+}
+
+#[test]
+fn import_surface_reader_never_panics_on_garbage() {
+    let (pe, _) = pe_with_imports(&[("kernel32.dll", &["Sleep"])]);
+    assert!(read_import_surface(&[], &pe).is_none());
+    let junk = vec![0xAAu8; 0x600];
+    let _ = read_import_surface(&junk, &pe);
+    // A PE whose import directory RVA is zero yields None, not a panic.
+    // (Zero the RVA before parsing: the walk keys on the parsed header.)
+    let (_, mut image_zero) = pe_with_imports(&[("kernel32.dll", &["Sleep"])]);
+    let oh = 0x40 + 24;
+    image_zero[oh + 96 + 8..oh + 96 + 12].copy_from_slice(&0u32.to_le_bytes());
+    let pe_zero = PeHeader::from_bytes(&image_zero).expect("zero-dir fixture must parse");
+    assert!(read_import_surface(&image_zero, &pe_zero).is_none());
+}

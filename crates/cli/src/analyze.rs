@@ -66,7 +66,7 @@ pub fn analyze_file(opts: &AnalyzeOptions<'_>) -> Result<(), anyhow::Error> {
         if let Some(upx) = mida_packers_upx::detect(&pe, &image) {
             return analyze_upx(&pe, &image, opts, &upx);
         }
-        return analyze_themida_or_fail(&pe, opts);
+        return analyze_themida_or_fail(&pe, opts, &image);
     };
 
     log::log(LogType::Good, &format!("Packer: {}", detection.summary()));
@@ -123,7 +123,11 @@ fn analyze_upx(
 /// against `D:\Projects\shiguang\时光一键宏.exe`.  The static report is
 /// VMProtect-shaped, so for Themida this prints the section inventory and
 /// points at the pipeline that can actually unpack it.
-fn analyze_themida_or_fail(pe: &PeHeader, opts: &AnalyzeOptions<'_>) -> Result<(), anyhow::Error> {
+fn analyze_themida_or_fail(
+    pe: &PeHeader,
+    opts: &AnalyzeOptions<'_>,
+    image: &[u8],
+) -> Result<(), anyhow::Error> {
     let mut sections: Vec<&str> = Vec::new();
     for section in pe.sections.iter() {
         if mida_packers_themida::is_themida_section(section) {
@@ -139,13 +143,37 @@ fn analyze_themida_or_fail(pe: &PeHeader, opts: &AnalyzeOptions<'_>) -> Result<(
         ));
     }
 
+    // Version fingerprint: the measured import-surface rules (see
+    // `detect_version_with_image`) distinguish the 1.x-generation classic stub
+    // from SecureEngine-2.x from V3.  "Unknown" is reported as such — a v3 x86
+    // sample is exactly the shape that needs the runtime decision.
+    let version = mida_packers_themida::detect_version_with_image(pe, pe.is_64bit, image);
+    let version_line = match version {
+        mida_packers_themida::ThemidaVersion::Ancient => {
+            "Themida version      Ancient (\"Themida \" section; 1.x generation)".to_string()
+        }
+        mida_packers_themida::ThemidaVersion::V1 => {
+            "Themida version      V1 (classic stub: kernel32+comctl32 import pair)".to_string()
+        }
+        mida_packers_themida::ThemidaVersion::V2 => {
+            "Themida version      V2 (SecureEngine 2.x: single kernel32 import)".to_string()
+        }
+        mida_packers_themida::ThemidaVersion::V3 => "Themida version      V3".to_string(),
+        mida_packers_themida::ThemidaVersion::Unknown => {
+            "Themida version      unknown statically (x86: V1/V2/V3 need a runtime decision)"
+                .to_string()
+        }
+    };
+
     log::log(LogType::Good, "Packer: Themida");
     log::log(
         LogType::Info,
         &format!("  Themida sections: {}", sections.join(", ")),
     );
+    log::log(LogType::Info, &format!("  Themida version: {version:?}"));
     println!("Themida");
     println!("  Themida sections    {}", sections.join(", "));
+    println!("  {version_line}");
     println!("  next                /unpack {}", opts.input.display());
 
     if opts.extract_to.is_some() {

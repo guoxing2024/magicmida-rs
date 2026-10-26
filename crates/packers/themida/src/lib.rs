@@ -65,7 +65,8 @@ pub use trace_imports::{
     TRACE_LIMIT,
 };
 pub use version::{
-    check_virtualized_oep, detect_version, is_themida_section, ThemidaVersion,
+    check_virtualized_oep, detect_version, detect_version_with_image, is_classic_stub_surface,
+    is_secureengine2_surface, is_themida_section, read_import_surface, ImportedDll, ThemidaVersion,
 };
 
 // ---------------------------------------------------------------------------

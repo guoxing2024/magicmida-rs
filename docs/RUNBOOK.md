@@ -268,6 +268,54 @@ x86 `da7a1dce…`——NRV2B（`upx --nrv2b`）/NRV2D（`--nrv2d`）样本与 NR
 内嵌解码器自校验），无样本也全绿）。移植参考：UPX v5.2.1 源码（`OUT\upx-5.2.1\`
 + `OUT\ucl_src\`）与 Python 原型（`OUT\upx_unpack_proto.py`）。
 
+## Themida 版本判定：1.x/2.x 阶梯（2026-10-26 实测落地）
+
+### 语料从哪来（可复现）
+
+本地扫描（`OUT\v1v2\themida_census.py`）确认全机 **没有** 1.x/2.x 样品后，从
+archive.org 的 [tuts-4-you-collection-2011_202405](https://archive.org/details/tuts-4-you-collection-2011_202405)
+按成员**范围下载**（zip 中央目录定位 + HTTP Range，`OUT\v1v2\zip_over_http.py` /
+`fetch_zip_members.py`；本机代理走 `socks5h://127.0.0.1:10808`，curl 要加
+`--ssl-no-revoke`，schannel 吊销检查会挂起——AGENTS.md 早有记录的坑）。
+取的是 `UnPackMe Collection/PE32/` 全套 + 2.0.6.5 的 CISC/RISC 例子，共 **76 个 PE**，
+每个都按加壳版本命名。解压到 `OUT\v1v2\unpackmes\x\`。**目录名就是真值**，gate 据此断言。
+
+### 实测结论（每条都有样本背书）
+
+| 世代 | 静态指纹 | 实测 |
+|---|---|---|
+| 1.1.1–1.8.2 | 节名 `Themida `（8 字节带尾空格） | 41/41 |
+| 1.9.1（节名被用户改成 `Tuts4You`） | **经典导入对**：KERNEL32[CreateFileA,ExitProcess]+COMCTL32[InitCommonControls]，恰 2 DLL ≤4 函数 | 9/9 |
+| WinLicense 1.1.1–1.8.9 | 同上经典导入对；节名 `WinLicen`（截断 8 字节） | 20/20 |
+| WinLicense 2.0.1.0 / 2.0.6.5（CISC/RISC） | **单 kernel32 导入**（函数逐 build 随机：SizeofResource/lstrlenW/GetProfileStringW） | 5/5 |
+| WinLicense 2.0.8.0 | 经典导入对（`CreateFileA,lstrcpy`+`InitCommonControls`）——**与 1.x 同面，静态不可分**，判 V1 属如实 | 1/1 |
+
+三条反直觉的实测事实（都写进了 `version/mod.rs` 的文档注释）：
+1. **节名在 1.9+ 不可靠**（用户可自定义），2.x 干脆随机化（`vlbnmttz` 之类）——
+   节名规则只覆盖 1.1.1–1.8.2；导入面才是全世代稳定指纹。
+2. **`is_themida_section` 原来看不见 `WinLicen`**（无点号的截断名）——19 个
+   WinLicense 1.x 样本全部漏路由。已加 `winlicen` 前缀信号（1c）。
+3. **unlicense 的 2.x 节首字节模式（`56 50 53 E8 01 …`）在本阶梯 0 命中**——
+   它针对别的 build；没有照抄，拒绝未测指纹。
+
+### 现代可跑性（Windows 11 26300 实测）
+
+Themida 1.1.1.0、1.9.1.0、WinLicense 2.0.1.0 的加壳样本**都能直接运行**
+（2005 年的 32 位壳在 WoW64 下活着；1.1.1 弹 `Themida - http://www.oreans.com`
+试用窗口）。WinLicense 2.0.8.0 因原始程序要缺版 SxS 运行库起不来（环境问题，非壳问题）。
+
+### 版本判定已落地，脱壳还没有（如实）
+
+`/analyze` 现在输出版本行（`Themida version: Ancient|V1|V2|V3|unknown statically`）。
+**但 `/unpack` 对 1.x/2.x 还不工作**：实测 Themida 1.1.1.0 走完整流程（ScyllaHide
+注入、正常退出）后报 `OEP not found`——OEP 判定是 v3 形状（.text 守护页访问计数 +
+TLS/VM 分支），1.x 壳没有这些形状。1.x OEP 分支是下一个增量；`IatFixStrategy::V1/V2`
+的 Pascal 移植已在代码里等样本。
+
+gate：`cargo test -p mida-packers-themida --test themida_ladder_gate`（默认跑，
+语料缺目录显式 SKIP；`MIDA_THEMIDA_LADDER` 可换路径）。单测用手工导入目录
+fixture（真实字节布局），无语料也全绿。
+
 ## x86 编译（2026-10-23 打通）
 
 ```powershell

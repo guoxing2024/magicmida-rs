@@ -29,7 +29,8 @@ SHA-256 recorded in `crates/packers/themida/tests/cases/`.
 | **VMProtect 3.x, x64, `MinProtection`** | ✅ Works | Identified with evidence; structure reported; payload extracted byte-exactly (`91d585e6…`, magic `XMP2QH_`). At this mode the original code is already in the file, so there is nothing to rebuild. |
 | **VMProtect 3.x, x64, `Packed`** | ✅ Works | Identified with evidence. Original sections are absent from the file, so `/dump-image --wait` captures them from a live process, flattens the image, and decodes the embedded payload (`14596cbd…` → `e7004e89…`) — byte-reconciled against the file the packer family itself writes out at run time, and load-tested (`LoadLibrary` + `DllMain` + ordinal exports; it is a `IMAGE_FILE_DLL`, named `.decoded.dll`). |
 | **VMProtect 3.x, x86** | ❓ No evidence | The detector is not architecture-specific, but only x64 targets have been measured. |
-| Themida **v1 / v2** | ❓ No evidence | Detection code exists; never run on a real sample |
+| Themida **v1** (1.1.1–1.9.1) | ⚠️ Version identified | Classified on a 76-sample version ladder (`Ancient` by section name, `V1` by the measured kernel32+comctl32 import pair); the 2005-era samples **run on modern Windows**. Unpacking is not implemented yet — the OEP pipeline is v3-shaped and reports `OEP not found` on a measured 1.x run. |
+| Themida/WinLicense **v2** (2.0.x) | ⚠️ Version identified | Classified as `V2` by the single-kernel32 import surface (2.0.1.0 / 2.0.6.5 CISC+RISC examples); 2.0.8 shares the classic V1 surface (documented ambiguity). Unpacking not implemented yet. |
 
 The 8 / 3 / 55 `not-an-import` slots are **not** failures. They hold bare RVAs
 pointing into read-only data — exactly what the real Windows loader sees. They
@@ -577,8 +578,8 @@ user-downloaded and verified at runtime via SHA-256 checksums (see
 
 | Themida Version | x86 | x64 | Notes |
 |---|---|---|---|
-| **V1** (Ancient) | ❓ unverified | — | Detection code exists; never run on a real sample. |
-| **V2** | ❓ unverified | — | Detected by dual `0x1000`-sized stub sections; never run on a real sample. |
+| **V1** (1.1.1–1.9.1, "Ancient") | ⚠️ **identified** | — | Classified on a 76-sample version ladder: `Ancient` = `"Themida "` section name (1.1.1–1.8.2), `V1` = the measured kernel32+comctl32 import pair (incl. 1.9.1 with a custom-named section). The 2005-era stubs **run on modern Windows**. Unpacking not yet — the OEP pipeline is v3-shaped (measured: `OEP not found`). |
+| **V2** (2.0.x) | ⚠️ **identified** | — | `V2` = the measured single-kernel32 import surface (2.0.1.0, 2.0.6.5 CISC/RISC) or the Pascal dual-`0x1000` stub rule. WinLicense 2.0.8 shares the classic V1 surface — documented ambiguity. Unpacking not yet. |
 | **V3** | ✅ **verified** | ✅ **verified** | x64 EXE, x64 DLL and x86 EXE are all gated. Requires ScyllaHide. |
 
 | VMProtect | Status | Notes |

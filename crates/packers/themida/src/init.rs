@@ -73,6 +73,8 @@ pub struct ThemidaPeInfo {
 /// - `entry_point_bytes` — optional raw bytes at the entry point.
 /// - `executable_path` — path to the on-disk PE file. Required for TLS
 ///   callback count resolution; pass `None` to skip.
+/// - `image` — the file bytes, for the measured import-surface version
+///   fingerprints; pass `&[]` to skip them.
 ///
 /// # Errors
 ///
@@ -83,6 +85,7 @@ pub fn init_pe_details(
     is_64bit: bool,
     entry_point_bytes: Option<&[u8]>,
     executable_path: Option<&std::path::Path>,
+    image: &[u8],
 ) -> Result<ThemidaPeInfo, ThemidaError> {
     // Step 1: Verify entry point is not in the first section.
     // (ThemidaCommon.pas InitPEDetails: entry point inside .text → not packed)
@@ -114,7 +117,7 @@ pub fn init_pe_details(
     };
 
     // Step 4: Detect Themida version.
-    let themida_version = version::detect_version(pe, is_64bit);
+    let themida_version = version::detect_version_with_image(pe, is_64bit, image);
 
     // Step 5: Locate the Themida section.
     let themida_section = locate_themida_section(pe);
@@ -476,7 +479,7 @@ mod tests {
     #[test]
     fn init_packed_pe64_succeeds() {
         let pe = make_packed_pe64();
-        let info = init_pe_details(&pe, true, None, None).unwrap();
+        let info = init_pe_details(&pe, true, None, None, &[]).unwrap();
 
         assert_eq!(info.image_base, 0x140000000);
         assert_eq!(info.themida_version, ThemidaVersion::V3); // x64
@@ -488,7 +491,7 @@ mod tests {
     #[test]
     fn init_unpacked_returns_not_themida() {
         let pe = make_unpacked_pe32();
-        let err = init_pe_details(&pe, false, None, None).unwrap_err();
+        let err = init_pe_details(&pe, false, None, None, &[]).unwrap_err();
         assert!(matches!(err, ThemidaError::NotThemida));
     }
 
@@ -511,7 +514,7 @@ mod tests {
         let pe = make_packed_pe64();
         // jmp +0x0FFB → target 0x4000 inside Themida section
         let entry_bytes = [0xE9u8, 0xFB, 0x0F, 0x00, 0x00];
-        let info = init_pe_details(&pe, true, Some(&entry_bytes), None).unwrap();
+        let info = init_pe_details(&pe, true, Some(&entry_bytes), None, &[]).unwrap();
         assert!(info.is_vm_oep);
     }
 }

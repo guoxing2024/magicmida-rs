@@ -293,7 +293,7 @@ pub fn unpack(
     }
     let entry_bytes_ref = entry_bytes.as_deref();
 
-    let pe_info = init_pe_details(&pe, is_64bit, entry_bytes_ref, Some(input))
+    let pe_info = init_pe_details(&pe, is_64bit, entry_bytes_ref, Some(input), &image)
         .map_err(|e| anyhow!("Themida detection failed: {e}"))?;
 
     log::log(

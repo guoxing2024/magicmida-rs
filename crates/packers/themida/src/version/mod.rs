@@ -36,10 +36,41 @@ const ANCIENT_THEMIDA_NAME: &[u8; 8] = b"Themida ";
 /// | Variant    | Criterion |
 /// |------------|-----------|
 /// | `Ancient`  | A section is named `"Themida "` (with trailing space). |
-/// | `V2`       | The last two sections both have `VirtualSize == 0x1000` |
-/// |            | *and* the very last section also has `SizeOfRawData == 0x1000`. |
+/// | `V1`       | The measured **classic stub import surface**: exactly two |
+/// |            | imported DLLs (`kernel32` + `comctl32`) with at most four |
+/// |            | functions in total. Measured on the version ladder |
+/// |            | (Themida 1.1.1–1.9.1, WinLicense 1.1.1–1.8.9 — and |
+/// |            | WinLicense 2.0.8, which shares the surface; see below). |
+/// | `V2`       | The measured **SecureEngine-2.x import surface**: exactly |
+/// |            | one imported DLL (`kernel32`) with at most two functions, |
+/// |            | or the Pascal dual-`0x1000`-stub shape. |
 /// | `V3`       | x64 is always V3; x86 requires runtime detection (see note). |
-/// | `Unknown`  | Static analysis cannot distinguish V1 from V3 for an x86 binary. |
+/// | `Unknown`  | None of the static signals matched. |
+///
+/// # Measured provenance (2026-10-26, Tuts 4 You version ladder)
+///
+/// 86 unpack-mes labelled by their exact packer version (Themida 1.1.1.0 →
+/// 1.9.1.0, WinLicense 1.1.1.0 → 2.0.8.0) were run through this
+/// classification.  Findings that shaped the rules:
+///
+/// * The 1.x-generation stub always imports exactly `KERNEL32.dll` +
+///   `COMCTL32.dll` with three functions in total — measured identically on
+///   Themida 1.1.1–1.9.1 and WinLicense 1.1.1–1.8.9.  WinLicense **2.0.8**
+///   carries the same two-DLL surface (`CreateFileA, lstrcpy` +
+///   `InitCommonControls`), so "classic surface" says *1.x-generation
+///   pipeline*, and 2.0.8 is the one known later build that shares it.
+/// * SecureEngine-2.x builds collapse the import table to a **single
+///   kernel32 function** — measured `SizeofResource` (2.0.1.0), `lstrlenW`
+///   (CISC example), `GetProfileStringW` (RISC example); the function name
+///   is randomised per build, the one-DLL shape is not.
+/// * Section names are **not** reliable below 3.x: 1.9.1 renames the section
+///   to whatever the user chose (`Tuts4You` in the ladder), and 2.x
+///   randomises section names per build (`vlbnmttz`-style).  The
+///   `"Themida "` name rule (this file's original rule, kept first) covers
+///   only 1.1.1–1.5 of the ladder.
+/// * The unlicense tool's 2.x section-start byte patterns (`56 50 53 E8 01 …`)
+///   do **not** occur anywhere in this ladder — measured, so they were not
+///   ported.
 ///
 /// # Runtime vs. static
 ///
@@ -111,6 +142,16 @@ pub enum ThemidaVersion {
 /// ```
 #[must_use]
 pub fn detect_version(pe: &PeHeader, is_64bit: bool) -> ThemidaVersion {
+    detect_version_with_image(pe, is_64bit, &[])
+}
+
+/// [`detect_version`], with the file bytes available so the measured
+/// import-surface fingerprints can be read (see the type-level table).
+///
+/// `image` may be empty; the import rules are then skipped and the result is
+/// exactly what [`detect_version`] has always returned.
+#[must_use]
+pub fn detect_version_with_image(pe: &PeHeader, is_64bit: bool, image: &[u8]) -> ThemidaVersion {
     // x64 targets are always V3 — Themida V2 has no x64 support.
     // (Themida64.pas constructor: `FThemidaV3 := True`)
     if is_64bit {
@@ -118,15 +159,27 @@ pub fn detect_version(pe: &PeHeader, is_64bit: bool) -> ThemidaVersion {
     }
 
     // Ancient version: any section named exactly "Themida " (8 bytes, trailing space).
-    // (Themida.pas → SelectThemidaSection)
+    // (Themida.pas → SelectThemidaSection; measured on ladder 1.1.1–1.8.2.)
     for section in &pe.sections {
         if &section.header.name == ANCIENT_THEMIDA_NAME {
             return ThemidaVersion::Ancient;
         }
     }
 
-    // V2 detection: the last two sections both have VirtualSize == 0x1000,
-    // and the very last section also has SizeOfRawData == 0x1000.
+    // Measured import-surface fingerprints (2026-10-26 ladder, see type doc).
+    if let Some(surface) = read_import_surface(image, pe) {
+        if is_secureengine2_surface(&surface) {
+            return ThemidaVersion::V2;
+        }
+        if is_classic_stub_surface(&surface) {
+            return ThemidaVersion::V1;
+        }
+    }
+
+    // V2 detection (Pascal reference; no ladder sample carries this shape,
+    // kept because it is the documented Themidie-era rule): the last two
+    // sections both have VirtualSize == 0x1000, and the very last section
+    // also has SizeOfRawData == 0x1000.
     // (Themida.pas → TMInit, FThemidaV2BySections)
     if pe.sections.len() >= 2 {
         let last = &pe.sections[pe.sections.len() - 1];
@@ -139,10 +192,153 @@ pub fn detect_version(pe: &PeHeader, is_64bit: bool) -> ThemidaVersion {
         }
     }
 
-    // Static analysis alone cannot distinguish V1 from V3 for x86 targets.
-    // V3 detection requires runtime heuristics (3 .text accesses without
-    // finding the Themida section — see Themida.pas OnHardwareBreakpoint).
+    // Static analysis alone cannot distinguish V1 from V3 for x86 targets
+    // beyond the signals above.  V3 detection requires runtime heuristics
+    // (3 .text accesses without finding the Themida section — see
+    // Themida.pas OnHardwareBreakpoint).
     ThemidaVersion::Unknown
+}
+
+// ---------------------------------------------------------------------------
+// Import-surface fingerprints
+// ---------------------------------------------------------------------------
+
+/// One imported DLL and the function names in its original thunk table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedDll {
+    /// DLL name as written in the import directory (original case).
+    pub dll: String,
+    /// Imported function names (ordinal imports appear as `#N`).
+    pub functions: Vec<String>,
+}
+
+/// Read the import directory's DLL/function names out of the file image.
+///
+/// Returns `None` when there is no import directory or its bytes do not map
+/// into the image; malformed entries stop the walk instead of panicking.
+#[must_use]
+pub fn read_import_surface(image: &[u8], pe: &PeHeader) -> Option<Vec<ImportedDll>> {
+    const IMAGE_DIRECTORY_ENTRY_IMPORT: usize = 1;
+    let dir = pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if dir.virtual_address == 0 || image.is_empty() {
+        return None;
+    }
+
+    let rva_to_off = |rva: u32| -> Option<usize> {
+        for s in &pe.sections {
+            let va = s.virtual_address;
+            let span = s.virtual_size.max(s.raw_size);
+            if rva >= va && rva < va.saturating_add(span) {
+                let delta = rva - va;
+                if delta < s.raw_size {
+                    return Some(s.raw_offset as usize + delta as usize);
+                }
+                return None; // inside the virtual tail: no file bytes
+            }
+        }
+        None
+    };
+    let read_u32 = |off: usize| -> Option<u32> {
+        image
+            .get(off..off + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let read_cstr = |off: usize| -> Option<String> {
+        let rest = image.get(off..)?;
+        let end = rest.iter().position(|&b| b == 0)?;
+        Some(String::from_utf8_lossy(&rest[..end]).into_owned())
+    };
+
+    let mut out = Vec::new();
+    let mut cursor = rva_to_off(dir.virtual_address)?;
+    // IMAGE_IMPORT_DESCRIPTOR = 20 bytes; terminated by an all-zero entry.
+    // Bounded so a malformed directory cannot loop forever.
+    for _ in 0..64 {
+        let (oft, _ts, _fwd, name_rva, ft) = (
+            read_u32(cursor)?,
+            read_u32(cursor + 4)?,
+            read_u32(cursor + 8)?,
+            read_u32(cursor + 12)?,
+            read_u32(cursor + 16)?,
+        );
+        if oft == 0 && name_rva == 0 && ft == 0 {
+            break;
+        }
+        let dll = read_cstr(rva_to_off(name_rva)?)?;
+
+        let mut functions = Vec::new();
+        let thunk_rva = if oft != 0 { oft } else { ft };
+        if let Some(mut toff) = rva_to_off(thunk_rva) {
+            for _ in 0..256 {
+                let Some(value) = read_u32(toff) else { break };
+                if value == 0 {
+                    break;
+                }
+                if value & 0x8000_0000 != 0 {
+                    functions.push(format!("#{}", value & 0xffff));
+                } else if let Some(name) = rva_to_off(value & 0x7fff_ffff).and_then(|o| {
+                    // IMAGE_IMPORT_BY_NAME: WORD hint, then the name.
+                    read_cstr(o + 2)
+                }) {
+                    functions.push(name);
+                }
+                toff += 4;
+            }
+        }
+        out.push(ImportedDll { dll, functions });
+        cursor += 20;
+    }
+
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// The measured 1.x-generation classic stub surface: exactly two imported
+/// DLLs, `kernel32` + `comctl32` (case-insensitive), at most four functions
+/// in total.
+///
+/// Measured: Themida 1.1.1–1.9.1 and WinLicense 1.1.1–1.8.9 all carry
+/// `KERNEL32.dll[CreateFileA, ExitProcess]` + `COMCTL32.dll[InitCommonControls]`;
+/// WinLicense 2.0.8 carries `KERNEL32.dll[CreateFileA, lstrcpy]` +
+/// `COMCTL32.dll[InitCommonControls]` — same two-DLL shape.
+#[must_use]
+pub fn is_classic_stub_surface(surface: &[ImportedDll]) -> bool {
+    if surface.len() != 2 {
+        return false;
+    }
+    let mut has_kernel32 = false;
+    let mut has_comctl32 = false;
+    let mut funcs = 0usize;
+    for entry in surface {
+        let name = entry.dll.to_ascii_lowercase();
+        if name == "kernel32.dll" {
+            has_kernel32 = true;
+        } else if name == "comctl32.dll" {
+            has_comctl32 = true;
+        } else {
+            return false;
+        }
+        funcs += entry.functions.len();
+    }
+    has_kernel32 && has_comctl32 && funcs <= 4
+}
+
+/// The measured SecureEngine-2.x import surface: exactly one imported DLL,
+/// `kernel32`, with at most two functions.
+///
+/// Measured: WinLicense 2.0.1.0 imports only `kernel32[SizeofResource]`;
+/// the 2.0.6.5 CISC/RISC examples import only `kernel32[lstrlenW]` /
+/// `kernel32[GetProfileStringW]`.  The function name is randomised per
+/// build, the one-DLL shape is not.
+#[must_use]
+pub fn is_secureengine2_surface(surface: &[ImportedDll]) -> bool {
+    surface.len() == 1
+        && surface[0].dll.eq_ignore_ascii_case("kernel32.dll")
+        && !surface[0].functions.is_empty()
+        && surface[0].functions.len() <= 2
 }
 
 /// Check whether the original entry point has been virtualised.
@@ -275,6 +471,15 @@ pub fn is_themida_section(section: &PeSection) -> bool {
     // Signal 1b: known Themida section names.
     let lower = section.name.to_lowercase();
     if lower.contains(".winlice") || lower.contains(".boot") || lower.contains(".themida") {
+        return true;
+    }
+
+    // Signal 1c: WinLicense 1.x truncates its section name to 8 bytes
+    // ("WinLicen") — measured on the version ladder (WinLicense 1.1.1.0 and
+    // 1.4.0.2 unpack-mes, 19 samples, every one otherwise invisible to this
+    // heuristic).  Without this the packer gate would route those targets
+    // away from the Themida pipeline.
+    if lower.starts_with("winlicen") {
         return true;
     }
 

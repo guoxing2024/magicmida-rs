@@ -8,6 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Themida/WinLicense version fingerprints for 1.x and 2.x** — measured on a
+  76-sample version ladder (Themida 1.1.1.0–1.9.1.0, WinLicense 1.1.1.0–2.0.8.0,
+  each labelled by its exact packer version, fetched from the archived Tuts 4 You
+  Collection 2011; see RUNBOOK for the reproducible range-download recipe).
+  `/analyze` now reports the generation: `Ancient` = `"Themida "` section name
+  (1.1.1–1.8.2), `V1` = the classic import pair (exactly kernel32+comctl32,
+  ≤ 4 functions — covers 1.9.1 whose section name the packer's user renamed),
+  `V2` = the SecureEngine single-kernel32 import surface (function randomised
+  per build) or the Pascal dual-`0x1000` stub rule. Measured corollaries, all
+  pinned: section names are unreliable below 3.x; `is_themida_section` was
+  blind to WinLicense 1.x's truncated `WinLicen` section name (19 samples
+  missed — now routed); unlicense's 2.x section-start byte patterns score 0
+  on this ladder and were deliberately not ported. WinLicense 2.0.8 shares the
+  classic V1 surface — recorded as a documented ambiguity. The 2005-era stubs
+  run on modern Windows; `/unpack` on 1.x/2.x is **not** claimed — a measured
+  run ends `OEP not found` because the OEP pipeline is v3-shaped.
+- **A version-ladder corpus gate** (`themida_ladder_gate`, runs by default,
+  SKIPs when the corpus is absent like the VMProtect corpus gate): every
+  ladder sample must classify by its labelled generation (76/76 measured) and
+  carry a Themida-section shape; unit tests drive the import-surface rules on
+  hand-built import directories, so the gate is green without the corpus.
+
 - **UPX as the third packer (`mida-packers-upx`)** — measured against UPX 5.2.1
   output and cross-checked with UPX's own source at tag v5.2.1: the 32-byte
   `PackHeader` (version 13; PE32 = 9, PE32+/AMD64 = 36; method 8 = NRV2E_LE32
