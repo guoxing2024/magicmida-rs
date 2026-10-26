@@ -144,7 +144,8 @@ The full measurement tables are in [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
 - **UPX branch** — detection, `PackHeader` parsing, a static layout report,
   and the **static unpacker**: `/unpack --packer upx` restores the original
   file with no process and no desktop session, byte-for-byte identical to
-  `upx -d` on the corpus (NRV2E/LZMA decode, filter undo, full `unpack0` PE
+  `upx -d` on the corpus (NRV2B/NRV2D/NRV2E/LZMA decode through a shared
+  UCL-core port, filter undo, full `unpack0` PE
   rebuild). Measured against UPX 5.2.1 output and cross-checked against UPX's
   own source. Also fixes a real trap: UPX's `UPX0` section would otherwise
   fire the Themida heuristic and hand a UPX file to the Themida debugger loop

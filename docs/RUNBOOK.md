@@ -221,11 +221,13 @@ cargo test --release -p mida-cli --test vmprotect_packed_gate -- --ignored --noc
 ```
 
 对账：**`upx -d` 自己的输出**，不是加壳前的原始文件（UPX 打包时改写 DOS stub 区且从不还原，
-4 样本实测尺寸全同、哈希全异）。golden sha256：injector `2f391f08…`、mida_x64 `459f4f8e…`、
-x86 `da7a1dce…`。gate：`cargo test -p mida-packers-upx`（默认就跑；语料缺目录时显式 SKIP，
-样本在 `OUT\upx_samples\`，upx 5.2.1 可再生；单测用手工位流向量，无样本也全绿）。
-移植参考：UPX v5.2.1 源码（`OUT\upx-5.2.1\` + `OUT\ucl_src\`）与 Python 原型
-（`OUT\upx_unpack_proto.py`）。
+7 样本实测尺寸全同、哈希全异）。golden sha256：injector `2f391f08…`、mida_x64 `459f4f8e…`、
+x86 `da7a1dce…`——NRV2B（`upx --nrv2b`）/NRV2D（`--nrv2d`）样本与 NRV2E/LZMA 样本
+同源，产物哈希两两相同，互为解码器交叉验证。gate：`cargo test -p mida-packers-upx`
+（默认就跑；语料缺目录时显式 SKIP，样本在 `OUT\upx_samples\`，upx 5.2.1 可再生；
+单测用手工位流向量——`OUT\nrv2e_encode.py` / `OUT\nrv2bd_encode.py`（BFS 编码器
+内嵌解码器自校验），无样本也全绿）。移植参考：UPX v5.2.1 源码（`OUT\upx-5.2.1\`
++ `OUT\ucl_src\`）与 Python 原型（`OUT\upx_unpack_proto.py`）。
 
 ## x86 编译（2026-10-23 打通）
 

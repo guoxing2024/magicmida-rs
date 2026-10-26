@@ -28,22 +28,28 @@
 //!
 //! ## The static unpacker
 //!
-//! [`unpack_static`] ports `PeFile::unpack0` of the same tag: decode
-//! (NRV2E `le32` per UCL `n2e_d.c`, or LZMA with UPX's 2-byte property
-//! header per `compress_lzma.cpp`), undo the call-trick filter
-//! (`cto.h` / `ctok.h`), rebuild imports, relocations and resources from the
-//! reconstruction data the decoded image carries at its tail, and reassemble
-//! the file.  Verified **byte-for-byte against `upx -d`** on all four corpus
-//! samples — with the recorded caveat that `upx -d`'s output is the ground
-//! truth, not the pre-pack original (UPX rewrites the DOS stub area when
-//! packing and never restores it).  See `unpack.rs` for the port and its
-//! three traps.
+//! [`unpack_static`] ports `PeFile::unpack0` of the same tag: decode (all
+//! four PE methods — NRV2B/NRV2D/NRV2E `le32` per UCL `n2b_d.c`/`n2d_d.c`/
+//! `n2e_d.c` through the shared core in `nrv.rs`, and LZMA with UPX's
+//! 2-byte property header per `compress_lzma.cpp`), undo the call-trick
+//! filter (`cto.h` / `ctok.h`), rebuild imports, relocations and resources
+//! from the reconstruction data the decoded image carries at its tail, and
+//! reassemble the file.  Verified **byte-for-byte against `upx -d`** on all
+//! seven corpus samples (both architectures, all three NRV methods, LZMA,
+//! both filters — NRV2B/NRV2D packed from the same originals cross-check
+//! against the NRV2E/LZMA goldens) — with the recorded caveat that
+//! `upx -d`'s output is the ground truth, not the pre-pack original (UPX
+//! rewrites the DOS stub area when packing and never restores it).  See
+//! `unpack.rs` for the port and its three traps.
 
 mod detect;
 mod error;
 mod filter;
 mod header;
 mod lzma;
+mod nrv;
+mod nrv2b;
+mod nrv2d;
 mod nrv2e;
 mod reloc;
 mod report;

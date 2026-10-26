@@ -259,6 +259,25 @@ const UNPACK_GOLDENS: &[(&str, u64, &str)] = &[
         6_234_165,
         "da7a1dce9944a2b8a49c426d78f143fda3d16eb389ef4d6d015d8c9cedd3fc14",
     ),
+    // NRV2B (method 2) and NRV2D (method 5), packed 2026-10-26 with
+    // `upx --nrv2b / --nrv2d` from the same two originals — the products
+    // hash to the same goldens as the NRV2E/LZMA lines above, which is the
+    // cross-check that all four decoders agree.
+    (
+        "mida_x64_nrv2b.upx.exe",
+        6_379_269,
+        "459f4f8e1b805961c725b5e6b65beab43da7c91cecdece836228e5e5be03c8a6",
+    ),
+    (
+        "mida_x64_nrv2d.upx.exe",
+        6_379_269,
+        "459f4f8e1b805961c725b5e6b65beab43da7c91cecdece836228e5e5be03c8a6",
+    ),
+    (
+        "mida_x86_b.upx.exe",
+        6_234_165,
+        "da7a1dce9944a2b8a49c426d78f143fda3d16eb389ef4d6d015d8c9cedd3fc14",
+    ),
 ];
 
 /// The static unpacker reproduces `upx -d` byte-for-byte, on every corpus

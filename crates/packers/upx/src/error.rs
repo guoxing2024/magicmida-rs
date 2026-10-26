@@ -31,8 +31,17 @@ pub enum UpxUnpackError {
     #[error("unsupported filter id {0:#x}")]
     UnsupportedFilter(u8),
 
+    #[error("nrv2b decode: {0}")]
+    Nrv2b(&'static str),
+
+    #[error("nrv2d decode: {0}")]
+    Nrv2d(&'static str),
+
     #[error("nrv2e decode: {0}")]
     Nrv2e(&'static str),
+
+    #[error("bitstream: {0}")]
+    Bitstream(&'static str),
 
     #[error("lzma decode: {0}")]
     Lzma(String),

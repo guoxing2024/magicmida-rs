@@ -86,6 +86,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **README screenshots** — the GUI's option rail and a finished run are now
   embedded in the Quick Start (`docs/img/`), captured with `PrintWindow` so
   no input automation and no focus stealing is involved.
+- **NRV2B and NRV2D decoding** — the UPX static unpacker now covers all four
+  PE methods. The three UCL NRV variants share one ported core (`nrv.rs`,
+  from `n2b_d.c`/`n2d_d.c`/`n2e_d.c`; the deltas — B's branchless offset
+  loop and 0xd00 threshold, D/E's LSB-theft length seed and 0x500, E's extra
+  selector level — are tabulated in the module doc), with `nrv2e.rs` turned
+  into a thin wrapper whose existing hand-built vector proves the refactor
+  faithful. New vectors come from `OUT\nrv2bd_encode.py` (BFS over the
+  decoder's own ops, self-verified against embedded Python ports and
+  cross-rejected: B's stream fails D's decoder and vice versa). Real-sample
+  proof: `upx --nrv2b` / `--nrv2d` on the two corpus originals unpack
+  byte-for-byte to the same `upx -d` goldens as NRV2E/LZMA
+  (`459f4f8e…` / `da7a1dce…`) — three new gate entries, corpus now seven
+  samples. The port bug this caught: B reads *two* fresh length bits, the
+  first Rust draft consumed one and desynced — exactly what the vectors are
+  for.
 
 ### Fixed
 - **`mida-run` parser missed the non-Themida product lines** — `RunState

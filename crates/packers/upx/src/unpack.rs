@@ -35,8 +35,8 @@
 use mida_pe::PeHeader;
 
 use super::error::UpxUnpackError;
-use super::header::{adler32, find_pack_header, M_LZMA, M_NRV2E_LE32};
-use super::{filter, lzma, nrv2e, reloc};
+use super::header::{adler32, find_pack_header, M_LZMA, M_NRV2B_LE32, M_NRV2D_LE32, M_NRV2E_LE32};
+use super::{filter, lzma, nrv2b, nrv2d, nrv2e, reloc};
 
 // ---------------------------------------------------------------------------
 // checked byte access
@@ -222,6 +222,8 @@ pub fn unpack_static(pe: &PeHeader, image: &[u8]) -> Result<Vec<u8>, UpxUnpackEr
     // ---- decompress (method dispatch; u_len is both the size and the bound)
     let u_len = ph.u_len as usize;
     let mut obuf: Vec<u8> = match ph.method {
+        M_NRV2B_LE32 => nrv2b::decompress(stream, u_len)?,
+        M_NRV2D_LE32 => nrv2d::decompress(stream, u_len)?,
         M_NRV2E_LE32 => nrv2e::decompress(stream, u_len)?,
         M_LZMA => lzma::decompress(stream, u_len)?,
         other => return Err(UpxUnpackError::UnsupportedMethod(other)),
