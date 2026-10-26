@@ -168,18 +168,42 @@ fn sha256_of(path: &Path) -> String {
 }
 
 /// Locate the CLI binary that belongs to this test run.
+///
+/// The pipeline goldens were recorded with a **release** build (the RUNBOOK's
+/// documented run path), and the debug build's timing is a different animal
+/// entirely (measured on the DLL gate 2026-10-26: debug reproducibly loses the
+/// shell's main thread before the IAT trace).  `cargo test` without
+/// `--release` puts this test binary in `target/<profile>/deps`, so prefer the
+/// same target triple's release binary and fall back to the test's own profile
+/// only when release was never built.
 fn mida_cli_path() -> PathBuf {
-    // target/<profile>/deps/<test-exe> → target/<profile>/mida-cli.exe
-    let mut dir = std::env::current_exe().expect("current_exe");
-    dir.pop(); // deps/
-    dir.pop(); // <profile>/
-    let exe = dir.join("mida-cli.exe");
+    let exe = std::env::current_exe().expect("current_exe");
+    let profile_dir = exe
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("test exe lives in target/<profile>/deps")
+        .to_path_buf();
+    let base = profile_dir
+        .parent()
+        .expect("profile dir has a parent")
+        .to_path_buf();
+    let release = base.join("release").join("mida-cli.exe");
+    if release.is_file() {
+        return release;
+    }
+    let same_profile = profile_dir.join("mida-cli.exe");
     assert!(
-        exe.exists(),
-        "mida-cli.exe not found at {} — build it first: cargo build --release -p mida-cli",
-        exe.display()
+        same_profile.exists(),
+        "mida-cli.exe not found at {} (or {}) — build it first: cargo build --release -p mida-cli",
+        release.display(),
+        same_profile.display()
     );
-    exe
+    println!(
+        "note: no release mida-cli.exe under {}, falling back to {}",
+        base.display(),
+        same_profile.display()
+    );
+    same_profile
 }
 
 // ---------------------------------------------------------------------------

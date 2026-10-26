@@ -113,6 +113,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Discriminating power measured: corrupting a product's
   `AddressOfEntryPoint` makes the probe die with `0xC0000005` and empty
   stdout — exactly what the two assertions catch.
+- **DLL gate control method** — the last hard, environment-sensitive window
+  assertion is now control-gated, mirroring the EXE gate: the **protected
+  original** runs through the same acceptance harness first (a plain
+  `LoadLibraryW` suffices for this shell — `LOADED=1 VERSION=1.1`), and the
+  judgement table decides: control creates+shows its window → the product's
+  window asserts stay hard (class/title/visibility); control itself cannot
+  show it (measured in a real session: `WINDOW_FOUND=1 WINDOW_VISIBLE=0`) →
+  the window checks print `NOT EXERCISED` naming the environment while
+  `LOADED`/`VERSION` remain hard; a control that does not load/answer fails
+  loudly ("this session cannot judge"). Discriminating power measured: a
+  wrong manifest title reds the gate on `WINDOW_TITLE`. The same round found
+  and fixed a buried gate defect: all three e2e gates resolved
+  `mida-cli.exe` profile-relatively, so `cargo test` silently ran the
+  **debug** pipeline — which reproducibly loses the shell's main thread
+  before the IAT trace (`OpenThread` succeeds, `GetThreadContext` returns
+  `ERROR_INVALID_HANDLE`; release passes 9/9, debug fails 7/7, with env /
+  cwd / pipes / stdin ruled out one by one) — the gates now prefer the same
+  target triple's release binary. The DLL byte golden was re-recorded a
+  third time (`8ba37a79…`): the live-IAT count still read 288 yet the bytes
+  moved again, and an A/B run with the `48fa9d4` worktree binary produced
+  byte-identical products — the session has more than one dial, the code is
+  innocent (manifest and POSTMORTEMS carry the evidence).
 
 ### Fixed
 - **`mida-run` parser missed the non-Themida product lines** — `RunState

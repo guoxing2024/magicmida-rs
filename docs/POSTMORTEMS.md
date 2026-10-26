@@ -724,3 +724,63 @@ EXE gate 用对照法判定"产物是否起来"。这一轮它的**对照样本*
    降级成 `GUI check NOT exercised` 而保留硬断言。**这个模式值得推广到 DLL gate**：
    目前 DLL gate 对 `WINDOW_VISIBLE` 是硬断言，若同类环境降级发生，它会红。
    单列出来是**已知缺口**，不是这一轮要修的事。
+
+## DLL gate 对照法落地 + gate 二进制的 profile 陷阱（2026-10-26）
+
+上一节教训 4 单列的已知缺口，本节收掉；顺带挖出一个埋了很久的 gate 缺陷。
+
+### 缺陷一：三条 e2e gate 跑的是 debug 管线
+
+`mida_cli_path()` 用 `current_exe` 推导 CLI 路径（deps → profile），`cargo test`
+不带 `--release` 时解析到 **`target\debug\mida-cli.exe`**。而 RUNBOOK 的运行路径、
+golden 的录制、MCP 的发布物全是 release。实测（同机、同会话、分钟间隔）：
+release 二进制 9/9 完成 DLL trace；debug 二进制**可复现地**在 trace 前丢失壳的
+主线程——`OpenThread` 成功而 `GetThreadContext` 返回 `ERROR_INVALID_HANDLE`
+（线程正在退出），`trace_start_sp=0` → trace 整段跳过 → dump 照写 → gate 在
+trace 计数断言上红。这不是时序抖动（7/7 vs 9/9，与启动参数、cwd、管道、环境变量
+无关——逐项排除过），是 debug 构建下壳的初始化节奏整个不同。
+（排查期间在 `get_thread_context` 里临时加过 `[diag]` 输出，定位后已还原。）
+**修法**：三个 gate 的 `mida_cli_path` 改为优先同 target triple 的 release 二进制
+（x86 gate 需要 triple 内的 release，故不能跨 triple），release 缺席时回退本
+profile 并打印 note。
+
+### 缺陷二：环境的 dial 不止 288/289 一个
+
+DLL gate 修好 profile 后第一跑，字节 golden（`a27eb68a…`）又漂了。本节上文的
+归因是 live-IAT 解析计数 288/289；**今天日志读到的正是 288——计数没动，字节
+还是动了**。A/B 定责照旧：`48fa9d4`（本分支最后一个"绿色基线"提交）worktree
+二进制，同机同会话同命令，产物 **`8ba37a79…` 与当前管线逐字节相同**——代码
+无罪，重录 golden（manifest 带 A/B 证据注释）。同一天里环境至少翻过三次：
+失败窗口（14:08–14:11）→ 恢复（14:19 起）→ 对照基线 `WINDOW_VISIBLE` 在
+14:31 量到 0、14:5x 量到 1。**结论：这个会话状态是多 dial 的、会自翻的；
+golden 锁的是"会话指纹"，跨会话不复现属于已记录的常态，不是回归。**
+
+### DLL gate 对照法落地
+
+把 EXE gate 的判定表（上文 477–479）移植进 DLL gate 第 7 节：
+
+- **对照 = 受保护原始样本本身**（`sample_path` 那个文件），先于产物跑同一
+  harness——DLL 的壳用普通 `LoadLibraryW` 就能跑起来（无调试器无反调，
+  实测 `LOADED=1 VERSION=1.1`），不需要 EXE 那样的特殊处置。
+- 对照必须 `LOADED=1` 且 `VERSION` 命中期望，否则本次会话**没有资格评判**，
+  gate 红并点名"this session cannot judge"——宁可响也不假绿。
+- 窗口断言按判定表门控：对照能创建+显示窗口 → 产物窗口断言全硬；对照自身
+  `WINDOW_FOUND=0` / `WINDOW_VISIBLE=0` → 打印 `NOT EXERCISED`（写明是环境、
+  指向本节），`LOADED`/`VERSION` 保持硬。产物若在对照缺席时自己创建了窗口，
+  class/title 照断（产物比对照强时检查只多不少）。
+- `injector` 类副作用样本不进对照（EXE gate 同款取舍）。
+
+**判别力**：manifest 的 `expect_window_title` 临时改成错值 → gate 红在
+`WINDOW_TITLE`（ exercising 分支的牙口）；`NOT EXERCISED` 分支由当日实测的
+`WINDOW_VISIBLE=0` 会话背书（该分支就是那次会话的形状）。教训 3 的"手工复测"
+在这里被结构化成对照轮：真实检查没有丢——会话允许时它照跑、照硬。
+
+### 留下的教训（本节）
+
+1. **gate 解析"自己的 CLI"时，profile 是陷阱**：`cargo test` 的默认 profile
+   与 RUNBOOK 的运行路径不同，`current_exe` 相对推导会静默错配。golden 是
+   哪个二进制录的，gate 就必须跑哪个。
+2. **"归因于一个计数器"的漂移解释要用下一次会话复核**——288/289 解释了
+   10-25 那次，解释不了这次；环境的 dial 数量只能多不能少。
+3. **对照轮是"手工复测"的脚本化**：把教训 3 的动作固化进 gate，检查项既不丢、
+   也不再依赖有人在旁边手工判断。

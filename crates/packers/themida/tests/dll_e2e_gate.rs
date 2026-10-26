@@ -35,12 +35,19 @@
 //! ```
 //!
 //! Needs Windows, the ScyllaHide helpers next to `mida-cli`, `gcc` on `PATH`
-//! (to build the harness), the sample itself, and — because the last assertion
-//! is a real window — an interactive desktop session.  On a headless CI runner
-//! the window assertion is the part that will not pass.
+//! (to build the harness), the sample itself, and — for the window checks — a
+//! session that can actually show a window.  The window assertions are
+//! **control-gated**: the protected original runs through the same harness
+//! first, and only a session where the control itself creates and shows the
+//! window may judge the product's window (see step 7a for the judgement
+//! table).  A degraded session reports the window checks as NOT EXERCISED
+//! instead of failing them — the spurious red the manifest recorded as
+//! "同类环境降级会让它红" is gone, and `LOADED`/`VERSION` stay hard in every
+//! session.  On a headless runner the whole case cannot run anyway: the
+//! unpack itself needs the desktop session.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use mida_pe::PeHeader;
 use sha2::{Digest, Sha256};
@@ -163,16 +170,44 @@ fn read_dir_bytes(path: &Path, rva: u32, len: u32) -> Option<Vec<u8>> {
 
 /// Locate the CLI binary that belongs to this test run.
 fn mida_cli_path() -> PathBuf {
-    let mut dir = std::env::current_exe().expect("current_exe");
-    dir.pop(); // deps/
-    dir.pop(); // <profile>/
-    let exe = dir.join("mida-cli.exe");
+    // The pipeline goldens were recorded with a **release** build (the
+    // RUNBOOK's documented run path), and the debug build cannot complete the
+    // DLL trace in this environment — measured 2026-10-26: release succeeds
+    // every time, the debug build reproducibly loses the shell's main thread
+    // before the trace (`GetThreadContext` → `ERROR_INVALID_HANDLE`, the same
+    // failure class as the documented gate race).  `cargo test` without
+    // `--release` puts this test binary in `target/<profile>/deps`, so the
+    // profile-relative resolution below would silently hand the gate a debug
+    // pipeline.  Prefer the **same target triple's** release binary and fall
+    // back to the test's own profile only when release was never built (the
+    // x86 gate needs its triple's release binary, hence "same triple").
+    let exe = std::env::current_exe().expect("current_exe");
+    let profile_dir = exe
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("test exe lives in target/<profile>/deps")
+        .to_path_buf();
+    let base = profile_dir
+        .parent()
+        .expect("profile dir has a parent")
+        .to_path_buf();
+    let release = base.join("release").join("mida-cli.exe");
+    if release.is_file() {
+        return release;
+    }
+    let same_profile = profile_dir.join("mida-cli.exe");
     assert!(
-        exe.exists(),
-        "mida-cli.exe not found at {} — build it first: cargo build --release -p mida-cli",
-        exe.display()
+        same_profile.exists(),
+        "mida-cli.exe not found at {} (or {}) — build it first: cargo build --release -p mida-cli",
+        release.display(),
+        same_profile.display()
     );
-    exe
+    println!(
+        "note: no release mida-cli.exe under {}, falling back to {}",
+        base.display(),
+        same_profile.display()
+    );
+    same_profile
 }
 
 /// Build the behaviour harness next to the test artifacts.
@@ -238,6 +273,10 @@ fn e2e_dll_case_matches_golden_record() {
     let _ = std::fs::remove_file(&out_dll);
 
     let output = Command::new(&cli)
+        // Pin stdin: the pipeline never reads it, and a closed/inherited
+        // handle must not be able to block anything (mirrors mida-run's
+        // `Job::spawn`).
+        .stdin(Stdio::null())
         .arg("/unpack")
         .arg(&case.sample_path)
         .arg("-o")
@@ -458,6 +497,90 @@ fn e2e_dll_case_matches_golden_record() {
     // and exports correctly but answers `"0.0"` is the defect this gate exists
     // to catch, and no structural check above would notice it.
     let harness = build_harness(&out_dir);
+
+    // ---- 7a. the control run ------------------------------------------------
+    //
+    // The **protected original itself** through the same harness, in the same
+    // session, before the product — the same control-sample method the EXE
+    // gate uses (see POSTMORTEMS「EXE gate 的启动判定改为对照法」).  The
+    // shell's window behaviour depends on the session it runs in, and this
+    // machine has already produced a session where the control's own window
+    // never became visible (measured 2026-10-26: the control reports
+    // `WINDOW_FOUND=1 WINDOW_VISIBLE=0`, window created but never shown).
+    // A hard `WINDOW_VISIBLE` assertion on the product alone turned that
+    // into a false red — the exact spurious failure the manifest recorded as
+    // "同类环境降级会让它红".
+    //
+    // Judgement table (control = protected original, product = our dump):
+    //
+    //   control creates+shows the window, product does too  -> gate green
+    //   control creates+shows it, product does not          -> real defect,
+    //                                                          red (the only
+    //                                                          case that
+    //                                                          accuses the
+    //                                                          dump)
+    //   control itself does not create/show it              -> this session
+    //                                                          cannot judge
+    //                                                          the window
+    //                                                          checks; they
+    //                                                          are reported
+    //                                                          as NOT
+    //                                                          EXERCISED and
+    //                                                          the remaining
+    //                                                          hard asserts
+    //                                                          stand
+    //
+    // Behaviour (stdout + exit) is compared, never bytes: the product and the
+    // protected original are different files by design.
+    let control_run = Command::new(&harness)
+        .arg(&case.sample_path)
+        .output()
+        .unwrap_or_else(|e| panic!("[{}] cannot run harness on the control: {e}", case.case_id));
+    let clog = String::from_utf8_lossy(&control_run.stdout).to_string()
+        + &String::from_utf8_lossy(&control_run.stderr);
+    let clog_path = out_dir.join("control.log");
+    std::fs::write(&clog_path, &clog).ok();
+
+    let cfield = |key: &str| -> Option<String> {
+        clog.lines()
+            .find_map(|l| l.strip_prefix(&format!("{key}=")))
+            .map(str::to_string)
+    };
+
+    // The control must load and answer the same version, or this session
+    // cannot judge anything about the case: the sample is the very file the
+    // pipeline just unpacked, so a control that does not run names the
+    // environment, not the dump.  Loud, not silent-green.
+    assert_eq!(
+        cfield("LOADED").as_deref(),
+        Some("1"),
+        "[{}] the control (the protected original itself) does not load \
+         standalone — this session cannot judge the case (control log: {})\n{}",
+        case.case_id,
+        clog_path.display(),
+        clog
+    );
+    assert_eq!(
+        cfield("VERSION").as_deref(),
+        Some(case.expect_version.as_str()),
+        "[{}] the control does not answer {} — the session cannot judge the \
+         behaviour checks (control log: {})\n{}",
+        case.case_id,
+        case.expect_version,
+        clog_path.display(),
+        clog
+    );
+    let c_found = cfield("WINDOW_FOUND").as_deref() == Some("1");
+    let c_visible = cfield("WINDOW_VISIBLE").as_deref() == Some("1");
+    println!(
+        "[{}] control baseline: LOADED=1 VERSION={} WINDOW_FOUND={} WINDOW_VISIBLE={}",
+        case.case_id,
+        cfield("VERSION").as_deref().unwrap_or("?"),
+        cfield("WINDOW_FOUND").as_deref().unwrap_or("?"),
+        cfield("WINDOW_VISIBLE").as_deref().unwrap_or("?"),
+    );
+
+    // ---- 7b. the product run ------------------------------------------------
     let run = Command::new(&harness)
         .arg(&out_dll)
         .output()
@@ -493,42 +616,95 @@ fn e2e_dll_case_matches_golden_record() {
         hlog
     );
 
-    assert_eq!(
-        field("WINDOW_FOUND").as_deref(),
-        Some("1"),
-        "[{}] the product never created its window — Run() did not get going \
-         (harness log: {})\n{}",
-        case.case_id,
-        hlog_path.display(),
-        hlog
-    );
-
-    assert_eq!(
-        field("WINDOW_CLASS").as_deref(),
-        Some(case.expect_window_class.as_str()),
-        "[{}] window class changed (harness log: {})\n{}",
-        case.case_id,
-        hlog_path.display(),
-        hlog
-    );
-
-    assert_eq!(
-        field("WINDOW_TITLE").as_deref(),
-        Some(case.expect_window_title.as_str()),
-        "[{}] window title changed (harness log: {})\n{}",
-        case.case_id,
-        hlog_path.display(),
-        hlog
-    );
-
-    // A visible window is the difference between "created" and "on screen".
-    assert_eq!(
-        field("WINDOW_VISIBLE").as_deref(),
-        Some("1"),
-        "[{}] window exists but is not visible (harness log: {})",
-        case.case_id,
-        hlog_path.display()
-    );
+    // The window block is judged against the control baseline.  `LOADED` and
+    // `VERSION` above are hard regardless: they do not depend on the session.
+    let p_found = field("WINDOW_FOUND").as_deref() == Some("1");
+    if c_found {
+        // The session exercises the window; the product must create it too.
+        // This is the one comparison that accuses the dump.
+        assert_eq!(
+            field("WINDOW_FOUND").as_deref(),
+            Some("1"),
+            "[{}] the product never created its window while the control \
+             sample did — Run() did not get going (harness log: {})\n{}",
+            case.case_id,
+            hlog_path.display(),
+            hlog
+        );
+        assert_eq!(
+            field("WINDOW_CLASS").as_deref(),
+            Some(case.expect_window_class.as_str()),
+            "[{}] window class changed (harness log: {})\n{}",
+            case.case_id,
+            hlog_path.display(),
+            hlog
+        );
+        assert_eq!(
+            field("WINDOW_TITLE").as_deref(),
+            Some(case.expect_window_title.as_str()),
+            "[{}] window title changed (harness log: {})\n{}",
+            case.case_id,
+            hlog_path.display(),
+            hlog
+        );
+        if c_visible {
+            // A visible window is the difference between "created" and "on
+            // screen" — assertable only when the session shows windows at all.
+            assert_eq!(
+                field("WINDOW_VISIBLE").as_deref(),
+                Some("1"),
+                "[{}] window exists but is not visible while the control's is \
+                 (harness log: {})",
+                case.case_id,
+                hlog_path.display()
+            );
+        } else {
+            println!(
+                "[{}] WINDOW_VISIBLE NOT EXERCISED — the control sample itself \
+                 reports WINDOW_VISIBLE=0 in this session (window created but \
+                 never shown; environment, see POSTMORTEMS 对照法).  Product \
+                 reports WINDOW_VISIBLE={}.  The byte gate, LOADED and VERSION \
+                 remain hard.",
+                case.case_id,
+                field("WINDOW_VISIBLE").as_deref().unwrap_or("?")
+            );
+        }
+    } else {
+        // The session cannot create the window even for the original: the
+        // window checks are void here.  Report explicitly instead of failing.
+        println!(
+            "[{}] window checks NOT EXERCISED — the control sample itself never \
+             created its window in this session (WINDOW_FOUND=0; environment, \
+             see POSTMORTEMS 对照法).  LOADED and VERSION remain hard and passed.",
+            case.case_id
+        );
+        if p_found {
+            // The product outperformed its control: the window exists, so the
+            // product's own properties are checkable after all.
+            assert_eq!(
+                field("WINDOW_CLASS").as_deref(),
+                Some(case.expect_window_class.as_str()),
+                "[{}] window class changed (harness log: {})\n{}",
+                case.case_id,
+                hlog_path.display(),
+                hlog
+            );
+            assert_eq!(
+                field("WINDOW_TITLE").as_deref(),
+                Some(case.expect_window_title.as_str()),
+                "[{}] window title changed (harness log: {})\n{}",
+                case.case_id,
+                hlog_path.display(),
+                hlog
+            );
+            println!(
+                "[{}] product created the window its control could not \
+                 (WINDOW_VISIBLE={}) — class and title asserted",
+                case.case_id,
+                field("WINDOW_VISIBLE").as_deref().unwrap_or("?")
+            );
+        }
+    }
 
     let _ = std::fs::remove_dir_all(&out_dir);
 }

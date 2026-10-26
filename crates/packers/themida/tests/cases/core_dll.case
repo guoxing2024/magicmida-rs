@@ -119,7 +119,23 @@ expect_output_size: 1737216
 #
 # The value below is deterministic: measured 4/4 identical across independent
 # runs (3 gate runs plus the `4df2c09` A/B run).
-expect_output_sha256: a27eb68a6e65ba58239d4fa1d2e489010b2fa32d5436e188d4352e42205c966a
+#
+# Re-recorded 2026-10-26 (→ `8ba37a79…`), because this session's environment
+# moved **another** dial.  The 2026-10-25 note attributed the drift to the
+# live-IAT resolution count (288 vs 289); today's log reads exactly `Resolved
+# 288 API addresses from live IAT image` — the same count the `a27eb68a…`
+# record was taken under — and yet the bytes moved.  So the environment has
+# more than one dial (this session also *restored* the shell's window creation:
+# the control baseline measured `WINDOW_FOUND=1`, where the 2026-10-25 session
+# had the EXE control never getting past 程序启动), and the product bytes track
+# the session state, not just that one counter.
+#
+# Code-innocence was proven by A/B with the workspace's own method: the binary
+# at commit `48fa9d4` (built in a separate worktree, predating every change
+# since) run against this same sample in this same session produced
+# **`8ba37a79…` byte for byte** — identical to the current pipeline's product.
+# The drift is the session, not the code.
+expect_output_sha256: 8ba37a79078fc2479d685f138a8f7928bbefd9b829bfdbc9b9fec781b61445f6
 
 # Characteristics the product's first section must declare.
 #
@@ -137,3 +153,29 @@ expect_version: 1.1
 # wrong code path was reached.
 expect_window_class: PigToGoLicenseDialog
 expect_window_title: 授权验证
+#
+# --- window assertions are control-gated (2026-10-26) ----------------------
+#
+# The gate runs the **protected original itself** through the same harness in
+# the same session before judging the product, and applies the judgement table
+# from POSTMORTEMS「EXE gate 的启动判定改为对照法」:
+#
+#   control creates+shows the window, product does too -> green
+#   control creates+shows it, product does not         -> real defect, red
+#   control itself does not create/show it             -> window checks are
+#                                                         reported NOT
+#                                                         EXERCISED, LOADED
+#                                                         and VERSION stay
+#                                                         hard
+#
+# Why: on 2026-10-26 this session's control baseline measured
+# `WINDOW_FOUND=1 WINDOW_VISIBLE=0` — the window is created but never shown —
+# which is exactly the environment degradation the manifest already recorded
+# on the EXE side ("its control sample reaches only 程序启动").  Under the old
+# hard assertion the DLL gate would have gone red on the product for behaving
+# identically to its own original.  The single hard window rule left: when the
+# control *does* exercise the window, a product that does not is a real defect.
+#
+# The single-instance-dialog trap applies to the control run too: clear any
+# leftover instances of the dialog owner before rerunning, or the next round
+# exits immediately (see POSTMORTEMS「EXE gate 的启动判定改为对照法」末尾).
