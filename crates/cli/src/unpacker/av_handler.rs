@@ -295,7 +295,28 @@ fn handle_access_violation(
     );
 
     if !ls.guard_installed {
-        dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+        // Ancient (1.1.1–1.8.2) shells decode via first-chance AVs + their
+        // own SEH: the decoder faults on purpose and expects its handler to
+        // fix the context up and advance.  `DBG_CONTINUE` here SWALLOWS the
+        // exception — the faulting instruction re-executes and refaults —
+        // measured on Themida 1.8.2: 1,024 identical faults at 0x1218235
+        // within seconds (the same shell standalone finishes its decode in
+        // ~25 s, because without a debugger the AV reaches its SEH).
+        // Deliver to the program's own SEH instead — exactly what it sees
+        // without a debugger.  1.1.1 also runs under this path today (slow:
+        // its swallowed-exception retry loops are the prime suspect for the
+        // 6–17 min vs 11–38 s standalone gap), so this only moves it closer
+        // to native behaviour.
+        //
+        // v3/V1 keep `DBG_CONTINUE`: their pre-guard phases tolerate the
+        // swallow (measured: the x86 v3 sample storms 156,309 faults at
+        // `.themida+0x538866` and still converges), and the v3/V1 byte
+        // goldens depend on the current behaviour — gated, not global.
+        if state.pe_info.themida_version == mida_packers_themida::ThemidaVersion::Ancient {
+            dbg.continue_event(thread_id, ContinueStatus::ExceptionNotHandled)?;
+        } else {
+            dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+        }
         return Ok(AvAction::Continue);
     }
 
@@ -926,7 +947,20 @@ fn handle_access_violation(
             } // end: EXE-oriented virtualised-OEP heuristics (skipped for DLLs)
         }
         GuardAccessResult::NotGuarded => {
-            dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+            // Second swallow point, same disease as the pre-guard branch
+            // (see the comment there): an Ancient shell faulting OUTSIDE the
+            // guarded range is running its own exception-driven logic, and
+            // `DBG_CONTINUE` swallows the exception — the faulting
+            // instruction re-executes and refaults.  Measured on Themida
+            // 1.8.2 after the first fix let the shell reach the CloseHandle
+            // milestone: 1,024 identical faults at 0x1227153 in the
+            // guard-installed phase.  Deliver to the shell's own SEH for
+            // Ancient; v3/V1 keep `DBG_CONTINUE` (byte goldens).
+            if state.pe_info.themida_version == mida_packers_themida::ThemidaVersion::Ancient {
+                dbg.continue_event(thread_id, ContinueStatus::ExceptionNotHandled)?;
+            } else {
+                dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+            }
             return Ok(AvAction::Continue);
         }
         GuardAccessResult::IatReady { address } => {

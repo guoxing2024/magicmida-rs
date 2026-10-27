@@ -1513,6 +1513,16 @@ fn try_ancient_watch_scan(
     if !state.ancient_watch {
         return;
     }
+    // Hard cap: a live shell in an exception storm produces THOUSANDS of
+    // debug events per minute, each one a freeze + a multi-MB snapshot.
+    // Measured on Themida 1.8.2 (2026-10-28): 25,644 snapshots ≈ 37 GB in
+    // one run.  64 numbered snapshots cover the informative window (the
+    // early ones, before the candidate set stabilises); past the cap the
+    // watch stays armed but silent.
+    const ANCIENT_SNAPSHOT_CAP: u32 = 64;
+    if state.ancient_snapshots >= ANCIENT_SNAPSHOT_CAP {
+        return;
+    }
     let packed_base = image_base_usize as u64;
     let Ok(images) = mida_pe::dumper::scan_mapped_images(dbg, false) else {
         return;
