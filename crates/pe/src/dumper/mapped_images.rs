@@ -16,7 +16,7 @@
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Memory::{
-    MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_MAPPED, VirtualQueryEx,
+    MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_MAPPED, MEM_PRIVATE, VirtualQueryEx,
 };
 
 use crate::error::PeError;
@@ -105,6 +105,79 @@ pub fn scan_mapped_images(
         }
 
         addr = mbi.BaseAddress as usize + mbi.RegionSize as usize;
+    }
+
+    Ok(images)
+}
+
+/// Deep scan: find MZ+PE images ANYWHERE inside committed `MEM_PRIVATE`
+/// regions — not just at region heads.
+///
+/// [`scan_mapped_images`] reads the first 0x400 bytes of each region; a PE
+/// decompressed into the MIDDLE of a shell workspace region (Themida 1.8.2's
+/// payload lives around 0x12xxxxx inside a large private allocation) is
+/// invisible to it.  This walk probes every page of every private region
+/// for the `MZ` signature, then parses a full header on a hit.
+///
+/// Cost is bounded by private-region size (the 1.8.2 workspace is ~0x200000:
+/// ~512 page probes per scan, ~1–2 ms).  Only `MEM_PRIVATE` is probed —
+/// module-backed (`MEM_IMAGE`) and file-backed (`MEM_MAPPED`) regions are
+/// covered by the head scan and the module list.
+pub fn scan_private_images(
+    debugger: &mut dyn DebuggerCore,
+) -> Result<Vec<MappedImage>, PeError> {
+    let h_process: HANDLE = debugger.process_handle();
+
+    let mut images: Vec<MappedImage> = Vec::new();
+    let mut addr: usize = 0;
+
+    while addr < 0x7FFF_FFFF {
+        let mut mbi = MEMORY_BASIC_INFORMATION::default();
+        let rc = unsafe {
+            VirtualQueryEx(
+                h_process,
+                Some(addr as *const _),
+                &mut mbi,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if rc != std::mem::size_of::<MEMORY_BASIC_INFORMATION>() {
+            addr = addr.checked_add(0x1000).unwrap_or(0x7FFF_FFFF);
+            continue;
+        }
+        let region_base = mbi.BaseAddress as usize;
+        let region_size = mbi.RegionSize as usize;
+        let next_region = region_base.checked_add(region_size).unwrap_or(0x7FFF_FFFF);
+
+        // Probe only committed private regions large enough to hold an image.
+        if mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE && region_size >= 0x10000 {
+            let mut page = 0usize;
+            while page + 0x400 <= region_size {
+                let mut head = [0u8; 0x400];
+                let ok = matches!(
+                    debugger.read_memory(region_base + page, &mut head),
+                    Ok(n) if n >= 0x200
+                );
+                if ok {
+                    if let Some(mz_off) = find_mz(&head) {
+                        if head[mz_off] == b'M' {
+                            if let Some(img) = parse_image(
+                                &head,
+                                mz_off,
+                                (region_base + page) as u64,
+                                (region_size - page) as u64,
+                                false,
+                            ) {
+                                images.push(img);
+                            }
+                        }
+                    }
+                }
+                page += 0x1000;
+            }
+        }
+
+        addr = next_region;
     }
 
     Ok(images)

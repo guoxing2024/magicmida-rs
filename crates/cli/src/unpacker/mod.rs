@@ -1630,9 +1630,24 @@ fn try_ancient_watch_scan(
     const ANCIENT_SNAPSHOT_CAP: u32 = 64;
     let snapshots_capped = state.ancient_snapshots >= ANCIENT_SNAPSHOT_CAP;
     let packed_base = image_base_usize as u64;
-    let Ok(images) = mida_pe::dumper::scan_mapped_images(dbg, false) else {
-        return;
+    // Two scans, merged and de-duplicated by base:
+    //  * the region-HEAD scan (module-backed images, file mappings, images
+    //    that start at a region boundary), and
+    //  * the PRIVATE deep scan (MZ+PE decompressed into the MIDDLE of a
+    //    shell workspace allocation — measured on Themida 1.8.2: the payload
+    //    runs natively from around 0x12xxxxx, a page far inside a large
+    //    MEM_PRIVATE region, invisible to any head-only scan).
+    let mut images = match mida_pe::dumper::scan_mapped_images(dbg, false) {
+        Ok(v) => v,
+        Err(_) => Vec::new(),
     };
+    if let Ok(deep) = mida_pe::dumper::scan_private_images(dbg) {
+        for img in deep {
+            if !images.iter().any(|i| i.base == img.base) {
+                images.push(img);
+            }
+        }
+    }
     // Candidates: not a registered module, big enough.  The PACKED IMAGE's
     // own first section is deliberately INCLUDED as a synthetic candidate
     // (rotated in every 3rd freeze): the shell may have decompressed the
