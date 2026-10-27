@@ -389,6 +389,12 @@ pub fn unpack(
     let h_process = dbg.process_handle();
 
     // The main debug loop runs until we've found the OEP and finished IAT.
+    let started = std::time::Instant::now();
+    // Workspace-stub trap RVA (diagnostic): `MAGICMIDA_STUB_TRAP=<rva>`.
+    // See the ThemidaState field docs for why this exists.
+    let stub_trap_rva: Option<usize> = std::env::var("MAGICMIDA_STUB_TRAP")
+        .ok()
+        .and_then(|v| usize::from_str_radix(v.trim_start_matches("0x"), 16).ok());
     loop {
         // Re-compute image_base and image_boundary every iteration so they
         // reflect the actual (ASLR-relocated) base from the CreateProcess event.
@@ -409,6 +415,102 @@ pub fn unpack(
             Err(mida_core::CoreError::Timeout) => {
                 try_map_scan(&mut dbg, &mut state, image_base_usize, &output_path);
                 try_ancient_watch_scan(&mut dbg, &mut state, image_base_usize, &output_path);
+                // Workspace-stub trap (diagnostic), page-guard variant: at
+                // the first quiet timeout after the decode's probe
+                // exceptions, guard the page containing
+                // `packed_base + MAGICMIDA_STUB_TRAP` with PAGE_NOACCESS —
+                // the stub's first execution faults and the AV handler
+                // dumps the live plaintext workspace.  Arming waits for the
+                // decode marker because DR0/PAGE_NOACCESS during the decode
+                // itself just storms (the decoder writes these pages).
+                if let Some(rva) = stub_trap_rva {
+                    if rva > 1
+                        && state.pe_info.themida_version
+                            == mida_packers_themida::ThemidaVersion::Ancient
+                        && !state.stub_guard_armed
+                        && started.elapsed().as_secs() >= 10
+                    {
+                        let page = (image_base_usize + rva) & !0xFFF;
+                        match mida_packers_themida::install_code_section_guard(
+                            h_process,
+                            page,
+                            0x1000,
+                            guard_protection,
+                        ) {
+                            Ok(()) => {
+                                state.stub_guard_armed = true;
+                                state.stub_guard_page = page;
+                                info!(
+                                    page = format!("{page:#x}"),
+                                    "Stub guard armed (PAGE_NOACCESS, post-decode)"
+                                );
+                            }
+                            Err(e) => warn!(error = %e, "Stub guard arm failed"),
+                        }
+                    }
+                }
+                // Workspace-stub trap (diagnostic), API-breakpoint variant:
+                // the payload must call one of the process-creation APIs to
+                // launch its payload (measured standalone: a Notepad window).
+                // Resolve WinExec / CreateProcessA / CreateProcessW /
+                // ShellExecuteA from the live module snapshot and arm DR0-3
+                // on them AFTER the decode (DR0 during decode deadlocks
+                // phase 2).  On a hit the stack top is the return address
+                // INTO the stub — self-locating, no hardcoded stub address.
+                if let Some(rva) = stub_trap_rva {
+                    if rva == 1
+                        && state.pe_info.themida_version
+                            == mida_packers_themida::ThemidaVersion::Ancient
+                        && !state.stub_trap_armed
+                        && started.elapsed().as_secs() >= 10
+                    {
+                        let wanted = [
+                            "winexec", "createprocessa", "createprocessw", "shellexecutea",
+                        ];
+                        let mut armed = 0usize;
+                        if let Ok(mods) = mida_pe::dumper::take_module_snapshot(
+                            dbg.process_handle(),
+                            dbg.pid(),
+                            dbg.image_base(),
+                            false,
+                        ) {
+                            'mods: for m in &mods {
+                                for (addr, name) in m.exports() {
+                                    let lower = name.to_lowercase();
+                                    if wanted.contains(&lower.as_str()) {
+                                        let slot = armed; // DR0..DR3
+                                        match dbg.set_hw_breakpoint(
+                                            slot,
+                                            addr as usize,
+                                            HwbpType::Execute,
+                                        ) {
+                                            Ok(()) => {
+                                                armed += 1;
+                                                state.stub_api_addrs.push(addr as usize);
+                                                info!(
+                                                    api = %name,
+                                                    addr = format!("{addr:#x}"),
+                                                    slot,
+                                                    "Stub API trap armed"
+                                                );
+                                                if armed >= 4 {
+                                                    break 'mods;
+                                                }
+                                            }
+                                            Err(e) => {
+                                                warn!(error = %e, api = %name, "API trap arm failed")
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if armed > 0 {
+                            state.stub_trap_armed = true;
+                            state.stub_guard_page = 1; // marks "API-trap mode armed"
+                        }
+                    }
+                }
                 // One-shot idle diagnostic (Ancient): after the decode
                 // converges some shells park their main thread on an
                 // Executive wait forever (measured on Themida 1.8.2: 4
@@ -731,6 +833,7 @@ pub fn unpack(
                                             | DebugEvent::SingleStep { thread_id, .. }
                                             | DebugEvent::AccessViolation { thread_id, .. }
                                             | DebugEvent::UnhandledException { thread_id, .. }
+                                            | DebugEvent::OutputDebugString { thread_id, .. }
                                             | DebugEvent::CreateThread { thread_id, .. }
                                             | DebugEvent::ExitThread { thread_id, .. }
                                             | DebugEvent::LoadDll { thread_id, .. }
@@ -1229,11 +1332,20 @@ pub fn unpack(
                 target_address,
                 exc_type,
             } => {
+                // Decode marker for the stub guard: the Ancient decode's
+                // probe exceptions (illegal/privileged instruction, the -1
+                // AV) are the observable "decode is running/ending" signal.
+                if state.pe_info.themida_version
+                    == mida_packers_themida::ThemidaVersion::Ancient
+                {
+                    state.decode_av_seen = true;
+                }
                 match handle_access_violation(
                     &mut ls, &mut dbg, &mut state, &pe,
                     h_process, guard_protection,
                     image_base_usize, image_boundary,
                     thread_id, exception_addr, target_address, exc_type, looks_like_dll,
+                    &output_path,
                 )? {
                     AvAction::Continue => {}
                     AvAction::Break => break,
@@ -1243,6 +1355,51 @@ pub fn unpack(
             // SINGLE_STEP — re-arm the code section guard after a guarded access
             // ---------------------------------------------------------------
             DebugEvent::SingleStep { thread_id, address } => {
+                // Workspace-stub trap, API-hit handling: the payload is
+                // launching.  The stack top ([esp]) is the return address
+                // into the workspace stub — dump the surrounding 64 KB while
+                // the stub bytes are live, clear the traps, and let the API
+                // call proceed (RF handling below resumes past the breakpoint).
+                if state.stub_guard_page == 1
+                    && state.stub_trap_armed
+                    && !state.stub_trap_hit
+                    && state.stub_api_addrs.contains(&(address as usize))
+                {
+                    state.stub_trap_hit = true;
+                    for slot in 0..4 {
+                        let _ = dbg.clear_hw_breakpoint(slot);
+                    }
+                    if let Ok(ctx) = dbg.get_thread_context_control(thread_id) {
+                        let sp = mida_core::debugger::ctx_sp(&ctx);
+                        let mut stack = [0u8; 8];
+                        if dbg.read_memory(sp, &mut stack).is_ok() {
+                            let ret =
+                                u32::from_le_bytes(stack[0..4].try_into().unwrap()) as usize;
+                            info!(
+                                api_addr = format!("{:#x}", address),
+                                ret_into_stub = format!("{ret:#x}"),
+                                "Stub API trap hit — payload launching"
+                            );
+                            let lo = ret.saturating_sub(0x8000);
+                            let mut buf = vec![0u8; 0x10000];
+                            match dbg.read_memory(lo, &mut buf) {
+                                Ok(n) => {
+                                    let path = output_path.with_extension("stub.bin");
+                                    match std::fs::write(&path, &buf[..n]) {
+                                        Ok(()) => info!(
+                                            path = %path.display(),
+                                            base = format!("{lo:#x}"),
+                                            size = n,
+                                            "Stub workspace captured at API moment"
+                                        ),
+                                        Err(e) => warn!(error = %e, "Stub dump write failed"),
+                                    }
+                                }
+                                Err(e) => warn!(error = %e, "Stub capture read failed"),
+                            }
+                        }
+                    }
+                }
                 // Re-arm the guard after a guard-related single-step
                 // (Pascal: FGuardStepping in OnSinglestep).
                 // When a library reads .text or Themida writes a call target,
@@ -1339,6 +1496,76 @@ pub fn unpack(
                 thread_id,
                 base_address: _,
             } => {
+                dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+            }
+
+            // ---------------------------------------------------------------
+            // OUTPUT_DEBUG_STRING — the thread is frozen INSIDE the caller
+            // ---------------------------------------------------------------
+            DebugEvent::OutputDebugString { thread_id, text } => {
+                log::log(LogType::Info, &format!("OutputDebugString: {text:?}"));
+                // Ancient workspace-stub capture: the frozen thread is inside
+                // OutputDebugString→RaiseException, CALLED FROM the shell's
+                // workspace stub — the stack holds the return address into
+                // the stub, and the stub bytes are live plaintext at this
+                // exact moment (transient: decrypt → execute → re-encrypt;
+                // passive snapshot freezes never land inside the window).
+                // Capture the stack and the surrounding workspace once.
+                if state.pe_info.themida_version
+                    == mida_packers_themida::ThemidaVersion::Ancient
+                    && !state.stub_trap_hit
+                {
+                    state.stub_trap_hit = true;
+                    if let Ok(ctx) = dbg.get_thread_context_control(thread_id) {
+                        let sp = mida_core::debugger::ctx_sp(&ctx);
+                        let mut stack = [0u8; 0x100];
+                        if dbg.read_memory(sp, &mut stack).is_ok() {
+                            let tm_lo = image_base_usize + 0x10000;
+                            let tm_hi = image_base_usize
+                                + state.pe_info.pe_sections.last().map(|s| {
+                                    s.virtual_address as usize + s.virtual_size as usize
+                                })
+                                .unwrap_or(0);
+                            let mut stub_site = None;
+                            for i in 0..stack.len() / 4 {
+                                let v = u32::from_le_bytes(
+                                    stack[i * 4..i * 4 + 4].try_into().unwrap(),
+                                ) as usize;
+                                if v >= tm_lo && v < tm_hi {
+                                    stub_site = Some(v);
+                                    break;
+                                }
+                            }
+                            if let Some(site) = stub_site {
+                                info!(
+                                    site = format!("{site:#x}"),
+                                    "ODS capture: stub call site found on stack"
+                                );
+                                let lo = site.saturating_sub(0x4000);
+                                let mut buf = vec![0u8; 0x8000];
+                                match dbg.read_memory(lo, &mut buf) {
+                                    Ok(n) => {
+                                        let path = output_path.with_extension("stub.bin");
+                                        match std::fs::write(&path, &buf[..n]) {
+                                            Ok(()) => info!(
+                                                path = %path.display(),
+                                                base = format!("{lo:#x}"),
+                                                size = n,
+                                                "Stub workspace captured at ODS moment"
+                                            ),
+                                            Err(e) => {
+                                                warn!(error = %e, "Stub dump write failed")
+                                            }
+                                        }
+                                    }
+                                    Err(e) => warn!(error = %e, "Stub capture read failed"),
+                                }
+                            } else {
+                                debug!("ODS capture: no shell-range return address on stack");
+                            }
+                        }
+                    }
+                }
                 dbg.continue_event(thread_id, ContinueStatus::Continue)?;
             }
 

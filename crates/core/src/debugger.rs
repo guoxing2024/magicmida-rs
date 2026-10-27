@@ -237,8 +237,23 @@ pub enum DebugEvent {
         exit_code: u32,
     },
 
+    /// The target called `OutputDebugString`.  The kernel holds the calling
+    /// thread until the debugger continues this event — handlers MUST
+    /// continue it (`DBG_CONTINUE`) or the thread freezes forever.
+    ///
+    /// The thread is frozen mid-call, which makes this event a live snapshot
+    /// point: the caller's stack holds the return address into whatever code
+    /// invoked `OutputDebugString` (for Themida 1.x, the workspace stub —
+    /// see the pipeline's stub capture).
+    OutputDebugString {
+        /// Thread that called `OutputDebugString`.
+        thread_id: u32,
+        /// The string the target printed (lossy-decoded, capped at 4 KB).
+        text: String,
+    },
+
     /// An event that does not require special handling (e.g.
-    /// `OUTPUT_DEBUG_STRING`, `RIP_EVENT`, or an unhandled exception code).
+    /// `RIP_EVENT`, or an unhandled exception code).
     /// The caller should simply resume the thread.
     Other {
         /// Thread that reported the event.
@@ -284,6 +299,11 @@ impl fmt::Debug for DebugEvent {
                 .field("thread_id", thread_id)
                 .field("address", &format_args!("{address:#x}"))
                 .field("code", &format_args!("{code:#x}"))
+                .finish(),
+            Self::OutputDebugString { thread_id, text } => f
+                .debug_struct("OutputDebugString")
+                .field("thread_id", thread_id)
+                .field("text", &format_args!("{text:?}"))
                 .finish(),
             Self::CreateProcess {
                 process_id,

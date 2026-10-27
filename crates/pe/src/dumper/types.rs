@@ -83,6 +83,15 @@ impl RemoteModule {
     pub fn base(&self) -> u64 {
         self.base
     }
+
+    /// Iterate the module's export table as `(address, name)` pairs.
+    ///
+    /// Export names are lowercase; ordinal-only exports surface as
+    /// `"#<ordinal>"`.  The CLI's workspace-stub API trap uses this to
+    /// resolve process-creation APIs from the live module snapshot.
+    pub fn exports(&self) -> impl Iterator<Item = (u64, &str)> {
+        self.exports.iter().map(|(a, n)| (*a, n.as_str()))
+    }
 }
 
 /// A candidate resolution for one IAT slot.

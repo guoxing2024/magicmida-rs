@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 use windows::Win32::Foundation::{
     CloseHandle, HANDLE,
     EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_SINGLE_STEP,
@@ -1322,7 +1322,10 @@ impl WindowsDebugger {
                 // this arm returned `Handled` without continuing.
                 //
                 // Read the string (shell diagnostics are prime evidence for
-                // unpacking) and continue the event with DBG_CONTINUE.
+                // unpacking) and surface the event.  The thread stays frozen
+                // until the caller continues it — surfacing lets the pipeline
+                // act at this live moment (stack capture for the workspace
+                // stub) while guaranteeing the continue happens.
                 let od = unsafe { &raw.u.DebugString };
                 let want = (od.nDebugStringLength as usize).min(4096);
                 let mut buf = vec![0u8; want];
@@ -1344,17 +1347,10 @@ impl WindowsDebugger {
                 } else {
                     "<unreadable>".to_string()
                 };
-                info!(
-                    thread_id = raw.dwThreadId,
-                    text = %text,
-                    "OutputDebugString from target"
-                );
-                // SAFETY: pid/thread_id come from the event being handled;
-                // DBG_CONTINUE is the correct status — the debugger consumed
-                // the print.
-                let _ =
-                    unsafe { ContinueDebugEvent(raw.dwProcessId, raw.dwThreadId, DBG_CONTINUE) };
-                return Err(CoreError::Handled);
+                DebugEvent::OutputDebugString {
+                    thread_id: raw.dwThreadId,
+                    text,
+                }
             }
 
             RIP_EVENT => {

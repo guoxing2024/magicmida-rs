@@ -147,7 +147,14 @@ expect_output_size: 1737216
 # since) run against this same sample in this same session produced
 # **`8ba37a79…` byte for byte** — identical to the current pipeline's product.
 # The drift is the session, not the code.
-expect_output_sha256: 5ac104f288b78ec9c8f63382a634fbd405e9c5acd76fd98e320e9cdc1bf7acf8
+expect_output_sha256: e129fe2649639b960f158d31efb12bd5a9b8f9594391afe4d5a04b2771b1c50a
+
+# Golden re-record 2026-10-28 (fifth record; fourth environment-drift event).
+# The bytes moved again on unchanged v3 code.  A/B with the `3f5cf8d`
+# worktree binary (built from the committed tree with `-p mida-cli`, same
+# session, same arguments) produced e129fe26... byte for byte — identical to
+# the current pipeline's product.  Previous value 5ac104f2... (recorded
+# 2026-10-27).
 
 # Characteristics the product's first section must declare.
 #

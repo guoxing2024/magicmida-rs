@@ -129,6 +129,34 @@ pub struct ThemidaState {
     /// caller chain is the evidence for what the shell expects to happen.
     pub idle_diag_done: bool,
     pub last_event_at: Option<std::time::Instant>,
+    /// Workspace-stub trap (diagnostic, `MAGICMIDA_STUB_TRAP=<rva>`): an
+    /// execute DR0 breakpoint armed LATE (after the decode settles) at
+    /// `packed_base + rva`, where the shell's native payload stub runs.
+    /// The stub is transient plaintext — decrypt, execute, re-encrypt — so
+    /// passive snapshot freezes miss it; the breakpoint freezes the process
+    /// at the exact moment the stub bytes are live.  DR0 is only armed
+    /// AFTER the decode phases (DR0 during decode deadlocks phase 2 —
+    /// see the CloseHandle-skip comment in the pipeline).
+    pub stub_trap_armed: bool,
+    pub stub_trap_hit: bool,
+    /// Page-guard variant of the stub trap: `MAGICMIDA_STUB_TRAP=<rva>`
+    /// arms a `PAGE_NOACCESS` guard over the page containing
+    /// `packed_base + rva` at the first quiet timeout after the decode's
+    /// probe exceptions — the stub's first execution then faults and the
+    /// pipeline dumps the live plaintext workspace around it.  Unlike a DR
+    /// execute breakpoint (one fixed address, and the stub's exact entry
+    /// varies) the guard covers the whole page.
+    pub stub_guard_armed: bool,
+    pub stub_guard_page: usize,
+    /// API-trap mode: the addresses armed in DR0-3 (WinExec /
+    /// CreateProcessA/W / ShellExecuteA).  A SingleStep at one of these is
+    /// the payload launching — stack top holds the return address into the
+    /// workspace stub.
+    pub stub_api_addrs: Vec<usize>,
+    /// Set when the decode's probe exceptions (illegal/privileged
+    /// instruction, the -1 AV) have been seen — the marker that the decode
+    /// phases are running/finished and the stub-guard may be armed.
+    pub decode_av_seen: bool,
 }
 
 impl ThemidaState {
@@ -164,6 +192,12 @@ impl ThemidaState {
             ancient_snapshots: 0,
             idle_diag_done: false,
             last_event_at: None,
+            stub_trap_armed: false,
+            stub_trap_hit: false,
+            stub_guard_armed: false,
+            stub_guard_page: 0,
+            stub_api_addrs: Vec::new(),
+            decode_av_seen: false,
             iat_write_addresses: HashSet::new(),
             // Default: wait for 3 unique write addresses before considering IAT ready.
             // This is a low threshold because the VM may write to the same address

@@ -88,6 +88,7 @@ fn settle_thread_id_of(ev: &DebugEvent) -> u32 {
         | DebugEvent::SingleStep { thread_id, .. }
         | DebugEvent::AccessViolation { thread_id, .. }
         | DebugEvent::UnhandledException { thread_id, .. }
+        | DebugEvent::OutputDebugString { thread_id, .. }
         | DebugEvent::CreateThread { thread_id, .. }
         | DebugEvent::ExitThread { thread_id, .. }
         | DebugEvent::LoadDll { thread_id, .. }
@@ -259,12 +260,59 @@ fn handle_access_violation(
     target_address: u64,
     exc_type: u8,
     is_dll_target: bool,
+    output_path: &std::path::Path,
 ) -> Result<AvAction, anyhow::Error> {
     debug!(
         exc = %format!("{exception_addr:#x}"),
         target = %format!("{target_address:#x}"),
         "Access violation"
     );
+
+    // ---- workspace-stub guard hit (Ancient diagnostic) ---------------------
+    //
+    // The faulting instruction is inside the PAGE_NOACCESS-guarded stub
+    // page: the shell's native payload stub is live plaintext at this exact
+    // moment (transient — decrypt/execute/re-encrypt; passive snapshots
+    // never land inside the window).  Dump the surrounding workspace, put
+    // the page back to RWX (its runtime state — `remove_code_section_guard`
+    // would restore PAGE_EXECUTE_READ and break the shell's re-encryption
+    // writes), and let the shell continue.
+    if state.stub_guard_armed
+        && !state.stub_trap_hit
+        && state.stub_guard_page != 0
+        && exception_addr >= state.stub_guard_page as u64
+        && exception_addr < (state.stub_guard_page + 0x1000) as u64
+    {
+        state.stub_trap_hit = true;
+        let lo = state.stub_guard_page.saturating_sub(0x4000);
+        let mut buf = vec![0u8; 0x10000];
+        match dbg.read_memory(lo, &mut buf) {
+            Ok(n) => {
+                let path = output_path.with_extension("stub.bin");
+                match std::fs::write(&path, &buf[..n]) {
+                    Ok(()) => info!(
+                        path = %path.display(),
+                        base = format!("{lo:#x}"),
+                        size = n,
+                        fault = format!("{exception_addr:#x}"),
+                        "Stub guard hit — live workspace captured"
+                    ),
+                    Err(e) => warn!(error = %e, "Stub dump write failed"),
+                }
+            }
+            Err(e) => warn!(error = %e, "Stub capture read failed"),
+        }
+        if let Err(e) = mida_packers_themida::install_code_section_guard(
+            h_process,
+            state.stub_guard_page,
+            0x1000,
+            0x20, // PAGE_EXECUTE_READWRITE — the Themida workspace's runtime state
+        ) {
+            warn!(error = %e, "Stub guard restore failed");
+        }
+        dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+        return Ok(AvAction::Continue);
+    }
 
     // ---- storm watchdog ---------------------------------------------------
     //

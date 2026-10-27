@@ -504,6 +504,7 @@ pub(crate) fn thread_id_of(ev: &DebugEvent) -> u32 {
         | DebugEvent::SingleStep { thread_id, .. }
         | DebugEvent::AccessViolation { thread_id, .. }
         | DebugEvent::UnhandledException { thread_id, .. }
+        | DebugEvent::OutputDebugString { thread_id, .. }
         | DebugEvent::CreateThread { thread_id, .. }
         | DebugEvent::ExitThread { thread_id, .. }
         | DebugEvent::LoadDll { thread_id, .. }
