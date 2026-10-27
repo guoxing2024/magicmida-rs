@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 use windows::Win32::Foundation::{
     CloseHandle, HANDLE,
     EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_SINGLE_STEP,
@@ -858,7 +858,7 @@ impl DebuggerCore for WindowsDebugger {
 
         match wait_result {
             Ok(()) => {
-                match Self::decode_event(&raw) {
+                match self.decode_event(&raw) {
                     Ok(event) => {
                         // Bookkeeping.
                         match &event {
@@ -935,7 +935,7 @@ impl DebuggerCore for WindowsDebugger {
             }
 
             let _event_code = raw.dwDebugEventCode;
-            let ev = match Self::decode_event(&raw) {
+            let ev = match self.decode_event(&raw) {
                         Ok(event) => event,
                         Err(CoreError::Handled) => continue,
                         Err(e) => return Err(e),
@@ -1167,7 +1167,7 @@ impl WindowsDebugger {
     }
 
     /// Translate a raw Windows `DEBUG_EVENT` into our abstract [`DebugEvent`].
-    fn decode_event(raw: &RAW_DEBUG_EVENT) -> Result<DebugEvent, CoreError> {
+    fn decode_event(&self, raw: &RAW_DEBUG_EVENT) -> Result<DebugEvent, CoreError> {
         // SAFETY: the union field we access corresponds to dwDebugEventCode
         // and is guaranteed valid by the Windows debug API.
         let ev = match raw.dwDebugEventCode {
@@ -1310,7 +1310,50 @@ impl WindowsDebugger {
             }
 
             OUTPUT_DEBUG_STRING_EVENT => {
-                trace!("Ignoring OUTPUT_DEBUG_STRING_EVENT");
+                // The target called OutputDebugString; the kernel holds the
+                // calling thread inside `kernelbase!RaiseException` until the
+                // debugger continues this event.  Swallowing it without
+                // `ContinueDebugEvent` freezes the thread FOREVER — measured
+                // on Themida 1.8.2 (2026-10-28): after the decode converged,
+                // the shell's startup hit an OutputDebugString, the whole
+                // process parked (main thread in `Wait/Executive` at
+                // `kernelbase!RaiseException+0x64`, 4 worker threads
+                // suspended, no windows, no events, indefinitely) because
+                // this arm returned `Handled` without continuing.
+                //
+                // Read the string (shell diagnostics are prime evidence for
+                // unpacking) and continue the event with DBG_CONTINUE.
+                let od = unsafe { &raw.u.DebugString };
+                let want = (od.nDebugStringLength as usize).min(4096);
+                let mut buf = vec![0u8; want];
+                let text = if self
+                    .read_memory(od.lpDebugStringData.0 as usize, &mut buf)
+                    .is_ok()
+                {
+                    if od.fUnicode != 0 {
+                        let units: Vec<u16> = buf
+                            .chunks_exact(2)
+                            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                            .take_while(|&u| u != 0)
+                            .collect();
+                        String::from_utf16_lossy(&units)
+                    } else {
+                        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+                        String::from_utf8_lossy(&buf[..end]).into_owned()
+                    }
+                } else {
+                    "<unreadable>".to_string()
+                };
+                info!(
+                    thread_id = raw.dwThreadId,
+                    text = %text,
+                    "OutputDebugString from target"
+                );
+                // SAFETY: pid/thread_id come from the event being handled;
+                // DBG_CONTINUE is the correct status — the debugger consumed
+                // the print.
+                let _ =
+                    unsafe { ContinueDebugEvent(raw.dwProcessId, raw.dwThreadId, DBG_CONTINUE) };
                 return Err(CoreError::Handled);
             }
 

@@ -122,6 +122,13 @@ pub struct ThemidaState {
     pub ancient_module_bases: std::collections::HashSet<u64>,
     /// Numbered raw snapshots written during the watch.
     pub ancient_snapshots: u32,
+    /// One-shot idle diagnostic (Ancient): after the decode converges some
+    /// shells park their main thread on an Executive wait forever.  When the
+    /// first timeout arrives ≥5 s after the last real event, the pipeline
+    /// dumps the main thread's context + stack once — the wait object's
+    /// caller chain is the evidence for what the shell expects to happen.
+    pub idle_diag_done: bool,
+    pub last_event_at: Option<std::time::Instant>,
 }
 
 impl ThemidaState {
@@ -155,6 +162,8 @@ impl ThemidaState {
             ancient_watch: false,
             ancient_module_bases: std::collections::HashSet::new(),
             ancient_snapshots: 0,
+            idle_diag_done: false,
+            last_event_at: None,
             iat_write_addresses: HashSet::new(),
             // Default: wait for 3 unique write addresses before considering IAT ready.
             // This is a low threshold because the VM may write to the same address

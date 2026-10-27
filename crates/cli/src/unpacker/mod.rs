@@ -409,6 +409,53 @@ pub fn unpack(
             Err(mida_core::CoreError::Timeout) => {
                 try_map_scan(&mut dbg, &mut state, image_base_usize, &output_path);
                 try_ancient_watch_scan(&mut dbg, &mut state, image_base_usize, &output_path);
+                // One-shot idle diagnostic (Ancient): after the decode
+                // converges some shells park their main thread on an
+                // Executive wait forever (measured on Themida 1.8.2: 4
+                // worker threads suspended by the shell, main thread in
+                // Wait/Executive, no windows, no children).  Dump the main
+                // thread's context + stack once — the wait object's caller
+                // chain is the evidence for what the shell expects to
+                // happen next.
+                if state.pe_info.themida_version
+                    == mida_packers_themida::ThemidaVersion::Ancient
+                    && !state.idle_diag_done
+                    && state
+                        .last_event_at
+                        .map(|t| t.elapsed().as_secs() >= 5)
+                        .unwrap_or(false)
+                    && state.main_thread_id != 0
+                {
+                    state.idle_diag_done = true;
+                    match dbg.get_thread_context_control(state.main_thread_id) {
+                        Ok(ctx) => {
+                            info!(
+                                tid = state.main_thread_id,
+                                ip = format!("{:#x}", mida_core::debugger::ctx_ip(&ctx)),
+                                sp = format!("{:#x}", mida_core::debugger::ctx_sp(&ctx)),
+                                "Idle diagnostic: main thread context"
+                            );
+                            let mut stack = [0u8; 0x80];
+                            if let Ok(n) =
+                                dbg.read_memory(mida_core::debugger::ctx_sp(&ctx), &mut stack)
+                            {
+                                let mut words = Vec::new();
+                                for i in (0..n / 4).step_by(1) {
+                                    let v = u32::from_le_bytes(
+                                        stack[i * 4..i * 4 + 4].try_into().unwrap(),
+                                    );
+                                    words.push(format!("{v:#x}"));
+                                }
+                                warn!(
+                                    sp = format!("{:#x}", mida_core::debugger::ctx_sp(&ctx)),
+                                    stack = ?words,
+                                    "Idle diagnostic: main thread stack"
+                                );
+                            }
+                        }
+                        Err(e) => warn!(error = %e, "Idle diagnostic: context read failed"),
+                    }
+                }
                 continue;
             }
             Err(e) => {
@@ -416,6 +463,7 @@ pub fn unpack(
                 return Err(e.into());
             }
         };
+        state.last_event_at = Some(std::time::Instant::now());
         log::log(LogType::Info, &format!("event received: {event:?}"));
 
         match event {
@@ -435,6 +483,21 @@ pub fn unpack(
                 // The shell's main thread: the jump into the materialised
                 // image (Themida 1.1.1) happens on it.
                 state.main_thread_id = thread_id;
+
+                // Ancient targets: arm the exit-window watch from the start.
+                // The CloseHandle breakpoint is skipped for Ancient (DR0
+                // poisons decode phase 2), so the watch can no longer be
+                // armed from the breakpoint path — and the materialised
+                // original (Themida 1.8.2 runs its payload natively,
+                // measured: Notepad window standalone) only exists while the
+                // process runs.  The module-base cache is populated lazily
+                // by the first watch scan, ~500 ms in, when the startup DLL
+                // cascade has settled.
+                if state.pe_info.themida_version
+                    == mida_packers_themida::ThemidaVersion::Ancient
+                {
+                    state.ancient_watch = true;
+                }
 
                 // Note: `image_base`, `process_id`, and the main-thread handle
                 // are now stored by the core's `wait_event` bookkeeping
@@ -876,7 +939,27 @@ pub fn unpack(
                     // 5 s, with `.bss` at 0 non-zero bytes and `hinstDLL` never
                     // written.  Without it the same DLL, same debugger, same
                     // ScyllaHide reaches `.bss` = 177 with `hinstDLL` set.
-                    if no_chbp {
+                    // ---- Ancient targets: no CloseHandle breakpoint ---------
+                    //
+                    // Measured 2026-10-28 on Themida 1.8.2 with the
+                    // DBG_CONTINUE swallow fixes in place: with DR0 armed the
+                    // shell's decode phase 2 deadlocks on a sentinel pointer
+                    // (2,047 identical faults at 0x1227153 reading
+                    // 0xffffffff — the shell's SEH validates the debug
+                    // registers and refuses to advance while DR0 != 0), while
+                    // the very same shell with `MAGICMIDA_NO_CHBP=1` sailed
+                    // past phase 2.  1.1.1 tolerates DR0; later Ancients do
+                    // not.  For Ancient the exit-window watch arms from the
+                    // shell's own int3/TF events instead (measured: the
+                    // NO_CHBP run armed the watch and took 64 snapshots),
+                    // and the ExitProcess fallback covers the end.
+                    // V1 (1.9.x) keeps the breakpoint — its classic guard
+                    // chain depends on the CloseHandle milestone.
+                    let ancient = state.pe_info.themida_version
+                        == mida_packers_themida::ThemidaVersion::Ancient;
+                    if ancient {
+                        debug!("Ancient target — skipping the CloseHandle breakpoint (DR0 poisons decode phase 2)");
+                    } else if no_chbp {
                         info!("MAGICMIDA_NO_CHBP=1 — skipping the CloseHandle breakpoint (diagnostic)");
                     } else if looks_like_dll {
                         debug!("DLL target — skipping the CloseHandle breakpoint");
@@ -1513,16 +1596,39 @@ fn try_ancient_watch_scan(
     if !state.ancient_watch {
         return;
     }
+    // Module bases are re-taken FRESH on every scan.  A once-populated
+    // cache is wrong in both directions: populated at the first event it
+    // misses the rest of the startup DLL cascade (later loads then pose as
+    // candidates and drown the rotation — measured: 63/64 snapshots were
+    // bystander system DLLs), and it never learns about DLLs the payload
+    // loads mid-run.  The ToolHelp snapshot costs ~5–20 ms, same order as
+    // the address-space scan itself.
+    let module_bases: std::collections::HashSet<u64> =
+        match mida_pe::dumper::take_module_snapshot(
+            dbg.process_handle(),
+            dbg.pid(),
+            dbg.image_base(),
+            false,
+        ) {
+            Ok(mods) => mods.iter().map(|m| m.base()).collect(),
+            Err(_) => std::collections::HashSet::new(),
+        };
     // Hard cap: a live shell in an exception storm produces THOUSANDS of
     // debug events per minute, each one a freeze + a multi-MB snapshot.
     // Measured on Themida 1.8.2 (2026-10-28): 25,644 snapshots ≈ 37 GB in
     // one run.  64 numbered snapshots cover the informative window (the
-    // early ones, before the candidate set stabilises); past the cap the
-    // watch stays armed but silent.
+    // early ones, before the candidate set stabilises).
+    //
+    // IMPORTANT: the cap gates only the snapshot WRITE, not the scan.  The
+    // scan itself (~5–15 ms per event, process frozen) turned out to be
+    // load-bearing: with the cap skipping the scan entirely, 1.8.2 died at
+    // decode phase 2 again, while the uncapped run — a full scan after
+    // every event — passed it.  The per-event scan pacing reproduces the
+    // timing under which the shell's later decode phases converge (the
+    // standalone run has no debugger freezes at all; under a debugger the
+    // freeze/thaw cadence is the observable that changed).
     const ANCIENT_SNAPSHOT_CAP: u32 = 64;
-    if state.ancient_snapshots >= ANCIENT_SNAPSHOT_CAP {
-        return;
-    }
+    let snapshots_capped = state.ancient_snapshots >= ANCIENT_SNAPSHOT_CAP;
     let packed_base = image_base_usize as u64;
     let Ok(images) = mida_pe::dumper::scan_mapped_images(dbg, false) else {
         return;
@@ -1547,7 +1653,7 @@ fn try_ancient_watch_scan(
         .iter()
         .filter(|img| {
             img.size_of_image >= 0x10000
-                && !state.ancient_module_bases.contains(&img.base)
+                && !module_bases.contains(&img.base)
         })
         .cloned()
         .collect();
@@ -1567,6 +1673,11 @@ fn try_ancient_watch_scan(
         return;
     }
     let img = candidates[state.ancient_snapshots as usize % candidates.len()].clone();
+    if snapshots_capped {
+        // Scan happened (the pacing is load-bearing, see above); skip only
+        // the disk write.
+        return;
+    }
     let n = state.ancient_snapshots;
     state.ancient_snapshots += 1;
     let snap_path = output_path.with_extension(format!("raw{n:03}.bin"));

@@ -1108,6 +1108,42 @@ x64 413 / x86 406、三 e2e gate 全绿（字节 golden 持住）、1.1.1 行为
 （watch + 兜底 dump 照常）。两处修复是保真度修正（向裸跑行为对齐），
 对任何首异常驱动的壳都是纯收益。
 
+## 1.8.2 攻坚下半场：OUTPUT_DEBUG_STRING 冻结 + DR0 规避 → 壳全生命周期跑通（2026-10-28）
+
+上半场的"剩余阻塞"当轮继续攻，三个根因全部落定：
+
+1. **闲置分支根因 = `OUTPUT_DEBUG_STRING_EVENT` 被吞且从不 continue**（core
+   `decode_event`）：目标调 OutputDebugString → 内核把线程冻在
+   `kernelbase!RaiseException` 里等调试器应答 → 我们"忽略"该事件却不
+   `ContinueDebugEvent` → **线程永久冻结**。实测证据：闲置诊断（超时臂
+   5 秒无事件后 dump 主线程上下文）显示主线程 EIP 恰在 RaiseException+0x64、
+   栈顶 0x40010006（DBG_* 状态族）、栈上有壳解码区返回址 0x122163d。
+   修：读出字符串（INFO 记录——壳的调试输出是脱壳金矿）+ `DBG_CONTINUE`
+   继续。**这是 core 级缺陷，任何被调试目标踩到 OutputDebugString 都会冻死。**
+2. **解码期二毒源 = DR0**（AV 流形态 + NO_CHBP 对照确证）：DR0 武装时壳的
+   SEH 校验调试寄存器、拒绝推进（2,047 连发 -1 指针），NO_CHBP 则一帆风顺。
+   修：**Ancient 门控跳过 CloseHandle 硬件断点**（watch 改从 CreateProcess
+   武装——1.8.2 不再经过 CloseHandle 里程碑，1.9.x V1 的经典链不受影响）。
+3. **快照轮转被旁观 DLL 淹没**：模块基址缓存在首个事件就灌入（级联未完），
+   后加载的 DLL 全成"候选"——63/64 张快照是系统 DLL。修：模块基址**每扫
+   现取**（ToolHelp ~5-20ms，与地址空间扫描同量级），候选收缩到加壳镜像
+   合成候选 + 真非模块镜像。
+
+**结果：1.8.2 在管线内跑完全生命周期**（解码 → 载荷运行 → ExitProcess 0,
+74 s；裸跑 25 s）。终态仍是 "OEP not found"——因为**原程序不在任何 MZ
+镜像里**：全轮 64 张快照 + ExitProcess 兜底 dump 验明，载荷（裸跑出现记事本
+窗口的那个）是壳工作区（0x12xxxxx）里的微型裸码 stub,不是 PE 镜像——
+OEP 链（.text 守护/OEP 候选）对它物理上不适用。1.8.2 的"脱壳产物"要换
+采集目标（工作区 stub 转储），那是新的 scope 决策。
+
+**顺带的假回归惊魂**：外来 int3 透传（把非我们武装的断点递给目标 VEH）
+一度让 v3 EXE gate 红——查实 v3 的 golden 依赖旧的吞掉行为（RF+Continue）,
+该透传是错误假设的产物（1.8.2 的真根因是 ODS 冻结,其运行里零个外来
+int3）,已整体移除。另：x86/x64 gate 各出现过一次 4-10 s 快速失败,
+重跑即绿——既有的桌面会话方差,与改动无关（stash 二分 + 复跑三连绿确证）。
+
+**回归全绿**：x64 413 / x86 406、三 e2e gate 绿（字节 golden 持住）。
+
 ## gdi32 系 stub 推导：静态形状验证（2026-10-27）
 
 stub 推导机制是模块无关的（扫所有已加载模块的导出地址、认 `ff 25/ff 15
