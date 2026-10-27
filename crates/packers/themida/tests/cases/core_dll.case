@@ -120,6 +120,18 @@ expect_output_size: 1737216
 # The value below is deterministic: measured 4/4 identical across independent
 # runs (3 gate runs plus the `4df2c09` A/B run).
 #
+# Re-recorded 2026-10-27 (→ `5ac104f2…`), because this session's environment
+# moved **another** dial — the third recorded flip.  The structural metrics did
+# not move again: `V3`, `289 resolved / 0 failed / 3 not-an-import`, 12
+# modules, `Resolved 288 API addresses from live IAT image`, product
+# 1,737,216 B.  What moved is one byte stream again, and the bytes track the
+# session state, not any counter.  Code-innocence by the workspace's own A/B
+# method: the binary at commit `351ed2f` (worktree-built, pre-dating every
+# change since) run against this same sample with the same arguments produced
+# `5ac104f2…` **byte for byte**, identical to the current pipeline's product.
+# The current session's changes are all classic-gated (`classic_imports`), and
+# this target is V3, so no code path they touch even runs here.
+#
 # Re-recorded 2026-10-26 (→ `8ba37a79…`), because this session's environment
 # moved **another** dial.  The 2026-10-25 note attributed the drift to the
 # live-IAT resolution count (288 vs 289); today's log reads exactly `Resolved
@@ -135,7 +147,7 @@ expect_output_size: 1737216
 # since) run against this same sample in this same session produced
 # **`8ba37a79…` byte for byte** — identical to the current pipeline's product.
 # The drift is the session, not the code.
-expect_output_sha256: 8ba37a79078fc2479d685f138a8f7928bbefd9b829bfdbc9b9fec781b61445f6
+expect_output_sha256: 5ac104f288b78ec9c8f63382a634fbd405e9c5acd76fd98e320e9cdc1bf7acf8
 
 # Characteristics the product's first section must declare.
 #

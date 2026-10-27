@@ -131,7 +131,17 @@ expect_output_size: 110592
 # Nothing structural moved: the trace still reports
 # `55 resolved, 0 failed, 55 not-an-import`, the product is still 110,592 B, and
 # `.text` still declares `0x60000020`.
-expect_output_sha256: 4761923dabe02b1b8fe2b6801a19d3f7eb1f7ff6c1f363650a6b191e2f7c6c7c
+expect_output_sha256: 5ba5dd534eb77b670dd3c466f939b55049eb8e3e774d8ff2e92ecaa76fad2f32
+
+# Golden re-record 2026-10-27 (fifth record; fourth environment-drift event).
+# The bytes moved again on unchanged v3 code: this session's changes are all
+# classic-gated (`classic_imports`) and this sample is V3, so no code path they
+# touch runs here.  A/B with the `351ed2f` worktree binary (built from the
+# committed tree, same session, same arguments) produced 5ba5dd53... byte for
+# byte — identical to the current pipeline's product.  Structural metrics did
+# not move: `55 resolved, 0 failed, 55 not-an-import`, 110,592 B,
+# `Resolved 55 API addresses from live IAT image`, `.text` 0x60000020.
+# Previous value 4761923d... (recorded 2026-10-26).
 
 # Golden re-record 2026-10-26 (fourth record; third environment-drift event).
 # The product bytes moved again on the SAME code: A/B with the c629368-era

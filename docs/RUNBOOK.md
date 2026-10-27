@@ -325,10 +325,17 @@ Themida 1.1.1.0、1.9.1.0、WinLicense 2.0.1.0 的加壳样本**都能直接运�
 （复盘见 `POSTMORTEMS.md` 的「classic IAT 交错桶」与「classic 首段 RWX」），
 1.9.1 样本的产物**加载通过并跑到主窗口**（`http://www.tuts4you.com/`，
 与加壳对照同标题，线程 28（壳）→ 4（纯原程序），两次独立运行可复现）。
-宣称边界：74 个槽中 **34 个 loader 解析**（6 个描述符，逐一对真实系统 DLL
-导出表验证全有效）、**40 个槽保留壳会话的 live 地址同 boot 可用**
-（user32/win32u 交错簇，任何单一 DLL 名都无法表达——`NtUser*` 不在 user32
-名字表、user32 名不在 win32u 名字表；跨 boot 需 stub 反汇编推原名，未做）。
+宣称边界（2026-10-27 升级）：74 个槽**全部 loader 解析**（7 个描述符，
+逐一对真实系统 DLL 导出表验证全有效，uncovered_slots=0）。跨 boot 的关键
+一步是 stub 反汇编推导（复盘见 `POSTMORTEMS.md` 同名小节）：user32 的
+`NtUser*` 类 stub 是 `ff 25 [abs32]` 一跳，IAT 指针值恰是壳塞进重建槽的
+win32u 函数地址；dump 期建 stub 目标映射（实测 1,394 条），regroup 时
+**推导优先**——槽归回 (user32, "RedrawWindow") 而非 (win32u,
+"NtUserRedrawWindow")，两对都合法且解析到同一函数，但只有前者是原始
+导入表的名字。user32/win32u 簇因此自然连续成一个 40 槽描述符，same-boot
+依赖消失（本样本实测：另有一次干净 exit 0——原程序自结束）。边界：
+`_unknown_` 占位名（解析失败的槽）仍会迫使簇不描述；gdi32 系 stub 形态
+未逐一验证；1.1.1 文件映射壳形状仍未覆盖。
 配套已落地：`validate_and_regroup`（按名字校验 (模块,函数) 对——**按地址校验
 是错的**：壳会话经 kernelbase 解析的地址物理上不在 kernel32，会把合法对搬家、
 v3 字节 golden 跟着动，x64 gate 实测红过）+ `normalize_module_runs`

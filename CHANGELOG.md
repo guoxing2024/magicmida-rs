@@ -8,11 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Classic v1 product runs (control-verified)** — after the IAT
-  serialization fix and the first-section RWX restoration, the measured 1.9.1
-  unpackme's product loads past import resolution (was `0xC0000139`) and runs
-  to its main window (same title as the packed control, threads 28→4,
-  reproducible). `normalize_module_runs` splits interleaved per-name buckets
+- **Classic v1 product runs, all imports loader-resolved (control-verified)** —
+  after the IAT serialization fix and the first-section RWX restoration, the
+  measured 1.9.1 unpackme's product loads past import resolution (was
+  `0xC0000139`) and runs to its main window (same title as the packed control,
+  threads 28→4, reproducible; one run exited 0 cleanly — the original program
+  ends itself, the shell's 28 threads are what keep the packed control alive).
+  A `stub_target_map` closes the same-boot gap: every loaded module's export
+  thunks (`ff 25/ff 15 [abs32]`, measured on user32's `NtUser*` stubs) are
+  read live and recorded as target-address → (stub module, original name); the
+  regroup then prefers the derived pair over the shell's resolved one, so
+  `win32u!NtUserRedrawWindow` slots re-home to `(user32, "RedrawWindow")`
+  (both pairs resolve identically; only the derived one is loader-portable).
+  74/74 slots described, `uncovered_slots=0`, no same-boot dependency left on
+  the measured sample. `normalize_module_runs` splits interleaved per-name buckets
   into address-contiguous descriptors (loader contract: one descriptor walks
   `FirstThunk` until the first zero under ITS name only), merges adjacent-run
   clusters under the first module that exports every name (ole32's forwarder

@@ -124,6 +124,7 @@ fn validate_and_regroup(
     iat_base_rva: u32,
     modules: &[RemoteModule],
     is_64bit: bool,
+    stub_map: Option<&std::collections::HashMap<u64, (usize, String)>>,
 ) {
     let ptr_size = if is_64bit { 8 } else { 4 };
     let resolve = |addr: u64| -> Option<(usize, String)> {
@@ -156,6 +157,22 @@ fn validate_and_regroup(
                 0
             };
 
+            // Prefer the stub-derived original (module, name) when this
+            // slot's live address is a stub target.  Measured on the classic
+            // ladder's 1.9.1 unpackme (2026-10-27): the rebuilt IAT holds
+            // win32u!NtUserRedrawWindow's address where user32's own
+            // RedrawWindow stub (`ff 25 [abs]`, IAT slot holding the very
+            // same pointer) jumps through — the original import table named
+            // user32, and (user32, "RedrawWindow") is loader-valid (the name
+            // is in user32's export table, the stub lands on the same
+            // function).  Both pairs resolve identically, but only the
+            // derived one lets the whole user32/win32u cluster collapse
+            // back into one portable user32 descriptor instead of staying
+            // same-boot on the dumped live addresses.
+            let derived = stub_map
+                .and_then(|m| m.get(&live))
+                .map(|&(mi, ref n)| (modules[mi].name.clone(), n.clone()));
+
             // A thunk with NEITHER a name NOR an ordinal serialises as a raw
             // value in the ILT - the loader reads it as a hint/name RVA,
             // finds it unmapped, and kills the process with
@@ -164,6 +181,20 @@ fn validate_and_regroup(
             // unpackme, in combase/ole32).  Resolve the name from the slot's
             // live address, or drop the thunk.
             if thunk.function_name.is_none() && thunk.ordinal.is_none() {
+                if let Some((target_module, name)) = &derived {
+                    let mut fixed = thunk.clone();
+                    fixed.function_name = Some(name.clone());
+                    fixed.ordinal = None;
+                    moved += 1;
+                    let entry = if let Some(g) = groups.get_mut(target_module) {
+                        g
+                    } else {
+                        order.push(target_module.clone());
+                        groups.entry(target_module.clone()).or_default()
+                    };
+                    entry.push(fixed);
+                    continue;
+                }
                 match resolve(live) {
                     Some((mi, name)) => {
                         let target = modules[mi].name.clone();
@@ -184,6 +215,29 @@ fn validate_and_regroup(
                     }
                 }
                 continue;
+            }
+
+            // Named thunks: adopt the derived pair unless it equals the
+            // current one (win32u bucket with its own NtUser* name is already
+            // fine when no derivation exists; with one, the stub's module is
+            // the faithful home).
+            if let Some((target_module, name)) = &derived {
+                let differs = *target_module != module.name
+                    || thunk.function_name.as_deref() != Some(name.as_str());
+                if differs {
+                    let mut fixed = thunk.clone();
+                    fixed.function_name = Some(name.clone());
+                    fixed.ordinal = None;
+                    moved += 1;
+                    let entry = if let Some(g) = groups.get_mut(target_module) {
+                        g
+                    } else {
+                        order.push(target_module.clone());
+                        groups.entry(target_module.clone()).or_default()
+                    };
+                    entry.push(fixed);
+                    continue;
+                }
             }
 
             // Does the thunk's current module export the thunk's NAME?  The
@@ -264,6 +318,78 @@ fn validate_and_regroup(
             }
         })
         .collect();
+}
+
+// -----------------------------------------------------------------------
+// build_stub_target_map (classic path)
+// -----------------------------------------------------------------------
+
+/// Extract the absolute target of a `ff 25` / `ff 15` (jmp/call [abs32])
+/// stub from its first six bytes, if any.
+fn stub_jump_target(bytes: &[u8]) -> Option<u32> {
+    if bytes.len() < 6 || bytes[0] != 0xFF {
+        return None;
+    }
+    match bytes[1] {
+        0x25 | 0x15 => Some(u32::from_le_bytes([
+            bytes[2], bytes[3], bytes[4], bytes[5],
+        ])),
+        _ => None,
+    }
+}
+
+/// Reverse-derive stub targets: every live function address that some
+/// loaded module's export stub jumps to, mapped back to that stub's own
+/// (module, name).
+///
+/// Measured shape (2026-10-27): user32.dll's `RedrawWindow` etc. are
+/// five-byte thunks `ff 25 xx xx xx xx` whose indirect target is a pointer
+/// held in user32's IAT — the very win32u!NtUser* address a classic shell
+/// stores in the rebuilt IAT slot.  Reading that pointer from live memory
+/// gives the address to join against; the stub's module and export name are
+/// the original import pair the loader can resolve.
+///
+/// Scans every export address of every loaded module; a stub is only
+/// recorded when its target lands inside a *different* module's range.
+/// Cost: one 6-byte read per export plus one pointer read per thunk — a
+/// few thousand reads on a 20k-export snapshot, classic-only.
+fn build_stub_target_map(
+    debugger: &mut dyn mida_core::DebuggerCore,
+    modules: &[RemoteModule],
+    _is_64bit: bool,
+) -> std::collections::HashMap<u64, (usize, String)> {
+    let mut map: std::collections::HashMap<u64, (usize, String)> =
+        std::collections::HashMap::new();
+
+    for (mi, m) in modules.iter().enumerate() {
+        for (&addr, name) in m.exports.iter() {
+            let mut stub = [0u8; 6];
+            if debugger.read_memory(addr as usize, &mut stub).map(|n| n < 6).unwrap_or(true) {
+                continue;
+            }
+            let Some(target) = stub_jump_target(&stub) else { continue };
+            let target = target as u64;
+            let mut ptr = [0u8; 4];
+            if debugger
+                .read_memory(target as usize, &mut ptr)
+                .map(|n| n < 4)
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            let ptr_val = u32::from_le_bytes(ptr) as u64;
+            // The pointer must land in a different module's range for the
+            // join against a rebuilt IAT slot to be meaningful.
+            let owner = modules
+                .iter()
+                .position(|m2| m2.base != m.base && m2.base <= ptr_val && ptr_val < m2.end_off);
+            if let Some(_owner_idx) = owner {
+                map.entry(ptr_val).or_insert((mi, name.clone()));
+            }
+        }
+    }
+
+    map
 }
 
 // -----------------------------------------------------------------------
@@ -558,7 +684,11 @@ fn rebuild_import_table_inner(
     // that the named module actually exports the named function.
     let iat_base_rva = (iat_address - image_base) as u32;
     if classic_imports {
-        validate_and_regroup(&mut builder, &iat_data, iat_base_rva, &modules, is_64bit);
+        let stub_map = build_stub_target_map(debugger, &modules, is_64bit);
+        if !stub_map.is_empty() {
+            info!(stub_targets = stub_map.len(), "Stub target map built");
+        }
+        validate_and_regroup(&mut builder, &iat_data, iat_base_rva, &modules, is_64bit, Some(&stub_map));
         normalize_module_runs(&mut builder, &modules);
     }
 
@@ -1020,5 +1150,154 @@ mod normalize_tests {
         // candidate module expresses both, so the whole cluster stays
         // undescribed and both slots keep their dumped live addresses.
         assert!(builder.modules.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod stub_tests {
+    use super::*;
+    use crate::import_table::{ImportThunk};
+
+    fn thunk(rva: u32, name: Option<&str>) -> ImportThunk {
+        ImportThunk {
+            iat_address: rva,
+            function_name: name.map(|n| n.to_string()),
+            ordinal: None,
+            is_64bit: false,
+        }
+    }
+
+    fn snapshot_module(name: &str, exports: &[(&str, u64)]) -> RemoteModule {
+        let mut map = std::collections::HashMap::new();
+        for (n, a) in exports {
+            map.insert(*a, n.to_string());
+        }
+        RemoteModule {
+            base: 0x7f000000,
+            end_off: 0x7f800000,
+            name: name.to_string(),
+            exports: map,
+            forwards: Vec::new(),
+        }
+    }
+
+    /// The measured user32.dll (SysWOW64, 2026-10-27) stub shape — pinned
+    /// byte-for-byte against the real file so a shape change fails the test.
+    #[test]
+    fn measured_user32_stub_shape_is_recognised() {
+        // RedrawWindow @0x3b0e0: ff 25 90 ee 0e 10 -> jmp [0x100eee90]
+        assert_eq!(
+            stub_jump_target(&[0xff, 0x25, 0x90, 0xee, 0x0e, 0x10]),
+            Some(0x100eee90)
+        );
+        // InvalidateRect @0x3ad10: ff 25 84 ef 0e 10 -> jmp [0x100eef84]
+        assert_eq!(
+            stub_jump_target(&[0xff, 0x25, 0x84, 0xef, 0x0e, 0x10]),
+            Some(0x100eef84)
+        );
+        // call [abs] variant
+        assert_eq!(stub_jump_target(&[0xff, 0x15, 0x11, 0x22, 0x33, 0x44]), Some(0x44332211));
+        // Real function bodies are not thunks: GetSysColor (8b ff 55 8b ec),
+        // LoadIconA (8b ff 55 8b ec 51), a plain jmp rel32 (e8).
+        assert_eq!(stub_jump_target(&[0x8b, 0xff, 0x55, 0x8b, 0xec, 0x8b]), None);
+        assert_eq!(stub_jump_target(&[0x8b, 0xff, 0x55, 0x8b, 0xec, 0x51]), None);
+        assert_eq!(stub_jump_target(&[0xe8, 0x94, 0x21, 0x00, 0x00, 0xff]), None);
+        // short buffers
+        assert_eq!(stub_jump_target(&[0xff, 0x25]), None);
+        assert_eq!(stub_jump_target(&[]), None);
+    }
+
+    /// The measured regroup scenario: a win32u-bucketed NtUser* thunk whose
+    /// live address is user32's RedrawWindow stub target gets re-homed to
+    /// (user32, RedrawWindow) — the original, portable pair.
+    #[test]
+    fn stub_derivation_rehomes_ntuser_thunks_to_user32() {
+        let live_win32u_addr: u64 = 0x7f12a0; // win32u base 0x7f000000 + 0x12a0
+        let mut iat_data = vec![0u8; 8];
+        iat_data[0..4].copy_from_slice(&(live_win32u_addr as u32).to_le_bytes());
+
+        let mut builder = ImportTableBuilder::new(false);
+        builder.modules.push(ImportModule {
+            name: "win32u.dll".into(),
+            thunks: vec![thunk(0x60de8, Some("NtUserRedrawWindow"))],
+        });
+        builder.modules.push(ImportModule {
+            name: "user32.dll".into(),
+            thunks: vec![thunk(0x60e00, Some("MessageBoxA"))],
+        });
+
+        let modules = vec![
+            snapshot_module("user32.dll", &[("RedrawWindow", 0x7f00100), ("MessageBoxA", 0x7f00200)]),
+            snapshot_module("win32u.dll", &[("NtUserRedrawWindow", live_win32u_addr)]),
+        ];
+        let mut stub_map = std::collections::HashMap::new();
+        stub_map.insert(live_win32u_addr, (0, "RedrawWindow".to_string()));
+
+        validate_and_regroup(
+            &mut builder, &iat_data, 0x60de8, &modules, false, Some(&stub_map),
+        );
+
+        assert_eq!(builder.modules.len(), 1, "win32u group is empty and dropped");
+        assert_eq!(builder.modules[0].name, "user32.dll");
+        assert_eq!(builder.modules[0].thunks.len(), 2);
+        let renamed = &builder.modules[0].thunks[0];
+        assert_eq!(renamed.iat_address, 0x60de8);
+        assert_eq!(renamed.function_name.as_deref(), Some("RedrawWindow"));
+    }
+
+    /// No derivation for the address: the thunk keeps its own bucket.
+    #[test]
+    fn without_derivation_thunk_stays_where_it_was() {
+        let live_addr: u64 = 0x7f12a0;
+        let mut iat_data = vec![0u8; 8];
+        iat_data[0..4].copy_from_slice(&(live_addr as u32).to_le_bytes());
+
+        let mut builder = ImportTableBuilder::new(false);
+        builder.modules.push(ImportModule {
+            name: "win32u.dll".into(),
+            thunks: vec![thunk(0x60de8, Some("NtUserRedrawWindow"))],
+        });
+        let modules = vec![
+            snapshot_module("user32.dll", &[("RedrawWindow", 0x7f00100)]),
+            snapshot_module("win32u.dll", &[("NtUserRedrawWindow", live_addr)]),
+        ];
+        let empty: std::collections::HashMap<u64, (usize, String)> =
+            std::collections::HashMap::new();
+
+        validate_and_regroup(
+            &mut builder, &iat_data, 0x60de8, &modules, false, Some(&empty),
+        );
+
+        assert_eq!(builder.modules.len(), 1);
+        assert_eq!(builder.modules[0].name, "win32u.dll");
+        assert_eq!(builder.modules[0].thunks[0].function_name.as_deref(), Some("NtUserRedrawWindow"));
+    }
+
+    /// A nameless thunk gets the derived name instead of a placeholder.
+    #[test]
+    fn nameless_thunk_gets_derived_name() {
+        let live_addr: u64 = 0x7f12a0;
+        let mut iat_data = vec![0u8; 8];
+        iat_data[0..4].copy_from_slice(&(live_addr as u32).to_le_bytes());
+
+        let mut builder = ImportTableBuilder::new(false);
+        builder.modules.push(ImportModule {
+            name: "win32u.dll".into(),
+            thunks: vec![thunk(0x60de8, None)],
+        });
+        let modules = vec![
+            snapshot_module("user32.dll", &[("RedrawWindow", 0x7f00100)]),
+            snapshot_module("win32u.dll", &[]),
+        ];
+        let mut stub_map = std::collections::HashMap::new();
+        stub_map.insert(live_addr, (0, "RedrawWindow".to_string()));
+
+        validate_and_regroup(
+            &mut builder, &iat_data, 0x60de8, &modules, false, Some(&stub_map),
+        );
+
+        assert_eq!(builder.modules.len(), 1);
+        assert_eq!(builder.modules[0].name, "user32.dll");
+        assert_eq!(builder.modules[0].thunks[0].function_name.as_deref(), Some("RedrawWindow"));
     }
 }

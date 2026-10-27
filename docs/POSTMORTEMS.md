@@ -873,3 +873,68 @@ or_gap_slots`（合成实测形态，模拟 loader 走查断言永不跨桶/永�
 教训与 x64 `.text` 保真度那轮（2026-10-24）同源但方向相反：那次是"别把壳的
 签名当目标"，这次是"别把壳运行时改写的头当权威"——**声明以输入文件为准，
 行为以实测为准，golden 只属于 v3**。关联小节：「classic IAT 交错桶」。
+
+## classic 跨 boot 可移植：stub 反汇编推 NtUser* ↔ 原名（2026-10-27 落地）
+
+上一节（classic IAT 交错桶）之后，产物里仍有 40 槽（user32/win32u 簇）保留
+壳会话 live 地址——loader 描述不了，只能同 boot 用。本轮把这条缺口收掉。
+
+### 前提实测：user32 的 RX stub 形态
+
+SysWOW64 的 user32.dll 上量（pefile，2026-10-27）：
+
+```
+user32!RedrawWindow      @0x3b0e0: ff 25 90 ee 0e 10  → jmp [0x100eee90]
+user32!InvalidateRect    @0x3ad10: ff 25 84 ef 0e 10  → jmp [0x100eef84]
+user32!SetActiveWindow   @0x3b270: ff 25 2c ee 0e 10  → jmp [0x100ee2c]
+user32!GetSysColor       @0x37c80: 8b ff 55 8b ec ...  （真函数，非 stub）
+```
+
+user32 的 `NtUser*` 类 stub 是五字节 `ff 25 [abs32]` 一跳，`[abs32]` 指向
+user32 自己 IAT 里的指针——**该指针的值恰是 win32u!NtUser* 的函数地址**，
+也就是壳塞进重建 IAT 槽的活体地址。静态文件里的 IAT 指针是重定位前值，
+直接相等比较只有在 live 进程里成立——所以映射必须在 dump 期建。
+
+### 修法：stub 目标映射 + regroup 推导优先
+
+`build_stub_target_map`（classic 门控，dump 期执行）：扫描快照里**所有**
+模块的所有导出地址，前 6 字节是 `ff 25`/`ff 15`（jmp/call [abs32]）的读
+指针；指针落在**别的**模块范围内就记 `target_addr → (stub模块, 原名)`。
+实测一次扫出 1,394 条（user32 的 679 条 win32u 导入 + gdi32 系）。
+
+`validate_and_regroup` 里**推导优先**：槽的活体地址命中 stub map 时，
+thunk 归到 (user32, "RedrawWindow") 而不是 (win32u, "NtUserRedrawWindow")
+——两对都合法且解析到同一函数，但只有前者是原始导入表的名字。实测
+moved=3，win32u 组空被丢，**uncovered_slots=0**：user32 簇自然连续成
+一个 40 槽描述符，74/74 全部 loader 描述，same-boot 依赖消失。
+
+### 收益与边界
+
+| 项 | 2026-10-27 前 | 现在 |
+|---|---|---|
+| loader 解析槽 | 34/74 | **74/74**（实测样本） |
+| same-boot 依赖 | 40 槽 | 无（本样本） |
+| 加载 | ✓ | ✓（另有一次干净 exit 0——原程序自结束，壳的 28 线程才是它常活的原因） |
+
+宣称边界：**"v1 产物可运行"成立**；本样本已不依赖同 boot，但那是
+"实测样本的形态"——user32 之外的 stub 模块（gdi32 系）形态未逐一验证，
+`_unknown_` 占位名（解析失败的槽）仍会迫使簇不描述。1.1.1 文件映射壳
+形状仍未覆盖。
+
+测试钉子：`stub_tests` 4 条（真实 user32 stub 字节逐字节钉死 + re-bucket
+三态：推导归桶/无推导留原桶/无名槽拿推导名）+ 既有 loader-walk pin。
+
+## 两条 golden 的第六、第七次漂移（2026-10-27，A/B 定责：环境，非代码）
+
+本 session 两条 v3 e2e gate 的字节 golden 各漂一次，结构指标一项没动，
+A/B 定责同上文方法（worktree 取 `351ed2f` 二进制、同机同命令）：
+
+| gate | 旧值 | 新值 | A/B 证据 |
+|---|---|---|---|
+| DLL (`core_dll.case`) | `8ba37a79…` | `5ac104f2…` | 旧二进制产出 `5ac104f2…` 逐字节同 |
+| x86 (`x86_sample.case`) | `4761923d…` | `5ba5dd53…` | 旧二进制产出 `5ba5dd53…` 逐字节同 |
+
+结构指标照旧（DLL：289/0/3、288 resolved、1,737,216 B；x86：55/0/55、
+110,592 B、Resolved 55）。本轮改动全部 classic 门控（`classic_imports`），
+两个目标都是 V3，相关代码路径根本不跑——漂移归因照旧：会话多 dial。
+golden 按 manifest 规程重录，证据注释留在两个 case 文件里。
