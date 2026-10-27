@@ -71,6 +71,15 @@ pub enum Command {
         verbose: bool,
         /// Which packer branch to take (`--packer`).
         packer: PackerChoice,
+        /// Skip ScyllaHide hook injection (`--no-scylla`).
+        ///
+        /// The ScyllaHide hook DLL intercepts anti-debug APIs inside the
+        /// target.  For some shells (measured: Themida 1.1.1 file-mapping
+        /// shells) the hook's presence changes the shell's runtime behaviour
+        /// — the shell's decompression completes in only 1/7 runs with the
+        /// hook injected.  This flag runs the pipeline without injecting the
+        /// hook, for diagnostics and for shells that misbehave under hooks.
+        no_scylla: bool,
     },
 
     /// Analyse a protected binary statically.
@@ -295,6 +304,7 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
     let mut shrink = true; // Default: shrink Themida sections (surpasses Pascal)
     let mut verbose = false;
     let mut packer = PackerChoice::Auto;
+    let mut no_scylla = false;
 
     let mut i = 3;
     while i < args.len() {
@@ -322,6 +332,9 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
             "--no-shrink" => {
                 shrink = false;
             }
+            "--no-scylla" => {
+                no_scylla = true;
+            }
             "-v" | "--verbose" => {
                 verbose = true;
             }
@@ -347,6 +360,7 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
         shrink,
         verbose,
         packer,
+        no_scylla,
     })
 }
 
@@ -646,6 +660,7 @@ mod tests {
                 shrink,
                 verbose,
                 packer,
+                no_scylla,
             } => {
                 assert!(input.ends_with("Cargo.toml"));
                 assert!(output.is_none());
@@ -653,6 +668,7 @@ mod tests {
                 assert!(shrink);
                 assert!(verbose);
                 assert_eq!(packer, PackerChoice::Auto, "the default must be auto");
+                assert!(!no_scylla, "no-scylla must default to off");
             }
             _ => panic!("expected Unpack, got {cmd:?}"),
         }
@@ -717,6 +733,32 @@ mod tests {
                 assert_eq!(output, Some(PathBuf::from("out.exe")));
             }
             _ => panic!("expected Unpack"),
+        }
+    }
+
+    #[test]
+    fn unpack_no_scylla_flag_parses_and_defaults_off() {
+        // Default: no_scylla is false.
+        let args = vec![
+            "prog".into(),
+            "/unpack".into(),
+            "Cargo.toml".into(),
+        ];
+        match parse_unpack(&args).unwrap() {
+            Command::Unpack { no_scylla, .. } => assert!(!no_scylla),
+            other => panic!("expected Unpack, got {other:?}"),
+        }
+
+        // Explicit: no_scylla is true.
+        let args = vec![
+            "prog".into(),
+            "/unpack".into(),
+            "Cargo.toml".into(),
+            "--no-scylla".into(),
+        ];
+        match parse_unpack(&args).unwrap() {
+            Command::Unpack { no_scylla, .. } => assert!(no_scylla),
+            other => panic!("expected Unpack, got {other:?}"),
         }
     }
 

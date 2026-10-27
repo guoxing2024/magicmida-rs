@@ -46,4 +46,4 @@ pub use self::helpers::is_dotnet;
 pub use self::original_imports::get_original_imports;
 pub use self::remote_modules::take_module_snapshot;
 pub use self::types::{DumpOptions, RemoteModule};
-pub use self::mapped_images::{dump_mapped_image_product, scan_mapped_images, MappedImage};
+pub use self::mapped_images::{dump_mapped_image_product, dump_mapped_image_raw, scan_mapped_images, MappedImage};

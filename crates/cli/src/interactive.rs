@@ -269,6 +269,7 @@ fn unpack_flow() -> bool {
                 shrink: true,
                 verbose: false,
                 packer,
+                no_scylla: false,
             }
         }
     };
@@ -597,6 +598,7 @@ mod tests {
             shrink: true,
             verbose: false,
             packer: PackerChoice::Upx,
+            no_scylla: false,
         };
         assert_eq!(describe(&cmd), "mida-cli /unpack t.exe --packer upx -o tU.exe");
 

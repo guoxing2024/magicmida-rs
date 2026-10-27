@@ -16,12 +16,14 @@ pub fn run_command(cmd: Command) -> Result<(), anyhow::Error> {
             shrink,
             verbose: _,
             packer,
+            no_scylla,
         } => crate::unpacker::unpack(
             &input,
             output.as_deref(),
             create_data_sections,
             shrink,
             packer,
+            no_scylla,
         ),
         Command::Analyze {
             input,
@@ -76,6 +78,7 @@ pub fn print_help() {
     println!("      -o, --output <path>                   Output path (default: <file>U.exe)");
     println!("      --data-sections                       Restore .rdata/.data from the process");
     println!("      --shrink / --no-shrink                Drop Themida sections (default: shrink)");
+    println!("      --no-scylla                          Skip ScyllaHide hook injection (diagnostics)");
     println!("  mida-cli /analyze <file> [--extract <dir>] [-v]");
     println!("                                         Static report — no process, works headless");
     println!();

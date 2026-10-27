@@ -141,10 +141,18 @@ fn parse_image(
     let size_of_image = u32::from_le_bytes(buf[opt + 56..opt + 60].try_into().ok()?);
     let entry_point = u32::from_le_bytes(buf[opt + 16..opt + 20].try_into().ok()?);
 
-    // Import directory: data directory 0.
+    // Import directory: data directory 0.  The VirtualAddress is at
+    // dd_off + 0, the Size at dd_off + 4 (each entry is 8 bytes: 4 RVA
+    // + 4 Size).  An earlier revision read dd_off + 8, which is the
+    // *Export* directory — the filter then matched system DLLs whose
+    // export RVA happened to be zero.
     let dd_off = opt + if is64 { 112 } else { 96 };
-    let import_rva = u32::from_le_bytes(buf[dd_off + 8..dd_off + 12].try_into().ok()?);
-    let import_size = u32::from_le_bytes(buf[dd_off + 12..dd_off + 16].try_into().ok()?);
+    let import_rva = u32::from_le_bytes(
+        buf[dd_off..dd_off + 4].try_into().ok()?,
+    );
+    let import_size = u32::from_le_bytes(
+        buf[dd_off + 4..dd_off + 8].try_into().ok()?,
+    );
 
     // Section table.
     let nsec = u16::from_le_bytes(buf[pe_off + 6..pe_off + 8].try_into().ok()?);
@@ -366,4 +374,50 @@ pub fn dump_mapped_image_product(
         "Mapped image product written",
     );
     Ok(())
+}
+
+/// Dump the raw bytes of a mapped image to a file, for offline
+/// post-processing.
+///
+/// When the in-pipeline OEP discovery (single-stepping into the image) fails
+/// — the shell's main thread may have already jumped through the image and
+/// exited before TF could catch it — the raw image bytes are still the
+/// original program, just without a patched header or rebuilt imports.  This
+/// function writes them verbatim; an offline script can then locate the
+/// MZ+PE, parse the header, find the IAT by content, and run the same
+/// product-assembly logic that [`dump_mapped_image_product`] does in-pipeline.
+///
+/// The output path is derived from `output_path` by replacing the extension
+/// with `raw.bin` (e.g. `t111U.exe` → `t111U.raw.bin`).
+pub fn dump_mapped_image_raw(
+    debugger: &mut dyn DebuggerCore,
+    image: &MappedImage,
+    output_path: &std::path::Path,
+) -> Result<std::path::PathBuf, PeError> {
+    use tracing::info;
+
+    let mut content = vec![0u8; image.size_of_image as usize];
+    let read = debugger
+        .read_memory(image.base as usize, &mut content)
+        .map_err(|e| PeError::Parse(format!("Failed to read mapped image for raw dump: {e}")))?;
+    if read < content.len() {
+        info!(
+            expected = content.len(),
+            actual = read,
+            "Short read on mapped image (raw dump)"
+        );
+        content.truncate(read);
+    }
+
+    let raw_path = output_path.with_extension("raw.bin");
+    std::fs::write(&raw_path, &content)
+        .map_err(|e| PeError::Io(e))?;
+
+    info!(
+        path = %raw_path.display(),
+        size = content.len(),
+        base = %format!("{:#x}", image.base),
+        "Raw mapped image dumped for offline post-processing",
+    );
+    Ok(raw_path)
 }

@@ -141,6 +141,7 @@ pub fn unpack(
     do_data_sections: bool,
     shrink: bool,
     packer: PackerChoice,
+    no_scylla: bool,
 ) -> Result<(), anyhow::Error> {
     // ---- step 1: resolve output path ----
     let output_path = resolve_output_path(input, output);
@@ -398,7 +399,7 @@ pub fn unpack(
         } else {
             pe_image_boundary
         };
-        let event = match dbg.wait_event_timeout(2000) {
+        let event = match dbg.wait_event_timeout(500) {
             Ok(ev) => ev,
             // Periodic wake-up: the classic shells go silent while
             // decompressing (no debug events), and the materialised image
@@ -481,28 +482,24 @@ pub fn unpack(
 
                 // Apply ScyllaHide — asynchronously, and *without* blocking.
                 //
-                // `InjectorCLIx86.exe` injects by suspending and hijacking the
-                // target's main thread, and it only returns once that thread
-                // actually runs the hijacked `LoadLibraryW`.  A debuggee's
-                // threads are frozen by the kernel while it has a pending debug
-                // event, and they stay frozen until the debugger calls
-                // `ContinueDebugEvent`.  So blocking here would deadlock: the
-                // injector waits for a thread that only the (blocked) debug
-                // loop can release.  That is exactly how the x86 run died —
-                // >15 s with no exit, main thread left at `Suspended`, loop
-                // stuck in `WaitForDebugEvent` after logging "ScyllaHide
-                // injected".
-                //
-                // `inject_scylla_hide` therefore spawns and returns.  The loop
-                // continues the event right below, which unfreezes the target
-                // and lets the injector finish in ~47 ms.
-                let injector_path = scylla_injector_path();
-                let scylla_config = ScyllaHideConfig {
-                    injector_cli_path: injector_path.display().to_string(),
-                    hook_library_path: scylla_hook_path().display().to_string(),
-                };
-                if let Err(e) = inject_scylla_hide(pid, &scylla_config) {
-                    warn!("ScyllaHide injection failed (non-fatal): {e}");
+                // `--no-scylla` skips the injection entirely: for some shells
+                // (measured: Themida 1.1.1 file-mapping shells) the hook's
+                // presence changes the shell's runtime behaviour — the
+                // shell's decompression completes in only 1/7 runs with the
+                // hook injected.  The flag runs the pipeline without injecting
+                // the hook, for diagnostics and for shells that misbehave
+                // under hooks.
+                if no_scylla {
+                    info!("ScyllaHide injection skipped (--no-scylla)");
+                } else {
+                    let injector_path = scylla_injector_path();
+                    let scylla_config = ScyllaHideConfig {
+                        injector_cli_path: injector_path.display().to_string(),
+                        hook_library_path: scylla_hook_path().display().to_string(),
+                    };
+                    if let Err(e) = inject_scylla_hide(pid, &scylla_config) {
+                        warn!("ScyllaHide injection failed (non-fatal): {e}");
+                    }
                 }
 
                 // Store resolved APIs for later breakpoint comparisons.
@@ -888,6 +885,90 @@ pub fn unpack(
                     }
                 }
 
+                // ---- Classic v1 file-mapping: check if this LoadDll is
+                // the materialised image (Themida 1.1.1). -----------------
+                //
+                // The shell LoadLibrary's the decompressed program mid-run.
+                // Its header has `import_rva == 0` (the shell resolved
+                // imports itself and scrubbed the import directory) and
+                // `entry_point == 0` (the shell keeps the real OEP in its
+                // own records).  System DLLs and the packed image itself
+                // carry a real import directory, so they are excluded.
+                //
+                // The import_rva offset was previously wrong (read the
+                // Export directory at dd_off + 8 instead of the Import
+                // directory at dd_off + 0), which made the check match
+                // system DLLs whose export RVA happened to be zero.
+                // Fixed: the Import directory VirtualAddress is at
+                // dd_off + 0.
+                //
+                // This check fires on the LoadDll event, which is the
+                // moment the image is guaranteed to be present — more
+                // reliable than waiting for the CloseHandle BP (the
+                // shell's variance means CloseHandle sometimes never
+                // fires within the timeout).
+                if !looks_like_dll
+                    && state.pending_mapped_dump.is_none()
+                    && matches!(
+                        state.pe_info.themida_version,
+                        mida_packers_themida::ThemidaVersion::V1
+                            | mida_packers_themida::ThemidaVersion::Ancient
+                    )
+                    && base_address as u64 != image_base_usize as u64
+                {
+                    let mut head = [0u8; 0x400];
+                    if dbg.read_memory(base_address as usize, &mut head).is_ok()
+                        && head[0] == b'M' && head[1] == b'Z'
+                    {
+                        let e_lfanew = u32::from_le_bytes(
+                            head[0x3C..0x40].try_into().unwrap_or([0; 4]),
+                        ) as usize;
+                        if e_lfanew + 0x200 <= head.len()
+                            && head[e_lfanew] == b'P'
+                            && head[e_lfanew + 1] == b'E'
+                        {
+                            let opt = e_lfanew + 24;
+                            let is64 = u16::from_le_bytes(
+                                head[opt..opt + 2].try_into().unwrap_or([0; 2]),
+                            ) == 0x20B;
+                            let dd_off = opt + if is64 { 112 } else { 96 };
+                            // DataDirectory[0] (Import): VirtualAddress at
+                            // dd_off + 0, Size at dd_off + 4.
+                            let import_rva = u32::from_le_bytes(
+                                head[dd_off..dd_off + 4].try_into().unwrap_or([0; 4]),
+                            );
+                            let size_of_image = u32::from_le_bytes(
+                                head[opt + 56..opt + 60].try_into().unwrap_or([0; 4]),
+                            );
+                            let entry_point = u32::from_le_bytes(
+                                head[opt + 16..opt + 20].try_into().unwrap_or([0; 4]),
+                            );
+                            if import_rva == 0 && entry_point == 0 && size_of_image >= 0x10000 {
+                                let import_size = u32::from_le_bytes(
+                                    head[dd_off + 4..dd_off + 8].try_into().unwrap_or([0; 4]),
+                                );
+                                info!(
+                                    base = %format!("{:#x}", base_address),
+                                    size_img = %format!("{:#x}", size_of_image),
+                                    "Classic file-mapping shape: materialised image found (LoadDll event)",
+                                );
+                                state.pending_mapped_dump = Some(
+                                    mida_pe::dumper::MappedImage {
+                                        base: base_address as u64,
+                                        region_size: size_of_image as u64,
+                                        size_of_image,
+                                        entry_point,
+                                        import_rva,
+                                        import_size,
+                                        sections: Vec::new(),
+                                        is_mapped: true,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+
                 debug!("LoadDll handler: calling continue_event for tid={thread_id}");
                 dbg.continue_event(thread_id, ContinueStatus::Continue)?;
                 debug!("LoadDll handler: continue_event returned OK for tid={thread_id}");
@@ -996,51 +1077,8 @@ pub fn unpack(
                 // original program as a mapped image (Themida 1.1.1).  Step
                 // into it to find the OEP and dump the image directly — the
                 // `.text` guard path never fires for these shells.
-                if let Some(img) = state.pending_mapped_dump.take() {
-                    let img_end = img.base + img.size_of_image as u64;
-                    // The jump into the image happens on the shell's main
-                    // thread; worker threads deliver events during the
-                    // decompression storm, so arm TF on the main thread.
-                    let step_thread = if state.main_thread_id != 0 {
-                        state.main_thread_id
-                    } else {
-                        thread_id
-                    };
-                    match step_until_in_image(&mut dbg, step_thread, img.base, img_end, 5000) {
-                        Ok(Some(oep_addr)) => {
-                            let oep_rva = (oep_addr - img.base) as u32;
-                            info!(oep = %format!("{oep_addr:#x}"), "OEP found inside mapped image");
-                            match mida_pe::dumper::dump_mapped_image_product(
-                                &mut dbg, &img, oep_rva, true, &output_path,
-                            ) {
-                                Ok(()) => {
-                                    info!("Mapped image product written");
-                                    dbg.continue_event(thread_id, ContinueStatus::Continue)?;
-                                    break;
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, "Mapped image dump failed — falling back to .text guard path");
-                                }
-                            }
-                        }
-                        Ok(None) => {
-                            warn!("OEP not found inside mapped image — falling back to .text guard path");
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "OEP stepping failed — falling back to .text guard path");
-                        }
-                    }
-                    // Clear TF (step_until_in_image leaves it armed) so the
-                    // guard path's events behave normally.
-                    let step_thread = if state.main_thread_id != 0 {
-                        state.main_thread_id
-                    } else {
-                        thread_id
-                    };
-                    if let Ok(mut ctx) = dbg.get_thread_context_control(step_thread) {
-                        ctx.EFlags &= !0x100;
-                        let _ = session::set_thread_context_control(&mut dbg, step_thread, &ctx);
-                    }
+                if try_mapped_dump(&mut dbg, &mut state, thread_id, &output_path)? {
+                    break;
                 }
 
                 // Handle anti-debug calls detected via breakpoint.
@@ -1162,6 +1200,18 @@ pub fn unpack(
                 }
 
                 log::log(LogType::Info, "handle_hw_breakpoint returned OK — about to continue_event");
+
+                // Classic file-mapping shape: the mapped dump arm must also
+                // fire from the SingleStep path.  HW breakpoint hits on
+                // protector-packaged targets arrive as SingleStep events
+                // (the kernel delivers them that way), so an arm that only
+                // lives in the Breakpoint handler never runs — measured:
+                // 7/7 1.1.1 runs hit "OEP not found" because the arm was
+                // missing here.
+                if try_mapped_dump(&mut dbg, &mut state, thread_id, &output_path)? {
+                    break;
+                }
+
                 dbg.continue_event(thread_id, ContinueStatus::Continue)?;
                 log::log(LogType::Info, "continue_event returned OK");
             }
@@ -1246,7 +1296,7 @@ fn try_map_scan(
             | mida_packers_themida::ThemidaVersion::Ancient
     ) && state.pending_mapped_dump.is_none()
     {
-        if state.last_map_scan.elapsed().as_secs() >= 2 {
+        if state.last_map_scan.elapsed().as_millis() >= 500 {
             state.last_map_scan = std::time::Instant::now();
             if let Ok(images) = mida_pe::dumper::scan_mapped_images(dbg, false) {
                 for img in &images {
@@ -1254,6 +1304,7 @@ fn try_map_scan(
                         base = format!("{:#x}", img.base),
                         size_img = format!("{:#x}", img.size_of_image),
                         ep = format!("{:#x}", img.entry_point),
+                        import_rva = format!("{:#x}", img.import_rva),
                         mapped = img.is_mapped,
                         "periodic scan: image",
                     );
@@ -1264,6 +1315,16 @@ fn try_map_scan(
                 // that appeared afterwards — the materialised program is
                 // LoadLibrary'd by the shell mid-run (measured: its base is
                 // in the 0x61xxxxxx family the shell unloads at exit).
+                //
+                // Two filters narrow the candidate to the materialised
+                // image:
+                //   * `import_rva == 0` — the shell scrubs the mapped
+                //     image's import directory (it resolved the imports
+                //     itself).  System DLLs and the packed image itself
+                //     carry a real import directory, so they are excluded.
+                //   * `size_of_image >= 0x10000` — the materialised
+                //     program is at least 64 KiB; tiny mappings are
+                //     shell helper structures.
                 let is_first_scan = state.seen_image_bases.is_empty();
                 let candidate = if is_first_scan {
                     None
@@ -1273,6 +1334,7 @@ fn try_map_scan(
                         .filter(|img| {
                             img.base != packed_base
                                 && img.size_of_image >= 0x10000
+                                && img.import_rva == 0
                                 && !state.seen_image_bases.contains(&img.base)
                         })
                         .max_by_key(|img| img.size_of_image)
@@ -1298,6 +1360,115 @@ fn try_map_scan(
     }
 }
 
+/// Try to dump the materialised mapped image (Themida 1.1.1 file-mapping
+/// shells).  Called from both the `Breakpoint` and `SingleStep` handlers
+/// after `handle_hw_breakpoint` — HW breakpoint hits arrive as `SingleStep`
+/// events on protector-packaged targets, so the arm must live in both paths
+/// or it never fires (measured: 7/7 runs hit "OEP not found" because the
+/// arm was only in the `Breakpoint` handler).
+///
+/// Returns `true` when the dump was written and the caller should `break`
+/// out of the debug loop.
+fn try_mapped_dump(
+    dbg: &mut ProcessSession,
+    state: &mut ThemidaState,
+    thread_id: u32,
+    output_path: &std::path::Path,
+) -> Result<bool, anyhow::Error> {
+    // If the periodic scan hasn't found the image yet, run an immediate
+    // scan at the CloseHandle hit.  The shell jumps into the image at this
+    // moment, so the image is guaranteed to be present.  In the no-hook
+    // environment the shell decompresses in ~11 s (vs ~90 s with hooks),
+    // so the image only exists for ~80 ms — the 2 s periodic scan misses
+    // it, but an immediate scan at the CloseHandle hit catches it.
+    if state.pending_mapped_dump.is_none() {
+        let packed_base = dbg.image_base() as u64;
+        if let Ok(images) = mida_pe::dumper::scan_mapped_images(dbg, false) {
+            let candidate = images
+                .iter()
+                .filter(|img| {
+                    img.base != packed_base
+                        && img.size_of_image >= 0x10000
+                        && img.import_rva == 0
+                        && !state.seen_image_bases.contains(&img.base)
+                })
+                .max_by_key(|img| img.size_of_image)
+                .cloned();
+            if let Some(img) = candidate {
+                info!(
+                    base = format!("{:#x}", img.base),
+                    size_img = format!("{:#x}", img.size_of_image),
+                    ep = format!("{:#x}", img.entry_point),
+                    "Classic file-mapping shape: materialised image found (immediate scan at CloseHandle hit)",
+                );
+                state.pending_mapped_dump = Some(img);
+            }
+        }
+    }
+    let Some(img) = state.pending_mapped_dump.take() else {
+        return Ok(false);
+    };
+    let img_end = img.base + img.size_of_image as u64;
+    // The jump into the image happens on the shell's main thread; worker
+    // threads deliver events during the decompression storm, so arm TF on
+    // the main thread.
+    let step_thread = if state.main_thread_id != 0 {
+        state.main_thread_id
+    } else {
+        thread_id
+    };
+    match step_until_in_image(dbg, step_thread, img.base, img_end, 5000) {
+        Ok(Some(oep_addr)) => {
+            let oep_rva = (oep_addr - img.base) as u32;
+            info!(oep = %format!("{oep_addr:#x}"), "OEP found inside mapped image");
+            match mida_pe::dumper::dump_mapped_image_product(
+                dbg, &img, oep_rva, true, output_path,
+            ) {
+                Ok(()) => {
+                    info!("Mapped image product written");
+                    dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+                    return Ok(true);
+                }
+                Err(e) => {
+                    warn!(error = %e, "Mapped image dump failed — falling back to .text guard path");
+                }
+            }
+        }
+        Ok(None) => {
+            warn!("OEP not found inside mapped image — falling back to .text guard path");
+        }
+        Err(e) => {
+            warn!(error = %e, "OEP stepping failed — falling back to .text guard path");
+        }
+    }
+    // Offline raw dump: even when the OEP discovery failed, the image bytes
+    // are still the original program.  Dump them verbatim so an offline
+    // script can locate the MZ+PE, parse the header, find the IAT by
+    // content, and assemble the product without a live debugger.
+    match mida_pe::dumper::dump_mapped_image_raw(dbg, &img, output_path) {
+        Ok(raw_path) => {
+            warn!(
+                path = %raw_path.display(),
+                "Raw mapped image dumped for offline post-processing"
+            );
+        }
+        Err(e) => {
+            warn!(error = %e, "Raw mapped image dump also failed");
+        }
+    }
+    // Clear TF (step_until_in_image leaves it armed) so the
+    // guard path's events behave normally.
+    let step_thread = if state.main_thread_id != 0 {
+        state.main_thread_id
+    } else {
+        thread_id
+    };
+    if let Ok(mut ctx) = dbg.get_thread_context_control(step_thread) {
+        ctx.EFlags &= !0x100;
+        let _ = session::set_thread_context_control(dbg, step_thread, &ctx);
+    }
+    Ok(false)
+}
 
     // ---- phases B/C/D: IAT repair, post-processing, dump ----
     run_post_loop_phases(
