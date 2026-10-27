@@ -6,7 +6,7 @@ use tracing::{debug, info};
 use windows::core::s;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
-use mida_core::DebuggerCore;
+use mida_core::{ContinueStatus, DebugEvent, DebuggerCore};
 use mida_packers_themida::{install_code_section_guard, ThemidaState};
 use super::session::{ResolvedApis, ProcessSession, ReadOnlyProcessDebugger};
 
@@ -401,6 +401,49 @@ pub(super) fn handle_hw_breakpoint(
                     guard_protection,
                 )?;
                 *guard_installed = true;
+
+                // Themida 1.1.1-shape: the shell materialised the original
+                // program as a file-mapped image the `.text` guard cannot
+                // see (no in-place decompression — the program simply runs
+                // and exits, measured: hit at 13.5 s, exit 67 ms later).
+                // At this point the decompression is complete, so scan the
+                // address space for the materialised image and hand it to
+                // the pipeline's mapped-dump path.
+                if let Ok(images) = mida_pe::dumper::scan_mapped_images(dbg, false) {
+                    for img in &images {
+                        debug!(
+                            base = format!("{:#x}", img.base),
+                            region = format!("{:#x}", img.region_size),
+                            size_img = format!("{:#x}", img.size_of_image),
+                            ep = format!("{:#x}", img.entry_point),
+                            imp = format!("{:#x}/{:#x}", img.import_rva, img.import_size),
+                            secs = img.sections.len(),
+                            mapped = img.is_mapped,
+                            "Mapped image found in target",
+                        );
+                    }
+                    // Candidate: a file-mapped image, not the packed image
+                    // itself, not a system DLL, big enough to be a program.
+                    let packed_base = image_base_usize as u64;
+                    let candidate = images
+                        .iter()
+                        .filter(|img| {
+                            img.is_mapped
+                                && img.base != packed_base
+                                && img.base < 0x7C00_0000
+                                && img.size_of_image >= 0x10000
+                        })
+                        .max_by_key(|img| img.size_of_image);
+                    if let Some(img) = candidate {
+                        info!(
+                            base = format!("{:#x}", img.base),
+                            size_img = format!("{:#x}", img.size_of_image),
+                            ep = format!("{:#x}", img.entry_point),
+                            "Classic file-mapping shape: materialised image found,                              stepping to its OEP",
+                        );
+                        state.pending_mapped_dump = Some(img.clone());
+                    }
+                }
             } else {
                 info!(
                     rip = %format_args!("{rip:#x}"),
@@ -592,4 +635,91 @@ pub(super) fn live_data_nonzero(dbg: &ProcessSession, image_base: usize, pe_sect
         }
     }
     total
+}
+
+/// Single-step `thread_id` until its instruction pointer lands inside
+/// `[start, end)` — the shell's jump into the materialised image, which is
+/// the original program's OEP.  Returns the OEP address, or `None` after
+/// `max_steps` steps.
+///
+/// Events from other threads are resumed immediately; only the target
+/// thread's `SingleStep` traps are inspected.
+pub(super) fn step_until_in_image(
+    dbg: &mut ProcessSession,
+    thread_id: u32,
+    start: u64,
+    end: u64,
+    max_steps: u32,
+) -> Result<Option<u64>, anyhow::Error> {
+    use tracing::warn;
+
+    let mut ctx = dbg
+        .get_thread_context_control(thread_id)
+        .map_err(|e| anyhow!("get_thread_context_control: {e}"))?;
+    ctx.EFlags |= 0x100; // TF
+    super::session::set_thread_context_control(dbg, thread_id, &ctx)?;
+    dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+
+    for _ in 0..max_steps {
+        // Timeout-guarded wait: the shell's main thread may spin on
+        // `pause`/`rep` while waiting for the decompression, and TF never
+        // fires on a paused thread — a blocking wait would hang forever.
+        // On timeout, re-arm TF and keep stepping.
+        let ev = match dbg.wait_event_timeout(10000) {
+            Ok(ev) => ev,
+            Err(mida_core::CoreError::Timeout) => {
+                let mut ctx = dbg
+                    .get_thread_context_control(thread_id)
+                    .map_err(|e| anyhow!("get_thread_context_control: {e}"))?;
+                ctx.EFlags |= 0x100;
+                super::session::set_thread_context_control(dbg, thread_id, &ctx)?;
+                dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+                continue;
+            }
+            Err(e) => return Err(anyhow!("wait_event: {e}")),
+        };
+        match ev {
+            DebugEvent::SingleStep { thread_id: tid, address } if tid == thread_id => {
+                if address >= start && address < end {
+                    return Ok(Some(address));
+                }
+                // keep stepping
+                let mut ctx = dbg
+                    .get_thread_context_control(thread_id)
+                    .map_err(|e| anyhow!("get_thread_context_control: {e}"))?;
+                ctx.EFlags |= 0x100;
+                super::session::set_thread_context_control(dbg, thread_id, &ctx)?;
+                dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+            }
+            _ => {
+                // Another thread's event (or the target's own fault): resume
+                // it and keep the target stepping.
+                if let DebugEvent::AccessViolation {
+                    thread_id: tid,
+                    address,
+                    ..
+                } = ev
+                {
+                    if tid == thread_id {
+                        warn!(address, "Shell faulted during OEP stepping — aborting mapped dump");
+                        return Ok(None);
+                    }
+                }
+                if let DebugEvent::Breakpoint { thread_id: tid, .. }
+                | DebugEvent::SingleStep { thread_id: tid, .. }
+                | DebugEvent::AccessViolation { thread_id: tid, .. } = ev
+                {
+                    dbg.continue_event(tid, ContinueStatus::Continue)?;
+                }
+                // keep the target stepping regardless
+                let mut ctx = dbg
+                    .get_thread_context_control(thread_id)
+                    .map_err(|e| anyhow!("get_thread_context_control: {e}"))?;
+                ctx.EFlags |= 0x100;
+                super::session::set_thread_context_control(dbg, thread_id, &ctx)?;
+                dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+            }
+        }
+    }
+    Ok(None)
 }

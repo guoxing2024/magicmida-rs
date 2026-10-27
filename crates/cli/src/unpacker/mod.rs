@@ -58,7 +58,7 @@ use helpers::{
     read_tls_callback_oep,
     scylla_ini_path, scylla_injector_path, scylla_hook_path, resolve_output_path, resolve_api_addrs,
     resolve_host_api, compute_data_section_bounds, detect_packed_dll, pe_section_name_remote_rva,
-    dotnet_dump_and_dump_output, handle_hw_breakpoint, section_table,
+    dotnet_dump_and_dump_output, handle_hw_breakpoint, section_table, step_until_in_image,
 };
 use av_handler::{AvAction, handle_access_violation};
 // Re-export public functions for commands.rs
@@ -398,10 +398,22 @@ pub fn unpack(
         } else {
             pe_image_boundary
         };
-        let event = dbg.wait_event().map_err(|e| {
-            log::log(LogType::Fatal, &format!("wait_event returned error: {e:#}"));
-            e
-        })?;
+        let event = match dbg.wait_event_timeout(2000) {
+            Ok(ev) => ev,
+            // Periodic wake-up: the classic shells go silent while
+            // decompressing (no debug events), and the materialised image
+            // appears during that silence — scanning only after events
+            // would miss it (measured: the CloseHandle hit never fired and
+            // the image existed only during the quiet phase).
+            Err(mida_core::CoreError::Timeout) => {
+                try_map_scan(&mut dbg, &mut state, image_base_usize);
+                continue;
+            }
+            Err(e) => {
+                log::log(LogType::Fatal, &format!("wait_event returned error: {e:#}"));
+                return Err(e.into());
+            }
+        };
         log::log(LogType::Info, &format!("event received: {event:?}"));
 
         match event {
@@ -417,6 +429,10 @@ pub fn unpack(
                 h_file,
             } => {
                 debug!(image_base = %format!("{image_base:#x}"), "CREATE_PROCESS_DEBUG_EVENT");
+
+                // The shell's main thread: the jump into the materialised
+                // image (Themida 1.1.1) happens on it.
+                state.main_thread_id = thread_id;
 
                 // Note: `image_base`, `process_id`, and the main-thread handle
                 // are now stored by the core's `wait_event` bookkeeping
@@ -976,6 +992,57 @@ pub fn unpack(
                     guard_protection,
                 )?;
 
+                // Classic file-mapping shape: the shell materialised the
+                // original program as a mapped image (Themida 1.1.1).  Step
+                // into it to find the OEP and dump the image directly — the
+                // `.text` guard path never fires for these shells.
+                if let Some(img) = state.pending_mapped_dump.take() {
+                    let img_end = img.base + img.size_of_image as u64;
+                    // The jump into the image happens on the shell's main
+                    // thread; worker threads deliver events during the
+                    // decompression storm, so arm TF on the main thread.
+                    let step_thread = if state.main_thread_id != 0 {
+                        state.main_thread_id
+                    } else {
+                        thread_id
+                    };
+                    match step_until_in_image(&mut dbg, step_thread, img.base, img_end, 5000) {
+                        Ok(Some(oep_addr)) => {
+                            let oep_rva = (oep_addr - img.base) as u32;
+                            info!(oep = %format!("{oep_addr:#x}"), "OEP found inside mapped image");
+                            match mida_pe::dumper::dump_mapped_image_product(
+                                &mut dbg, &img, oep_rva, true, &output_path,
+                            ) {
+                                Ok(()) => {
+                                    info!("Mapped image product written");
+                                    dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+                                    break;
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "Mapped image dump failed — falling back to .text guard path");
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            warn!("OEP not found inside mapped image — falling back to .text guard path");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "OEP stepping failed — falling back to .text guard path");
+                        }
+                    }
+                    // Clear TF (step_until_in_image leaves it armed) so the
+                    // guard path's events behave normally.
+                    let step_thread = if state.main_thread_id != 0 {
+                        state.main_thread_id
+                    } else {
+                        thread_id
+                    };
+                    if let Ok(mut ctx) = dbg.get_thread_context_control(step_thread) {
+                        ctx.EFlags &= !0x100;
+                        let _ = session::set_thread_context_control(&mut dbg, step_thread, &ctx);
+                    }
+                }
+
                 // Handle anti-debug calls detected via breakpoint.
                 if let Ok(handled) = handle_nt_set_information_thread(&dbg, thread_id) {
                     if handled {
@@ -1157,7 +1224,79 @@ pub fn unpack(
                 dbg.continue_event(thread_id, ContinueStatus::ExceptionNotHandled)?;
             }
         }
+
+        // Also scan after events: the materialised image loads during busy
+        // periods (the decompression storm), where no 2 s quiet gap ever
+        // arrives for the timeout scan to fire.
+        try_map_scan(&mut dbg, &mut state, image_base_usize);
     }
+
+/// Periodic scan for the classic shells' materialised image (Themida
+/// 1.1.1).  Two call sites: the event-loop timeout (quiet periods) and the
+/// loop tail (busy periods); both are 2 s-gated.  First scan records the
+/// startup image set; later scans only consider new images.
+fn try_map_scan(
+    dbg: &mut ProcessSession,
+    state: &mut ThemidaState,
+    image_base_usize: usize,
+) {
+    if matches!(
+        state.pe_info.themida_version,
+        mida_packers_themida::ThemidaVersion::V1
+            | mida_packers_themida::ThemidaVersion::Ancient
+    ) && state.pending_mapped_dump.is_none()
+    {
+        if state.last_map_scan.elapsed().as_secs() >= 2 {
+            state.last_map_scan = std::time::Instant::now();
+            if let Ok(images) = mida_pe::dumper::scan_mapped_images(dbg, false) {
+                for img in &images {
+                    debug!(
+                        base = format!("{:#x}", img.base),
+                        size_img = format!("{:#x}", img.size_of_image),
+                        ep = format!("{:#x}", img.entry_point),
+                        mapped = img.is_mapped,
+                        "periodic scan: image",
+                    );
+                }
+                let packed_base = image_base_usize as u64;
+                // First scan: record the startup image set (the shell's own
+                // DLLs + the system DLLs).  Later scans only consider images
+                // that appeared afterwards — the materialised program is
+                // LoadLibrary'd by the shell mid-run (measured: its base is
+                // in the 0x61xxxxxx family the shell unloads at exit).
+                let is_first_scan = state.seen_image_bases.is_empty();
+                let candidate = if is_first_scan {
+                    None
+                } else {
+                    images
+                        .iter()
+                        .filter(|img| {
+                            img.base != packed_base
+                                && img.size_of_image >= 0x10000
+                                && !state.seen_image_bases.contains(&img.base)
+                        })
+                        .max_by_key(|img| img.size_of_image)
+                        .cloned()
+                };
+                // Record the current scan's bases (after the candidate
+                // decision, so the current images count as "seen" for the
+                // next scan).
+                for img in &images {
+                    state.seen_image_bases.insert(img.base);
+                }
+                if let Some(img) = candidate {
+                    info!(
+                        base = format!("{:#x}", img.base),
+                        size_img = format!("{:#x}", img.size_of_image),
+                        ep = format!("{:#x}", img.entry_point),
+                        "Classic file-mapping shape: materialised image found (periodic scan)",
+                    );
+                    state.pending_mapped_dump = Some(img);
+                }
+            }
+        }
+    }
+}
 
 
     // ---- phases B/C/D: IAT repair, post-processing, dump ----

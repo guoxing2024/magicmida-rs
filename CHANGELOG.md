@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Themida 1.1.1 file-mapping shells: dedicated pipeline path (acceptance pending)** —
+  1.1.1 shells decompress the program into a file mapping and run it via
+  `LoadLibrary`, so the classic `.text` guard chain never fires.  New
+  classic-gated path: a dual-rate periodic scan (event-loop timeout + loop
+  tail, 2 s-gated) finds the materialised image (first scan records the
+  startup image set; later scans only consider new images), a TF
+  single-step on the shell's main thread (timeout-guarded against `pause`
+  spins) finds the OEP inside the image, and `dump_mapped_image_product`
+  dumps it directly — header patched (OEP, base, ASLR off), IAT located
+  inside the image, the full import rebuild reused, hardcoded addresses
+  rebased from the mapped base.  v3 paths byte-untouched (all three e2e
+  gates green).  Acceptance on the ladder's 1.1.1 sample is **not**
+  achieved: under the debugger the shell completes its decompression in
+  only 1 of 7 measured runs (the materialised image appears only in the
+  80 ms exit sequence otherwise) — a shell-runtime variance, documented
+  in POSTMORTEMS with the next inputs (hook-free debugger environment, or
+  offline post-processing of a memory dump).
+
 - **Classic v1 product runs, all imports loader-resolved (control-verified)** —
   after the IAT serialization fix and the first-section RWX restoration, the
   measured 1.9.1 unpackme's product loads past import resolution (was

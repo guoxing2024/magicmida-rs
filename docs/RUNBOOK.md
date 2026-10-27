@@ -355,6 +355,16 @@ classic 首段 RWX 位从输入声明恢复 + `classic_imports` 标志（regroup
 gate：`themida_ladder_gate`（默认跑、缺语料 SKIP）76/76 + 手工导入 fixture 单测。
 三 e2e gate 的日志刮刀已剥 ANSI（tracing 结构化字段包装使断言假红）。
 
+**1.1.1 文件映射壳（2026-10-27，管线路径已落地、验收待壳稳定）** ——
+壳把原程序解压进文件映射再 LoadLibrary 运行，`.text` 守护链对它无效。
+管线新增独立路径：双路周期扫描（超时+尾部，2s 门控）找素材化镜像（首扫
+记录启动集、只认新镜像）→ TF 单步壳主线程到镜像内得 OEP（超时防护 pause
+自旋）→ `dump_mapped_image_product` 直接 dump（头部修补 + 镜像内扫 IAT +
+复用全套导入重建 + 重定基传映射基址）。全部 classic 门控，v3 三 gate 绿。
+**验收未达成**：t111 在管线下 6/7 轮壳不完成解压（镜像只在退出瞬间出现）
+——壳的运行时方差（2005 壳 + hooks + debugger），非管线缺陷；下一步输入
+见 `POSTMORTEMS.md` 同名小节。1.9.1 形状目标不受影响。
+
 ## x86 编译（2026-10-23 打通）## x86 编译（2026-10-23 打通）
 
 ```powershell

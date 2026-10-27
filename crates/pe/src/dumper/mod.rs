@@ -36,6 +36,7 @@ mod import_section;
 mod output_writer;
 mod dump_process;
 mod original_imports;
+mod mapped_images;
 #[cfg(test)]
 mod tests;
 
@@ -45,3 +46,4 @@ pub use self::helpers::is_dotnet;
 pub use self::original_imports::get_original_imports;
 pub use self::remote_modules::take_module_snapshot;
 pub use self::types::{DumpOptions, RemoteModule};
+pub use self::mapped_images::{dump_mapped_image_product, scan_mapped_images, MappedImage};

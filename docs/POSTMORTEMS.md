@@ -938,3 +938,45 @@ A/B 定责同上文方法（worktree 取 `351ed2f` 二进制、同机同命令�
 110,592 B、Resolved 55）。本轮改动全部 classic 门控（`classic_imports`），
 两个目标都是 V3，相关代码路径根本不跑——漂移归因照旧：会话多 dial。
 golden 按 manifest 规程重录，证据注释留在两个 case 文件里。
+
+## Themida 1.1.1 文件映射壳：管线路径已落地，验收被壳的运行时方差挡住（2026-10-27）
+
+1.1.1 的壳与 1.9.1 的壳形状不同：壳把原程序解压进**文件映射**，再
+`LoadLibrary` 素材化镜像运行——`.text` 守护链（写故障→OEP 候选）对它完全
+无效（首段零写活动）。本轮把这条线做成一条独立管线路径。
+
+### 实测（t111.exe，Themida 1.1.1.0）
+
+| 观测 | 结果 |
+|---|---|
+| 加壳文件 | EP=0x6c014（Themida 段内），经典 stub 对（kernel32+comctl32） |
+| 无调试器直跑 | 窗口 `Themida - http://www.oreans.com`，壳正常跑完 |
+| 壳的素材化 | 文件映射视图（0x31000×3 + 0xA9000 解压区，READONLY）渐进填充 40s+；`LoadLibrary` 的镜像族在 0x61xxxxxx（退出时 UnloadDll 确认） |
+| 管线内（debugger+ScyllaHide） | **方差极大**：今天 7 轮只有第 1 轮命中 CloseHandle（3.98 min，解压已完成）；其余 6 轮壳在 4–12 min 内 exit 0，素材化镜像**只在退出瞬间**（80ms）出现，运行期间从未加载 |
+
+### 落地的管线路径（全部 classic 门控，v3 三 gate 绿、golden 不动）
+
+1. `scan_mapped_images`（pe crate）：VirtualQueryEx 走遍目标地址空间，
+   每个 committed 区读 0x400 找 MZ+PE，解析 ep/size_of_image/导入目录/节表。
+2. **双路周期扫描**：事件循环超时（wait_event_timeout 2s，静默期）+ 循环
+   尾部（2s 门控，繁忙期）——素材化镜像在解压风暴期间加载，单一触发器
+   （CloseHandle 命中或超时）都会错过。首扫记录启动镜像集，后续只认新镜像
+   （壳自己的 DLL 与系统 DLL 全在首扫里）。
+3. **单步 OEP**：TF 装在壳的**主线程**（CreateProcess 的线程；工作线程在
+   风暴里送事件，装错线程必错过跳转）；wait_event_timeout 防护 pause 自旋
+   （TF 在 paused 线程上不触发，阻塞等待会挂死）。
+4. `dump_mapped_image_product`：读镜像内容 → 头部修补（EP=单步得到的 OEP、
+   base=0x400000、ASLR 关）→ 镜像内扫 IAT（最长 API 地址 run）→ 复用
+   `rebuild_import_table_complete`（含 stub 推导/run 归一化全套）→ 组装
+   产品（sanitize → .import 段 → 输出 → fix_hardcoded_addresses **传映射
+   基址**做重定基 → reloc）。
+
+### 未达成的验收与下一步输入
+
+**t111 产物可运行未达成**：壳在管线下 6/7 轮不完成解压（素材化镜像不出现），
+扫描无从触发。这是壳的运行时行为（2005 壳 + ScyllaHide hooks + Win11
+debugger），不是管线缺陷——第 1 轮（无扫描 hook 的旧二进制）解压是完成的
+（命中在 3.98 min）。下一步输入：① 用无 hook 的裸 debugger 环境跑
+1.1.1（hook 是解压失败的嫌疑）；② 或者接受"1.1.1 在管线内不稳定"，
+把素材化镜像的识别做成离线后处理（dump 进程内存后离线找镜像）。
+1.9.1 形状的 classic 目标（守卫链）不受影响，照常工作。

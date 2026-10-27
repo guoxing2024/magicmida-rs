@@ -35,6 +35,26 @@ pub struct ThemidaState {
     /// IAT monitoring mode: when true, the guard is set on the Themida section
     /// and we're waiting for enough writes to consider the IAT decrypted.
     pub iat_monitoring: bool,
+    /// Themida 1.1.1-shape: the shell materialised the original program as a
+    /// file-mapped image (the `.text` guard chain never fires — the program
+    /// simply runs and exits).  When set, the pipeline steps the shell into
+    /// the image to find the OEP and dumps the image directly.
+    pub pending_mapped_dump: Option<mida_pe::dumper::MappedImage>,
+    /// Last time the periodic mapped-image scan ran (the CloseHandle hit is
+    /// not a reliable trigger for 1.1.1 shells — measured: some runs exit
+    /// without it ever firing, so the pipeline scans on its own).
+    pub last_map_scan: std::time::Instant,
+    /// The shell's main thread (from the CreateProcess event).  The jump
+    /// into the materialised image happens on it, so the OEP single-step
+    /// must arm TF on this thread, not on whatever thread delivered the
+    /// current event (measured: worker threads deliver events during the
+    /// decompression storm).
+    pub main_thread_id: u32,
+    /// Image bases seen by the first periodic scan (the startup DLL set).
+    /// Later scans only consider images that appeared afterwards — the
+    /// materialised program is LoadLibrary'd by the shell mid-run, while
+    /// the shell's own DLLs and the system DLLs are all in the initial set.
+    pub seen_image_bases: std::collections::HashSet<u64>,
     /// Set of unique write addresses detected during IAT monitoring.
     /// Using HashSet to avoid counting duplicate writes to the same address.
     pub iat_write_addresses: HashSet<usize>,
@@ -111,6 +131,10 @@ impl ThemidaState {
             tls_total: 0,
             tls_counter: 0,
             iat_monitoring: false,
+            pending_mapped_dump: None,
+            last_map_scan: std::time::Instant::now(),
+            main_thread_id: 0,
+            seen_image_bases: std::collections::HashSet::new(),
             iat_write_addresses: HashSet::new(),
             // Default: wait for 3 unique write addresses before considering IAT ready.
             // This is a low threshold because the VM may write to the same address
