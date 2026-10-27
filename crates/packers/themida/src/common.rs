@@ -105,6 +105,23 @@ pub struct ThemidaState {
     /// dismissed without re-running the stepping dance (measured: the stage
     /// at `0x4271dc` is entered thousands of times).
     pub classic_rejected: Vec<usize>,
+    /// Ancient (1.1.1) exit-window watch.  The materialised image is created
+    /// AND wiped entirely inside the last tens of milliseconds before
+    /// `ExitProcess` (measured: at the CloseHandle hit the scan finds only
+    /// the packed image and system DLLs; at the `ExitProcess` event the
+    /// image exists but its content is already destroyed).  After the
+    /// CloseHandle hit the pipeline therefore scans after EVERY debug
+    /// event and writes a numbered raw snapshot each time the image
+    /// appears — each debug event freezes the process, so every snapshot
+    /// is a consistent catch of the window, and the best one (usually the
+    /// last before the wipe) is picked offline.
+    pub ancient_watch: bool,
+    /// Module bases cached when the watch started (the watch filter is
+    /// "not the packed image and not a registered module"; re-taking the
+    /// module snapshot at every event is too slow for the exit window).
+    pub ancient_module_bases: std::collections::HashSet<u64>,
+    /// Numbered raw snapshots written during the watch.
+    pub ancient_snapshots: u32,
 }
 
 impl ThemidaState {
@@ -135,6 +152,9 @@ impl ThemidaState {
             last_map_scan: std::time::Instant::now(),
             main_thread_id: 0,
             seen_image_bases: std::collections::HashSet::new(),
+            ancient_watch: false,
+            ancient_module_bases: std::collections::HashSet::new(),
+            ancient_snapshots: 0,
             iat_write_addresses: HashSet::new(),
             // Default: wait for 3 unique write addresses before considering IAT ready.
             // This is a low threshold because the VM may write to the same address

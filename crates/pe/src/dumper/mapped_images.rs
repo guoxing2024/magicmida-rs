@@ -78,7 +78,15 @@ pub fn scan_mapped_images(
             )
         };
         if rc != std::mem::size_of::<MEMORY_BASIC_INFORMATION>() {
-            break;
+            // At `ExitProcess` the debuggee is in teardown and some
+            // regions may already be freed, causing `VirtualQueryEx`
+            // to return 0 for those addresses.  The old code `break`
+            // on the first failure, which meant the scan returned
+            // `Ok(vec![])` (or fewer images than were actually
+            // present) right when the last-chance dump needed it
+            // most.  Skip forward by one page and keep walking.
+            addr = addr.checked_add(0x1000).unwrap_or(0x7FFF_FFFF);
+            continue;
         }
 
         if mbi.State == MEM_COMMIT && (mbi.RegionSize as u64) >= 0x1000 {
@@ -389,35 +397,120 @@ pub fn dump_mapped_image_product(
 ///
 /// The output path is derived from `output_path` by replacing the extension
 /// with `raw.bin` (e.g. `t111U.exe` → `t111U.raw.bin`).
+///
+/// Also writes a module snapshot next to the raw dump (`<stem>.raw.modules.txt`)
+/// so an offline script can resolve IAT slots to module names and function
+/// names without a live process.
 pub fn dump_mapped_image_raw(
     debugger: &mut dyn DebuggerCore,
     image: &MappedImage,
     output_path: &std::path::Path,
 ) -> Result<std::path::PathBuf, PeError> {
-    use tracing::info;
+    use tracing::{info, warn};
 
-    let mut content = vec![0u8; image.size_of_image as usize];
-    let read = debugger
-        .read_memory(image.base as usize, &mut content)
-        .map_err(|e| PeError::Parse(format!("Failed to read mapped image for raw dump: {e}")))?;
-    if read < content.len() {
-        info!(
-            expected = content.len(),
-            actual = read,
-            "Short read on mapped image (raw dump)"
+    let total = image.size_of_image as usize;
+    let mut content = vec![0u8; total];
+
+    // At `ExitProcess` the debuggee is in teardown and some pages may
+    // already be freed, causing a single large `read_memory` to fail
+    // entirely (measured: "Failed to read memory at 0x2990000
+    // (requested 720896 bytes)").  Read page-by-page (0x1000) and
+    // skip failures — the offline script can still work with partial
+    // data (the MZ+PE header and section table are almost always
+    // intact because they are in the first few pages).
+    let page_size = 0x1000usize;
+    let mut pages_read = 0usize;
+    let mut pages_failed = 0usize;
+    let mut failed_offsets: Vec<usize> = Vec::new();
+    for off in (0..total).step_by(page_size) {
+        let len = std::cmp::min(page_size, total - off);
+        match debugger.read_memory(image.base as usize + off, &mut content[off..off + len]) {
+            Ok(n) => {
+                if n < len {
+                    // Partial page — zero the tail.
+                    content[off + n..off + len].fill(0);
+                }
+                pages_read += 1;
+            }
+            Err(_) => {
+                pages_failed += 1;
+                failed_offsets.push(off);
+            }
+        }
+    }
+    if failed_offsets.is_empty() {
+        info!(total = total, pages = pages_read, "Raw dump: page-by-page read complete");
+    } else {
+        warn!(
+            total = total,
+            pages_read = pages_read,
+            pages_failed = pages_failed,
+            failed_rvas = ?failed_offsets.iter().map(|o| format!("{o:#x}")).collect::<Vec<_>>(),
+            "Raw dump: page-by-page read complete with failures"
         );
-        content.truncate(read);
     }
 
     let raw_path = output_path.with_extension("raw.bin");
     std::fs::write(&raw_path, &content)
         .map_err(|e| PeError::Io(e))?;
 
+    // Determine architecture from the image header.
+    let e_lfanew = u32::from_le_bytes(
+        content[0x3C..0x40].try_into().map_err(|_| PeError::Parse("short header".into()))?,
+    ) as usize;
+    let opt = e_lfanew + 24;
+    let is_64bit = u16::from_le_bytes(
+        content[opt..opt + 2].try_into().map_err(|_| PeError::Parse("short header".into()))?,
+    ) == 0x20B;
+
+    // Dump the module snapshot so the offline script can resolve IAT slots.
+    let modules_path = output_path.with_extension("raw.modules.txt");
+    let modules = take_module_snapshot(
+        debugger.process_handle(),
+        debugger.pid(),
+        image.base,
+        is_64bit,
+    )?;
+    let mut mod_text = String::new();
+    for m in &modules {
+        mod_text.push_str(&format!("{} {} {:#x}\n", m.name, format!("{:#x}", m.base), m.end_off));
+        for (&addr, name) in &m.exports {
+            mod_text.push_str(&format!("{:#x} {}\n", addr, name));
+        }
+    }
+    std::fs::write(&modules_path, mod_text).map_err(|e| PeError::Io(e))?;
+
     info!(
         path = %raw_path.display(),
+        modules = %modules_path.display(),
         size = content.len(),
         base = %format!("{:#x}", image.base),
         "Raw mapped image dumped for offline post-processing",
     );
     Ok(raw_path)
+}
+
+/// Read the image bytes page-by-page (failure-tolerant) and write them to
+/// `raw_path` verbatim.  No module snapshot, no path derivation — the
+/// exit-window watch calls this once per debug event with a numbered
+/// snapshot path, where re-taking the module list every time would be too
+/// slow and the path is caller-chosen.
+///
+/// Returns the number of bytes written.
+pub fn dump_mapped_image_raw_to(
+    debugger: &mut dyn DebuggerCore,
+    image: &MappedImage,
+    raw_path: &std::path::Path,
+) -> Result<usize, PeError> {
+    let total = image.size_of_image as usize;
+    let mut content = vec![0u8; total];
+    let page_size = 0x1000usize;
+    for off in (0..total).step_by(page_size) {
+        let len = std::cmp::min(page_size, total - off);
+        // Errors are tolerated: teardown may free pages under us.  The
+        // offline analysis sees zeroed pages for the misses.
+        let _ = debugger.read_memory(image.base as usize + off, &mut content[off..off + len]);
+    }
+    std::fs::write(raw_path, &content).map_err(|e| PeError::Io(e))?;
+    Ok(content.len())
 }

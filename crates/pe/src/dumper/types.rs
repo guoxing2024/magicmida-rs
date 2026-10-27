@@ -74,6 +74,17 @@ pub struct RemoteModule {
     pub(crate) forwards: Vec<(String, u64)>,
 }
 
+impl RemoteModule {
+    /// Base address of the module in the target's virtual address space.
+    ///
+    /// The fields themselves are `pub(crate)`; callers outside `mida-pe`
+    /// (the CLI's mapped-image dump arm) only need to test whether a
+    /// mapping base coincides with a registered module.
+    pub fn base(&self) -> u64 {
+        self.base
+    }
+}
+
 /// A candidate resolution for one IAT slot.
 #[derive(Debug, Clone)]
 pub(crate) struct ResolutionCandidate {

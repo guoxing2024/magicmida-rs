@@ -407,7 +407,8 @@ pub fn unpack(
             // would miss it (measured: the CloseHandle hit never fired and
             // the image existed only during the quiet phase).
             Err(mida_core::CoreError::Timeout) => {
-                try_map_scan(&mut dbg, &mut state, image_base_usize);
+                try_map_scan(&mut dbg, &mut state, image_base_usize, &output_path);
+                try_ancient_watch_scan(&mut dbg, &mut state, image_base_usize, &output_path);
                 continue;
             }
             Err(e) => {
@@ -1220,7 +1221,19 @@ pub fn unpack(
             // EXIT_PROCESS — target exited (unexpected before dump)
             // ---------------------------------------------------------------
             DebugEvent::ExitProcess { exit_code } => {
-                warn!(exit_code, "Target process exited before unpack completed");
+                warn!(exit_code, "Target process exiting — attempting final raw dump");
+                // Last chance: the shell has finished decompressing and is
+                // calling ExitProcess.  The materialised image is in memory
+                // right now.  The periodic scan never caught it because
+                // (a) the 2.75 s full-address-space scan is too slow for
+                // the ~65 ms window between the CloseHandle hit and exit,
+                // and (b) the `seen_image_bases` filter excludes images
+                // at bases that were previously used by unloaded DLLs
+                // (measured: the 1.1.1 shell reuses a DLL base for the
+                // materialised image).  This final scan ignores
+                // `seen_image_bases` and dumps any candidate with the
+                // materialised image signature (import_rva==0 OR ep==0).
+                try_exit_dump(&mut dbg, &mut state, image_base_usize, &output_path);
                 break;
             }
 
@@ -1278,7 +1291,12 @@ pub fn unpack(
         // Also scan after events: the materialised image loads during busy
         // periods (the decompression storm), where no 2 s quiet gap ever
         // arrives for the timeout scan to fire.
-        try_map_scan(&mut dbg, &mut state, image_base_usize);
+        try_map_scan(&mut dbg, &mut state, image_base_usize, &output_path);
+        // Ancient exit-window watch: after the CloseHandle hit, snapshot
+        // the materialised image at every event freeze (the image exists
+        // only for the last tens of milliseconds before ExitProcess, and
+        // each debug event is a freeze inside that window).
+        try_ancient_watch_scan(&mut dbg, &mut state, image_base_usize, &output_path);
     }
 
 /// Periodic scan for the classic shells' materialised image (Themida
@@ -1289,6 +1307,7 @@ fn try_map_scan(
     dbg: &mut ProcessSession,
     state: &mut ThemidaState,
     image_base_usize: usize,
+    output_path: &std::path::Path,
 ) {
     if matches!(
         state.pe_info.themida_version,
@@ -1353,9 +1372,194 @@ fn try_map_scan(
                         ep = format!("{:#x}", img.entry_point),
                         "Classic file-mapping shape: materialised image found (periodic scan)",
                     );
+                    // Raw dump at scan time is an Ancient-only convenience:
+                    // for V1 the pending-dump → OEP-stepping → product path
+                    // below must stay in charge, and an Ancient candidate
+                    // that first appears mid-run is usually still mid-
+                    // decompression (the bytes get overwritten by the
+                    // pre-wipe CloseHandle dump or the ExitProcess fallback
+                    // anyway — same output path).
+                    if state.pe_info.themida_version
+                        == mida_packers_themida::ThemidaVersion::Ancient
+                    {
+                        if let Err(e) =
+                            mida_pe::dumper::dump_mapped_image_raw(dbg, &img, output_path)
+                        {
+                            warn!(error = %e, "Raw dump at scan time failed");
+                        }
+                    }
                     state.pending_mapped_dump = Some(img);
                 }
             }
+        }
+    }
+}
+
+/// Last-chance raw dump at the `ExitProcess` event.  The periodic scan
+/// (`try_map_scan`) and the CloseHandle-hit scan (`try_mapped_dump`) both
+/// use the `seen_image_bases` filter, which excludes images at bases that
+/// were previously used by DLLs that have since been unloaded.  The 1.1.1
+/// shell reuses such a base for the materialised image, so every earlier
+/// scan misses it.  At `ExitProcess` the shell has finished decompressing
+/// and the image is present — this scan ignores `seen_image_bases` and
+/// dumps any candidate with the materialised signature (import_rva==0
+/// OR entry_point==0).  The process is still alive (the debugger holds
+/// the handle), so `VirtualQueryEx` / `read_memory` work normally.
+fn try_exit_dump(
+    dbg: &mut ProcessSession,
+    state: &mut ThemidaState,
+    image_base_usize: usize,
+    output_path: &std::path::Path,
+) {
+    if !matches!(
+        state.pe_info.themida_version,
+        mida_packers_themida::ThemidaVersion::V1
+            | mida_packers_themida::ThemidaVersion::Ancient
+    ) || state.pending_mapped_dump.is_some()
+    {
+        return;
+    }
+    match mida_pe::dumper::scan_mapped_images(dbg, false) {
+        Ok(images) => {
+            let packed_base = image_base_usize as u64;
+        // Log every image found — the debug-level log in try_map_scan
+        // is suppressed at INFO level, so we log here at WARN to see
+        // what the process memory looks like at exit.
+        for img in &images {
+            warn!(
+                base = format!("{:#x}", img.base),
+                size_img = format!("{:#x}", img.size_of_image),
+                ep = format!("{:#x}", img.entry_point),
+                import_rva = format!("{:#x}", img.import_rva),
+                mapped = img.is_mapped,
+                "ExitProcess scan: image in memory",
+            );
+        }
+        // Candidate filter: not the packed base, large enough, and BOTH
+        // import_rva==0 AND entry_point==0 (the shell scrubs both).
+        // Deliberately does NOT check `seen_image_bases` — the image may
+        // be at a base that was previously used by an unloaded DLL.
+        //
+        // Requiring both fields zero is critical: at ExitProcess the
+        // shell has finished decompressing and some DLLs may have had
+        // their entry point scrubbed (ep==0) but still carry a valid
+        // import directory (import_rva != 0).  Such images are false
+        // positives — measured: 0x76ec0000 (a DLL with ep==0 but
+        // import_rva=0x120750) was picked over the real materialised
+        // image at 0x4c00000 (ep==0, import_rva==0, mapped=true).
+        let candidate = images
+            .iter()
+            .filter(|img| {
+                img.base != packed_base
+                    && img.size_of_image >= 0x10000
+                    && img.import_rva == 0
+                    && img.entry_point == 0
+            })
+            .max_by_key(|img| img.size_of_image)
+            .cloned();
+        if let Some(img) = candidate {
+            info!(
+                base = format!("{:#x}", img.base),
+                size_img = format!("{:#x}", img.size_of_image),
+                ep = format!("{:#x}", img.entry_point),
+                import_rva = format!("{:#x}", img.import_rva),
+                "Materialised image found at ExitProcess — dumping raw bytes for offline rebuild",
+            );
+            if let Err(e) = mida_pe::dumper::dump_mapped_image_raw(dbg, &img, output_path) {
+                warn!(error = %e, "Raw dump at ExitProcess failed");
+            }
+        } else {
+            warn!(
+                image_count = images.len(),
+                "No materialised image candidate at ExitProcess — offline rebuild unavailable",
+            );
+        }
+        }
+        Err(e) => {
+            warn!(error = %e, "ExitProcess scan failed — offline rebuild unavailable");
+        }
+    }
+}
+
+/// Ancient (1.1.1) exit-window watch scan.  Runs after EVERY debug event
+/// once `state.ancient_watch` is armed (armed at the CloseHandle hit).
+///
+/// The materialised image is created and wiped inside the last tens of
+/// milliseconds before `ExitProcess`, and no debug event marks either
+/// boundary — but the `ExitThread` storm in that window freezes the
+/// process at a dozen points, and each freeze is a chance to snapshot the
+/// image in a pre-wipe (possibly mid-decompression) state.  Every snapshot
+/// is written under a numbered name (`<stem>.raw000.bin`, …) so the offline
+/// analysis can pick the most complete one; the canonical `raw.bin` is
+/// overwritten each time, so the LAST catch wins there.
+fn try_ancient_watch_scan(
+    dbg: &mut ProcessSession,
+    state: &mut ThemidaState,
+    image_base_usize: usize,
+    output_path: &std::path::Path,
+) {
+    if !state.ancient_watch {
+        return;
+    }
+    let packed_base = image_base_usize as u64;
+    let Ok(images) = mida_pe::dumper::scan_mapped_images(dbg, false) else {
+        return;
+    };
+    // Candidates: not a registered module, big enough.  The PACKED IMAGE's
+    // own first section is deliberately INCLUDED as a synthetic candidate
+    // (rotated in every 3rd freeze): the shell may have decompressed the
+    // original program in place BEFORE the CloseHandle hit — at which point
+    // the `.text` guard did not exist yet — or may clear the guard with its
+    // own VirtualProtect and execute from there.  Both are invisible to the
+    // guard machinery and to the MZ-image scan (the packed base was excluded
+    // from every earlier sampling pass — measured gap).
+    //
+    // Selection ROTATES across candidates instead of picking the largest:
+    // measured on 1.1.1, the exit window loads bystander DLLs that are
+    // LARGER than anything else (wetype_tip_core.dll 4.5 MB, d2d1.dll 5.1
+    // MB — loaded because the original program's UI touched TSF/Direct2D;
+    // the 0xb0000 "materialised image" itself turned out to be
+    // KernelBase.dll.mui, a Chinese MUI resource DLL).  max_by_key let one
+    // candidate monopolise every freeze.
+    let mut candidates: Vec<mida_pe::dumper::MappedImage> = images
+        .iter()
+        .filter(|img| {
+            img.size_of_image >= 0x10000
+                && !state.ancient_module_bases.contains(&img.base)
+        })
+        .cloned()
+        .collect();
+    if let Some(sec0) = state.pe_info.pe_sections.first() {
+        candidates.push(mida_pe::dumper::MappedImage {
+            base: packed_base + sec0.virtual_address as u64,
+            region_size: sec0.virtual_size as u64,
+            size_of_image: sec0.virtual_size,
+            entry_point: 0,
+            import_rva: 0,
+            import_size: 0,
+            sections: Vec::new(),
+            is_mapped: false,
+        });
+    }
+    if candidates.is_empty() {
+        return;
+    }
+    let img = candidates[state.ancient_snapshots as usize % candidates.len()].clone();
+    let n = state.ancient_snapshots;
+    state.ancient_snapshots += 1;
+    let snap_path = output_path.with_extension(format!("raw{n:03}.bin"));
+    match mida_pe::dumper::dump_mapped_image_raw_to(dbg, &img, &snap_path) {
+        Ok(written) => {
+            info!(
+                snapshot = %snap_path.display(),
+                base = format!("{:#x}", img.base),
+                size = written,
+                watch_index = n,
+                "Exit-window watch: raw snapshot taken"
+            );
+        }
+        Err(e) => {
+            warn!(error = %e, snapshot = %snap_path.display(), "Exit-window watch snapshot failed");
         }
     }
 }
@@ -1375,6 +1579,155 @@ fn try_mapped_dump(
     thread_id: u32,
     output_path: &std::path::Path,
 ) -> Result<bool, anyhow::Error> {
+    // Ancient (1.1.1) file-mapping shape: the shell WIPES the materialised
+    // image right before ExitProcess (measured: at the ExitProcess event the
+    // code region at RVA 0x1000 is high-entropy re-encrypted content, the
+    // import names are gone, and 2 of 176 pages read-fail — while the
+    // CloseHandle hit fires ~65 ms of runtime earlier, with the image still
+    // intact).  The process is SUSPENDED inside this debug event, so the
+    // scan + page-by-page dump (~3 s wall) run against the pre-wipe state.
+    //
+    // Two earlier filters both missed this catch point: the periodic scan's
+    // `seen_image_bases` check records the image's base at the FIRST scan
+    // (the mapping exists from process start) and then excludes it forever,
+    // and the CloseHandle scan inherited that filter.  Here the scan ignores
+    // `seen_image_bases` and uses the strict double-zero signature
+    // (import_rva==0 AND entry_point==0), which system DLLs and the packed
+    // image itself never match.
+    //
+    // The dump is RAW (no OEP stepping): the offline rebuild route consumes
+    // `raw.bin` + `raw.modules.txt` directly, and `step_until_in_image`
+    // cannot complete anyway — the shell exits ~65 ms after resume.
+    if state.pe_info.themida_version == mida_packers_themida::ThemidaVersion::Ancient {
+        let packed_base = dbg.image_base() as u64;
+        if let Ok(images) = mida_pe::dumper::scan_mapped_images(dbg, false) {
+            // Diagnostics: the pre-wipe header state is not known a priori
+            // (measured: at ExitProcess the shell has zeroed ep/import_rva
+            // and re-encrypted content, but at CloseHandle the header may
+            // still carry REAL values).  Log every image so the offline
+            // analysis can see what the scan actually saw.
+            for img in &images {
+                if img.base < 0x7000_0000 {
+                    warn!(
+                        base = format!("{:#x}", img.base),
+                        size_img = format!("{:#x}", img.size_of_image),
+                        ep = format!("{:#x}", img.entry_point),
+                        import_rva = format!("{:#x}", img.import_rva),
+                        mapped = img.is_mapped,
+                        "CloseHandle scan: low image"
+                    );
+                }
+            }
+            // Candidate cascade — strictest first:
+            //  1. double-zero signature (post-scrub shape)
+            //  2. either field zero, below the system-DLL range
+            //  3. largest mapping that is neither the packed image nor a
+            //     registered module (the materialised image is a raw
+            //     MapViewOfFile copy — LoadLibrary never registered it,
+            //     so it is absent from the module list regardless of what
+            //     the shell wrote into its header)
+            let strict = images
+                .iter()
+                .filter(|img| {
+                    img.base != packed_base
+                        && img.size_of_image >= 0x10000
+                        && img.import_rva == 0
+                        && img.entry_point == 0
+                })
+                .max_by_key(|img| img.size_of_image)
+                .cloned();
+            let relaxed = if strict.is_some() {
+                None
+            } else {
+                images
+                    .iter()
+                    .filter(|img| {
+                        img.base != packed_base
+                            && img.base < 0x7000_0000
+                            && img.size_of_image >= 0x10000
+                            && (img.import_rva == 0 || img.entry_point == 0)
+                    })
+                    .max_by_key(|img| img.size_of_image)
+                    .cloned()
+            };
+            let fallback = if strict.is_some() || relaxed.is_some() {
+                None
+            } else {
+                let module_bases: std::collections::HashSet<u64> =
+                    match mida_pe::dumper::take_module_snapshot(
+                        dbg.process_handle(),
+                        dbg.pid(),
+                        packed_base,
+                        false,
+                    ) {
+                        Ok(mods) => mods.iter().map(|m| m.base()).collect(),
+                        Err(_) => std::collections::HashSet::new(),
+                    };
+                images
+                    .iter()
+                    .filter(|img| {
+                        img.base != packed_base
+                            && img.size_of_image >= 0x10000
+                            && !module_bases.contains(&img.base)
+                    })
+                    .max_by_key(|img| img.size_of_image)
+                    .cloned()
+            };
+            let picked = strict.or(relaxed).or(fallback);
+            if let Some(img) = picked {
+                info!(
+                    base = format!("{:#x}", img.base),
+                    size_img = format!("{:#x}", img.size_of_image),
+                    ep = format!("{:#x}", img.entry_point),
+                    import_rva = format!("{:#x}", img.import_rva),
+                    "Ancient file-mapping shape: dumping materialised image at CloseHandle (pre-wipe)",
+                );
+                match mida_pe::dumper::dump_mapped_image_raw(dbg, &img, output_path) {
+                    Ok(raw_path) => {
+                        info!(
+                            path = %raw_path.display(),
+                            "Pre-wipe raw dump written — offline rebuild can proceed"
+                        );
+                        // Clear TF if a previous step armed it, then report
+                        // the dump as complete.
+                        let step_thread = if state.main_thread_id != 0 {
+                            state.main_thread_id
+                        } else {
+                            thread_id
+                        };
+                        if let Ok(mut ctx) = dbg.get_thread_context_control(step_thread) {
+                            ctx.EFlags &= !0x100;
+                            let _ = session::set_thread_context_control(dbg, step_thread, &ctx);
+                        }
+                        return Ok(true);
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Pre-wipe raw dump at CloseHandle failed — falling through");
+                    }
+                }
+            }
+        }
+        // Whether or not the CloseHandle scan saw the image: from here on
+        // the shell materialises AND wipes the image inside the last tens
+        // of milliseconds before `ExitProcess` (measured: the CloseHandle
+        // scan finds only the packed image and system DLLs, while the
+        // `ExitProcess` scan finds the image with its content already
+        // destroyed).  Arm the exit-window watch: every subsequent debug
+        // event freezes the process, and each freeze is a snapshot
+        // opportunity before the wipe.
+        state.ancient_watch = true;
+        if state.ancient_module_bases.is_empty() {
+            if let Ok(mods) = mida_pe::dumper::take_module_snapshot(
+                dbg.process_handle(),
+                dbg.pid(),
+                dbg.image_base(),
+                false,
+            ) {
+                state.ancient_module_bases = mods.iter().map(|m| m.base()).collect();
+            }
+        }
+        return Ok(false);
+    }
     // If the periodic scan hasn't found the image yet, run an immediate
     // scan at the CloseHandle hit.  The shell jumps into the image at this
     // moment, so the image is guaranteed to be present.  In the no-hook
