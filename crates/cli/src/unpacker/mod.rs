@@ -851,6 +851,16 @@ pub fn unpack(
                 }
 
                 if !ls.close_handle_bp_set {
+                    // Diagnostic knob (2026-10-28): the 1.2–1.8.2 Ancient
+                    // shells decode fine standalone but die in a 1024-strong
+                    // identical-AV loop under this debugger within seconds —
+                    // prime suspect is the DR0 hardware breakpoint armed
+                    // before the decode phase (1.1.1 tolerates it, later
+                    // Ancients may not).  `MAGICMIDA_NO_CHBP=1` skips arming
+                    // so a single run can confirm or clear the suspect.
+                    let no_chbp = std::env::var("MAGICMIDA_NO_CHBP")
+                        .map(|v| v == "1")
+                        .unwrap_or(false);
                     let close_handle_addr = dbg.apis.as_ref().map(|a| a.close_handle);
                     // ---- DLL targets: no CloseHandle breakpoint --------------
                     //
@@ -866,7 +876,9 @@ pub fn unpack(
                     // 5 s, with `.bss` at 0 non-zero bytes and `hinstDLL` never
                     // written.  Without it the same DLL, same debugger, same
                     // ScyllaHide reaches `.bss` = 177 with `hinstDLL` set.
-                    if looks_like_dll {
+                    if no_chbp {
+                        info!("MAGICMIDA_NO_CHBP=1 — skipping the CloseHandle breakpoint (diagnostic)");
+                    } else if looks_like_dll {
                         debug!("DLL target — skipping the CloseHandle breakpoint");
                     } else if let Some(addr) = close_handle_addr {
                         match dbg.set_hw_breakpoint(0, addr, HwbpType::Execute) {
