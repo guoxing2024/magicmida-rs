@@ -125,6 +125,7 @@ pub(super) fn resolve_api_addrs() -> Result<ResolvedApis, anyhow::Error> {
         sleep: resolve(k32, s!("Sleep"))?,
         lstrlen: resolve(k32, s!("lstrlen"))?,
         exit_process: resolve(k32, s!("ExitProcess"))?,
+        get_local_time: resolve(k32, s!("GetLocalTime"))?,
     };
 
     debug!(
@@ -374,7 +375,9 @@ pub(super) fn handle_hw_breakpoint(
         .apis
         .as_ref()
         .map(|a| a.exit_process)
-        .filter(|&ep| dbg.hw_breakpoint_addr(1) == Some(ep as u64));
+        .filter(|&ep| {
+            rip == ep as usize && dbg.hw_breakpoint_addr(3) == Some(ep as u64)
+        });
     if bail_hit.is_some() {
             let ctx = dbg
                 .get_thread_context_control(_thread_id)
@@ -453,8 +456,78 @@ pub(super) fn handle_hw_breakpoint(
             } else {
                 warn!("V2 BAILTRACE: stack read at ExitProcess failed");
             }
-            dbg.clear_hw_breakpoint(1)?;
+            // Raw stack head + registers: [esp] tells call (return address)
+            // vs jmp-after-push (exit code) — the bail image has no static
+            // ExitProcess reference, so the call shape is only observable
+            // here.  Measured: none of the 13 image-range stack values has
+            // a call opcode ending at it — the stack is stale junk and the
+            // real call came through a register after runtime resolution.
+            let mut head = [0u8; 64];
+            if dbg
+                .read_memory(mida_core::debugger::ctx_sp(&ctx), &mut head)
+                .is_ok()
+            {
+                let dwords: Vec<String> = head
+                    .chunks_exact(4)
+                    .map(|c| format!("{:#x}", u32::from_le_bytes(c.try_into().unwrap())))
+                    .collect();
+                info!(stack_head = ?dwords, "V2 BAILTRACE: raw stack head at ExitProcess");
+            }
+            #[cfg(target_arch = "x86")]
+            info!(
+                eax = format!("{:#x}", ctx.Eax),
+                ecx = format!("{:#x}", ctx.Ecx),
+                edx = format!("{:#x}", ctx.Edx),
+                ebx = format!("{:#x}", ctx.Ebx),
+                esi = format!("{:#x}", ctx.Esi),
+                edi = format!("{:#x}", ctx.Edi),
+                ebp = format!("{:#x}", ctx.Ebp),
+                "V2 BAILTRACE: registers at ExitProcess"
+            );
+            dbg.clear_hw_breakpoint(3)?;
             return Ok(());
+    }
+
+    // V2 bailtrace: time-API observation hits (slots 2/3).  Log the caller
+    // and how close to the bail the shell reads the clock, then RF-continue
+    // with the BP still armed.  If a time API is the LAST outside call
+    // before the bail, the expiry check is date-based and the fix is a time
+    // shim, not a code patch.
+    let time_hit = dbg
+        .apis
+        .as_ref()
+        .map(|a| {
+            if rip == a.get_local_time
+                && dbg.hw_breakpoint_addr(1) == Some(a.get_local_time as u64)
+            {
+                Some((1usize, "GetLocalTime"))
+            } else if dbg.hw_breakpoint_addr(2) == Some(0x102888a) {
+                Some((2usize, "api-resolver"))
+            } else {
+                None
+            }
+        })
+        .unwrap_or(None);
+    if let Some((slot, label)) = time_hit {
+        if let Ok(ctx) = dbg.get_thread_context_control(_thread_id) {
+            let sp = mida_core::debugger::ctx_sp(&ctx);
+            let mut stack = [0u8; 8];
+            if dbg.read_memory(sp, &mut stack).is_ok() {
+                let ret =
+                    u32::from_le_bytes(stack[0..4].try_into().unwrap()) as usize;
+                info!(
+                    api = label,
+                    slot,
+                    ret = format!("{ret:#x}"),
+                    esp = format!("{sp:#x}"),
+                    "V2 BAILTRACE: time-API hit"
+                );
+            }
+            let mut ctx2 = ctx;
+            ctx2.EFlags |= 0x0001_0000;
+            super::session::set_thread_context_control(dbg, _thread_id, &ctx2)?;
+        }
+        return Ok(());
     }
 
     if let Some(ref apis) = dbg.apis {
@@ -565,32 +638,10 @@ pub(super) fn handle_hw_breakpoint(
                     info!(
                         "V2 pipeline: CloseHandle BP cleared, .text write BP set (anti-bail), watch armed"
                     );
-                    // Bailtrace diagnostic (MAGICMIDA_V2_BAILTRACE=1): the
-                    // shell exits with code 2 both bare and debugged — a
-                    // license/environment check, not anti-debug — and the
-                    // .text decrypt never runs.  Arm an execute BP on
-                    // ExitProcess so the hit walks the stack and exposes
-                    // the check site; the offline analysis turns that into
-                    // an in-memory patch for the next run.
-                    if std::env::var("MAGICMIDA_V2_BAILTRACE")
-                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                        .unwrap_or(false)
-                    {
-                        let exit_process_addr = dbg.apis.as_ref().map(|a| a.exit_process);
-                        if let Some(exit_process_addr) = exit_process_addr {
-                            match dbg.set_hw_breakpoint(
-                                1,
-                                exit_process_addr,
-                                mida_core::HwbpType::Execute,
-                            ) {
-                                Ok(_) => info!(
-                                    exit_process = format!("{exit_process_addr:#x}"),
-                                    "V2 BAILTRACE: execute BP armed on ExitProcess (slot 1)"
-                                ),
-                                Err(e) => warn!(error = %e, "V2 BAILTRACE: arming failed"),
-                            }
-                        }
-                    }
+                    // Bailtrace observation slots 1-3 were armed at process
+                    // start (the check may run during the decode phase);
+                    // only slot 0 changes here (CloseHandle BP → .text
+                    // write BP).
                 } else {
                     info!("switching to .text write BP");
                     dbg.clear_hw_breakpoint(0)?;

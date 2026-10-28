@@ -39,6 +39,9 @@ pub(super) struct ResolvedApis {
     /// bailtrace diagnostic arms an execute HW-BP here to catch the check
     /// site from the stack.
     pub(super) exit_process: usize,
+    /// kernel32!GetLocalTime — bailtrace observation slot: the WinLicense
+    /// eval-expiry hypothesis says the bail check reads the system date.
+    pub(super) get_local_time: usize,
 }
 
 // ---------------------------------------------------------------------------

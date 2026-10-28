@@ -1093,6 +1093,44 @@ pub fn unpack(
                             }
                         }
                     }
+                    // V2 bailtrace: arm the observation slots at process
+                    // START, not at the CloseHandle hit.  Measured: the bail
+                    // can land within 15 ms of the CloseHandle hit, and the
+                    // one GetLocalTime hit logged in that window came from a
+                    // different thread during teardown — the check (or the
+                    // time read it depends on) runs during the decode phase,
+                    // where slots 1-3 are still free (slot 0 holds the
+                    // CloseHandle BP until the hit).
+                    if state.pe_info.themida_version
+                        == mida_packers_themida::ThemidaVersion::V2
+                        && std::env::var("MAGICMIDA_V2_BAILTRACE")
+                            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                            .unwrap_or(false)
+                    {
+                        // Slot 2 = the shell's import resolver (every API
+                        // call runs `push <name_ptr>; jmp 0x102888a` on this
+                        // build — measured via the GetLocalTime caller's
+                        // thunk chain).  GetTickCount had zero hits: the
+                        // shell never calls it.
+                        let resolver: usize = 0x102888a;
+                        let bp3 = dbg.apis.as_ref().map(|a| (a.get_local_time, a.exit_process));
+                        if let Some((lt, ep)) = bp3 {
+                            for (slot, addr, label) in [
+                                (1usize, lt, "GetLocalTime"),
+                                (2usize, resolver, "api-resolver"),
+                                (3usize, ep, "ExitProcess"),
+                            ] {
+                                match dbg.set_hw_breakpoint(slot, addr, HwbpType::Execute) {
+                                    Ok(()) => info!(
+                                        api = label,
+                                        addr = format!("{addr:#x}"),
+                                        "V2 BAILTRACE: execute BP armed at process start"
+                                    ),
+                                    Err(e) => warn!(api = label, error = %e, "V2 BAILTRACE: start arming failed"),
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // ---- Classic v1 file-mapping: check if this LoadDll is
