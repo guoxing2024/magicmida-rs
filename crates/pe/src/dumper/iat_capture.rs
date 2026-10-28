@@ -278,3 +278,95 @@ pub fn capture_stub_iat(
     );
     Ok(Some((bin_path, txt_path)))
 }
+
+/// Resolve every pointer-shaped DWORD in `buf` (a dump whose first byte
+/// sits at `region_base`) against the live module snapshot's export
+/// tables, and return the report.
+///
+/// Built for the SecureEngine 2.x payload rounds: the shell materialises
+/// headless native code whose API calls go through a dense
+/// `call [abs32]` page in the region following the code (measured
+/// 2026-10-29 on CISC-1.exe: 272 distinct call targets in the 4 KB page
+/// at 0x56162000, immediately after the 0x560b5000 code region).  The
+/// resolved import NAMES identify what the materialised code is — shell
+/// engine or original program — without any PE header to parse.
+///
+/// The measured instance of that page turned out to belong to **WeType
+/// (微信输入法) injected worker threads** — the import profile
+/// (crashrpt1500.dll, imm32.dll, input.dll, d2d1) is the IME stack's, and
+/// `crashrpt1500.dll` exists on disk at
+/// `C:\Program Files\Tencent\WeType\3.0.0.38\`.  `per_module` is exposed
+/// so callers can run that classification themselves.
+///
+/// `skip_base` is passed to the module snapshot as the module to omit
+/// (the packed main image).
+pub struct PointerReport {
+    /// Full text report (header lines + one line per resolved slot).
+    pub text: String,
+    /// Resolved-slot count per owning module name.
+    pub per_module: std::collections::BTreeMap<String, usize>,
+}
+
+pub fn resolve_pointer_report(
+    debugger: &mut dyn DebuggerCore,
+    buf: &[u8],
+    region_base: u64,
+    skip_base: u64,
+) -> Result<PointerReport, PeError> {
+    let modules = take_module_snapshot(
+        debugger.process_handle(),
+        debugger.pid(),
+        skip_base,
+        false,
+    )?;
+    let mut lines = String::new();
+    lines.push_str(&format!("# region_base {region_base:#x}\n"));
+    lines.push_str(&format!("# dump_size {:#x}\n", buf.len()));
+    lines.push_str(&format!("# modules {}\n", modules.len()));
+    let mut resolved = 0usize;
+    let mut in_module_unnamed = 0usize;
+    // Per-module resolved-slot counts, so one glance says which DLL set
+    // this pointer page belongs to.
+    let mut per_module: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for (i, chunk) in buf.chunks_exact(4).enumerate() {
+        let v = u32::from_le_bytes(chunk.try_into().expect("4-byte chunk")) as u64;
+        if v < 0x10000 {
+            continue;
+        }
+        let owner = modules.iter().find(|m| v > m.base && v < m.end_off);
+        let Some(m) = owner else { continue };
+        match m.exports.get(&v) {
+            Some(name) => {
+                resolved += 1;
+                *per_module.entry(m.name().to_string()).or_insert(0) += 1;
+                lines.push_str(&format!(
+                    "{:#x} {v:#x} {} {}\n",
+                    region_base + 4 * i as u64,
+                    m.name(),
+                    name
+                ));
+            }
+            None => {
+                in_module_unnamed += 1;
+                lines.push_str(&format!(
+                    "{:#x} {v:#x} {} -\n",
+                    region_base + 4 * i as u64,
+                    m.name()
+                ));
+            }
+        }
+    }
+    lines.push_str(&format!("# resolved {resolved}\n"));
+    lines.push_str(&format!("# in_module_unnamed {in_module_unnamed}\n"));
+    for (m, c) in &per_module {
+        lines.push_str(&format!("# per_module {} {c}\n", m));
+    }
+    info!(
+        region_base = format!("{region_base:#x}"),
+        resolved,
+        per_module = ?per_module.iter().map(|(k, v)| (k.clone(), *v)).collect::<Vec<_>>(),
+        "V2 payload pointer page resolved"
+    );
+    Ok(PointerReport { text: lines, per_module })
+}

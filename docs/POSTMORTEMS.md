@@ -1270,6 +1270,61 @@ V2 脱壳可用**。下一增量若再做 V2，输入应是"壳工作区裸码"�
 "这是载荷"。数据目录索引是 0=导出、1=导入；注释与代码要一起对着
 独立来源（remote_modules 的导出读取就是对的）验，不能互为论据。
 
+## devirt 侦察："载荷区"是 WeType 输入法注入（2026-10-29，未发布）
+
+**用户指示 devirt**（V2 线的最后一条路）。按"不承诺先侦察"的规矩，第一步
+用上一轮留下的 6 个 v2payload 区 dump 做离线侦察——回答"载荷区里有没有
+可分析的 VM（解释器循环 + 字节码）"。答案：**这些区根本不是载荷**。
+
+**侦察链条（全部离线，样本不必重跑）**：
+1. **熵剖面**：6 个区零高熵页（≥7.2）——无页级加密；中熵（6.0-7.2）为主，
+   每个区的**末尾**带低熵代码块（124KB / 56KB）。
+2. **线程起点反汇编**：全是干净 MSVC 代码——标准 prologue、C++ vtable 调用
+   （`mov eax,[ecx]; call [eax+4]`）、int3 填充。线程起点读 `[esi+0x3c]`
+   （e_lfanew 偏移）——在检查 PE 头。
+3. **dispatch loop 搜索**：270 处 `jmp/call [reg*4+imm32]` 全部是编译器
+   switch 跳转表（`cmp N; ja default; movzx; jmp [table]`），**零 VM 取指
+   形状**（movzx byte [ptr]; inc; jmp [table] 不存在）。
+4. **ff15/ff25 聚类**：数千个 `call [abs32]` 调用点收束到**两页密集指针表**
+   （0x56162000 页 272 槽、0x564c3000 页 125 槽），各自紧贴一个代码区末尾
+   ——**这是导入表形状**（每调用点直指自己的槽），不是 VM（VM 会经一个
+   寄存器索引的中央分发器调 API）。
+5. **导入剖面**：IAT 解析（管线新增 `resolve_pointer_report`，live 模块
+   快照逐槽解析）= **现代 GUI 应用**：kernel32 177 / advapi32 34（注册表
+   +加密）/ gdi32 20 / imm32 10 / combase / dbghelp / d2d1 / dwrite /
+   input.dll / **crashrpt1500.dll 5**。2011 年代的 LCF-AT crackme 不可能
+   导入 CrashRpt 1.5.0（2017 年的库）。
+6. ** smoking gun**：`C:\Program Files\Tencent\WeType\3.0.0.38\CrashRpt1500.dll`
+   ——本机装着微信输入法 3.0.0.38。
+
+**判定：v2payload 区 = WeType 注入到被调进程的工作线程**（被调进程弹了
+窗口 → TSF/IME 激活 → WeType 注入 worker，其代码在 VirtualAlloc 区里、
+自带 IAT）。内存映射在毫秒间churn（区被释放重分配，同一 IAT 页服务多个
+代码区；55f91ad0 的"下一区"查询直接跳过了已释放的 0x560b5000 落到
+0x56162000）。所谓"载荷运行两轮 exit 0"= WeType worker 的两轮工作。
+
+**波及面（本机测量的第三次环境污染，KernelBase.dll.mui → CoreUIComponents.dll
+→ WeType）**：
+- run1 的"载荷线程 0x64035dc0 等"、本日 0x55f9xxxx 全系——都是 WeType。
+- **1.1.1"VM 解释型"定案的根基动摇**：该定案依赖 64 张快照 + 兜底 dump +
+  深扫全零命中——但那三样**只搜 MZ+PE**。无头原生码（今天实锤存在的形状：
+  WeType 的注入代码就是无头原生码 + 私有 IAT）对全部既有扫描**不可见**。
+  "原程序从未以原生代码存在"从未被证明，只被"没搜到 PE"替代过。
+- V2 同理：载荷可能以无头原生码形态瞬态物化，从未被搜到过。
+
+**管线落地（保留）**：
+- `resolve_pointer_report`（mida-pe，pub）：对任意 dump 逐 DWORD 对 live
+  模块导出表解析，产出报告 + per_module 计数。
+- `capture_v2_payload_iat`（CLI，V2 门控）：CreateThread 载荷区 dump 后
+  追加"下一区"dump（64KB 上限）+ 指针解析；`crashrpt/wetype/input.dll`
+  剖面 → 判定 IME 噪声 → 大 dump 改名 `.imenoise`——**磁盘上的
+  v2payload_\* 从此只剩真候选**。
+
+**下一步（下一个增量的输入）**：无头原生码扫描——枚举私有 RX 区、按导入
+剖面分类（排除 WeType/已知注入组件）、非噪声候选全量 dump → 若原程序真以
+无头原生码物化，走重建路线（合成 PE 头 + IAT 重建，机器全在）；**devirt
+仍未开始——没有任何一个已定位的 VM 可供 devirtualize，继续不承诺**。
+
 ## V2 (SecureEngine 2.x) 战役：历史小节（均已推翻，仅供追溯）
 
 **"载荷区探测 + 诚实收束"（2026-10-28）**：A/B 定责壳方差大、hang 非管线

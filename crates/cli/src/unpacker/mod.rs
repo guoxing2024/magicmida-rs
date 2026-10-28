@@ -1290,6 +1290,44 @@ pub fn unpack(
                                     "V2: payload region dumped",
                                 );
                             }
+                            // The payload rounds materialise headless native
+                            // code whose API calls go through a dense
+                            // `call [abs32]` page in the region right after
+                            // the code (measured 2026-10-29: 272 distinct
+                            // targets at 0x56162000, directly after the
+                            // 0x560b5000 code region).  Dump that following
+                            // region and resolve its pointers against the
+                            // live module exports — the import names
+                            // identify what the materialised code is.
+                            // Measured: every region captured so far
+                            // resolves to the WeType IME stack (injected
+                            // worker threads, NOT the payload) — rename
+                            // those dumps so v2payload_* on disk stays
+                            // "real candidates only".
+                            if capture_v2_payload_iat(
+                                &mut dbg,
+                                region_base,
+                                region_size,
+                                &output_path,
+                                start_address,
+                            ) {
+                                let mut noise_name = dump_path
+                                    .file_name()
+                                    .expect("dump path has a file name")
+                                    .to_os_string();
+                                noise_name.push(".imenoise");
+                                let noise_path =
+                                    dump_path.with_file_name(noise_name);
+                                if std::fs::rename(&dump_path, &noise_path)
+                                    .is_ok()
+                                {
+                                    info!(
+                                        from = %dump_path.display(),
+                                        to = %noise_path.display(),
+                                        "V2: payload region dump reclassified as IME noise",
+                                    );
+                                }
+                            }
                         }
                         // Search the dump buffer for MZ+PE at every byte
                         // offset (not just page-aligned — the PE's MZ may be
@@ -2262,6 +2300,116 @@ fn try_ancient_watch_scan(
 /// filter is simply: not the packed base, not a registered module, big
 /// enough.  The largest candidate is dumped each time a NEW candidate
 /// appears (dedup by base to avoid re-dumping the same region).
+
+/// V2: dump the region following a payload code region and resolve its
+/// pointer page against the live module exports.
+///
+/// The payload rounds materialise headless native code (measured
+/// 2026-10-29 on CISC-1.exe: clean MSVC prologues, switch tables, no
+/// strings, no PE header anywhere) whose API calls go through a dense
+/// `call [abs32]` page in the region immediately after the code
+/// (272 distinct targets at 0x56162000, right after the 0x560b5000 code
+/// region; 125 at 0x564c3000, right after 0x5642c000).  Resolving those
+/// slots names the imports, which identifies what the materialised code
+/// is — shell engine or the original program — and is the input for the
+/// rebuild route if it turns out to be the latter.
+///
+/// Returns `true` when the import profile classifies the region as
+/// IME/WeType injection noise (measured: every region captured on
+/// 2026-10-29 resolved to the WeType stack — crashrpt1500.dll /
+/// imm32.dll / input.dll / d2d1; WeType 3.0.0.38 is installed on this
+/// machine and injects worker threads into any process that shows a
+/// window).  The caller renames those dumps so `v2payload_*` on disk
+/// stays "real candidates only".
+fn capture_v2_payload_iat(
+    dbg: &mut ProcessSession,
+    region_base: u64,
+    region_size: u64,
+    output_path: &std::path::Path,
+    start_address: u64,
+) -> bool {
+    let next_addr = region_base + region_size;
+    let (next_base, next_size) =
+        match mida_pe::dumper::query_region(&*dbg, next_addr) {
+            Some(r) => r,
+            None => {
+                debug!(
+                    next = format!("{next_addr:#x}"),
+                    "V2 payload IAT: no committed region after the code region"
+                );
+                return false;
+            }
+        };
+    if next_base != next_addr {
+        debug!(
+            expected = format!("{next_addr:#x}"),
+            actual = format!("{next_base:#x}"),
+            "V2 payload IAT: following region is not contiguous with the code region"
+        );
+    }
+    let read_size = next_size.min(0x40000) as usize;
+    let mut buf = vec![0u8; read_size];
+    if dbg.read_memory(next_base as usize, &mut buf).is_err() {
+        warn!(
+            next_base = format!("{next_base:#x}"),
+            "V2 payload IAT: read of the following region failed"
+        );
+        return false;
+    }
+    let stem = output_path
+        .with_extension(format!("v2payload_{start_address:x}"));
+    let mut bin_name =
+        stem.file_name().expect("output path has a file name").to_os_string();
+    bin_name.push(".next.bin");
+    let next_path = stem.with_file_name(bin_name);
+    if let Err(e) = std::fs::write(&next_path, &buf) {
+        warn!(error = %e, path = %next_path.display(), "V2 payload IAT: next-region dump failed");
+        return false;
+    }
+    let image_base = dbg.image_base();
+    let report = match mida_pe::dumper::resolve_pointer_report(
+        dbg,
+        &buf,
+        next_base,
+        image_base,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "V2 payload IAT: resolution failed");
+            return false;
+        }
+    };
+    // IME/WeType classification: the injected IME worker threads carry
+    // crashrpt/imm32/input in their import profile.  The REAL payload,
+    // if it materialises headless native code, will have a normal
+    // application profile (kernel32/user32/...) — keep those.
+    let is_ime_noise = report.per_module.keys().any(|m| {
+        let m = m.to_lowercase();
+        m.contains("crashrpt") || m.contains("wetype") || m == "input.dll"
+    });
+    let mut txt_name =
+        stem.file_name().expect("output path has a file name").to_os_string();
+    txt_name.push(".iat.txt");
+    let txt_path = stem.with_file_name(txt_name);
+    match std::fs::write(&txt_path, &report.text) {
+        Ok(_) => info!(
+            bin = %next_path.display(),
+            txt = %txt_path.display(),
+            next_base = format!("{next_base:#x}"),
+            "V2 payload IAT: following region dumped and pointers resolved"
+        ),
+        Err(e) => warn!(error = %e, path = %txt_path.display(), "V2 payload IAT: report write failed"),
+    }
+    if is_ime_noise {
+        warn!(
+            start = format!("{start_address:#x}"),
+            profile = ?report.per_module.keys().collect::<Vec<_>>(),
+            "V2 payload region classified as IME/WeType injection noise — NOT the SecureEngine payload"
+        );
+    }
+    is_ime_noise
+}
+
 fn try_v2_watch_scan(
     dbg: &mut ProcessSession,
     state: &mut ThemidaState,
