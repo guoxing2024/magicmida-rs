@@ -1198,56 +1198,84 @@ gdi32 系本轮做了静态形状验证：SysWOW64\gdi32.dll 的 995 个导出�
 gdi32!NtGdi* 槽——语料样本（s1/s2）在管线内的壳行为不稳定（见上节
 1.1.1 的方差记录），本轮未取到活体命中；形状验证 + 机制单测构成当前证据。
 
-## V2 (SecureEngine 2.x) 战役：PE 找到 + dump + 离线重建（2026-10-28，未发布）
+## V2 (SecureEngine 2.x) 战役：dd[0]/dd[1] 假阳性定案（2026-10-28，未发布）
+
+**此节推翻下面两节**："载荷区探测 + 诚实收束"的"不物化"结论和"PE 找到 + dump +
+离线重建"的"物化"结论——两个相反的结论都建立在同一个读错数据目录的 bug 上。
+定案后回到：**V2 载荷不物化 PE 映像**（这次带着排除了假阳性的干净证据链）。
 
 **样本**：`OUT/v1v2/unpackmes/x/WinLicense 2.0.6.5/(CISC-1) Examples-LCF-AT/CISC-1.exe`，
 Themida V2，x86，image_base 0x1000000，EP RVA 0x371000，6 节（节名随机化）。
 
-**命门复现与突破**：CloseHandle 命中 → "switching to .text write BP" → BP 永不触发
-（V2 不在 CloseHandle 后原地解压 .text，v3 路径不适用）→ 管线等待 →
-壳要么跑完载荷 exit 2，要么 hang 25-300s。
+**触发**：用户指示"ExitProcess 时 dump IAT 区域（0x5804e000）+ 匹配 API 地址 +
+重建导入表"（基于上一节的"载荷 PE"）。本轮把管线落地（`capture_stub_iat`：
+ff15/ff25 聚类 + 模块导出表解析 + `.v2iat.bin`/`.v2iat.txt` sidecar）并实跑，
+IAT 捕获门没触发——离线打开"载荷 PE" dump 对账，发现它根本不是载荷。
 
-**关键突破 ①：.text 写 BP 防 bail**：移除 V2 的 .text 写 BP 后，壳在 CloseHandle
-后 ~38s 内 bail exit_code=2，载荷线程永不创建（所有线程都在壳映像 0x1022b62）。
-恢复 .text 写 BP（虽不触发，但存在本身防止壳反调试 bail）后，壳正常解码，载荷
-线程在壳 VirtualAlloc 区域启动（0x560b5a70 等）。
+**铁证清单（dump = CoreUIComponents.dll，Windows 系统 DLL）**：
+- 版本资源 `ProductName = Microsoft® Windows® Operating System`；`.rdata` PDB
+  路径 `mincore\CoreUIComponents\Messaging\Proxy\MessageProxyN.cpp`。
+- 与 `C:\Windows\SysWOW64\CoreUIComponents.dll` 对账：EP 0x6a710、
+  SizeOfImage 0x295000、6 节（.text/.rdata/.data/.didat/.rsrc/.reloc）全同。
+- 两次会话的 dump 逐字节比对新旧仅差 **41 字节**，全在 .data 可变全局。
+- 真·导入目录 dd[1] = 0x22b5b8 指向 msvcrt.dll 描述符，
+  FT[0] = 0x76816160（loader 已解析的绝对地址）——它是被正常加载的旁观模块，
+  壳从没碰过它的导入表。
+- "外部 IAT 0x5804e000（0x454 B）" = 加载基址 0x57ed0000 + dd[12]（IAT 目录）
+  0x17e000 + 0x454 尺寸——**它自己的 IAT**，从不在任何"独立 VirtualAlloc 区域"。
+  （"PE base 0x50c0000" 的归因也是错的：两个 dump 的头里 ImageBase 都是
+  0x57ed0000——同一天同一 boot，系统 DLL 基址只随机化一次。）
+- ".reloc XOR 增长密钥"假：0x271000 处是**明文有效重定位**
+  （PageRVA 0x1000，HIGHLOW 条目）——在噪声上选密钥总能"解出"第一块。
 
-**关键突破 ②：PE 找到并 dump**：模块 PE scan（二次过滤：模块镜像中 EP>0 +
-import_rva>0 的载荷 PE）在 0x50c0000 找到载荷 PE，dump 为 `CISC-1U.v2raw026.bin`
-（2,707,456 B）。PE 结构：PE32 x86，6 节（.text/.rdata/.data/.didat/.rsrc/.reloc），
-EP RVA 0x6a710，ImageBase 0x1000，SizeOfImage 0x295000，ImportDirectory RVA
-0x22b210。**节名不乱码**（与早期判断不同）。
+**根因：`parse_image` 读 dd[0]（导出目录）当导入目录。** PE 数据目录
+索引 0 = 导出、1 = 导入；代码读 `dd_off + 0`，注释还把颠倒写死
+（"An earlier revision read dd_off + 8, which is the *Export* directory"——
+dd_off+8 恰是导入目录，旧读法是对的，"修复"把对的改成错的）。
+`MappedImage.import_rva` 从此语义为"导出 RVA"，而所有过滤器的意图是"有没有
+导入"。"无导出 ≈ EXE"的代理判据在 MUI（无导出的资源 DLL）上失效——
+1.1.1 战役的 KernelBase.dll.mui 假阳性是同一根因的第一次发作；LoadDll
+handler 里复制粘贴的同款注释 + 同款读法是第二处。
 
-**导入表被 scrub**：IMPORT_DESCRIPTOR 第一项 ILT=0, Name=0x1, IAT=0xffffffff。
-壳解析了全部导入并把 API 地址写入 IAT，然后擦除了导入目录描述符。IAT 在目标
-进程中的绝对地址 0x5804e000（从 `ff 15 [abs32]` 指令反推），在独立 VirtualAlloc
-区域，不在 PE 映像内。
+**修复清单（本轮全部落地，x64 413 / x86 406 全绿）**：
+- `parse_image`：改读 dd[1]（导入），注释重写为真话；新增
+  `MappedImage.is_dll`（COFF `IMAGE_FILE_DLL`）——旁观 DLL 的诚实判据。
+- `iat_capture.rs`（新，IAT 捕获机器）：门改为 EP>0 + EXE 标志 + 导入目录
+  不可用（dd[1]==0 或首描述符全零）；ff15/ff25 目标聚类 + 边界按模块地址
+  扩张 + 逐槽对 live 模块快照解析；产出 `<stem>.v2iat.bin`/`.v2iat.txt`。
+  **当前无已确证消费者**——为未来真物化载荷的壳保留。
+- 过滤器全面从 `import_rva==0` 代理改为 `!is_dll`：LoadDll handler、
+  `try_exit_dump` 双分支、watch scan 一二次候选、ancient 级联（strict/
+  relaxed）、CloseHandle immediate scan。
+- 同样修正了 `iat_capture.rs` 首稿里复制的 dd[0] 读法（写新代码时把
+  parse_image 的错当成了事实）。
 
-**.reloc XOR 编码**：.reloc 节（vsize=0x235c4）不是标准重定位数据。8 字节 XOR
-密钥可解码前 2-3 个块（page_rva=0x1000/0x2000/0x3000, block_size=8, 0 entries），
-但第 4 块起失效。密钥似乎按块增长（每块追加 8 字节），不是固定重复密钥。
-可能是 VM 数据或更复杂编码。
+**验证**：修复后在同一样本重跑——CoreUIComponents 的 LoadDll（0x57ed0000）
+照常出现，但 watch scan 不再 dump 它；38 张/轮的旁观 DLL 快照噪声归零。
 
-**离线重建脚本**（`OUT/v1v2/v2_rebuild.py`）：修 ImageBase 0x1000→0x400000 +
-禁 ASLR + 修 .reloc 重定位。因 .reloc 编码 + 导入表 scrub，产物不可运行。
+**保留（独立于假阳性、实测有效）**：
+- `.text` 写 BP 防 bail（移除 → 壳 ~38s 内 exit_code=2；恢复 → 正常解码）——
+  行为观察，与"载荷 PE"无关。
+- `scan_private_images` 深扫修复（每页 0x400→0x1000 字节、PE base =
+  page+mz_off）——真实的覆盖率缺陷。
+- 载荷区探测机器（`v2_watch`/`try_v2_watch_scan`/CreateThread region dump/
+  idle 诊断）——机器本身无误，只是此样本无真载荷可抓。
 
-**深度扫描修复**：`scan_private_images` 原每页只读 0x400 字节，MZ 在偏移 >0x400
-时漏检。改为读完整 0x1000 字节 + 修正 PE base（page+mz_off 而非 page）。
+**结论**：V2 载荷不物化 PE 映像（1.1.1 = VM 解释型的同族判断）。**不宣称
+V2 脱壳可用**。下一增量若再做 V2，输入应是"壳工作区裸码"分析（同 1.8.2
+的瞬态明文死路）或 devirt——两者都先不承诺。
 
-**载荷区探测机器（保留）**：
-- `v2_watch` + `try_v2_watch_scan`：CloseHandle 后周期扫描（冷却 500ms）
-- `CreateThread` handler：VirtualQueryEx 找完整 VirtualAlloc region dump
-- `try_exit_dump` V2 过滤：EP>0 + import_rva>0（原 EP==0 排除载荷 PE）
-- idle 诊断：壳 hang 时主线程 IP 诊断
+**教训（第二次犯同一课）**：签名命中必须开内容验——版本资源、与系统盘文件
+对账、跨 dump 逐字节 diff，三样都是十分钟级的事，"PE 头结构完整"证明不了
+"这是载荷"。数据目录索引是 0=导出、1=导入；注释与代码要一起对着
+独立来源（remote_modules 的导出读取就是对的）验，不能互为论据。
 
-**结论**：V2 载荷 PE **物化了**（推翻此前"不物化 PE 映像"的判断）。PE 已找到
-并 dump。产物不可运行——需 IAT 捕获（从目标进程 dump 0x5804e000 区域）+
-.reloc 解码 + 导入表重建。不宣称 V2 脱壳可用。
+## V2 (SecureEngine 2.x) 战役：历史小节（均已推翻，仅供追溯）
 
-## V2 (SecureEngine 2.x) 战役：载荷区探测 + 诚实收束（2026-10-28，已推翻）
-
-**此节结论已被上面"PE 找到 + dump"节推翻**。保留作为历史记录。
-
-**样本**：同上。**载荷区探测机器**（`try_exit_dump`/`v2_watch`/CreateThread handler）
-保留。A/B 定责：提交前二进制也 hang。当时结论"V2 载荷不物化 PE 映像"——
-**后被推翻**：模块 PE scan 找到了载荷 PE。
+**"载荷区探测 + 诚实收束"（2026-10-28）**：A/B 定责壳方差大、hang 非管线
+导致；当时结论"V2 载荷不物化 PE 映像"。
+**"PE 找到 + dump + 离线重建"（2026-10-28）**：声称模块 PE scan 在 0x50c0000
+找到载荷 PE（v2raw026.bin），导入表被 scrub、IAT 外置 0x5804e000、.reloc
+XOR 编码——**全部是 dd[0]/dd[1] 假阳性 + 错误基址归因的产物**，见上节铁证
+清单。载荷区探测机器（`try_exit_dump`/`v2_watch`/CreateThread handler）
+保留。

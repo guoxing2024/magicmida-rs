@@ -45,6 +45,15 @@ pub struct MappedImage {
     pub import_rva: u32,
     pub import_size: u32,
 
+    /// `IMAGE_FILE_DLL` from the COFF characteristics.  The honest
+    /// "bystander DLL" discriminator: original programs are EXEs, system
+    /// DLLs are DLLs.  The import-directory checks used before this field
+    /// existed were proxies for it (and, while `parse_image` misread the
+    /// export directory as the import directory, accidentally effective
+    /// ones — no exports ≈ EXE — which is how KernelBase.dll.mui slipped
+    /// through: a resource DLL has no exports either).
+    pub is_dll: bool,
+
     /// Section table: (name, virtual address, virtual size).
     pub sections: Vec<(String, u32, u32)>,
 
@@ -222,17 +231,28 @@ fn parse_image(
     let size_of_image = u32::from_le_bytes(buf[opt + 56..opt + 60].try_into().ok()?);
     let entry_point = u32::from_le_bytes(buf[opt + 16..opt + 20].try_into().ok()?);
 
-    // Import directory: data directory 0.  The VirtualAddress is at
-    // dd_off + 0, the Size at dd_off + 4 (each entry is 8 bytes: 4 RVA
-    // + 4 Size).  An earlier revision read dd_off + 8, which is the
-    // *Export* directory — the filter then matched system DLLs whose
-    // export RVA happened to be zero.
+    // Data directories.  Index 0 is the *export* directory, index 1 the
+    // *import* directory — `import_rva` below reads index 1.  A previous
+    // revision read index 0, with a comment claiming index 1 was the
+    // export directory; that inverted the two and made every
+    // `MappedImage::import_rva` actually carry the export RVA.  The
+    // SecureEngine 2.x "payload PE" of 2026-10-28 was a system DLL
+    // (CoreUIComponents.dll) recognised by exactly this mistake — and the
+    // "external IAT at 0x5804e000" derived from it was that DLL's own IAT
+    // (base 0x57ed0000 + dd[12] 0x17e000).  Measured against
+    // SysWOW64\CoreUIComponents.dll: dd[0] (export) = 0x22b210,
+    // dd[1] (import) = 0x22b5b8.
     let dd_off = opt + if is64 { 112 } else { 96 };
     let import_rva = u32::from_le_bytes(
-        buf[dd_off..dd_off + 4].try_into().ok()?,
+        buf[dd_off + 8..dd_off + 12].try_into().ok()?,
     );
     let import_size = u32::from_le_bytes(
-        buf[dd_off + 4..dd_off + 8].try_into().ok()?,
+        buf[dd_off + 12..dd_off + 16].try_into().ok()?,
+    );
+
+    // COFF characteristics — the IMAGE_FILE_DLL flag feeds `is_dll`.
+    let file_chars = u16::from_le_bytes(
+        buf[pe_off + 22..pe_off + 24].try_into().ok()?,
     );
 
     // Section table.
@@ -261,6 +281,7 @@ fn parse_image(
         entry_point,
         import_rva,
         import_size,
+        is_dll: file_chars & 0x2000 != 0,
         sections,
         is_mapped,
     })

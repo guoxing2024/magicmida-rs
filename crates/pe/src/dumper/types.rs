@@ -97,6 +97,11 @@ impl RemoteModule {
     pub fn exports(&self) -> impl Iterator<Item = (u64, &str)> {
         self.exports.iter().map(|(a, n)| (*a, n.as_str()))
     }
+
+    /// Module file name (lowercase, e.g. `"kernel32.dll"`).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 /// A candidate resolution for one IAT slot.

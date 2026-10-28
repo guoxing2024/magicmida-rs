@@ -1142,10 +1142,12 @@ pub fn unpack(
                                 head[opt..opt + 2].try_into().unwrap_or([0; 2]),
                             ) == 0x20B;
                             let dd_off = opt + if is64 { 112 } else { 96 };
-                            // DataDirectory[0] (Import): VirtualAddress at
-                            // dd_off + 0, Size at dd_off + 4.
+                            // DataDirectory[1] (Import): index 0 is the
+                            // *export* directory — see the parse_image
+                            // comment in mida-pe for the 2026-10-28
+                            // false positive this inversion caused.
                             let import_rva = u32::from_le_bytes(
-                                head[dd_off..dd_off + 4].try_into().unwrap_or([0; 4]),
+                                head[dd_off + 8..dd_off + 12].try_into().unwrap_or([0; 4]),
                             );
                             let size_of_image = u32::from_le_bytes(
                                 head[opt + 56..opt + 60].try_into().unwrap_or([0; 4]),
@@ -1153,9 +1155,21 @@ pub fn unpack(
                             let entry_point = u32::from_le_bytes(
                                 head[opt + 16..opt + 20].try_into().unwrap_or([0; 4]),
                             );
-                            if import_rva == 0 && entry_point == 0 && size_of_image >= 0x10000 {
+                            // The materialised original program is an EXE
+                            // image: `IMAGE_FILE_DLL` clear is the honest
+                            // bystander-DLL discriminator (a resource DLL
+                            // has no exports and often no EP either —
+                            // KernelBase.dll.mui passed the old
+                            // export-proxy checks).
+                            let file_chars = u16::from_le_bytes(
+                                head[e_lfanew + 22..e_lfanew + 24].try_into().unwrap_or([0; 2]),
+                            );
+                            if entry_point == 0
+                                && size_of_image >= 0x10000
+                                && file_chars & 0x2000 == 0
+                            {
                                 let import_size = u32::from_le_bytes(
-                                    head[dd_off + 4..dd_off + 8].try_into().unwrap_or([0; 4]),
+                                    head[dd_off + 12..dd_off + 16].try_into().unwrap_or([0; 4]),
                                 );
                                 info!(
                                     base = %format!("{:#x}", base_address),
@@ -1170,6 +1184,7 @@ pub fn unpack(
                                         entry_point,
                                         import_rva,
                                         import_size,
+                                        is_dll: file_chars & 0x2000 != 0,
                                         sections: Vec::new(),
                                         is_mapped: true,
                                     },
@@ -1322,6 +1337,10 @@ pub fn unpack(
                                         buf[opt+56], buf[opt+57], buf[opt+58], buf[opt+59],
                                     ]) as u64
                                 };
+                                // COFF characteristics: IMAGE_FILE_DLL flag.
+                                let file_chars = u16::from_le_bytes([
+                                    buf[off+pe_rva+22], buf[off+pe_rva+23],
+                                ]);
                                 // Build a minimal MappedImage and dump it.
                                 let img = mida_pe::dumper::MappedImage {
                                     base: pe_base as u64,
@@ -1330,6 +1349,7 @@ pub fn unpack(
                                     entry_point: ep_rva as u32,
                                     import_rva: 0,
                                     import_size: 0,
+                                    is_dll: file_chars & 0x2000 != 0,
                                     sections: Vec::new(),
                                     is_mapped: false,
                                 };
@@ -1358,8 +1378,33 @@ pub fn unpack(
                                             size = written,
                                             "V2: PE image dumped (raw — offline rebuild needed)",
                                         );
-                                        // Signal the pipeline to break.
-                                        state.v2_product_done = true;
+                                        // Capture the shell's external IAT
+                                        // before ending the session — a raw
+                                        // dump without the IAT sidecars has no
+                                        // offline-rebuild path.  Only a
+                                        // successful capture (scrubbed
+                                        // descriptor) breaks the loop; a
+                                        // non-payload image keeps the session
+                                        // alive for the later capture points.
+                                        match mida_pe::dumper::capture_stub_iat(
+                                            &mut dbg,
+                                            &img,
+                                            &pe_path,
+                                        ) {
+                                            Ok(Some((iat_bin, iat_txt))) => {
+                                                info!(
+                                                    iat_bin = %iat_bin.display(),
+                                                    iat_txt = %iat_txt.display(),
+                                                    "V2: IAT captured — offline rebuild inputs complete",
+                                                );
+                                                // Signal the pipeline to break.
+                                                state.v2_product_done = true;
+                                            }
+                                            Ok(None) => {}
+                                            Err(e) => {
+                                                warn!(error = %e, "V2: IAT capture failed");
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1872,10 +1917,10 @@ fn try_map_scan(
                 //
                 // Two filters narrow the candidate to the materialised
                 // image:
-                //   * `import_rva == 0` — the shell scrubs the mapped
-                //     image's import directory (it resolved the imports
-                //     itself).  System DLLs and the packed image itself
-                //     carry a real import directory, so they are excluded.
+                //   * `!is_dll` — the materialised program is an EXE
+                //     image; bystander DLLs (including resource-only MUI
+                //     DLLs, which have no import directory and slipped
+                //     through the old export-RVA proxy check) are DLLs.
                 //   * `size_of_image >= 0x10000` — the materialised
                 //     program is at least 64 KiB; tiny mappings are
                 //     shell helper structures.
@@ -1888,7 +1933,7 @@ fn try_map_scan(
                         .filter(|img| {
                             img.base != packed_base
                                 && img.size_of_image >= 0x10000
-                                && img.import_rva == 0
+                                && !img.is_dll
                                 && !state.seen_image_bases.contains(&img.base)
                         })
                         .max_by_key(|img| img.size_of_image)
@@ -1984,10 +2029,13 @@ fn try_exit_dump(
     }
     let packed_base = image_base_usize as u64;
     let candidate = if is_v2 {
-        // V2: look for the payload PE — EP > 0 AND import_rva > 0.
-        // The V2 shell materialises a real PE image with valid EP and
-        // import directory.  Filter out system DLLs (in module snapshot
-        // or v2_dll_bases) and the packed base.
+        // V2: look for a materialised payload — an EXE image with its EP
+        // intact that the module tracking doesn't know.  (The earlier
+        // "EP > 0 AND import_rva > 0" shape matched bystander system DLLs:
+        // `import_rva` carried the export RVA until the 2026-10-28 fix,
+        // and the "payload PE" it produced was CoreUIComponents.dll.)  The
+        // capture gate after the dump (EP > 0, EXE flag, unusable import
+        // directory) is the authority on whether the shell processed it.
         let module_bases: std::collections::HashSet<u64> =
             match mida_pe::dumper::take_module_snapshot(
                 dbg.process_handle(),
@@ -2003,39 +2051,58 @@ fn try_exit_dump(
             .filter(|img| {
                 img.base != packed_base
                     && img.size_of_image >= 0x10000
+                    && !img.is_dll
                     && img.entry_point > 0
-                    && img.import_rva > 0
                     && !module_bases.contains(&img.base)
                     && !state.v2_dll_bases.contains(&img.base)
             })
             .max_by_key(|img| img.size_of_image)
             .cloned()
     } else {
-        // V1/Ancient: look for the materialised image — EP == 0 AND
-        // import_rva == 0 (the shell scrubs both).
+        // V1/Ancient: look for the materialised image — EP scrubbed to 0
+        // and NOT a DLL (the old import_rva == 0 check was the export-RVA
+        // proxy for "not a DLL"; the flag itself is exact).
         images
             .iter()
             .filter(|img| {
                 img.base != packed_base
                     && img.size_of_image >= 0x10000
-                    && img.import_rva == 0
+                    && !img.is_dll
                     && img.entry_point == 0
             })
             .max_by_key(|img| img.size_of_image)
             .cloned()
     };
-    if let Some(img) = candidate {
-        info!(
-            base = format!("{:#x}", img.base),
-            size_img = format!("{:#x}", img.size_of_image),
-            ep = format!("{:#x}", img.entry_point),
-            import_rva = format!("{:#x}", img.import_rva),
-            "Materialised image found at ExitProcess — dumping raw bytes for offline rebuild",
-        );
-        if let Err(e) = mida_pe::dumper::dump_mapped_image_raw(dbg, &img, output_path) {
-            warn!(error = %e, "Raw dump at ExitProcess failed");
-        }
-    } else {
+        if let Some(img) = candidate {
+            info!(
+                base = format!("{:#x}", img.base),
+                size_img = format!("{:#x}", img.size_of_image),
+                ep = format!("{:#x}", img.entry_point),
+                import_rva = format!("{:#x}", img.import_rva),
+                "Materialised image found at ExitProcess — dumping raw bytes for offline rebuild",
+            );
+            if let Err(e) = mida_pe::dumper::dump_mapped_image_raw(dbg, &img, output_path) {
+                warn!(error = %e, "Raw dump at ExitProcess failed");
+            } else {
+                // V2 fallback capture point: the watch scan may have missed
+                // the payload PE (it materialises late).  Same scrubbed-
+                // descriptor gate — real modules return Ok(None) silently.
+                match mida_pe::dumper::capture_stub_iat(dbg, &img, output_path) {
+                    Ok(Some((iat_bin, iat_txt))) => {
+                        info!(
+                            iat_bin = %iat_bin.display(),
+                            iat_txt = %iat_txt.display(),
+                            "V2 exit dump: IAT captured — offline rebuild inputs complete"
+                        );
+                        state.v2_product_done = true;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!(error = %e, "V2 exit dump: IAT capture failed");
+                    }
+                }
+            }
+        } else {
         warn!(
             image_count = images.len(),
             is_v2,
@@ -2148,6 +2215,7 @@ fn try_ancient_watch_scan(
             entry_point: 0,
             import_rva: 0,
             import_size: 0,
+            is_dll: false,
             sections: Vec::new(),
             is_mapped: false,
         });
@@ -2292,17 +2360,16 @@ fn try_v2_watch_scan(
                 && img.size_of_image >= 0x10000
                 && !module_bases.contains(&img.base)
                 && !state.v2_dll_bases.contains(&img.base)
+                && !img.is_dll
         })
         .collect();
-    // Second pass: also check module/dll images for a valid PE structure
-    // (EP > 0 AND import_rva > 0).  The V2 payload PE may be loaded as a
-    // module (in the module snapshot) — the non-module filter above would
-    // miss it.  System DLLs also have EP > 0 and import_rva > 0, but they
-    // have normal section names and large sizes; the payload PE has
-    // scrambled section names.  We can't easily distinguish them by PE
-    // header alone, so we dump any module image with EP > 0 AND
-    // import_rva > 0 that hasn't been dumped yet, and let the offline
-    // rebuild script filter by structure.
+    // Second pass: also check module/dll images that could be the payload
+    // loaded through the loader.  The discriminator is the EXE flag plus a
+    // live capture gate (`capture_stub_iat` requires EP > 0 and an
+    // unusable import directory) — a bystander system DLL never passes,
+    // which is what the previous "EP > 0 AND import_rva > 0" shape check
+    // got wrong: it kept matching CoreUIComponents.dll (2026-10-28 false
+    // positive, see POSTMORTEMS).
     let module_candidates: Vec<&mida_pe::dumper::MappedImage> = images
         .iter()
         .filter(|img| {
@@ -2310,15 +2377,15 @@ fn try_v2_watch_scan(
                 && img.size_of_image >= 0x10000
                 && (module_bases.contains(&img.base)
                     || state.v2_dll_bases.contains(&img.base))
+                && !img.is_dll
                 && img.entry_point > 0
-                && img.import_rva > 0
                 && !state.v2_dumped_bases.contains(&img.base)
         })
         .collect();
     if !module_candidates.is_empty() {
         info!(
             count = module_candidates.len(),
-            "V2 watch: module images with valid PE structure (EP>0, import>0)"
+            "V2 watch: non-DLL module images with a live EP (capture gate decides)"
         );
         for img in &module_candidates {
             info!(
@@ -2326,7 +2393,7 @@ fn try_v2_watch_scan(
                 size_img = format!("{:#x}", img.size_of_image),
                 ep = format!("{:#x}", img.entry_point),
                 import_rva = format!("{:#x}", img.import_rva),
-                "V2 watch: module PE candidate",
+                "V2 watch: module EXE-image candidate",
             );
         }
     }
@@ -2383,6 +2450,27 @@ fn try_v2_watch_scan(
                     size = written,
                     "V2 watch: raw snapshot taken",
                 );
+                // V2: the payload PE's import directory is scrubbed —
+                // capture the shell's external IAT now, while the process
+                // is fully alive.  The scrubbed-descriptor gate inside
+                // keeps real modules out (their descriptors never match);
+                // only a successful capture ends the session, because a
+                // raw dump without the IAT sidecars has no offline-rebuild
+                // path and later capture points (exit dump) would be lost.
+                match mida_pe::dumper::capture_stub_iat(dbg, img, &snap_path) {
+                    Ok(Some((iat_bin, iat_txt))) => {
+                        info!(
+                            iat_bin = %iat_bin.display(),
+                            iat_txt = %iat_txt.display(),
+                            "V2 watch: IAT captured — offline rebuild inputs complete"
+                        );
+                        state.v2_product_done = true;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!(error = %e, "V2 watch: IAT capture failed");
+                    }
+                }
             }
             Err(e) => {
                 warn!(error = %e, snapshot = %snap_path.display(), "V2 watch snapshot failed");
@@ -2446,7 +2534,9 @@ fn try_mapped_dump(
                 }
             }
             // Candidate cascade — strictest first:
-            //  1. double-zero signature (post-scrub shape)
+            //  1. EP scrubbed to 0 on a non-DLL image (the old
+            //     import_rva == 0 check was the export-RVA proxy for "not
+            //     a DLL"; the flag itself is exact)
             //  2. either field zero, below the system-DLL range
             //  3. largest mapping that is neither the packed image nor a
             //     registered module (the materialised image is a raw
@@ -2458,7 +2548,7 @@ fn try_mapped_dump(
                 .filter(|img| {
                     img.base != packed_base
                         && img.size_of_image >= 0x10000
-                        && img.import_rva == 0
+                        && !img.is_dll
                         && img.entry_point == 0
                 })
                 .max_by_key(|img| img.size_of_image)
@@ -2472,6 +2562,7 @@ fn try_mapped_dump(
                         img.base != packed_base
                             && img.base < 0x7000_0000
                             && img.size_of_image >= 0x10000
+                            && !img.is_dll
                             && (img.import_rva == 0 || img.entry_point == 0)
                     })
                     .max_by_key(|img| img.size_of_image)
@@ -2569,7 +2660,7 @@ fn try_mapped_dump(
                 .filter(|img| {
                     img.base != packed_base
                         && img.size_of_image >= 0x10000
-                        && img.import_rva == 0
+                        && !img.is_dll
                         && !state.seen_image_bases.contains(&img.base)
                 })
                 .max_by_key(|img| img.size_of_image)
