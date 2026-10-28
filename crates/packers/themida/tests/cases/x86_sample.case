@@ -131,7 +131,19 @@ expect_output_size: 110592
 # Nothing structural moved: the trace still reports
 # `55 resolved, 0 failed, 55 not-an-import`, the product is still 110,592 B, and
 # `.text` still declares `0x60000020`.
-expect_output_sha256: 397c259ccdb4a1ac96542950ffb32d71c7e14f6bdce47773531b0f82f9545995
+expect_output_sha256: 2254bad098d305432b2f63abc1ac279b93dac7e16bbe9bc52909aa8a3353407d
+
+# Golden re-record 2026-10-28 #2 (seventh record; sixth environment-drift
+# event) — same session as the 397c259c record above (sixth record, earlier
+# the same day).  A/B with the `8ccc7ae` worktree binary (built from the
+# committed tree with `-p mida-cli` for the i686 target, same session, same
+# arguments) produced 2254bad0... byte for byte — identical to the current
+# pipeline's product.  Structural metrics did not move: `55 resolved,
+# 0 failed, 55 not-an-import`, `Resolved 55 API addresses from live IAT
+# image`.  Worktree note: the i686 build needs the gitignored
+# `.cargo/config.toml` (w64devkit linker) copied over, plus the x86 ScyllaHide
+# helpers next to the binary — without them the run dies before OEP.
+# Previous value 397c259c... (recorded 2026-10-28).
 
 # Golden re-record 2026-10-28 (sixth record; fifth environment-drift event).
 # The bytes moved again on unchanged v3 code.  A/B with the `3f5cf8d`

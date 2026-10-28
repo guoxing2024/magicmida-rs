@@ -147,14 +147,20 @@ expect_output_size: 1737216
 # since) run against this same sample in this same session produced
 # **`8ba37a79…` byte for byte** — identical to the current pipeline's product.
 # The drift is the session, not the code.
-expect_output_sha256: e129fe2649639b960f158d31efb12bd5a9b8f9594391afe4d5a04b2771b1c50a
+expect_output_sha256: 5ec5632572c65444e691ea609fc777a2cf18fc2e55032495a90c217b695d632d
 
-# Golden re-record 2026-10-28 (fifth record; fourth environment-drift event).
-# The bytes moved again on unchanged v3 code.  A/B with the `3f5cf8d`
+# Golden re-record 2026-10-28 #2 (sixth record; fifth environment-drift event).
+# The bytes moved again on unchanged v3 code — same session as the e129fe26
+# record above (fifth record, earlier the same day).  A/B with the `8ccc7ae`
 # worktree binary (built from the committed tree with `-p mida-cli`, same
-# session, same arguments) produced e129fe26... byte for byte — identical to
-# the current pipeline's product.  Previous value 5ac104f2... (recorded
-# 2026-10-27).
+# session, same arguments) produced 5ec56325... byte for byte — identical to
+# the current pipeline's product.  Structural metrics did not move:
+# `V3`, `289 resolved / 0 failed / 3 not-an-import`, `Resolved 288 API
+# addresses from live IAT image`, product 1,737,216 B.  Worktree note: the
+# A/B binary needs the ScyllaHide helpers (InjectorCLIx64.exe /
+# HookLibraryx64.dll / scylla_hide.ini) copied next to it, or the run dies
+# with `OEP not found` — three such failures were harness artefacts, not
+# pipeline variance.  Previous value e129fe26... (recorded 2026-10-28).
 
 # Characteristics the product's first section must declare.
 #
