@@ -1552,6 +1552,7 @@ pub fn unpack(
                     image_boundary,
                     h_process,
                     guard_protection,
+                    &output_path,
                 )?;
 
                 // Classic file-mapping shape: the shell materialised the
@@ -1729,6 +1730,7 @@ pub fn unpack(
                     image_boundary,
                     h_process,
                     guard_protection,
+                    &output_path,
                 ) {
                     log::log(LogType::Fatal, &format!("handle_hw_breakpoint FAILED: {e:#}"));
                     return Err(e);
@@ -2147,6 +2149,49 @@ fn try_exit_dump(
             "No materialised image candidate at ExitProcess — offline rebuild unavailable",
         );
     }
+    if is_v2 {
+        // Last-chance headless pass: ExitProcess may still see private
+        // code regions the churn already recycled during the run.  The
+        // dedup set keeps regions the watch already classified.
+        let module_bases: std::collections::HashSet<u64> =
+            match mida_pe::dumper::take_module_snapshot(
+                dbg.process_handle(),
+                dbg.pid(),
+                dbg.image_base(),
+                false,
+            ) {
+                Ok(mods) => mods.iter().map(|m| m.base()).collect(),
+                Err(_) => std::collections::HashSet::new(),
+            };
+        scan_v2_headless_regions(dbg, state, image_base_usize, output_path, &module_bases);
+        // Exit-time image snapshot: paired with the CloseHandle snapshot —
+        // a diff between the two says whether the shell wipes or rewrites
+        // its image during the payload phase (the Ancient 1.1.1 shell
+        // re-encrypted its materialised image before ExitProcess).
+        let total = state
+            .pe_info
+            .pe_sections
+            .iter()
+            .map(|s| s.virtual_address as usize + s.virtual_size as usize)
+            .max()
+            .unwrap_or(0);
+        if total > 0 {
+            let mut buf = vec![0u8; total];
+            for off in (0..total).step_by(0x1000) {
+                let len = std::cmp::min(0x1000, total - off);
+                let _ = dbg.read_memory(image_base_usize + off, &mut buf[off..off + len]);
+            }
+            let stem = output_path.with_extension("v2image_exit");
+            let mut name =
+                stem.file_name().expect("output path has a file name").to_os_string();
+            name.push(".bin");
+            let snap = stem.with_file_name(name);
+            match std::fs::write(&snap, &buf) {
+                Ok(_) => info!(path = %snap.display(), total = format!("{total:#x}"), "V2: packed image snapshot at ExitProcess written"),
+                Err(e) => warn!(error = %e, "V2: exit image snapshot write failed"),
+            }
+        }
+    }
 }
 
 /// Ancient (1.1.1) exit-window watch scan.  Runs after EVERY debug event
@@ -2301,33 +2346,33 @@ fn try_ancient_watch_scan(
 /// enough.  The largest candidate is dumped each time a NEW candidate
 /// appears (dedup by base to avoid re-dumping the same region).
 
-/// V2: dump the region following a payload code region and resolve its
-/// pointer page against the live module exports.
+/// IME/WeType import-profile classification: the injected IME worker
+/// threads carry crashrpt/wetype/input.dll in their resolved import
+/// profile (measured 2026-10-29: every captured payload region on this
+/// machine resolved to the WeType stack — `C:\Program
+/// Files\Tencent\WeType\3.0.0.38\CrashRpt1500.dll`).  The REAL payload,
+/// if it materialises headless native code, will have a normal
+/// application profile (kernel32/user32/...) — keep those.
+fn is_ime_profile(per_module: &std::collections::BTreeMap<String, usize>) -> bool {
+    per_module.keys().any(|m| {
+        let m = m.to_lowercase();
+        m.contains("crashrpt") || m.contains("wetype") || m == "input.dll"
+    })
+}
+
+/// Dump the committed region following `region_base + region_size`, then
+/// resolve its pointer page against the live module exports.
 ///
-/// The payload rounds materialise headless native code (measured
-/// 2026-10-29 on CISC-1.exe: clean MSVC prologues, switch tables, no
-/// strings, no PE header anywhere) whose API calls go through a dense
-/// `call [abs32]` page in the region immediately after the code
-/// (272 distinct targets at 0x56162000, right after the 0x560b5000 code
-/// region; 125 at 0x564c3000, right after 0x5642c000).  Resolving those
-/// slots names the imports, which identifies what the materialised code
-/// is — shell engine or the original program — and is the input for the
-/// rebuild route if it turns out to be the latter.
-///
-/// Returns `true` when the import profile classifies the region as
-/// IME/WeType injection noise (measured: every region captured on
-/// 2026-10-29 resolved to the WeType stack — crashrpt1500.dll /
-/// imm32.dll / input.dll / d2d1; WeType 3.0.0.38 is installed on this
-/// machine and injects worker threads into any process that shows a
-/// window).  The caller renames those dumps so `v2payload_*` on disk
-/// stays "real candidates only".
-fn capture_v2_payload_iat(
+/// Writes `<stem>.next.bin` (the region bytes, 256 KB cap) and
+/// `<stem>.iat.txt` (the resolution report).  Returns the report on
+/// success — callers run the IME-profile classification on
+/// `report.per_module`.
+fn dump_next_region_and_resolve(
     dbg: &mut ProcessSession,
     region_base: u64,
     region_size: u64,
-    output_path: &std::path::Path,
-    start_address: u64,
-) -> bool {
+    stem: &std::path::Path,
+) -> Option<mida_pe::dumper::PointerReport> {
     let next_addr = region_base + region_size;
     let (next_base, next_size) =
         match mida_pe::dumper::query_region(&*dbg, next_addr) {
@@ -2337,7 +2382,7 @@ fn capture_v2_payload_iat(
                     next = format!("{next_addr:#x}"),
                     "V2 payload IAT: no committed region after the code region"
                 );
-                return false;
+                return None;
             }
         };
     if next_base != next_addr {
@@ -2354,17 +2399,15 @@ fn capture_v2_payload_iat(
             next_base = format!("{next_base:#x}"),
             "V2 payload IAT: read of the following region failed"
         );
-        return false;
+        return None;
     }
-    let stem = output_path
-        .with_extension(format!("v2payload_{start_address:x}"));
     let mut bin_name =
-        stem.file_name().expect("output path has a file name").to_os_string();
+        stem.file_name().expect("stem path has a file name").to_os_string();
     bin_name.push(".next.bin");
     let next_path = stem.with_file_name(bin_name);
     if let Err(e) = std::fs::write(&next_path, &buf) {
         warn!(error = %e, path = %next_path.display(), "V2 payload IAT: next-region dump failed");
-        return false;
+        return None;
     }
     let image_base = dbg.image_base();
     let report = match mida_pe::dumper::resolve_pointer_report(
@@ -2376,19 +2419,11 @@ fn capture_v2_payload_iat(
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "V2 payload IAT: resolution failed");
-            return false;
+            return None;
         }
     };
-    // IME/WeType classification: the injected IME worker threads carry
-    // crashrpt/imm32/input in their import profile.  The REAL payload,
-    // if it materialises headless native code, will have a normal
-    // application profile (kernel32/user32/...) — keep those.
-    let is_ime_noise = report.per_module.keys().any(|m| {
-        let m = m.to_lowercase();
-        m.contains("crashrpt") || m.contains("wetype") || m == "input.dll"
-    });
     let mut txt_name =
-        stem.file_name().expect("output path has a file name").to_os_string();
+        stem.file_name().expect("stem path has a file name").to_os_string();
     txt_name.push(".iat.txt");
     let txt_path = stem.with_file_name(txt_name);
     match std::fs::write(&txt_path, &report.text) {
@@ -2400,6 +2435,39 @@ fn capture_v2_payload_iat(
         ),
         Err(e) => warn!(error = %e, path = %txt_path.display(), "V2 payload IAT: report write failed"),
     }
+    Some(report)
+}
+
+/// V2: dump the region following a payload code region and resolve its
+/// pointer page against the live module exports.
+///
+/// The payload rounds materialise headless native code (measured
+/// 2026-10-29 on CISC-1.exe: clean MSVC prologues, switch tables, no
+/// strings, no PE header anywhere) whose API calls go through a dense
+/// `call [abs32]` page in the region immediately after the code
+/// (272 distinct targets at 0x56162000, right after the 0x560b5000 code
+/// region; 125 at 0x564c3000, right after 0x5642c000).  Resolving those
+/// slots names the imports, which identifies what the materialised code
+/// is — shell engine or the original program — and is the input for the
+/// rebuild route if it turns out to be the latter.
+///
+/// Returns `true` when the import profile classifies the region as
+/// IME/WeType injection noise.  The caller renames those dumps so
+/// `v2payload_*` on disk stays "real candidates only".
+fn capture_v2_payload_iat(
+    dbg: &mut ProcessSession,
+    region_base: u64,
+    region_size: u64,
+    output_path: &std::path::Path,
+    start_address: u64,
+) -> bool {
+    let stem = output_path
+        .with_extension(format!("v2payload_{start_address:x}"));
+    let Some(report) = dump_next_region_and_resolve(dbg, region_base, region_size, &stem)
+    else {
+        return false;
+    };
+    let is_ime_noise = is_ime_profile(&report.per_module);
     if is_ime_noise {
         warn!(
             start = format!("{start_address:#x}"),
@@ -2408,6 +2476,180 @@ fn capture_v2_payload_iat(
         );
     }
     is_ime_noise
+}
+
+/// V2: headless native-code scan.
+///
+/// Every previous V2/Ancient search only looked for MZ+PE images — but the
+/// 2026-10-29 recon proved that headless native code (no PE header at all:
+/// WeType's injected worker code) is a real shape on this machine and is
+/// INVISIBLE to all of those scans.  If the original program materialises
+/// the same way, this scan is what finds it.
+///
+/// The walk visits every committed `MEM_PRIVATE` region with an executable
+/// protection and no MZ at its head, runs a cheap code-density prefilter
+/// (function-prologue and relative-call counts over the first 64 KB), then
+/// classifies each candidate by its import profile (the dense
+/// `call [abs32]` page pattern resolved against the live modules):
+/// IME/WeType-profile regions are recorded as noise and skipped, anything
+/// else is dumped in full (16 MB cap) with the next region and the
+/// resolution report — the rebuild route's raw material.
+///
+/// Dedup by base per run (`v2_headless_bases`); dump count capped
+/// (`v2_headless_dump_count`).  Called from the watch scan (500 ms
+/// cooldown, shared) and from the ExitProcess V2 branch (last chance).
+fn scan_v2_headless_regions(
+    dbg: &mut ProcessSession,
+    state: &mut ThemidaState,
+    image_base_usize: usize,
+    output_path: &std::path::Path,
+    module_bases: &std::collections::HashSet<u64>,
+) {
+    use windows::Win32::System::Memory::{
+        MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_PRIVATE, VirtualQueryEx,
+    };
+    let h_process = dbg.process_handle();
+    let packed_base = image_base_usize as u64;
+    let mut addr: usize = 0;
+    while addr < 0x7FFF_FFFF {
+        let mut mbi = MEMORY_BASIC_INFORMATION::default();
+        let rc = unsafe {
+            VirtualQueryEx(
+                h_process,
+                Some(addr as *const _),
+                &mut mbi,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if rc != std::mem::size_of::<MEMORY_BASIC_INFORMATION>() {
+            break;
+        }
+        let region_base = mbi.BaseAddress as usize;
+        let region_size = mbi.RegionSize as usize;
+        let next_region = region_base + region_size;
+        let prot = mbi.Protect.0;
+        let executable = matches!(prot, 0x10 | 0x20 | 0x40 | 0x80);
+        if mbi.State == MEM_COMMIT
+            && mbi.Type == MEM_PRIVATE
+            && executable
+            && region_size >= 0x8000
+        {
+            let base = region_base as u64;
+            if base != packed_base
+                && !state.v2_headless_bases.contains(&base)
+                && !state.v2_headless_noise_bases.contains(&base)
+                && !module_bases.contains(&base)
+                && !state.v2_dll_bases.contains(&base)
+            {
+                classify_headless_region(dbg, state, region_base, region_size, output_path);
+            }
+        }
+        addr = next_region;
+    }
+}
+
+/// Code-density prefilter + import-profile classification of one private
+/// executable region; on a non-noise verdict, dumps it in full.
+fn classify_headless_region(
+    dbg: &mut ProcessSession,
+    state: &mut ThemidaState,
+    region_base: usize,
+    region_size: usize,
+    output_path: &std::path::Path,
+) {
+    let base = region_base as u64;
+    // Head MZ check: MZ-bearing regions belong to the PE-image scans
+    // (scan_mapped_images / scan_private_images / the watch candidates) —
+    // the headless scan only owns MZ-less regions.
+    let mut head = [0u8; 0x200];
+    if dbg.read_memory(region_base, &mut head).is_err() {
+        state.v2_headless_bases.insert(base);
+        return;
+    }
+    if head[0] == b'M' && head[1] == b'Z' {
+        state.v2_headless_bases.insert(base);
+        return;
+    }
+    // Code-density prefilter over the first 64 KB: function prologues
+    // (`55 8b ec` push ebp; mov ebp, esp) and relative calls (`e8`).
+    // Thresholds are deliberately low — a false pass costs one
+    // classification round; a false drop loses the payload.
+    let probe_len = region_size.min(0x10000);
+    let mut probe = vec![0u8; probe_len];
+    if dbg.read_memory(region_base, &mut probe).is_err() {
+        state.v2_headless_bases.insert(base);
+        return;
+    }
+    let mut prologues = 0usize;
+    for w in probe.windows(3) {
+        if w[0] == 0x55 && w[1] == 0x8b && w[2] == 0xec {
+            prologues += 1;
+        }
+    }
+    let calls = probe.iter().filter(|&&b| b == 0xe8).count();
+    if prologues < 4 || calls < 32 {
+        debug!(
+            base = format!("{base:#x}"),
+            prologues,
+            calls,
+            "V2 headless: region below code-density threshold"
+        );
+        state.v2_headless_bases.insert(base);
+        return;
+    }
+    // Full region read (16 MB cap) and import-profile classification.
+    let read_len = region_size.min(0x1000000);
+    let mut buf = vec![0u8; read_len];
+    for off in (0..read_len).step_by(0x1000) {
+        let len = std::cmp::min(0x1000, read_len - off);
+        let _ = dbg.read_memory(region_base + off, &mut buf[off..off + len]);
+    }
+    let image_base = dbg.image_base();
+    let report = match mida_pe::dumper::resolve_pointer_report(dbg, &buf, base, image_base) {
+        Ok(r) => r,
+        Err(e) => {
+            debug!(error = %e, base = format!("{base:#x}"), "V2 headless: pointer resolution failed");
+            state.v2_headless_bases.insert(base);
+            return;
+        }
+    };
+    state.v2_headless_bases.insert(base);
+    let stem = output_path.with_extension(format!("v2headless_{base:x}"));
+    if is_ime_profile(&report.per_module) {
+        state.v2_headless_noise_bases.insert(base);
+        warn!(
+            base = format!("{base:#x}"),
+            size = format!("{region_size:#x}"),
+            prologues,
+            profile = ?report.per_module.keys().collect::<Vec<_>>(),
+            "V2 headless: code-dense region classified as IME/WeType noise"
+        );
+        return;
+    }
+    if state.v2_headless_dump_count >= 16 {
+        warn!(
+            base = format!("{base:#x}"),
+            profile = ?report.per_module.keys().collect::<Vec<_>>(),
+            "V2 headless: non-noise code-dense region found but dump cap reached"
+        );
+        return;
+    }
+    state.v2_headless_dump_count += 1;
+    let dump_path = stem.with_extension(format!("v2headless_{base:x}.bin"));
+    if let Err(e) = std::fs::write(&dump_path, &buf) {
+        warn!(error = %e, path = %dump_path.display(), "V2 headless: dump write failed");
+        return;
+    }
+    info!(
+        path = %dump_path.display(),
+        base = format!("{base:#x}"),
+        size = format!("{region_size:#x}"),
+        prologues,
+        calls,
+        profile = ?report.per_module.keys().collect::<Vec<_>>(),
+        "V2 HEADLESS: non-noise code-dense private region dumped — real payload candidate",
+    );
+    let _ = dump_next_region_and_resolve(dbg, base, region_size as u64, &stem);
 }
 
 fn try_v2_watch_scan(
@@ -2431,6 +2673,50 @@ fn try_v2_watch_scan(
         return;
     }
     state.v2_last_watch_ms = elapsed_ms;
+    // V2 image snapshot (one-shot, first tick): the shell finishes ALL its
+    // decode work BEFORE the CloseHandle hit — the .text write BP armed at
+    // the hit never fires for V2 — so if the original program is decoded
+    // in place into the packed image's own sections, that content exists
+    // only through this dump.  MEM_IMAGE regions are invisible to the
+    // headless scan and the packed base is excluded from every candidate
+    // filter; without this the image's decoded content is never captured.
+    if !state.v2_image_snapshot_taken {
+        state.v2_image_snapshot_taken = true;
+        let total = state
+            .pe_info
+            .pe_sections
+            .iter()
+            .map(|s| s.virtual_address as usize + s.virtual_size as usize)
+            .max()
+            .unwrap_or(0);
+        if total > 0 {
+            let mut buf = vec![0u8; total];
+            let mut ok = 0usize;
+            let mut fail = 0usize;
+            for off in (0..total).step_by(0x1000) {
+                let len = std::cmp::min(0x1000, total - off);
+                match dbg.read_memory(image_base_usize + off, &mut buf[off..off + len]) {
+                    Ok(_) => ok += 1,
+                    Err(_) => fail += 1,
+                }
+            }
+            let stem = output_path.with_extension("v2image_closehandle");
+            let mut name =
+                stem.file_name().expect("output path has a file name").to_os_string();
+            name.push(".bin");
+            let snap = stem.with_file_name(name);
+            match std::fs::write(&snap, &buf) {
+                Ok(_) => info!(
+                    path = %snap.display(),
+                    total = format!("{total:#x}"),
+                    pages_ok = ok,
+                    pages_failed = fail,
+                    "V2: packed image snapshot at CloseHandle written (decode is complete by now)"
+                ),
+                Err(e) => warn!(error = %e, "V2: image snapshot write failed"),
+            }
+        }
+    }
     debug!(
         elapsed_ms,
         "V2 watch: scan triggered"
@@ -2552,6 +2838,11 @@ fn try_v2_watch_scan(
         .chain(module_candidates.iter().cloned())
         .collect();
     if all_candidates.is_empty() {
+        // No PE-image candidates this tick — but the headless scan below
+        // must still run: MZ-less private code regions are its exclusive
+        // territory (measured 2026-10-29: the pre-fix early return here
+        // silently disabled the headless scan on every quiet tick).
+        scan_v2_headless_regions(dbg, state, image_base_usize, output_path, &module_bases);
         return;
     }
     // Log all candidates at INFO for diagnostics.
@@ -2625,6 +2916,13 @@ fn try_v2_watch_scan(
             }
         }
     }
+    // Headless native-code pass: the PE-image candidates above only cover
+    // MZ-bearing materialisations.  The 2026-10-29 recon proved headless
+    // native code (WeType's injected workers) exists in private RX regions
+    // and is invisible to every MZ-based scan — if the original program
+    // materialises the same way, this is what finds it.  Shares the watch
+    // scan's 500 ms cooldown and module snapshot; dedups by base per run.
+    scan_v2_headless_regions(dbg, state, image_base_usize, output_path, &module_bases);
 }
 
 /// Try to dump the materialised mapped image (Themida 1.1.1 file-mapping

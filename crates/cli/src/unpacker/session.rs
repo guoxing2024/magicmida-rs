@@ -35,6 +35,10 @@ pub(super) struct ResolvedApis {
     pub(super) sleep: usize,
     /// kernel32!lstrlen — anti-trace detection helper
     pub(super) lstrlen: usize,
+    /// kernel32!ExitProcess — the V2 shell's bail path (exit code 2); the
+    /// bailtrace diagnostic arms an execute HW-BP here to catch the check
+    /// site from the stack.
+    pub(super) exit_process: usize,
 }
 
 // ---------------------------------------------------------------------------

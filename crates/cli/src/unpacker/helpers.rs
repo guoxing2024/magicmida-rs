@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use anyhow::anyhow;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use windows::core::s;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
@@ -124,6 +124,7 @@ pub(super) fn resolve_api_addrs() -> Result<ResolvedApis, anyhow::Error> {
         nt_allocate_virtual_memory: resolve(ntdll, s!("NtAllocateVirtualMemory"))?,
         sleep: resolve(k32, s!("Sleep"))?,
         lstrlen: resolve(k32, s!("lstrlen"))?,
+        exit_process: resolve(k32, s!("ExitProcess"))?,
     };
 
     debug!(
@@ -354,12 +355,107 @@ pub(super) fn handle_hw_breakpoint(
     _image_boundary: usize,
     h_process: HANDLE,
     guard_protection: u32,
+    output_path: &std::path::Path,
 ) -> Result<(), anyhow::Error> {
     let rip = address as usize;
 
     let text_write_bp_addr = (image_base_usize + 0x1000) as u64;
     let slot0_is_text_write = dbg
         .hw_breakpoint_addr(0) == Some(text_write_bp_addr);
+
+    // V2 bailtrace hit: the ExitProcess execute BP (armed by the CloseHandle
+    // V2 branch when MAGICMIDA_V2_BAILTRACE is set) fired.  The shell has
+    // decided to bail (exit code 2 — same bare and debugged, so it is the
+    // license/environment check, not anti-debug) and its stack still holds
+    // the check-site return chain.  Walk the stack, log every return
+    // address inside the shell image with surrounding code bytes, clear the
+    // slot, and let ExitProcess run.
+    let bail_hit = dbg
+        .apis
+        .as_ref()
+        .map(|a| a.exit_process)
+        .filter(|&ep| dbg.hw_breakpoint_addr(1) == Some(ep as u64));
+    if bail_hit.is_some() {
+            let ctx = dbg
+                .get_thread_context_control(_thread_id)
+                .map_err(|e| anyhow!("bailtrace: get_thread_context_control: {e}"))?;
+            info!(
+                esp = format!("{:#x}", mida_core::debugger::ctx_sp(&ctx)),
+                eip = format!("{:#x}", mida_core::debugger::ctx_ip(&ctx)),
+                "V2 BAILTRACE: shell reached ExitProcess — walking the stack for the check site"
+            );
+            // Bail-time image dump: the shell re-encrypts its code during
+            // teardown (measured: the exit-snapshot bytes at the captured
+            // return sites differ from the live bytes read at this same
+            // hit), so the only stable view of the decoded check site is
+            // NOW — the process is suspended at ExitProcess's first
+            // instruction.
+            {
+                let total = state
+                    .pe_info
+                    .pe_sections
+                    .iter()
+                    .map(|s| s.virtual_address as usize + s.virtual_size as usize)
+                    .max()
+                    .unwrap_or(0);
+                if total > 0 {
+                    let mut buf = vec![0u8; total];
+                    for off in (0..total).step_by(0x1000) {
+                        let len = std::cmp::min(0x1000, total - off);
+                        let _ =
+                            dbg.read_memory(image_base_usize + off, &mut buf[off..off + len]);
+                    }
+                    let stem = output_path.with_extension("v2image_bail");
+                    let mut name =
+                        stem.file_name().expect("output path has a file name").to_os_string();
+                    name.push(".bin");
+                    let snap = stem.with_file_name(name);
+                    if let Err(e) = std::fs::write(&snap, &buf) {
+                        warn!(error = %e, "V2 BAILTRACE: bail-time image dump failed");
+                    } else {
+                        info!(path = %snap.display(), total = format!("{total:#x}"), "V2 BAILTRACE: bail-time image written (shell code decoded, pre-teardown)");
+                    }                }
+            }
+            let mut stack = [0u8; 0x800];
+            if dbg
+                .read_memory(mida_core::debugger::ctx_sp(&ctx), &mut stack)
+                .is_ok()
+            {
+                let lo = image_base_usize;
+                let hi = image_base_usize
+                    + state
+                        .pe_info
+                        .pe_sections
+                        .iter()
+                        .map(|s| s.virtual_address as usize + s.virtual_size as usize)
+                        .max()
+                        .unwrap_or(0);
+                for off in (0..stack.len() - 4).step_by(4) {
+                    let v = u32::from_le_bytes([
+                        stack[off],
+                        stack[off + 1],
+                        stack[off + 2],
+                        stack[off + 3],
+                    ]) as usize;
+                    if v >= lo && v < hi {
+                        let mut code = [0u8; 48];
+                        let from = v.saturating_sub(24);
+                        if dbg.read_memory(from, &mut code).is_ok() {
+                            info!(
+                                stack_off = format!("{off:#x}"),
+                                ret = format!("{v:#x}"),
+                                code = ?&code,
+                                "V2 BAILTRACE: return address into the shell image"
+                            );
+                        }
+                    }
+                }
+            } else {
+                warn!("V2 BAILTRACE: stack read at ExitProcess failed");
+            }
+            dbg.clear_hw_breakpoint(1)?;
+            return Ok(());
+    }
 
     if let Some(ref apis) = dbg.apis {
         let at_close = rip == apis.close_handle || rip == apis.nt_close;
@@ -469,6 +565,32 @@ pub(super) fn handle_hw_breakpoint(
                     info!(
                         "V2 pipeline: CloseHandle BP cleared, .text write BP set (anti-bail), watch armed"
                     );
+                    // Bailtrace diagnostic (MAGICMIDA_V2_BAILTRACE=1): the
+                    // shell exits with code 2 both bare and debugged — a
+                    // license/environment check, not anti-debug — and the
+                    // .text decrypt never runs.  Arm an execute BP on
+                    // ExitProcess so the hit walks the stack and exposes
+                    // the check site; the offline analysis turns that into
+                    // an in-memory patch for the next run.
+                    if std::env::var("MAGICMIDA_V2_BAILTRACE")
+                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false)
+                    {
+                        let exit_process_addr = dbg.apis.as_ref().map(|a| a.exit_process);
+                        if let Some(exit_process_addr) = exit_process_addr {
+                            match dbg.set_hw_breakpoint(
+                                1,
+                                exit_process_addr,
+                                mida_core::HwbpType::Execute,
+                            ) {
+                                Ok(_) => info!(
+                                    exit_process = format!("{exit_process_addr:#x}"),
+                                    "V2 BAILTRACE: execute BP armed on ExitProcess (slot 1)"
+                                ),
+                                Err(e) => warn!(error = %e, "V2 BAILTRACE: arming failed"),
+                            }
+                        }
+                    }
                 } else {
                     info!("switching to .text write BP");
                     dbg.clear_hw_breakpoint(0)?;

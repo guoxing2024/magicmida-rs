@@ -139,6 +139,28 @@ pub struct ThemidaState {
     /// cooldown — the scan is expensive and calling it on every CreateThread
     /// event during the shell's 30-thread storm would hang the pipeline).
     pub v2_last_watch_ms: u64,
+    /// Private executable regions already classified by the V2 headless-code
+    /// scan (dedup: each region is walked once per run, not at every 500 ms
+    /// tick).
+    pub v2_headless_bases: std::collections::HashSet<u64>,
+    /// Headless regions whose import profile matched the IME/WeType stack
+    /// (measured 2026-10-29: WeType injects worker threads into any process
+    /// that shows a window; their code lives in private RX regions with a
+    /// crashrpt/imm32/input.dll import profile).  Skipped fast on later
+    /// ticks.
+    pub v2_headless_noise_bases: std::collections::HashSet<u64>,
+    /// Number of non-noise headless regions dumped this run (cap: the real
+    /// payload is a handful of rounds; unbounded dumping during churn would
+    /// fill the disk).
+    pub v2_headless_dump_count: usize,
+    /// One-shot: the packed image dump at the first watch tick.  The V2
+    /// shell finishes ALL decode work before the CloseHandle hit (the .text
+    /// write BP armed at the hit never fires), so if the original program
+    /// is decoded in place into the packed image's own sections, that
+    /// content exists only through this dump — MEM_IMAGE regions are
+    /// invisible to the headless scan and the packed base is excluded from
+    /// every candidate filter.
+    pub v2_image_snapshot_taken: bool,
     /// Module bases cached when the ancient watch started (the watch filter is
     /// "not the packed image and not a registered module"; re-taking the
     /// module snapshot at every event is too slow for the exit window).
@@ -216,6 +238,10 @@ impl ThemidaState {
             v2_product_done: false,
             v2_dll_bases: std::collections::HashSet::new(),
             v2_last_watch_ms: 0,
+            v2_headless_bases: std::collections::HashSet::new(),
+            v2_headless_noise_bases: std::collections::HashSet::new(),
+            v2_headless_dump_count: 0,
+            v2_image_snapshot_taken: false,
             ancient_module_bases: std::collections::HashSet::new(),
             ancient_snapshots: 0,
             idle_diag_done: false,
