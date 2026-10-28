@@ -1325,6 +1325,43 @@ V2 脱壳可用**。下一增量若再做 V2，输入应是"壳工作区裸码"�
 无头原生码物化，走重建路线（合成 PE 头 + IAT 重建，机器全在）；**devirt
 仍未开始——没有任何一个已定位的 VM 可供 devirtualize，继续不承诺**。
 
+## V2 突破：原程序 = XP calc，就地解进镜像；bail = 许可检查（2026-10-29，未发布）
+
+**无头扫描落地后的两连击**：
+
+1. **无头扫描零命中 = 干净的排除证据**：全生命周期（含 ExitProcess 末次）
+   私有 RX 区里，除壳自己的 API thunk 区（0x4e0000/0x510000，ntdll+win32u
+   剖面，32KB）外**没有任何非噪声代码区**——载荷不在私有内存里，WeType 之外
+   连一个代码区都没有。
+2. **镜像快照抓到真相**（CloseHandle 首个 watch tick 全镜像 dump）：
+   - `.rsrc`（va 0x16000）**已解密**：VS_VERSION_INFO 完整可读——
+     **"Windows Calculator application file"，FileVersion 5.1.2600.0
+     （xpclient.010817-1148）**——原程序是 **XP 版 calc.exe**（LCF-AT 教程
+     拿它打包的 WinLicense 2.0.6.5）。
+   - `.text`（va 0x1000-0x8000）仍加密（熵 7.93，与盘上逐字节同头）；
+     0x9000-0x15000 全零；`.idata` 清零（壳代管导入）。
+   - **ExitProcess 时 .text 逐字节仍加密**、.rsrc 头被擦——壳在拆栈前擦自己。
+
+**V2 生命周期定案**：壳把原程序（XP calc）**就地解进加壳镜像自己的节**
+（.text/.rsrc/.idata 的 RVA 与原 PE 相同），.rsrc 在 CloseHandle 前解完；
+**.text 只在最终 OEP 跳转前才解密**——调试器和裸跑都到不了那一步：
+裸跑同样 `exit 2`（与被调试完全一致 = **许可/环境检查失败，不是反调试**；
+Themida 阶梯样本裸跑能活、WinLicense 2.0.6.5 裸跑死——差的就是许可层，
+2008 年的 eval 早已过期）。"VM 解释型"定案彻底死亡：calc 从头到尾是
+原生码，只是没解出来。
+
+**bailtrace（MAGICMIDA_V2_BAILTRACE=1）**：CloseHandle 时在 ExitProcess
+武装 exec BP（slot 1），命中时栈回溯 + **bail 时全镜像 dump**。实测：
+- 13 个返回址入壳镜像（最深 0x10e35a3 = `jmp rel32` 进 ExitProcess 的尾调；
+  0x10a4135 帧可见 `0f 85` jne + 变异 `e8+10` 跨垃圾调用的检查形状）。
+- **exit 时镜像快照与活体字节不同**——壳拆栈时重加密自己的代码，
+  bail 命中瞬间（进程冻结在 ExitProcess 首指令）是唯一稳定视图。
+
+**下一步**：离线分析 bail 时镜像的 0x10e3000-0x10e4000 / 0x10a4000-0x10a5000
+→ 定位许可检查的条件跳转 → 下一跑内存补丁（跳过 bail）→ 壳继续走 →
+.text 解密 → 镜像快照抓到解码后的 calc → 按已知原程序（XP calc 公开可查）
+对账 + 重建产品。**devirt 不需要**——calc 从未被虚拟化。
+
 ## V2 (SecureEngine 2.x) 战役：历史小节（均已推翻，仅供追溯）
 
 **"载荷区探测 + 诚实收束"（2026-10-28）**：A/B 定责壳方差大、hang 非管线
