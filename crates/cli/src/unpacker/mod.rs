@@ -415,7 +415,7 @@ pub fn unpack(
             Err(mida_core::CoreError::Timeout) => {
                 try_map_scan(&mut dbg, &mut state, image_base_usize, &output_path);
                 try_ancient_watch_scan(&mut dbg, &mut state, image_base_usize, &output_path);
-                try_v2_watch_scan(&mut dbg, &mut state, image_base_usize, &output_path);
+                try_v2_watch_scan(&mut dbg, &mut state, image_base_usize, &output_path, started.elapsed().as_millis() as u64);
                 // Workspace-stub trap (diagnostic), page-guard variant: at
                 // the first quiet timeout after the decode's probe
                 // exceptions, guard the page containing
@@ -1228,10 +1228,36 @@ pub fn unpack(
                             start = %format!("{start_address:#x}"),
                             "V2: thread starts outside shell image and DLLs — payload region?",
                         );
-                        // Dump 0x100000 bytes around the start address.
-                        let dump_start =
-                            (start_address as usize).saturating_sub(0x1000);
-                        let mut buf = vec![0u8; 0x100000];
+                        // Use VirtualQueryEx to find the full VirtualAlloc
+                        // region containing the thread start address.  The
+                        // payload PE header may be at the region's base,
+                        // far from the thread start (measured: thread at
+                        // 0x560b5a70, PE base potentially at region start
+                        // ~0x56000000).
+                        let region = mida_pe::dumper::query_region(&*dbg, start_address as u64);
+                        let (region_base, region_size) = match region {
+                            Some(r) => {
+                                info!(
+                                    region_base = format!("{:#x}", r.0),
+                                    region_size = format!("{:#x}", r.1),
+                                    "V2: VirtualAlloc region found",
+                                );
+                                r
+                            }
+                            None => {
+                                warn!(
+                                    "V2: VirtualQueryEx failed for thread start — falling back to 1MB dump",
+                                );
+                                (
+                                    (start_address as usize).saturating_sub(0x1000) as u64,
+                                    0x100000,
+                                )
+                            }
+                        };
+                        // Cap the dump at 16MB to avoid excessive reads.
+                        let dump_size = region_size.min(0x1000000) as usize;
+                        let dump_start = region_base as usize;
+                        let mut buf = vec![0u8; dump_size];
                         if dbg
                             .read_memory(dump_start, &mut buf)
                             .is_ok()
@@ -1244,12 +1270,120 @@ pub fn unpack(
                             if std::fs::write(&dump_path, &buf).is_ok() {
                                 info!(
                                     path = %dump_path.display(),
-                                    addr = %format!("{start_address:#x}"),
+                                    region_base = format!("{:#x}", region_base),
+                                    dump_size = dump_size,
                                     "V2: payload region dumped",
                                 );
                             }
                         }
+                        // Search the dump buffer for MZ+PE at every byte
+                        // offset (not just page-aligned — the PE's MZ may be
+                        // at a non-page-aligned offset within the dump,
+                        // measured: off=0xf4aa0, abs=0x72880000).
+                        if buf.len() >= 0x400 {
+                            let mut mz_off: Option<usize> = None;
+                            for off in 0..buf.len()-1 {
+                                if buf[off] == b'M' && buf[off+1] == b'Z' {
+                                    let pe_off_pos = off + 0x3c;
+                                    if pe_off_pos + 4 <= buf.len() {
+                                        let pe_off = u32::from_le_bytes([
+                                            buf[pe_off_pos],
+                                            buf[pe_off_pos+1],
+                                            buf[pe_off_pos+2],
+                                            buf[pe_off_pos+3],
+                                        ]) as usize;
+                                        if off + pe_off + 4 <= buf.len()
+                                            && buf[off+pe_off..off+pe_off+4] == [b'P', b'E', 0, 0]
+                                        {
+                                            mz_off = Some(off);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(off) = mz_off {
+                                let pe_base = dump_start + off;
+                                // Parse PE header for SizeOfImage, EP RVA.
+                                let pe_sig = off + 0x3c;
+                                let pe_rva = u32::from_le_bytes([
+                                    buf[pe_sig], buf[pe_sig+1], buf[pe_sig+2], buf[pe_sig+3],
+                                ]) as usize;
+                                let opt = off + pe_rva + 24;
+                                let magic = u16::from_le_bytes([buf[opt], buf[opt+1]]);
+                                let ep_rva = u32::from_le_bytes([
+                                    buf[opt+16], buf[opt+17], buf[opt+18], buf[opt+19],
+                                ]) as u64;
+                                let size_img = if magic == 0x20b {
+                                    u32::from_le_bytes([
+                                        buf[opt+56], buf[opt+57], buf[opt+58], buf[opt+59],
+                                    ]) as u64
+                                } else {
+                                    u32::from_le_bytes([
+                                        buf[opt+56], buf[opt+57], buf[opt+58], buf[opt+59],
+                                    ]) as u64
+                                };
+                                // Build a minimal MappedImage and dump it.
+                                let img = mida_pe::dumper::MappedImage {
+                                    base: pe_base as u64,
+                                    region_size: size_img,
+                                    size_of_image: size_img as u32,
+                                    entry_point: ep_rva as u32,
+                                    import_rva: 0,
+                                    import_size: 0,
+                                    sections: Vec::new(),
+                                    is_mapped: false,
+                                };
+                                let pe_base_u64 = pe_base as u64;
+                                if !state.v2_dumped_bases.contains(&pe_base_u64) {
+                                    state.v2_dumped_bases.insert(pe_base_u64);
+                                    info!(
+                                        base = format!("{:#x}", pe_base),
+                                        size_img = format!("{:#x}", size_img),
+                                        ep = format!("{:#x}", ep_rva),
+                                        "V2: PE image found in payload region",
+                                    );
+                                    let pe_path = output_path.with_extension(format!(
+                                        "v2pe_{:x}.bin",
+                                        pe_base
+                                    ));
+                                    if let Ok(written) =
+                                        mida_pe::dumper::dump_mapped_image_raw_to(
+                                            &mut dbg,
+                                            &img,
+                                            &pe_path,
+                                        )
+                                    {
+                                        info!(
+                                            path = %pe_path.display(),
+                                            size = written,
+                                            "V2: PE image dumped (raw — offline rebuild needed)",
+                                        );
+                                        // Signal the pipeline to break.
+                                        state.v2_product_done = true;
+                                    }
+                                }
+                            }
+                        }
                     }
+                }
+
+                // V2: also scan the full process memory for PE images on
+                // CreateThread events (with cooldown).  The payload PE may
+                // be at a separate VirtualAlloc region, not near the thread
+                // start address.  The watch scan finds it via
+                // scan_mapped_images + scan_private_images.
+                if state.pe_info.themida_version
+                    == mida_packers_themida::ThemidaVersion::V2
+                    && state.v2_watch
+                    && !state.v2_product_done
+                {
+                    try_v2_watch_scan(
+                        &mut dbg,
+                        &mut state,
+                        image_base_usize,
+                        &output_path,
+                        started.elapsed().as_millis() as u64,
+                    );
                 }
 
                 // Note: the core's `wait_event` has already inserted the new
@@ -1691,6 +1825,13 @@ pub fn unpack(
         // in 7.5 s).  The V2 watch only runs in the timeout arm (line 418),
         // which is lighter.  The CreateThread handler is the primary
         // capture mechanism for the V2 payload (threads at 0x64xxxxxx).
+
+        // V2 product done: the CreateThread handler dumped the payload PE
+        // and built the product.  Break out of the debug loop.
+        if state.v2_product_done {
+            info!("V2: product built — breaking out of debug loop");
+            break;
+        }
     }
 
 /// Periodic scan for the classic shells' materialised image (Themida
@@ -1814,35 +1955,65 @@ fn try_exit_dump(
     {
         return;
     }
-    match mida_pe::dumper::scan_mapped_images(dbg, false) {
-        Ok(images) => {
-            let packed_base = image_base_usize as u64;
-        // Log every image found — the debug-level log in try_map_scan
-        // is suppressed at INFO level, so we log here at WARN to see
-        // what the process memory looks like at exit.
-        for img in &images {
-            warn!(
-                base = format!("{:#x}", img.base),
-                size_img = format!("{:#x}", img.size_of_image),
-                ep = format!("{:#x}", img.entry_point),
-                import_rva = format!("{:#x}", img.import_rva),
-                mapped = img.is_mapped,
-                "ExitProcess scan: image in memory",
-            );
+    let is_v2 = state.pe_info.themida_version
+        == mida_packers_themida::ThemidaVersion::V2;
+    // Use both scans: scan_mapped_images (region heads) + scan_private_images
+    // (deep MEM_PRIVATE scan).  The V2 payload PE may be at a non-region-head
+    // position inside a MEM_PRIVATE region.
+    let mut images = match mida_pe::dumper::scan_mapped_images(dbg, false) {
+        Ok(v) => v,
+        Err(_) => Vec::new(),
+    };
+    if let Ok(deep) = mida_pe::dumper::scan_private_images(dbg) {
+        for img in deep {
+            if !images.iter().any(|i| i.base == img.base) {
+                images.push(img);
+            }
         }
-        // Candidate filter: not the packed base, large enough, and BOTH
-        // import_rva==0 AND entry_point==0 (the shell scrubs both).
-        // Deliberately does NOT check `seen_image_bases` — the image may
-        // be at a base that was previously used by an unloaded DLL.
-        //
-        // Requiring both fields zero is critical: at ExitProcess the
-        // shell has finished decompressing and some DLLs may have had
-        // their entry point scrubbed (ep==0) but still carry a valid
-        // import directory (import_rva != 0).  Such images are false
-        // positives — measured: 0x76ec0000 (a DLL with ep==0 but
-        // import_rva=0x120750) was picked over the real materialised
-        // image at 0x4c00000 (ep==0, import_rva==0, mapped=true).
-        let candidate = images
+    }
+    // Log every image found.
+    for img in &images {
+        warn!(
+            base = format!("{:#x}", img.base),
+            size_img = format!("{:#x}", img.size_of_image),
+            ep = format!("{:#x}", img.entry_point),
+            import_rva = format!("{:#x}", img.import_rva),
+            mapped = img.is_mapped,
+            "ExitProcess scan: image in memory",
+        );
+    }
+    let packed_base = image_base_usize as u64;
+    let candidate = if is_v2 {
+        // V2: look for the payload PE — EP > 0 AND import_rva > 0.
+        // The V2 shell materialises a real PE image with valid EP and
+        // import directory.  Filter out system DLLs (in module snapshot
+        // or v2_dll_bases) and the packed base.
+        let module_bases: std::collections::HashSet<u64> =
+            match mida_pe::dumper::take_module_snapshot(
+                dbg.process_handle(),
+                dbg.pid(),
+                dbg.image_base(),
+                false,
+            ) {
+                Ok(mods) => mods.iter().map(|m| m.base()).collect(),
+                Err(_) => std::collections::HashSet::new(),
+            };
+        images
+            .iter()
+            .filter(|img| {
+                img.base != packed_base
+                    && img.size_of_image >= 0x10000
+                    && img.entry_point > 0
+                    && img.import_rva > 0
+                    && !module_bases.contains(&img.base)
+                    && !state.v2_dll_bases.contains(&img.base)
+            })
+            .max_by_key(|img| img.size_of_image)
+            .cloned()
+    } else {
+        // V1/Ancient: look for the materialised image — EP == 0 AND
+        // import_rva == 0 (the shell scrubs both).
+        images
             .iter()
             .filter(|img| {
                 img.base != packed_base
@@ -1851,28 +2022,25 @@ fn try_exit_dump(
                     && img.entry_point == 0
             })
             .max_by_key(|img| img.size_of_image)
-            .cloned();
-        if let Some(img) = candidate {
-            info!(
-                base = format!("{:#x}", img.base),
-                size_img = format!("{:#x}", img.size_of_image),
-                ep = format!("{:#x}", img.entry_point),
-                import_rva = format!("{:#x}", img.import_rva),
-                "Materialised image found at ExitProcess — dumping raw bytes for offline rebuild",
-            );
-            if let Err(e) = mida_pe::dumper::dump_mapped_image_raw(dbg, &img, output_path) {
-                warn!(error = %e, "Raw dump at ExitProcess failed");
-            }
-        } else {
-            warn!(
-                image_count = images.len(),
-                "No materialised image candidate at ExitProcess — offline rebuild unavailable",
-            );
+            .cloned()
+    };
+    if let Some(img) = candidate {
+        info!(
+            base = format!("{:#x}", img.base),
+            size_img = format!("{:#x}", img.size_of_image),
+            ep = format!("{:#x}", img.entry_point),
+            import_rva = format!("{:#x}", img.import_rva),
+            "Materialised image found at ExitProcess — dumping raw bytes for offline rebuild",
+        );
+        if let Err(e) = mida_pe::dumper::dump_mapped_image_raw(dbg, &img, output_path) {
+            warn!(error = %e, "Raw dump at ExitProcess failed");
         }
-        }
-        Err(e) => {
-            warn!(error = %e, "ExitProcess scan failed — offline rebuild unavailable");
-        }
+    } else {
+        warn!(
+            image_count = images.len(),
+            is_v2,
+            "No materialised image candidate at ExitProcess — offline rebuild unavailable",
+        );
     }
 }
 
@@ -2031,10 +2199,26 @@ fn try_v2_watch_scan(
     state: &mut ThemidaState,
     image_base_usize: usize,
     output_path: &std::path::Path,
+    elapsed_ms: u64,
 ) {
     if !state.v2_watch {
         return;
     }
+    // Cooldown: the scan is expensive (module snapshot + VirtualQueryEx on
+    // every region).  Without a cooldown, calling it on every CreateThread
+    // event during the shell's 30-thread storm hangs the pipeline.  500ms
+    // cooldown catches the payload PE (which appears within ~5s of the
+    // CloseHandle hit) while avoiding the storm.
+    if elapsed_ms > 0 && state.v2_last_watch_ms > 0
+        && elapsed_ms - state.v2_last_watch_ms < 500
+    {
+        return;
+    }
+    state.v2_last_watch_ms = elapsed_ms;
+    debug!(
+        elapsed_ms,
+        "V2 watch: scan triggered"
+    );
     // Fresh module snapshot per scan (same reasoning as the ancient watch:
     // a stale cache misses late-loading DLLs).
     let module_bases: std::collections::HashSet<u64> =
@@ -2060,15 +2244,47 @@ fn try_v2_watch_scan(
             }
         }
     }
+    debug!(
+        total_images = images.len(),
+        module_bases = module_bases.len(),
+        "V2 watch: image scan complete"
+    );
     // Candidates: not the packed base, not a registered module, not a
-    // tracked LoadDll base, big enough, VirtualAlloc'd (is_mapped=false),
-    // and at a LOW address (base < 0x60000000).  System DLLs are loaded at
-    // 0x60000000+ (measured: the module snapshot and LoadDll tracking both
-    // miss some DLLs during the shell's rapid load/unload cycles).  The
-    // shell's payload region — if it materialises as a PE image at all —
-    // would be at a lower address.  The CreateThread handler is the primary
-    // capture mechanism for the 0x64xxxxxx payload threads (run1: threads
-    // started at 0x64035dc0 etc.).
+    // tracked LoadDll base, big enough, and VirtualAlloc'd (is_mapped=false).
+    // No address-range filter: the payload PE can be at any base (measured:
+    // 0x6459f000, above the typical system-DLL range).  The LoadDll base
+    // tracking (`v2_dll_bases`) and module snapshot are the DLL filters.
+    // Log every non-packed image that passes the size check but fails
+    // another filter, so we can see what the PE looks like.
+    for img in &images {
+        if img.base == packed_base {
+            continue;
+        }
+        if img.size_of_image < 0x10000 {
+            continue;
+        }
+        if !module_bases.contains(&img.base)
+            && !state.v2_dll_bases.contains(&img.base)
+        {
+            // This is a candidate — will be handled below.
+            continue;
+        }
+        // Filtered out — log why (info level, not debug, so it shows
+        // without -v).
+        info!(
+            base = format!("{:#x}", img.base),
+            size_img = format!("{:#x}", img.size_of_image),
+            ep = format!("{:#x}", img.entry_point),
+            mapped = img.is_mapped,
+            in_module = module_bases.contains(&img.base),
+            in_dll = state.v2_dll_bases.contains(&img.base),
+            "V2 watch: image filtered out (module/dll)",
+        );
+    }
+    // Candidates: not the packed base, not a registered module, not a
+    // tracked LoadDll base, big enough.  No is_mapped filter — the V2
+    // payload PE can be file-mapped (measured: base 0x5070000, is_mapped
+    // =true).  The content check (MZ header) below is the real filter.
     let candidates: Vec<&mida_pe::dumper::MappedImage> = images
         .iter()
         .filter(|img| {
@@ -2076,31 +2292,71 @@ fn try_v2_watch_scan(
                 && img.size_of_image >= 0x10000
                 && !module_bases.contains(&img.base)
                 && !state.v2_dll_bases.contains(&img.base)
-                && !img.is_mapped
-                && img.base < 0x6000_0000
         })
         .collect();
-    if candidates.is_empty() {
+    // Second pass: also check module/dll images for a valid PE structure
+    // (EP > 0 AND import_rva > 0).  The V2 payload PE may be loaded as a
+    // module (in the module snapshot) — the non-module filter above would
+    // miss it.  System DLLs also have EP > 0 and import_rva > 0, but they
+    // have normal section names and large sizes; the payload PE has
+    // scrambled section names.  We can't easily distinguish them by PE
+    // header alone, so we dump any module image with EP > 0 AND
+    // import_rva > 0 that hasn't been dumped yet, and let the offline
+    // rebuild script filter by structure.
+    let module_candidates: Vec<&mida_pe::dumper::MappedImage> = images
+        .iter()
+        .filter(|img| {
+            img.base != packed_base
+                && img.size_of_image >= 0x10000
+                && (module_bases.contains(&img.base)
+                    || state.v2_dll_bases.contains(&img.base))
+                && img.entry_point > 0
+                && img.import_rva > 0
+                && !state.v2_dumped_bases.contains(&img.base)
+        })
+        .collect();
+    if !module_candidates.is_empty() {
+        info!(
+            count = module_candidates.len(),
+            "V2 watch: module images with valid PE structure (EP>0, import>0)"
+        );
+        for img in &module_candidates {
+            info!(
+                base = format!("{:#x}", img.base),
+                size_img = format!("{:#x}", img.size_of_image),
+                ep = format!("{:#x}", img.entry_point),
+                import_rva = format!("{:#x}", img.import_rva),
+                "V2 watch: module PE candidate",
+            );
+        }
+    }
+    // Combine both sets of candidates.
+    let all_candidates: Vec<&mida_pe::dumper::MappedImage> = candidates
+        .iter()
+        .cloned()
+        .chain(module_candidates.iter().cloned())
+        .collect();
+    if all_candidates.is_empty() {
         return;
     }
-    // Log all candidates at WARN for diagnostics.
-    for img in &candidates {
-        warn!(
+    // Log all candidates at INFO for diagnostics.
+    for img in &all_candidates {
+        info!(
             base = format!("{:#x}", img.base),
             size_img = format!("{:#x}", img.size_of_image),
             ep = format!("{:#x}", img.entry_point),
             import_rva = format!("{:#x}", img.import_rva),
             mapped = img.is_mapped,
-            "V2 watch: candidate image in non-DLL region",
+            "V2 watch: candidate image (content check pending)",
         );
     }
     // Dump each NEW candidate (dedup by base).  Use numbered filenames so
     // multiple candidates in one run are all preserved.
-    let n = state.v2_dumped_bases.len();
-    for img in &candidates {
+    for img in &all_candidates {
         if state.v2_dumped_bases.contains(&img.base) {
             continue;
         }
+        let n = state.v2_dumped_bases.len();
         state.v2_dumped_bases.insert(img.base);
         // Content check: read the first 0x400 bytes and log whether the
         // first 2 bytes are 'MZ' (PE header present) or not (raw code).
@@ -2113,6 +2369,10 @@ fn try_v2_watch_scan(
             mapped = img.is_mapped,
             "V2 watch: candidate content check",
         );
+        // Only dump images with MZ header (real PE images, not raw code).
+        if !has_mz {
+            continue;
+        }
         // Dump the image.
         let snap_path = output_path.with_extension(format!("v2raw{n:03}.bin"));
         match mida_pe::dumper::dump_mapped_image_raw_to(dbg, img, &snap_path) {
@@ -2391,18 +2651,28 @@ fn try_mapped_dump(
 }
 
     // ---- phases B/C/D: IAT repair, post-processing, dump ----
-    run_post_loop_phases(
-        &mut dbg,
-        &mut state,
-        &mut pe,
-        ls.oep,
-        is_dotnet,
-        is_64bit,
-        do_data_sections,
-        shrink,
-        input,
-        &output_path,
-    )?;
+    // V2: the product was already built by the CreateThread handler
+    // (dump_mapped_image_product).  Skip the post-loop phases — the OEP
+    // check would fail (V2 doesn't use the v3 .text guard path).
+    if state.v2_product_done {
+        log::log(
+            LogType::Good,
+            "V2 product built — skipping post-loop phases",
+        );
+    } else {
+        run_post_loop_phases(
+            &mut dbg,
+            &mut state,
+            &mut pe,
+            ls.oep,
+            is_dotnet,
+            is_64bit,
+            do_data_sections,
+            shrink,
+            input,
+            &output_path,
+        )?;
+    }
 
     log::log(LogType::Good, "Done.");
     Ok(())

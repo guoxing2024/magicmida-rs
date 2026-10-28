@@ -152,8 +152,8 @@ pub fn scan_private_images(
         // Probe only committed private regions large enough to hold an image.
         if mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE && region_size >= 0x10000 {
             let mut page = 0usize;
-            while page + 0x400 <= region_size {
-                let mut head = [0u8; 0x400];
+            while page + 0x1000 <= region_size {
+                let mut head = [0u8; 0x1000];
                 let ok = matches!(
                     debugger.read_memory(region_base + page, &mut head),
                     Ok(n) if n >= 0x200
@@ -164,7 +164,7 @@ pub fn scan_private_images(
                             if let Some(img) = parse_image(
                                 &head,
                                 mz_off,
-                                (region_base + page) as u64,
+                                (region_base + page + mz_off) as u64,
                                 (region_size - page) as u64,
                                 false,
                             ) {

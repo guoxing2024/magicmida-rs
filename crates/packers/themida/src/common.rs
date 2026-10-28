@@ -128,10 +128,17 @@ pub struct ThemidaState {
     /// Bases already dumped by the V2 watch (dedup: each payload region is
     /// dumped once, not at every event freeze).
     pub v2_dumped_bases: std::collections::HashSet<u64>,
+    /// V2 product build completed (the payload PE was dumped and the product
+    /// was written).  Signals the debug loop to break.
+    pub v2_product_done: bool,
     /// LoadDll bases tracked during the V2 watch (the module snapshot misses
     /// some DLLs during the shell's rapid load/unload cycles, so LoadDll
     /// events are the reliable filter).
     pub v2_dll_bases: std::collections::HashSet<u64>,
+    /// Last time try_v2_watch_scan was called (ms since pipeline start, for
+    /// cooldown — the scan is expensive and calling it on every CreateThread
+    /// event during the shell's 30-thread storm would hang the pipeline).
+    pub v2_last_watch_ms: u64,
     /// Module bases cached when the ancient watch started (the watch filter is
     /// "not the packed image and not a registered module"; re-taking the
     /// module snapshot at every event is too slow for the exit window).
@@ -206,7 +213,9 @@ impl ThemidaState {
             ancient_watch: false,
             v2_watch: false,
             v2_dumped_bases: std::collections::HashSet::new(),
+            v2_product_done: false,
             v2_dll_bases: std::collections::HashSet::new(),
+            v2_last_watch_ms: 0,
             ancient_module_bases: std::collections::HashSet::new(),
             ancient_snapshots: 0,
             idle_diag_done: false,

@@ -448,32 +448,36 @@ pub(super) fn handle_hw_breakpoint(
                 info!(
                     rip = %format_args!("{rip:#x}"),
                     is_nt_close = rip == apis.nt_close,
-                    "CloseHandle/NtClose hit — switching to .text write BP",
+                    "CloseHandle/NtClose hit",
                 );
-                // V2 (SecureEngine 2.x): the .text write BP (v3 path) never
-                // fires because V2 does not decompress .text in place after
-                // CloseHandle.  V2's payload runs from a shell VirtualAlloc'd
-                // region (threads start at 0x64035dc0 etc. with no LoadDll
-                // event).  Arm the V2 watch so the pipeline scans for new PE
-                // images in non-DLL regions after every debug event.
-                //
-                // MAGICMIDA_NO_V2_WATCH=1 disables this (diagnostic): the
-                // V2 watch's per-event scan overhead changes the shell's
-                // decode timing and causes it to hang (measured: run2-8 all
-                // timed out at 30-300 s, while run1 — before the V2 watch
-                // existed — finished in 7.5 s with the payload running).
+                // V2 (SecureEngine 2.x) 分管道：保留 .text 写 BP（实测：
+                // 不设 BP 时壳在 CloseHandle 后 ~38s 内 bail exit_code=2，
+                // 载荷线程永不创建；设了 BP 壳正常解码，载荷线程在
+                // 0x64035dc0 等壳 VirtualAlloc 区域启动——BP 虽不触发，
+                // 但其存在防止壳反调试 bail）。同时武装 v2_watch，
+                // CreateThread handler 会在载荷线程启动时 dump 载荷区。
                 if state.pe_info.themida_version
                     == mida_packers_themida::ThemidaVersion::V2
-                    && std::env::var("MAGICMIDA_NO_V2_WATCH").is_err()
                 {
                     state.v2_watch = true;
+                    dbg.clear_hw_breakpoint(0)?;
+                    dbg.set_hw_breakpoint(
+                        0,
+                        image_base_usize + 0x1000,
+                        mida_core::HwbpType::Write,
+                    )?;
+                    info!(
+                        "V2 pipeline: CloseHandle BP cleared, .text write BP set (anti-bail), watch armed"
+                    );
+                } else {
+                    info!("switching to .text write BP");
+                    dbg.clear_hw_breakpoint(0)?;
+                    dbg.set_hw_breakpoint(
+                        0,
+                        image_base_usize + 0x1000,
+                        mida_core::HwbpType::Write,
+                    )?;
                 }
-                dbg.clear_hw_breakpoint(0)?;
-                dbg.set_hw_breakpoint(
-                    0,
-                    image_base_usize + 0x1000,
-                    mida_core::HwbpType::Write,
-                )?;
             }
         } else if at_virtual_alloc {
             info!(

@@ -251,6 +251,39 @@ pub(crate) fn section_rva_to_file_offset(sections: &[crate::PeSection], rva: u32
     rva as usize // fallback
 }
 
+/// Find the memory region containing `addr` via `VirtualQueryEx`.
+/// Returns `(base, size)` of the committed region, or `None` if the
+/// address is not in a committed region.
+///
+/// Used by the V2 pipeline: the payload thread starts at an offset within
+/// a large VirtualAlloc region, but the payload PE header may be at the
+/// region's base (far from the thread start).  This lets the CreateThread
+/// handler dump the entire region instead of just 1 MB around the thread.
+pub fn query_region(
+    debugger: &dyn mida_core::DebuggerCore,
+    addr: u64,
+) -> Option<(u64, u64)> {
+    let h_process: windows::Win32::Foundation::HANDLE = debugger.process_handle();
+    let mut mbi: MEMORY_BASIC_INFORMATION = MEMORY_BASIC_INFORMATION::default();
+    let rc = unsafe {
+        VirtualQueryEx(
+            h_process,
+            Some(addr as *const std::ffi::c_void),
+            &mut mbi,
+            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    if rc != std::mem::size_of::<MEMORY_BASIC_INFORMATION>() {
+        return None;
+    }
+    if mbi.State != MEM_COMMIT {
+        return None;
+    }
+    let base = mbi.BaseAddress as u64;
+    let size = mbi.RegionSize as u64;
+    Some((base, size))
+}
+
 // Silence unused-import warnings in configurations that don't use everything.
 #[allow(unused_imports)]
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;

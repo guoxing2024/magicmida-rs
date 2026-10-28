@@ -42,7 +42,7 @@ mod tests;
 
 // Re-export public API
 pub use self::dump_process::{dump_dotnet, dump_process};
-pub use self::helpers::is_dotnet;
+pub use self::helpers::{is_dotnet, query_region};
 pub use self::original_imports::get_original_imports;
 pub use self::remote_modules::take_module_snapshot;
 pub use self::types::{DumpOptions, RemoteModule};
