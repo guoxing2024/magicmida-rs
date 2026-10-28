@@ -1197,3 +1197,42 @@ gdi32 系本轮做了静态形状验证：SysWOW64\gdi32.dll 的 995 个导出�
 277/1043 同形），推导机制适用。活体样本级验证需要 classic 样本带
 gdi32!NtGdi* 槽——语料样本（s1/s2）在管线内的壳行为不稳定（见上节
 1.1.1 的方差记录），本轮未取到活体命中；形状验证 + 机制单测构成当前证据。
+
+## V2 (SecureEngine 2.x) 战役：载荷区探测 + 诚实收束（2026-10-28）
+
+**样本**：`OUT/v1v2/unpackmes/x/WinLicense 2.0.6.5/(CISC-1) Examples-LCF-AT/CISC-1.exe`，
+Themida V2，x86，image_base 0x1000000，EP RVA 0x371000，6 节（节名随机化）。
+
+**命门复现**：CloseHandle 命中 → "switching to .text write BP" → BP 永不触发
+（V2 不在 CloseHandle 后原地解压 .text，v3 路径不适用）→ 管线等待 →
+壳要么跑完载荷 exit 2（run1，7.5s），要么 hang 25-300s（run2-9，12+ 次）。
+
+**V2 运行时形状（run1，唯一跑完的一次）**：
+1. CloseHandle 命中 → 壳创建 30 个线程（start=0x1022b62，在壳映像内）
+2. DLL 加载风暴（0x64xxxxxx 区域）
+3. 载荷线程启动（0x64035dc0、0x64031ad0、0x64155a70 等）——不在 LoadDll
+   列表里，是壳 VirtualAlloc 的载荷区
+4. 载荷真实运行两轮（线程 exit 0），DLL 卸载/重加载
+5. 壳线程集体 exit_code=2（反调试 bail，独立运行 >30s timeout）
+
+**载荷区探测机器（本轮落地，保留）**：
+- `try_exit_dump` 扩展到 V2：ExitProcess 时扫描所有映像，28 个全是系统 DLL
+  + 壳映像，无物化载荷
+- `v2_watch` + `try_v2_watch_scan`：CloseHandle 后周期扫描非 DLL 区域的 PE
+  映像。过滤后零真实候选——抓到的全是假阳性：
+  - 壳自身文件映射（0x3530000，与加壳文件前 0x1000 字节逐字节相同）
+  - imageres.dll（0x5040000，24MB，版本信息确认）
+  - 系统 DLL（模块快照漏了它们，加 v2_dll_bases 跟踪 + is_mapped=false +
+    base < 0x60000000 过滤后归零）
+- `CreateThread` handler：线程启动地址在壳映像和 DLL 之外时 dump 0x100000
+  字节。run1 的载荷线程（0x64035dc0）能触发，但 handler 在 run1 之后才加
+  入，从未实际抓到。
+- idle 诊断扩展到 V2：壳 hang 时主线程 IP=0x7646123c（系统 DLL wait）
+
+**A/B 定责**：提交前二进制（无 V2 改动）也 hang——只创建 2 个线程
+（0x1022b62）就停，卡 56s 被 timeout 杀。**hang 非管线改动导致，V2 壳本身
+方差极大**。run1（7.5s 跑完）是罕见的幸运快跑。
+
+**结论**：V2 载荷不物化 PE 映像（类似 1.8.2 的 raw stub），壳方差太大
+无法可靠捕获。不宣称 V2 脱壳可用。载荷区探测机器保留，对未来 V2 样本
+（若遇到壳行为稳定的样本）可用。
