@@ -415,6 +415,7 @@ pub fn unpack(
             Err(mida_core::CoreError::Timeout) => {
                 try_map_scan(&mut dbg, &mut state, image_base_usize, &output_path);
                 try_ancient_watch_scan(&mut dbg, &mut state, image_base_usize, &output_path);
+                try_v2_watch_scan(&mut dbg, &mut state, image_base_usize, &output_path);
                 // Workspace-stub trap (diagnostic), page-guard variant: at
                 // the first quiet timeout after the decode's probe
                 // exceptions, guard the page containing
@@ -519,9 +520,11 @@ pub fn unpack(
                 // thread's context + stack once — the wait object's caller
                 // chain is the evidence for what the shell expects to
                 // happen next.
-                if state.pe_info.themida_version
-                    == mida_packers_themida::ThemidaVersion::Ancient
-                    && !state.idle_diag_done
+                if matches!(
+                    state.pe_info.themida_version,
+                    mida_packers_themida::ThemidaVersion::Ancient
+                        | mida_packers_themida::ThemidaVersion::V2
+                ) && !state.idle_diag_done
                     && state
                         .last_event_at
                         .map(|t| t.elapsed().as_secs() >= 5)
@@ -708,6 +711,14 @@ pub fn unpack(
                 h_file,
             } => {
                 debug!(base = %format!("{base_address:#x}"), "DLL loaded");
+                // Track LoadDll bases for the V2 watch filter (the module
+                // snapshot misses some DLLs during the shell's rapid
+                // load/unload cycles).
+                if state.pe_info.themida_version
+                    == mida_packers_themida::ThemidaVersion::V2
+                {
+                    state.v2_dll_bases.insert(base_address as u64);
+                }
                 // SAFETY: h_file is valid per contract.
                 unsafe {
                     let _ = windows::Win32::Foundation::CloseHandle(h_file);
@@ -1187,6 +1198,60 @@ pub fn unpack(
                     "Thread created"
                 );
 
+                // V2 payload-region capture: when a thread starts at an
+                // address outside all loaded modules and outside the shell
+                // image, the shell has decoded the payload into a
+                // VirtualAlloc'd region and is executing it.  Dump the
+                // region around the start address — the payload may or may
+                // not have a PE header (V2's shape is unknown; measured:
+                // threads start at 0x64035dc0 etc. with no LoadDll event).
+                //
+                // Lightweight filter: avoid `take_module_snapshot` (expensive
+                // on 30 shell-thread creates).  First check the shell image
+                // range (image_base .. image_base+0x1000000 — generous upper
+                // bound; V2 scrambles SizeOfImage so the header value is
+                // unreliable).  Then check tracked LoadDll bases (estimated
+                // end = base + 0x100000, covers most DLLs).
+                if state.pe_info.themida_version
+                    == mida_packers_themida::ThemidaVersion::V2
+                    && state.v2_watch
+                {
+                    let sa = start_address as usize;
+                    let in_shell = sa >= image_base_usize
+                        && sa < image_base_usize + 0x1000_000;
+                    let in_dll = state.v2_dll_bases.iter().any(|&base| {
+                        (start_address as u64) >= base
+                            && (start_address as u64) < base + 0x100_000
+                    });
+                    if !in_shell && !in_dll {
+                        warn!(
+                            start = %format!("{start_address:#x}"),
+                            "V2: thread starts outside shell image and DLLs — payload region?",
+                        );
+                        // Dump 0x100000 bytes around the start address.
+                        let dump_start =
+                            (start_address as usize).saturating_sub(0x1000);
+                        let mut buf = vec![0u8; 0x100000];
+                        if dbg
+                            .read_memory(dump_start, &mut buf)
+                            .is_ok()
+                        {
+                            let dump_path = output_path
+                                .with_extension(format!(
+                                    "v2payload_{:x}.bin",
+                                    start_address
+                                ));
+                            if std::fs::write(&dump_path, &buf).is_ok() {
+                                info!(
+                                    path = %dump_path.display(),
+                                    addr = %format!("{start_address:#x}"),
+                                    "V2: payload region dumped",
+                                );
+                            }
+                        }
+                    }
+                }
+
                 // Note: the core's `wait_event` has already inserted the new
                 // thread handle and propagated DR state.  Nothing else to do.
                 dbg.continue_event(thread_id, ContinueStatus::Continue)?;
@@ -1619,6 +1684,13 @@ pub fn unpack(
         // only for the last tens of milliseconds before ExitProcess, and
         // each debug event is a freeze inside that window).
         try_ancient_watch_scan(&mut dbg, &mut state, image_base_usize, &output_path);
+        // NOTE: the V2 watch is NOT called here.  Running it after every
+        // event (measured: ~5-20 ms per event) changes the V2 shell's
+        // decode timing and causes it to hang (run2-7: all timed out at
+        // 30-300 s, while run1 — before the V2 watch existed — finished
+        // in 7.5 s).  The V2 watch only runs in the timeout arm (line 418),
+        // which is lighter.  The CreateThread handler is the primary
+        // capture mechanism for the V2 payload (threads at 0x64xxxxxx).
     }
 
 /// Periodic scan for the classic shells' materialised image (Themida
@@ -1737,6 +1809,7 @@ fn try_exit_dump(
         state.pe_info.themida_version,
         mida_packers_themida::ThemidaVersion::V1
             | mida_packers_themida::ThemidaVersion::Ancient
+            | mida_packers_themida::ThemidaVersion::V2
     ) || state.pending_mapped_dump.is_some()
     {
         return;
@@ -1935,6 +2008,125 @@ fn try_ancient_watch_scan(
         }
         Err(e) => {
             warn!(error = %e, snapshot = %snap_path.display(), "Exit-window watch snapshot failed");
+        }
+    }
+}
+
+/// V2 (SecureEngine 2.x) exit-window watch scan.  Runs after EVERY debug
+/// event once `state.v2_watch` is armed (armed at the CloseHandle hit).
+///
+/// V2's payload runs from a shell VirtualAlloc'd region (not a LoadDll
+/// base — measured: threads start at 0x64035dc0 etc. with no corresponding
+/// LoadDll event).  The .text write BP (v3 path) never fires for V2 because
+/// V2 does not decompress .text in place after CloseHandle.  This watch
+/// scans for new PE images in non-DLL regions and dumps them.
+///
+/// Unlike the ancient watch (which looks for double-zero signature images),
+/// V2's payload may carry a real PE header with valid ep/import_rva.  The
+/// filter is simply: not the packed base, not a registered module, big
+/// enough.  The largest candidate is dumped each time a NEW candidate
+/// appears (dedup by base to avoid re-dumping the same region).
+fn try_v2_watch_scan(
+    dbg: &mut ProcessSession,
+    state: &mut ThemidaState,
+    image_base_usize: usize,
+    output_path: &std::path::Path,
+) {
+    if !state.v2_watch {
+        return;
+    }
+    // Fresh module snapshot per scan (same reasoning as the ancient watch:
+    // a stale cache misses late-loading DLLs).
+    let module_bases: std::collections::HashSet<u64> =
+        match mida_pe::dumper::take_module_snapshot(
+            dbg.process_handle(),
+            dbg.pid(),
+            dbg.image_base(),
+            false,
+        ) {
+            Ok(mods) => mods.iter().map(|m| m.base()).collect(),
+            Err(_) => std::collections::HashSet::new(),
+        };
+    let packed_base = image_base_usize as u64;
+    // Scan both region-head and deep PRIVATE.
+    let mut images = match mida_pe::dumper::scan_mapped_images(dbg, false) {
+        Ok(v) => v,
+        Err(_) => Vec::new(),
+    };
+    if let Ok(deep) = mida_pe::dumper::scan_private_images(dbg) {
+        for img in deep {
+            if !images.iter().any(|i| i.base == img.base) {
+                images.push(img);
+            }
+        }
+    }
+    // Candidates: not the packed base, not a registered module, not a
+    // tracked LoadDll base, big enough, VirtualAlloc'd (is_mapped=false),
+    // and at a LOW address (base < 0x60000000).  System DLLs are loaded at
+    // 0x60000000+ (measured: the module snapshot and LoadDll tracking both
+    // miss some DLLs during the shell's rapid load/unload cycles).  The
+    // shell's payload region — if it materialises as a PE image at all —
+    // would be at a lower address.  The CreateThread handler is the primary
+    // capture mechanism for the 0x64xxxxxx payload threads (run1: threads
+    // started at 0x64035dc0 etc.).
+    let candidates: Vec<&mida_pe::dumper::MappedImage> = images
+        .iter()
+        .filter(|img| {
+            img.base != packed_base
+                && img.size_of_image >= 0x10000
+                && !module_bases.contains(&img.base)
+                && !state.v2_dll_bases.contains(&img.base)
+                && !img.is_mapped
+                && img.base < 0x6000_0000
+        })
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+    // Log all candidates at WARN for diagnostics.
+    for img in &candidates {
+        warn!(
+            base = format!("{:#x}", img.base),
+            size_img = format!("{:#x}", img.size_of_image),
+            ep = format!("{:#x}", img.entry_point),
+            import_rva = format!("{:#x}", img.import_rva),
+            mapped = img.is_mapped,
+            "V2 watch: candidate image in non-DLL region",
+        );
+    }
+    // Dump each NEW candidate (dedup by base).  Use numbered filenames so
+    // multiple candidates in one run are all preserved.
+    let n = state.v2_dumped_bases.len();
+    for img in &candidates {
+        if state.v2_dumped_bases.contains(&img.base) {
+            continue;
+        }
+        state.v2_dumped_bases.insert(img.base);
+        // Content check: read the first 0x400 bytes and log whether the
+        // first 2 bytes are 'MZ' (PE header present) or not (raw code).
+        let mut head = [0u8; 0x400];
+        let head_ok = dbg.read_memory(img.base as usize, &mut head).is_ok();
+        let has_mz = head_ok && head[0] == b'M' && head[1] == b'Z';
+        info!(
+            base = format!("{:#x}", img.base),
+            has_mz,
+            mapped = img.is_mapped,
+            "V2 watch: candidate content check",
+        );
+        // Dump the image.
+        let snap_path = output_path.with_extension(format!("v2raw{n:03}.bin"));
+        match mida_pe::dumper::dump_mapped_image_raw_to(dbg, img, &snap_path) {
+            Ok(written) => {
+                info!(
+                    snapshot = %snap_path.display(),
+                    base = format!("{:#x}", img.base),
+                    size = written,
+                    "V2 watch: raw snapshot taken",
+                );
+            }
+            Err(e) => {
+                warn!(error = %e, snapshot = %snap_path.display(), "V2 watch snapshot failed");
+            }
         }
     }
 }

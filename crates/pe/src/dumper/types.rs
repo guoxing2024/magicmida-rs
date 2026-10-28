@@ -84,6 +84,11 @@ impl RemoteModule {
         self.base
     }
 
+    /// End address of the module (`base + size`).
+    pub fn end(&self) -> u64 {
+        self.end_off
+    }
+
     /// Iterate the module's export table as `(address, name)` pairs.
     ///
     /// Export names are lowercase; ordinal-only exports surface as

@@ -450,6 +450,24 @@ pub(super) fn handle_hw_breakpoint(
                     is_nt_close = rip == apis.nt_close,
                     "CloseHandle/NtClose hit — switching to .text write BP",
                 );
+                // V2 (SecureEngine 2.x): the .text write BP (v3 path) never
+                // fires because V2 does not decompress .text in place after
+                // CloseHandle.  V2's payload runs from a shell VirtualAlloc'd
+                // region (threads start at 0x64035dc0 etc. with no LoadDll
+                // event).  Arm the V2 watch so the pipeline scans for new PE
+                // images in non-DLL regions after every debug event.
+                //
+                // MAGICMIDA_NO_V2_WATCH=1 disables this (diagnostic): the
+                // V2 watch's per-event scan overhead changes the shell's
+                // decode timing and causes it to hang (measured: run2-8 all
+                // timed out at 30-300 s, while run1 — before the V2 watch
+                // existed — finished in 7.5 s with the payload running).
+                if state.pe_info.themida_version
+                    == mida_packers_themida::ThemidaVersion::V2
+                    && std::env::var("MAGICMIDA_NO_V2_WATCH").is_err()
+                {
+                    state.v2_watch = true;
+                }
                 dbg.clear_hw_breakpoint(0)?;
                 dbg.set_hw_breakpoint(
                     0,

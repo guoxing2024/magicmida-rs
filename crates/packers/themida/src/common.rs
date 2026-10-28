@@ -116,7 +116,23 @@ pub struct ThemidaState {
     /// is a consistent catch of the window, and the best one (usually the
     /// last before the wipe) is picked offline.
     pub ancient_watch: bool,
-    /// Module bases cached when the watch started (the watch filter is
+    /// V2 (SecureEngine 2.x) exit-window watch.  Armed at the CloseHandle
+    /// hit.  V2's payload runs from a shell VirtualAlloc'd region (not a
+    /// LoadDll base — measured: threads start at 0x64035dc0 etc. with no
+    /// corresponding LoadDll event).  The .text write BP (v3 path) never
+    /// fires for V2 because V2 does not decompress .text in place after
+    /// CloseHandle.  The watch scans for new PE images in non-DLL regions
+    /// after every debug event, and also dumps the region around any
+    /// CreateThread start_address that lies outside all loaded modules.
+    pub v2_watch: bool,
+    /// Bases already dumped by the V2 watch (dedup: each payload region is
+    /// dumped once, not at every event freeze).
+    pub v2_dumped_bases: std::collections::HashSet<u64>,
+    /// LoadDll bases tracked during the V2 watch (the module snapshot misses
+    /// some DLLs during the shell's rapid load/unload cycles, so LoadDll
+    /// events are the reliable filter).
+    pub v2_dll_bases: std::collections::HashSet<u64>,
+    /// Module bases cached when the ancient watch started (the watch filter is
     /// "not the packed image and not a registered module"; re-taking the
     /// module snapshot at every event is too slow for the exit window).
     pub ancient_module_bases: std::collections::HashSet<u64>,
@@ -188,6 +204,9 @@ impl ThemidaState {
             main_thread_id: 0,
             seen_image_bases: std::collections::HashSet::new(),
             ancient_watch: false,
+            v2_watch: false,
+            v2_dumped_bases: std::collections::HashSet::new(),
+            v2_dll_bases: std::collections::HashSet::new(),
             ancient_module_bases: std::collections::HashSet::new(),
             ancient_snapshots: 0,
             idle_diag_done: false,
