@@ -1357,10 +1357,26 @@ Themida 阶梯样本裸跑能活、WinLicense 2.0.6.5 裸跑死——差的就�
 - **exit 时镜像快照与活体字节不同**——壳拆栈时重加密自己的代码，
   bail 命中瞬间（进程冻结在 ExitProcess 首指令）是唯一稳定视图。
 
-**下一步**：离线分析 bail 时镜像的 0x10e3000-0x10e4000 / 0x10a4000-0x10a5000
-→ 定位许可检查的条件跳转 → 下一跑内存补丁（跳过 bail）→ 壳继续走 →
-.text 解密 → 镜像快照抓到解码后的 calc → 按已知原程序（XP calc 公开可查）
-对账 + 重建产品。**devirt 不需要**——calc 从未被虚拟化。
+**bailtrace 迭代（同日第二轮）**：
+- 地址校验 bug：bail/time 分支最初只查槽配置没查异常地址——一次 GetLocalTime
+  命中（武装后 28ms）被误标成 bail，还清掉了 ExitProcess 的槽。修正后：
+  bail 分支要求 eip==ExitProcess 本尊，time 分支要求 eip==各自 API。
+- 观察 BP 从 CloseHandle 挪到进程启动：快 bail 变体 CloseHandle 后 15ms 就退，
+  检查在解码期就跑完了。exec 型 HW-BP 命中后必须 RF（EFlags|0x10000）再继续，
+  否则原地重触发。
+- **时间观察结论**：壳解码期只调一次 GetLocalTime（ret=0x107547e，武装后
+  28ms），GetTickCount 零调用。0x107547e 的调用链是 `push <续址>;
+  jmp 0x102888a` thunk 链——解析器 BP（slot 2 = 0x102888a）一次拿到
+  **127 个按序 API 调用点**，全部落在加壳镜像第 4 节（ASLR 基址下
+  RVA 0x2bxxxx）——**壳的引擎按块解密在镜像大节里，用完即再加密**（快照
+  熵 7.74 的原因；1.8.2 瞬态明文同款机制）。ExitProcess 无静态引用
+  （运行期解析，`call [edx+disp]` 寄存器分发表）；栈上 13 个候选
+  返回址经 bail 镜像验证**全都不是真返回址**（前面没有 call 操作码）——
+  壳的栈充满 push/ret 混淆残渣，栈回溯不可信。
+- 下一增量：resolver 命中时读名字指针出 API 名（名字表在节内数据区/
+  工作区）→ bail 前的最后几个调用 = 检查行为 → 对症补丁（时间 shim 或
+  条件跳转翻转）→ .text 解密 → 快照抓解码后 calc（XP calc 公开可对账）
+  → 重建产品。**devirt 不需要**——calc 从未被虚拟化。
 
 ## V2 (SecureEngine 2.x) 战役：历史小节（均已推翻，仅供追溯）
 
