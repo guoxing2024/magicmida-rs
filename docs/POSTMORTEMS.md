@@ -1405,6 +1405,30 @@ GetLocalTime ret=0x107547e）——差异纯在采样频率。
 工作区 dump 全线皆零（壳 bail 前清零工作区）——名字表不可回收，
 代码本身带比较常量（过期日期），走反汇编路线。
 
+## V2：检查点 = 壳自修改块；shim 两条路线实测（2026-10-29，未发布）
+
+**检查点定位（GetLocalTime 命中 dump）**：壳的检查在镜像 RVA 0x75404 附近
+调用 GetLocalTime——ret=0x107547e（thunk 区 push），SYSTEMTIME 缓冲区
+st=0x1075404；同一次解码期还有第二次调用（ret=0x110871c / st=0x11038e7）。
+
+**壳的自修改设计（shim 实测暴露）**：SYSTEMTIME 缓冲区 = **检查代码自己的
+块**——壳把检查块解码进镜像大节，GetLocalTime 把 SYSTEMTIME 写进该块
+（覆盖检查代码），块用完即弃、下次再解码。证据：补丁式 shim（API 首字节
+改 ret）在写假日期后，壳的**指令地址 0x1075404**（= 缓冲区地址）读
+0xffffffff → AccessViolation 循环 1024 次 → 管线 FATAL（stuck loop）。
+跳过式 shim（esp+=8, rip=ret）不写缓冲区，但破坏壳解析器状态 →
+154 次垃圾 ret（0x62d81111）循环后 bail exit 2。
+
+**引擎代码不可离线读**：GetLocalTime 命中时工作区 2MB dump **pages_ok=0**
+（全部读失败）——引擎区 execute-only 或已搬走；bail 时工作区全零（壳清零）；
+bail 快照里引擎代码已重新加密（整镜像熵 ~7.9）。检查代码（比较常量 =
+过期日期）三条采集路线全部不可达。
+
+**结论**：检查 hunt 的下一步不是继续 shim（壳的自修改设计让任何写缓冲区
+的 shim 都摧毁检查代码），而是**在 API 层做假日期注入的第三种形状**——
+让 API 自己把假 SYSTEMTIME 写进缓冲区（补丁 API 的写入指令，而非外部
+write_memory），或直接找检查的比较常量（需要先解决引擎区读取）。
+
 ## V2 (SecureEngine 2.x) 战役：历史小节（均已推翻，仅供追溯）
 
 **"载荷区探测 + 诚实收束"（2026-10-28）**：A/B 定责壳方差大、hang 非管线
