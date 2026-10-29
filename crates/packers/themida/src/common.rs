@@ -167,6 +167,9 @@ pub struct ThemidaState {
     /// the first 64 KB is still zero/undecoded, gets recorded as "scanned"
     /// and is then skipped forever — even after the code lands in it.
     pub v2_headless_revisit: std::collections::HashMap<u64, u64>,
+    /// Number of runtime-copy snapshots taken (capped: the copy dumps
+    /// every watch tick to track the decode progression).
+    pub v2_copy_dumps: usize,
     /// Module bases cached when the ancient watch started (the watch filter is
     /// "not the packed image and not a registered module"; re-taking the
     /// module snapshot at every event is too slow for the exit window).
@@ -249,6 +252,7 @@ impl ThemidaState {
             v2_headless_dump_count: 0,
             v2_image_snapshot_taken: false,
             v2_headless_revisit: std::collections::HashMap::new(),
+            v2_copy_dumps: 0,
             ancient_module_bases: std::collections::HashSet::new(),
             ancient_snapshots: 0,
             idle_diag_done: false,

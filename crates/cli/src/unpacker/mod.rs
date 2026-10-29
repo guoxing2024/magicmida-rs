@@ -1093,6 +1093,20 @@ pub fn unpack(
                             }
                         }
                     }
+                    // V2: arm the watch from process start, not at the
+                    // CloseHandle hit.  Measured on the fast-bail variants:
+                    // the shell reaches its ExitProcess bail BEFORE calling
+                    // CloseHandle at all — the CloseHandle hit never fires,
+                    // v2_watch never armed, and the runtime image copy the
+                    // shell decodes into (measured: a full PE copy at
+                    // 0x3690000, same size/EP as the packed image; the
+                    // shell decrypts .rsrc/.text there, not in the original
+                    // at 0x1000000) is never seen by the watch scan.
+                    if state.pe_info.themida_version
+                        == mida_packers_themida::ThemidaVersion::V2
+                    {
+                        state.v2_watch = true;
+                    }
                     // V2 bailtrace: arm the observation slots at process
                     // START, not at the CloseHandle hit.  Measured: the bail
                     // can land within 15 ms of the CloseHandle hit, and the
@@ -2956,6 +2970,73 @@ fn try_v2_watch_scan(
             mapped = img.is_mapped,
             "V2 watch: candidate image (content check pending)",
         );
+    }
+    // The runtime copy: a full PE image with the same size/EP shape as
+    // the packed image, materialised by the shell in its own mapping
+    // (measured: base 0x3690000, size 0x372000, EP 0x371000 — the shell
+    // decodes .rsrc/.text INTO the copy, so the copy's content changes
+    // over time while the original at 0x1000000 stays frozen).  When
+    // found: arm the .text write BP on the copy's first section (the
+    // anti-bail BP the V2 branch arms targets the ORIGINAL's .text and
+    // never fires) and dump the copy EVERY tick — the decode progression
+    // is the evidence the periodic one-shot dumps cannot show.
+    let packed_size = state.pe_info.pe_sections.iter()
+        .map(|s| s.virtual_address as u64 + s.virtual_size as u64)
+        .max()
+        .unwrap_or(0);
+    let packed_ep = state.pe_info.packed_entry_point as u64;
+    let mut copy_base: Option<u64> = None;
+    for img in &images {
+        if img.base != packed_base
+            && img.size_of_image as u64 >= packed_size * 0x9 / 0x10
+            && img.size_of_image as u64 <= packed_size + 0x10000
+            && img.entry_point as u64 == packed_ep
+            && !img.is_dll
+        {
+            if copy_base != Some(img.base) {
+                copy_base = Some(img.base);
+                info!(
+                    base = format!("{:#x}", img.base),
+                    size_img = format!("{:#x}", img.size_of_image),
+                    ep = format!("{:#x}", img.entry_point),
+                    "V2: runtime image copy found — arming .text write BP on the copy",
+                );
+                // Slot 1 is free outside bailtrace mode; in bailtrace
+                // mode all slots are busy and the periodic copy dumps
+                // compensate.
+                if std::env::var("MAGICMIDA_V2_BAILTRACE").is_err() {
+                    if let Err(e) = dbg.set_hw_breakpoint(
+                        1,
+                        img.base as usize + 0x1000,
+                        mida_core::HwbpType::Write,
+                    ) {
+                        warn!(error = %e, "V2 copy: .text write BP arming failed");
+                    }
+                }
+            }
+        }
+    }
+    if let Some(cb) = copy_base {
+        // Copy dump every tick (decode progression evidence), capped.
+        if state.v2_copy_dumps < 24 {
+            state.v2_copy_dumps += 1;
+            let snap_path = output_path.with_extension(format!(
+                "v2copy_{:03}.bin",
+                state.v2_copy_dumps
+            ));
+            if let Ok(written) = mida_pe::dumper::dump_mapped_image_raw_to(
+                dbg,
+                images.iter().find(|i| i.base == cb).unwrap(),
+                &snap_path,
+            ) {
+                info!(
+                    snapshot = %snap_path.display(),
+                    base = format!("{cb:#x}"),
+                    size = written,
+                    "V2: copy snapshot (decode progression)",
+                );
+            }
+        }
     }
     // Dump each NEW candidate (dedup by base).  Use numbered filenames so
     // multiple candidates in one run are all preserved.
