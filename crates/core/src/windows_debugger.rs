@@ -979,9 +979,16 @@ impl DebuggerCore for WindowsDebugger {
                 } else if self.post_attach && (hresult & 0xFFFF) == 6 {
                     // Post-attach mode: the process is NOT being debugged, so
                     // `WaitForDebugEvent` fails with ERROR_INVALID_HANDLE (6)
-                    // on every poll.  That is the expected polling cadence —
-                    // map it to `Timeout` so the unpack loop's scan branches
-                    // (try_map_scan / watch scans) run on the poll interval.
+                    // *immediately* on every poll — unlike a real debug-object
+                    // timeout, which consumes the requested interval first.
+                    // Without sleeping here the caller's poll loop busy-spins
+                    // at full CPU (measured: thousands of "ticks" per second),
+                    // and any per-tick sampling (RIPSAMPLE / RECORD_PHASE /
+                    // FREEZE_RVA) turns into a SuspendThread storm that
+                    // stalls the shell's engine.  Sleep the requested
+                    // interval so the cadence the caller asked for is the
+                    // cadence it actually gets.
+                    std::thread::sleep(std::time::Duration::from_millis(timeout_ms.into()));
                     Err(CoreError::Timeout)
                 } else {
                     Err(CoreError::Windows(hresult & 0xFFFF))
@@ -1009,7 +1016,12 @@ impl DebuggerCore for WindowsDebugger {
                 }
                 if self.post_attach && (hresult & 0xFFFF) == 6 {
                     // Post-attach: not debugged → ERROR_INVALID_HANDLE on
-                    // every poll (same mapping as wait_event_timeout).
+                    // every poll (same mapping as wait_event_timeout, which
+                    // also sleeps there — see that comment for why the sleep
+                    // is load-bearing).  This no-timeout variant has no
+                    // caller-requested interval; 100 ms keeps a post-attach
+                    // caller from busy-spinning.
+                    std::thread::sleep(std::time::Duration::from_millis(100));
                     return Err(CoreError::Timeout);
                 }
                 return Err(CoreError::Windows(hresult & 0xFFFF));

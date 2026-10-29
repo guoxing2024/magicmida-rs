@@ -375,20 +375,6 @@ pub(super) fn sample_main_rip(dbg: &mut ProcessSession) -> Option<(usize, usize,
     Some((ctx.Eip as usize, ctx.Esp as usize, code, stack))
 }
 
-/// Cheap non-suspending probe of the main thread's RIP: GetThreadContext
-/// on a RUNNING thread returns whatever context the kernel last saved —
-/// stale by up to one scheduler quantum, but it costs zero disruption
-/// (no SuspendThread), which matters because sustained suspension during
-/// the decode phase stalls the shell's timing-sensitive engine (measured
-/// 2026-10-30: flat sampling from t=5 hung three runs that otherwise exit
-/// in 9-26 s).  Used purely as the trigger for the real suspending burst.
-#[cfg(target_arch = "x86")]
-pub(super) fn probe_main_rip_nosuspend(dbg: &mut ProcessSession) -> Option<usize> {
-    let tid = dbg.main_thread_id();
-    let ctx = dbg.get_thread_context_control(tid).ok()?;
-    Some(ctx.Eip as usize)
-}
-
 /// V2 post-attach freeze-on-RIP: sample the main thread; when RIP's RVA
 /// falls inside `[lo, hi)` the thread is LEFT SUSPENDED and the full bail
 /// scene is dumped (see [`dump_v2_bail_scene`]) — this is the unpatched
@@ -590,6 +576,79 @@ fn dump_v2_bail_scene(
                     );
                     // SAFETY: h_snap is a valid snapshot handle; me is sized.
                     if unsafe { Module32NextW(h_snap, &mut me) }.is_err() {
+                        break;
+                    }
+                }
+            }
+            // SAFETY: handle from CreateToolhelp32Snapshot.
+            unsafe {
+                let _ = CloseHandle(h_snap);
+            }
+        }
+    }
+
+    // All-threads park map: the frozen main thread is often just the
+    // *symptom* — the engine's wait typically depends on a worker's
+    // completion.  Suspend every thread of the target and log where each
+    // one is parked (RIP; match against the module list above offline).
+    {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Diagnostics::Debug::{GetThreadContext, CONTEXT};
+        use windows::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Thread32First, Thread32Next, THREADENTRY32,
+            TH32CS_SNAPTHREAD,
+        };
+        use windows::Win32::System::Threading::{
+            OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_SUSPEND_RESUME,
+        };
+        let pid = dbg.pid();
+        // SAFETY: pid 0 = system-wide thread snapshot; handle closed below.
+        if let Ok(h_snap) = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) } {
+            let mut te = THREADENTRY32::default();
+            te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+            // SAFETY: h_snap is a valid snapshot handle; te is sized.
+            if unsafe { Thread32First(h_snap, &mut te) }.is_ok() {
+                loop {
+                    if te.th32OwnerProcessID == pid {
+                        // SAFETY: tid from the snapshot; handle closed below.
+                        if let Ok(h) = unsafe {
+                            OpenThread(
+                                THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME,
+                                false,
+                                te.th32ThreadID,
+                            )
+                        } {
+                            // SAFETY: valid thread handle.
+                            let prev = unsafe { SuspendThread(h) };
+                            if prev != u32::MAX {
+                                let mut ctx = CONTEXT::default();
+                                ctx.ContextFlags =
+                                    windows::Win32::System::Diagnostics::Debug::CONTEXT_FLAGS(
+                                        0x0001_0003,
+                                    );
+                                // SAFETY: valid handle and sized CONTEXT.
+                                if unsafe { GetThreadContext(h, &mut ctx) }.is_ok() {
+                                    info!(
+                                        tid = te.th32ThreadID,
+                                        is_main = te.th32ThreadID == dbg.main_thread_id(),
+                                        eip = format!("{:#x}", ctx.Eip),
+                                        esp = format!("{:#x}", ctx.Esp),
+                                        "V2 BAIL SCENE: thread park"
+                                    );
+                                }
+                                // SAFETY: thread suspended above.
+                                unsafe {
+                                    let _ = ResumeThread(h);
+                                }
+                            }
+                            // SAFETY: handle from OpenThread.
+                            unsafe {
+                                let _ = CloseHandle(h);
+                            }
+                        }
+                    }
+                    // SAFETY: h_snap is a valid snapshot handle; te is sized.
+                    if unsafe { Thread32Next(h_snap, &mut te) }.is_err() {
                         break;
                     }
                 }

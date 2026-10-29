@@ -604,49 +604,63 @@ pub fn unpack(
                 } else if rip_sample_on && post_attach {
                     if let Some((rip, esp, _code, stack)) = helpers::sample_main_rip(&mut dbg) {
                         rip_samples.push((started.elapsed().as_secs_f64(), rip, esp, stack));
+                        // Periodic trajectory rewrite: the exit-dump only
+                        // runs when the shell exits on its own — a run
+                        // killed by the outer timeout would otherwise leave
+                        // nothing (measured: the stall point differs per
+                        // run, and the stall IS the question).
+                        if rip_samples.len() % 200 == 0 {
+                            let mut blob = Vec::new();
+                            for (t, rip, _esp, _stack) in &rip_samples {
+                                blob.extend_from_slice(&((*t * 1000.0) as u32).to_le_bytes());
+                                blob.extend_from_slice(&(*rip as u32).to_le_bytes());
+                            }
+                            let rname = output_path
+                                .file_stem()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| "v2rip".to_string());
+                            let rpath = output_path
+                                .parent()
+                                .unwrap_or(std::path::Path::new("."))
+                                .join(format!("{rname}.v2riptraj.bin"));
+                            let _ = std::fs::write(&rpath, &blob);
+                        }
                     }
                 }
                 // Phase recorder: engine-pool executions during the license
-                // window, with the plaintext code bytes at RIP.  Two stages:
-                // a non-suspending stale-context probe (zero disruption) at
-                // the baseline tick, and — only while the probe reports the
-                // thread inside the engine pool — a 2 s suspending burst at
-                // 5 ms that reads the code bytes.  The exit timing varies
-                // wildly (measured 9 s — 211 s), so the blob is rewritten
-                // every 1000 samples.
+                // window, with the plaintext code bytes at RIP.  Real
+                // suspending samples at the baseline tick (50 ms ≈ 20 Hz —
+                // ~0.1% overhead, versus the pre-sleep-fix busy-spin that
+                // sampled at ~2 kHz and stalled the shell); a pool hit
+                // opens a 2 s burst at 5 ms.  The stale-context probe was
+                // removed: for CPU-bound threads the kernel-saved EIP
+                // never refreshes (measured: the probe fired only during
+                // the first 0.5 s, then went blind exactly when the decode
+                // started running flat out).
                 #[cfg(target_arch = "x86")]
                 if recording_now && post_attach {
-                    if in_burst {
-                        if let Some((rip, _esp, code, _stack)) = helpers::sample_main_rip(&mut dbg)
-                        {
-                            let rva = rip.wrapping_sub(image_base_usize);
-                            if (0x28000..0x40000).contains(&rva) {
-                                phase_samples
-                                    .push((started.elapsed().as_millis() as u32, rip, code));
-                                burst_until_ms = started.elapsed().as_millis() + 2000;
-                                if phase_samples.len() % 1000 == 0 {
-                                    let mut blob = Vec::new();
-                                    for (ms, rip, code) in &phase_samples {
-                                        blob.extend_from_slice(&ms.to_le_bytes());
-                                        blob.extend_from_slice(&(*rip as u32).to_le_bytes());
-                                        blob.extend_from_slice(code);
-                                    }
-                                    let pname = output_path
-                                        .file_stem()
-                                        .map(|s| s.to_string_lossy().into_owned())
-                                        .unwrap_or_else(|| "v2phase".to_string());
-                                    let ppath = output_path
-                                        .parent()
-                                        .unwrap_or(std::path::Path::new("."))
-                                        .join(format!("{pname}.v2phase.bin"));
-                                    let _ = std::fs::write(&ppath, &blob);
-                                }
-                            }
-                        }
-                    } else if let Some(rip) = helpers::probe_main_rip_nosuspend(&mut dbg) {
+                    if let Some((rip, _esp, code, _stack)) = helpers::sample_main_rip(&mut dbg) {
                         let rva = rip.wrapping_sub(image_base_usize);
                         if (0x28000..0x40000).contains(&rva) {
+                            phase_samples.push((started.elapsed().as_millis() as u32, rip, code));
                             burst_until_ms = started.elapsed().as_millis() + 2000;
+                            if phase_samples.len() % 100 == 0 {
+                                let mut blob = Vec::new();
+                                for (ms, rip, code) in &phase_samples {
+                                    blob.extend_from_slice(&ms.to_le_bytes());
+                                    blob.extend_from_slice(&(*rip as u32).to_le_bytes());
+                                    blob.extend_from_slice(code);
+                                }
+                                let pname = output_path
+                                    .file_stem()
+                                    .map(|s| s.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| "v2phase".to_string());
+                                let ppath = output_path
+                                    .parent()
+                                    .unwrap_or(std::path::Path::new("."))
+                                    .join(format!("{pname}.v2phase.bin"));
+                                let _ = std::fs::write(&ppath, &blob);
+                            }
                         }
                     }
                 }

@@ -1405,6 +1405,40 @@ GetLocalTime ret=0x107547e）——差异纯在采样频率。
 工作区 dump 全线皆零（壳 bail 前清零工作区）——名字表不可回收，
 代码本身带比较常量（过期日期），走反汇编路线。
 
+## V2：post-attach 忙转缺陷 + 对话框停车定案（2026-10-30 深夜，未发布）
+
+**真缺陷：post-attach 轮询从不等待（忙转 2 kHz）**——`WaitForDebugEvent`
+对无端口进程**立即**返回 ERROR_INVALID_HANDLE，映射成 Timeout 后调用方的
+"500 ms 轮询"实为全速空转（实测每秒数千次 tick，一个核 100%）。所有采样
+模式（RIPSAMPLE/RECORD/FREEZE）因此变成每秒数千次 `SuspendThread` 风暴；
+此前把三连挂归因"采样扰动""环境负载"各错一轮。修：post-attach 的
+Timeout 映射处真 `sleep(timeout_ms)`（wait_event 无参版补 100 ms）。
+**教训：把一个"立即返回的错误"映射成"超时"时，超时的语义（消耗时间）
+必须由映射方补齐。**
+
+**停车 run = 对话框在等点击（不是挂死）**：晚间的 run 亚秒级跑完
+license 相位（比下午的 21.7 s 快得多），弹出硬件锁对话框后**全线程停车
+等 OK**——主线程 win32u（GUI 系统调用）、全部 worker ntdll 等待桩、
+零 CPU、无 socket。窗口枚举实锤：`#32770` 类、标题 CALC、**可见**。
+下午与晚间的差异是壳走了不同分支（下午：解码 → 硬件锁失败；晚间：
+跳过解码 → 直达 trial-nag 分支——场景代码里有 "This is a …tion"
+字符串解密立即数），触发器未定位。
+
+**会话级停滞排查 10 连排除**（裸跑也挂、换路径拷贝也挂 = 全局状态）：
+机器负载、采样扰动、锁屏（截图验证桌面活跃）、注册表（键名+值双 diff
+零变化）、socket（netstat 空）、TSF/输入服务重启、GDI/桌面堆（大户
+explorer 187 句柄，正常）、僵尸进程（无）、路径派生命名对象（换名照挂）、
+WeType 全家重启（照挂）。**剩余杠杆：重启/注销登录会话**（04:30 由
+用户侧决定）。
+
+**机器增量**：bail 场景新增**全线程停车图**（ToolHelp 线程快照 +
+OpenThread 逐个 SuspendThread/GetThreadContext，主线程已挂起时挂起计数
+平衡）；RIPSAMPLE 轨迹每 200 样本周期落盘（被杀不丢）；RECORD_PHASE
+周期落盘阈值 1000→100（license 相位只有 ~40 样本量）；**陈旧上下文探针
+移除**——`GetThreadContext` 不挂起时返回内核上次保存的上下文，对
+CPU 密集线程永不刷新（实测探针只在前 0.5 s 触发，解码一开跑就全盲）；
+真实 20 Hz 挂起采样替代（开销 ~0.1%）。
+
 ## V2：post-attach 打通 + 硬件锁定案（2026-10-30，未发布）
 
 **post-attach 移植成功（上游 magicmida vNext 模式）**：V2 样本改走
