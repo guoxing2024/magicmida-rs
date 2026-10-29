@@ -1387,3 +1387,24 @@ Themida 阶梯样本裸跑能活、WinLicense 2.0.6.5 裸跑死——差的就�
 XOR 编码——**全部是 dd[0]/dd[1] 假阳性 + 错误基址归因的产物**，见上节铁证
 清单。载荷区探测机器（`try_exit_dump`/`v2_watch`/CreateThread handler）
 保留。
+
+## 环境突变：组织 Device Guard 策略封掉样本语料（2026-10-29，环境回归）
+
+今日 ~02:06 UTC（约 10:06 本地）起，本机的**组织 Device Guard 策略**开始
+阻止受保护样本语料的进程创建：
+- CISC-1.exe 裸跑与管线 CreateProcessW 均 `0x8007109A`（"应用程序控制策略
+  已阻止此文件"；cmd 直跑报"已被组织的 Device Guard 策略阻止"）。
+- UnPackMe_Themida 1.9.1.0 同命。
+- **我们的工具/测试二进制全部放行**（mida-cli x64/x86、各 gate 测试二进制、
+  golden_product.exe 实测运行）；被堵的只是 crackme 语料本身（哈希/信誉级，
+  非路径级——Temp 拷贝同样被堵）。
+- 连带：三个 e2e gate 的 debuggee 是受保护样本 → DLL/EXE gate 现红（管线
+  在创建 debuggee 处失败，非哈希漂移）；x86 gate 同。默认单元套件
+  （413 passed / 0 failed）不受影响。
+- 瞬态：vmprotect_packed_gate 有一次 os error 4551（cargo spawn 被堵），
+  直接执行与随后 cargo test 复跑均正常——策略部署中的瞬态。
+
+**波及**：V2 线的全部实跑（bailtrace 重试循环、镜像快照）与经典线样本的
+实跑在策略解除前无法进行。离线资产全部在（bail 镜像、127 个解析器调用
+点、WeType 判定、XP calc 定案）。**V2 实跑战役暂停，等待策略放行**。
+策略归属组织，解封路径需用户侧决定。
