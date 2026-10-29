@@ -515,43 +515,44 @@ pub(super) fn handle_hw_breakpoint(
             if dbg.read_memory(sp, &mut stack).is_ok() {
                 let ret =
                     u32::from_le_bytes(stack[0..4].try_into().unwrap()) as usize;
-                // Resolver body reads the name pointer at [esp+0x24]
-                // (measured on the decoded 0x102888bb: `mov esi,
-                // [esp+0x24]`).  Dump the raw stack head here; offline
-                // correlation maps the slots to API names.
                 let mut raw = [0u8; 0x40];
                 let _ = dbg.read_memory(sp, &mut raw);
-                // Inline name extraction: the resolver reads the name
-                // pointer at [esp+0x24] (measured `mov esi, [esp+0x24]`
-                // at decoded 0x102888bb).  The name strings live in the
-                // shell's workspace region (absolute addresses 0x122bxxxx,
-                // outside the packed image — the image carries zero API
-                // names), so read the string directly and log it per hit.
-                let name_ptr = u32::from_le_bytes(raw[0x24..0x28].try_into().unwrap()) as usize;
-                let mut name_buf = [0u8; 80];
-                let name = if name_ptr > 0x10000
-                    && dbg.read_memory(name_ptr, &mut name_buf).is_ok()
-                {
-                    let end =
-                        name_buf.iter().position(|&b| b == 0).unwrap_or(name_buf.len());
-                    String::from_utf8_lossy(&name_buf[..end]).into_owned()
-                } else {
-                    String::new()
-                };
-                let dwords: Vec<String> = raw
-                    .chunks_exact(4)
-                    .map(|c| format!("{:#x}", u32::from_le_bytes(c.try_into().unwrap())))
-                    .collect();
+                // Multi-slot name probe: the resolver's entry-time
+                // stack layout is not pinned (its own prologue shifts
+                // esp before it reads the name).  Dump the raw stack as
+                // HEX plus every 4-byte slot's readable string, so the
+                // offline analysis can map slot -> name without another
+                // live run.  Name-looking = ASCII letters/digits/_ 4-32
+                // chars (the shell's API names are plain ASCII).
+                let mut name_hits: Vec<(usize, String)> = Vec::new();
+                for (slot_off, chunk) in raw.chunks_exact(4).enumerate() {
+                    let name_ptr =
+                        u32::from_le_bytes(chunk.try_into().unwrap()) as usize;
+                    if name_ptr < 0x10000 {
+                        continue;
+                    }
+                    let mut nb = [0u8; 64];
+                    if dbg.read_memory(name_ptr, &mut nb).is_ok() {
+                        let end = nb.iter().position(|&b| b == 0).unwrap_or(nb.len());
+                        let str = String::from_utf8_lossy(&nb[..end]).into_owned();
+                        let looks_like_name = !str.is_empty()
+                            && str.len() <= 32
+                            && str.bytes().all(|b| {
+                                b.is_ascii_alphanumeric() || b == b'_' || b == b'.'
+                            });
+                        if looks_like_name {
+                            name_hits.push((slot_off * 4, str));
+                        }
+                    }
+                }
                 info!(
                     api = label,
                     slot,
                     ret = format!("{ret:#x}"),
                     esp = format!("{sp:#x}"),
-                    name = %name,
-                    stack = ?dwords,
-                    "V2 BAILTRACE: resolver hit (raw stack + caller)"
-                );
-                #[cfg(target_arch = "x86")]
+                    names = ?name_hits,
+                    "V2 BAILTRACE: resolver hit (multi-slot name probe)"
+                );                #[cfg(target_arch = "x86")]
                 info!(
                     eax = format!("{:#x}", ctx.Eax),
                     ecx = format!("{:#x}", ctx.Ecx),
@@ -561,6 +562,21 @@ pub(super) fn handle_hw_breakpoint(
                     edi = format!("{:#x}", ctx.Edi),
                     "V2 BAILTRACE: resolver hit (registers)"
                 );
+                // Continuation-memory dump: the API name strings live in
+                // the shell's workspace region next to the continuation
+                // code (the image carries zero API names — measured).
+                // 0x200 bytes at the continuation address, logged at debug
+                // so offline scanning can find the name offsets.
+                {
+                    let mut cont = [0u8; 0x200];
+                    if dbg.read_memory(ret, &mut cont).is_ok() {
+                        debug!(
+                            ret = format!("{ret:#x}"),
+                            cont = ?String::from_utf8_lossy(&cont),
+                            "V2 BAILTRACE: resolver continuation memory"
+                        );
+                    }
+                }
             }
             let mut ctx2 = ctx;
             ctx2.EFlags |= 0x0001_0000;
