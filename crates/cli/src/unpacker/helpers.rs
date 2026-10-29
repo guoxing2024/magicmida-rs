@@ -744,62 +744,40 @@ pub(super) fn handle_hw_breakpoint(
             // keeps the plain RF-continue (the observation-only mode).
             // NOTE (measured 2026-10-29): the shell's SYSTEMTIME buffer IS
             // the check code's own block (self-modifying design) — the
-            // patch-ret shape below destroys the check code and the shell
-            // dies in a 1024-hit AccessViolation loop at 0x1075404.  The
-            // shim is kept as a diagnostic; the check hunt needs the API
-            // to write the fake itself (see POSTMORTEMS).
+            // external write_memory shape destroys the check code and the
+            // shell dies in a 1024-hit AccessViolation loop at 0x1075404
+            // (the shim's fake overwrote the check instruction at the
+            // buffer's address).  The API-level injection below patches
+            // GetLocalTime's entry into a fake-writer: the API itself
+            // writes the fake SYSTEMTIME into the buffer, which is the
+            // exact flow the shell's design expects (the API's write
+            // overwrites the check block; the shell re-decodes it).
             #[cfg(target_arch = "x86")]
             if slot == 1 && std::env::var("MAGICMIDA_V2_NO_SHIM").is_err() {
-                let mut stack2 = [0u8; 4];
-                let ret = if dbg.read_memory(sp, &mut stack2).is_ok() {
-                    u32::from_le_bytes(stack2.try_into().unwrap()) as usize
-                } else {
-                    0
-                };
-                // The SYSTEMTIME pointer is the stdcall stack arg: [esp+4].
-                let mut arg = [0u8; 4];
-                let arg_ptr = if dbg.read_memory(sp + 4, &mut arg).is_ok() {
-                    u32::from_le_bytes(arg.try_into().unwrap()) as usize
-                } else {
-                    0
-                };
-                if arg_ptr != 0 {
-                    // 2008-06-15 12:00:00.000 (SYSTEMTIME, 8 u16 LE)
-                    let fake: [u8; 16] = [
-                        0x07, 0xD0, 0x06, 0x00, 0x00, 0x00, 0x0F, 0x00, 0x0C, 0x00, 0x00, 0x00,
-                        0x00, 0x00, 0x00, 0x00,
-                    ];
-                    if dbg.write_memory(arg_ptr, &fake).is_ok() {
-                        info!(
-                            st = format!("{arg_ptr:#x}"),
-                            "V2 BAILTRACE: GetLocalTime shimmed — fake SYSTEMTIME (2008-06-15) written"
-                        );
-                    }
-                }
-                // Patch-ret shim: replace the API's first instruction with
-                // `ret` so the real GetLocalTime never runs (the fake
-                // stays in the buffer) while the API's normal return path
-                // (the dispatcher's return address, popped by the ret) is
-                // preserved.  The skip-style shim (esp+=8, rip=ret) broke
-                // the shell's resolver state after the two real check
-                // calls — measured: 154 garbage re-hits with return
-                // addresses like 0x62d81111.  Pop the stack arg here
-                // (the patched ret only pops the return address) and set
-                // eax=1 (the resolver reads the API's return value).
-                if dbg.write_memory(rip, &[0xC3]).is_ok() {
+                // The fake-writer patch (39 B): reads the stdcall arg
+                // from [esp+4], writes the fake SYSTEMTIME
+                // (2008-06-15 12:00:00.000), pops the arg, returns 1.
+                const FAKE_WRITER: [u8; 40] = [
+                    0x8B, 0x7C, 0x24, 0x04,             // mov edi, [esp+4]
+                    0xC7, 0x07, 0x07, 0xD0, 0x06, 0x00, // mov [edi], 0x0006D007
+                    0xC7, 0x47, 0x04, 0x00, 0x0F, 0x00, 0x00, // mov [edi+4], 0x000F0000
+                    0xC7, 0x47, 0x08, 0x00, 0x0C, 0x00, 0x00, // mov [edi+8], 0x000C0000
+                    0xC7, 0x47, 0x0C, 0x00, 0x00, 0x00, 0x00, // mov [edi+12], 0
+                    0xB8, 0x01, 0x00, 0x00, 0x00,       // mov eax, 1
+                    0x83, 0xC4, 0x04,                   // add esp, 4
+                    0xC3,                               // ret
+                ];
+                if dbg.write_memory(rip, &FAKE_WRITER).is_ok() {
                     info!(
                         api = format!("{rip:#x}"),
-                        "V2 BAILTRACE: GetLocalTime entry patched to ret"
+                        "V2 BAILTRACE: GetLocalTime entry patched to fake-writer (API writes the fake SYSTEMTIME itself)"
                     );
                 }
                 let mut ctx2 = ctx;
-                ctx2.Eax = 1;
-                mida_core::debugger::set_ctx_sp(&mut ctx2, sp + 4);
                 ctx2.EFlags |= 0x0001_0000;
                 super::session::set_thread_context_control(dbg, _thread_id, &ctx2)?;
                 info!(
-                    ret = format!("{ret:#x}"),
-                    "V2 BAILTRACE: GetLocalTime patched-ret — API returns immediately"
+                    "V2 BAILTRACE: GetLocalTime API-injected — fake SYSTEMTIME (2008-06-15) written by the API"
                 );
                 return Ok(());
             }
