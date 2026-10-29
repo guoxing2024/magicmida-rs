@@ -2229,6 +2229,29 @@ fn try_exit_dump(
                 Err(e) => warn!(error = %e, "V2: exit image snapshot write failed"),
             }
         }
+        // Workspace snapshot at ExitProcess (paired with the bail-time
+        // workspace dump): the teardown may leave the decoded engine +
+        // name table readable even after the image gets re-encrypted.
+        {
+            const WS_BASE: u64 = 0x1220_0000;
+            const WS_SIZE: u64 = 0x200_000;
+            let mut ws = vec![0u8; WS_SIZE as usize];
+            for off in (0..WS_SIZE).step_by(0x1000) {
+                let off = off as usize;
+                let len = std::cmp::min(0x1000, WS_SIZE - off as u64) as usize;
+                let _ = dbg.read_memory(WS_BASE as usize + off, &mut ws[off..off + len]);
+            }
+            let stem = output_path.with_extension("v2ws_exit");
+            let mut name =
+                stem.file_name().expect("output path has a file name").to_os_string();
+            name.push(".bin");
+            let ws_path = stem.with_file_name(name);
+            if std::fs::write(&ws_path, &ws).is_ok() {
+                info!(path = %ws_path.display(), "V2: workspace snapshot at ExitProcess written");
+            } else {
+                warn!("V2: exit workspace snapshot write failed");
+            }
+        }
     }
 }
 
