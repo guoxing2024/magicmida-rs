@@ -515,12 +515,51 @@ pub(super) fn handle_hw_breakpoint(
             if dbg.read_memory(sp, &mut stack).is_ok() {
                 let ret =
                     u32::from_le_bytes(stack[0..4].try_into().unwrap()) as usize;
+                // Resolver body reads the name pointer at [esp+0x24]
+                // (measured on the decoded 0x102888bb: `mov esi,
+                // [esp+0x24]`).  Dump the raw stack head here; offline
+                // correlation maps the slots to API names.
+                let mut raw = [0u8; 0x40];
+                let _ = dbg.read_memory(sp, &mut raw);
+                // Inline name extraction: the resolver reads the name
+                // pointer at [esp+0x24] (measured `mov esi, [esp+0x24]`
+                // at decoded 0x102888bb).  The name strings live in the
+                // shell's workspace region (absolute addresses 0x122bxxxx,
+                // outside the packed image — the image carries zero API
+                // names), so read the string directly and log it per hit.
+                let name_ptr = u32::from_le_bytes(raw[0x24..0x28].try_into().unwrap()) as usize;
+                let mut name_buf = [0u8; 80];
+                let name = if name_ptr > 0x10000
+                    && dbg.read_memory(name_ptr, &mut name_buf).is_ok()
+                {
+                    let end =
+                        name_buf.iter().position(|&b| b == 0).unwrap_or(name_buf.len());
+                    String::from_utf8_lossy(&name_buf[..end]).into_owned()
+                } else {
+                    String::new()
+                };
+                let dwords: Vec<String> = raw
+                    .chunks_exact(4)
+                    .map(|c| format!("{:#x}", u32::from_le_bytes(c.try_into().unwrap())))
+                    .collect();
                 info!(
                     api = label,
                     slot,
                     ret = format!("{ret:#x}"),
                     esp = format!("{sp:#x}"),
-                    "V2 BAILTRACE: time-API hit"
+                    name = %name,
+                    stack = ?dwords,
+                    "V2 BAILTRACE: resolver hit (raw stack + caller)"
+                );
+                #[cfg(target_arch = "x86")]
+                info!(
+                    eax = format!("{:#x}", ctx.Eax),
+                    ecx = format!("{:#x}", ctx.Ecx),
+                    edx = format!("{:#x}", ctx.Edx),
+                    ebx = format!("{:#x}", ctx.Ebx),
+                    esi = format!("{:#x}", ctx.Esi),
+                    edi = format!("{:#x}", ctx.Edi),
+                    "V2 BAILTRACE: resolver hit (registers)"
                 );
             }
             let mut ctx2 = ctx;
