@@ -157,6 +157,501 @@ pub(super) fn resolve_host_api(dll: &str, func: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// V2 post-attach fake-time injection (x86 targets): patch the target's
+/// kernelbase!GetLocalTime / GetSystemTime with a stub returning a fixed
+/// date, so the WinLicense eval-expiry check passes and the shell proceeds
+/// to the `.text` decryption instead of bailing with exit code 2.
+///
+/// Why the API layer: post-attach mode has no debug port, so the only
+/// external levers are ReadProcessMemory / WriteProcessMemory.  The shell's
+/// engine region churns (allocated, used, freed — measured 2026-10-29), so
+/// code patches inside it don't stick; KUSER_SHARED_DATA is read-only.
+/// System-DLL ASLR is per-boot rather than per-process, so the kernelbase
+/// address resolved in this process (`resolve_host_api`) is valid in the
+/// target.
+///
+/// Why `kernelbase` and not `kernel32`: kernel32!GetLocalTime is an export
+/// *forwarder* — its "address" points at the ASCII forwarding string in
+/// kernel32's export table, and writing code there corrupts the table the
+/// shell's own resolver walks.
+///
+/// Date selection via `MAGICMIDA_V2_FAKE_TIME`: unset = don't patch,
+/// `1` = 2000-06-15, otherwise `YYYY-MM-DD`.  2000 sits safely before the
+/// expiry window of any 2005-2011 eval sample, so a `now > expiry` compare
+/// keeps the trial "valid".
+///
+/// The stub preserves EDI (callee-saved — the earlier FAKE_WRITER trashed
+/// it), points at the buffer through EAX, and returns with the stdcall
+/// `ret 4`.  The earlier variant's `add esp,4; ret` popped the *argument
+/// value* into EIP, sending the shell into the SYSTEMTIME buffer — the real
+/// cause of the 1024-AV loop at 0x1075404 that was first misread as a
+/// self-modifying check block (see POSTMORTEMS).
+///
+/// Returns true when at least one API was patched.
+#[cfg(target_arch = "x86")]
+pub(super) fn patch_v2_fake_time(dbg: &mut ProcessSession) -> bool {
+    let var = match std::env::var("MAGICMIDA_V2_FAKE_TIME") {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let (year, month, day) = match var.trim() {
+        "1" | "" => (2000u16, 6u16, 15u16),
+        date => {
+            let parts: Vec<u16> = date
+                .split('-')
+                .map(str::trim)
+                .filter_map(|p| p.parse().ok())
+                .collect();
+            if parts.len() != 3 {
+                warn!(value = %date, "MAGICMIDA_V2_FAKE_TIME: expected 1 or YYYY-MM-DD — not patching");
+                return false;
+            }
+            (parts[0], parts[1], parts[2])
+        }
+    };
+
+    let mut stub: [u8; 34] = [
+        0x8B, 0x44, 0x24, 0x04,              // mov eax, [esp+4]   (lpSystemTime)
+        0xC7, 0x00, 0, 0, 0, 0,              // mov dword [eax],   {wYear, wMonth}
+        0xC7, 0x40, 0x04, 0, 0, 0, 0,        // mov dword [eax+4], {wDayOfWeek, wDay}
+        0xC7, 0x40, 0x08, 0, 0, 0, 0,        // mov dword [eax+8], {wHour, wMinute}
+        0xC7, 0x40, 0x0C, 0, 0, 0, 0,        // mov dword [eax+12],{wSecond, wMilliseconds}
+        0xC2, 0x04, 0x00,                    // ret 4 (stdcall, one pointer arg)
+    ];
+    stub[6..8].copy_from_slice(&year.to_le_bytes());
+    stub[8..10].copy_from_slice(&month.to_le_bytes());
+    stub[13..15].copy_from_slice(&4u16.to_le_bytes()); // wDayOfWeek: date compares don't read it
+    stub[15..17].copy_from_slice(&day.to_le_bytes());
+    stub[19..21].copy_from_slice(&12u16.to_le_bytes()); // wHour
+    // wMinute / wSecond / wMilliseconds stay zero.
+
+    let mut patched = 0;
+    for name in ["GetLocalTime", "GetSystemTime"] {
+        let addr = resolve_host_api("kernelbase.dll", name);
+        if addr == 0 {
+            warn!(api = name, "fake-time: kernelbase export not resolved in host");
+            continue;
+        }
+        // The target's loader maps kernelbase a moment after the main thread
+        // resumes; poll until the API's first bytes are readable.  The
+        // shell's first time call is seconds away (decode phase), so the
+        // race is safe by a wide margin.
+        let mut original = [0u8; 4];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut ready = false;
+        while std::time::Instant::now() < deadline {
+            if dbg.read_memory(addr, &mut original).is_ok()
+                && original != *b"KERN"
+                && original != [0u8; 4]
+            {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if !ready {
+            warn!(
+                api = name,
+                addr = format!("{addr:#x}"),
+                "fake-time: API never became readable in the target — not patched"
+            );
+            continue;
+        }
+        match dbg.write_memory(addr, &stub) {
+            Ok(_) => {
+                patched += 1;
+                info!(
+                    api = name,
+                    addr = format!("{addr:#x}"),
+                    date = format!("{year}-{month:02}-{day:02}"),
+                    "fake-time: API patched to return the fixed date"
+                );
+            }
+            Err(e) => warn!(api = name, error = %e, "fake-time: write failed"),
+        }
+    }
+    patched > 0
+}
+
+/// V2 bail-scene diagnostics, part 1: trap the shell's exit path so the
+/// bail moment can be frozen and inspected (x86 targets).
+///
+/// Post-attach mode has no debug port, so an exit is invisible from
+/// outside: one poll tick the process is alive, the next the handle
+/// reports an exit code — with zero visibility into *why*.  Overwriting
+/// ExitProcess's first two bytes with `jmp $` turns the bail into an
+/// infinite spin at a known address; the poll loop then suspends the
+/// thread and dumps the full scene (registers, stack, check block) while
+/// everything is still live.
+///
+/// Patched: kernelbase!ExitProcess and kernel32!ExitProcess (the latter
+/// skipped when its prologue reads `KERN`, i.e. it is an export
+/// forwarder).  The bailtrace previously confirmed the shell executes
+/// kernel32!ExitProcess (exec-BP fired at its address), and kernel32's
+/// stub jumps into kernelbase — both are covered.
+///
+/// Returns every armed trap address (empty when `MAGICMIDA_V2_TRAP_EXIT`
+/// is unset or no candidate was patchable).  All of them must be checked —
+/// measured 2026-10-29: the shell resolved ExitProcess straight from
+/// kernelbase (it spun in the kernelbase trap while the checker compared
+/// only kernel32's address and the run timed out).
+#[cfg(target_arch = "x86")]
+pub(super) fn arm_v2_exit_trap(dbg: &mut ProcessSession) -> Vec<usize> {
+    use std::time::Duration;
+
+    if std::env::var("MAGICMIDA_V2_TRAP_EXIT").is_err() {
+        return Vec::new();
+    }
+    const JMP_SELF: [u8; 2] = [0xEB, 0xFE];
+    let mut armed = Vec::new();
+    for (dll, func) in [
+        ("kernelbase.dll", "ExitProcess"),
+        ("kernel32.dll", "ExitProcess"),
+        ("ntdll.dll", "RtlExitUserProcess"),
+    ] {
+        let addr = resolve_host_api(dll, func);
+        if addr == 0 {
+            continue;
+        }
+        // The module maps a moment after the main thread resumes; poll
+        // until the first bytes are readable (and not a forwarder string).
+        let mut original = [0u8; 4];
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut ready = false;
+        while std::time::Instant::now() < deadline {
+            if dbg.read_memory(addr, &mut original).is_ok()
+                && original != *b"KERN"
+                && original != [0u8; 4]
+            {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if !ready {
+            warn!(dll, "V2 bail trap: exit API never became readable — skipped");
+            continue;
+        }
+        match dbg.write_memory(addr, &JMP_SELF) {
+            Ok(_) => {
+                armed.push(addr);
+                info!(dll, func, addr = format!("{addr:#x}"), "V2 bail trap armed (jmp $)");
+            }
+            Err(e) => warn!(dll, error = %e, "V2 bail trap: write failed"),
+        }
+    }
+    armed
+}
+
+/// Sample the main thread's RIP/ESP (plus 64 B of code at RIP and 256 B of
+/// stack, both read while the thread is suspended) without a debug port
+/// (post-attach V2): SuspendThread + GetThreadContext + ResumeThread,
+/// microseconds of stall.  Invisible to the shell's integrity checks — no
+/// byte of the target is modified, unlike the ExitProcess/time-API patches
+/// it detects within seconds (measured 2026-10-29).
+#[cfg(target_arch = "x86")]
+pub(super) fn sample_main_rip(dbg: &mut ProcessSession) -> Option<(usize, usize, Vec<u8>, Vec<u8>)> {
+    use windows::Win32::System::Threading::{ResumeThread, SuspendThread};
+
+    let tid = dbg.main_thread_id();
+    let h = dbg.thread_handle(tid).ok()?;
+    // SAFETY: thread handle from the debugger's own map.
+    let prev = unsafe { SuspendThread(h) };
+    if prev == u32::MAX {
+        return None;
+    }
+    let ctx = dbg.get_thread_context_control(tid).ok();
+    let mut code = vec![0u8; 64];
+    let mut stack = vec![0u8; 256];
+    if let Some(c) = ctx.as_ref() {
+        let _ = dbg.read_memory(c.Eip as usize, &mut code);
+        let _ = dbg.read_memory(c.Esp as usize, &mut stack);
+    }
+    // SAFETY: thread was suspended above.
+    unsafe {
+        let _ = ResumeThread(h);
+    }
+    let ctx = ctx?;
+    Some((ctx.Eip as usize, ctx.Esp as usize, code, stack))
+}
+
+/// Cheap non-suspending probe of the main thread's RIP: GetThreadContext
+/// on a RUNNING thread returns whatever context the kernel last saved —
+/// stale by up to one scheduler quantum, but it costs zero disruption
+/// (no SuspendThread), which matters because sustained suspension during
+/// the decode phase stalls the shell's timing-sensitive engine (measured
+/// 2026-10-30: flat sampling from t=5 hung three runs that otherwise exit
+/// in 9-26 s).  Used purely as the trigger for the real suspending burst.
+#[cfg(target_arch = "x86")]
+pub(super) fn probe_main_rip_nosuspend(dbg: &mut ProcessSession) -> Option<usize> {
+    let tid = dbg.main_thread_id();
+    let ctx = dbg.get_thread_context_control(tid).ok()?;
+    Some(ctx.Eip as usize)
+}
+
+/// V2 post-attach freeze-on-RIP: sample the main thread; when RIP's RVA
+/// falls inside `[lo, hi)` the thread is LEFT SUSPENDED and the full bail
+/// scene is dumped (see [`dump_v2_bail_scene`]) — this is the unpatched
+/// alternative to the ExitProcess trap, which the shell's integrity checks
+/// detect.  `MAGICMIDA_V2_FREEZE_RVA=<lo>-<hi>` (RVA, hex ok).
+///
+/// Returns true when the freeze fired (scene dumped, process terminated —
+/// the caller ends the run).
+#[cfg(target_arch = "x86")]
+pub(super) fn freeze_v2_on_rip(
+    dbg: &mut ProcessSession,
+    range: (usize, usize),
+    output_path: &Path,
+    image_base: usize,
+) -> bool {
+    use windows::Win32::System::Threading::{ResumeThread, SuspendThread, TerminateProcess};
+
+    let Some((rip, _esp, _code, _stack)) = sample_main_rip(dbg) else {
+        return false;
+    };
+    // In range: re-suspend (sample_main_rip resumed) and hold while the
+    // scene is dumped.  Range values >= 0x400_000 are ABSOLUTE addresses
+    // (the image is 0x372000, so no RVA is that large) — used to freeze
+    // inside late-loaded DLLs the shell runs through (measured: the exit
+    // path enters 0x62f00000-0x63200000).
+    let in_range = if range.0 >= 0x400_000 {
+        rip >= range.0 && rip < range.1
+    } else {
+        rip >= image_base + range.0 && rip < image_base + range.1
+    };
+    if !in_range {
+        return false;
+    }
+    // In range: re-suspend (sample_main_rip resumed) and hold while the
+    // scene is dumped.
+    let tid = dbg.main_thread_id();
+    let Ok(h) = dbg.thread_handle(tid) else {
+        return false;
+    };
+    // SAFETY: thread handle from the debugger's own map.
+    let prev = unsafe { SuspendThread(h) };
+    if prev == u32::MAX {
+        return false;
+    }
+    let Ok(ctx) = dbg.get_thread_context_control(tid) else {
+        // SAFETY: thread was suspended above.
+        unsafe {
+            let _ = ResumeThread(h);
+        }
+        return false;
+    };
+    info!(
+        rip = format!("{rip:#x}"),
+        rva = format!("{:#x}", rip - image_base),
+        range = format!("{:#x}-{:#x}", range.0, range.1),
+        "V2 FREEZE: main thread inside the target range — dumping scene"
+    );
+    dump_v2_bail_scene(dbg, &ctx, output_path, image_base);
+    // SAFETY: live PROCESS_ALL_ACCESS handle.
+    unsafe {
+        let _ = TerminateProcess(dbg.process_handle(), 0x2B);
+    }
+    true
+}
+
+/// Dump the frozen-scene evidence shared by the ExitProcess-trap and the
+/// freeze-on-RIP paths: full register log, 4 KB stack at Esp (+ image-range
+/// values), 128 bytes of code at every image-range stack value (the live
+/// caller frames are plaintext at freeze time — the engine re-encrypts
+/// blocks only after they return), 2 KB centred on the topmost return
+/// address, and 4 KB at each known check-site region.
+#[cfg(target_arch = "x86")]
+fn dump_v2_bail_scene(
+    dbg: &mut ProcessSession,
+    ctx: &windows::Win32::System::Diagnostics::Debug::CONTEXT,
+    output_path: &Path,
+    image_base: usize,
+) {
+    let out_dir = output_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let stem = output_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "v2bail".to_string());
+    let dump = |suffix: &str, addr: usize, len: usize| -> Option<PathBuf> {
+        let mut buf = vec![0u8; len];
+        let n = dbg.read_memory(addr, &mut buf).ok()?;
+        buf.truncate(n);
+        let path = out_dir.join(format!("{stem}.{suffix}"));
+        std::fs::write(&path, &buf).ok()?;
+        Some(path)
+    };
+    let rip = ctx.Eip as usize;
+
+    info!(
+        eip = format!("{rip:#x}"),
+        esp = format!("{:#x}", ctx.Esp),
+        ebp = format!("{:#x}", ctx.Ebp),
+        eax = format!("{:#x}", ctx.Eax),
+        ebx = format!("{:#x}", ctx.Ebx),
+        ecx = format!("{:#x}", ctx.Ecx),
+        edx = format!("{:#x}", ctx.Edx),
+        esi = format!("{:#x}", ctx.Esi),
+        edi = format!("{:#x}", ctx.Edi),
+        "V2 BAIL SCENE: thread frozen — dumping"
+    );
+
+    // Stack: 4 KB from Esp, plus every dword that points into the image
+    // (candidate return addresses into the check code), plus 128 bytes of
+    // CODE at each such address — the live caller frames are plaintext at
+    // trap time by construction (the engine re-encrypts blocks only after
+    // they return, and these frames have not returned), unlike the
+    // encrypted-at-rest engine pages the watch snapshots see.
+    let esp = ctx.Esp as usize;
+    let mut image_sites: Vec<usize> = Vec::new();
+    if let Some(path) = dump("v2bail_stack.bin", esp, 0x1000) {
+        info!(path = %path.display(), "V2 BAIL SCENE: stack dumped");
+        let mut stack = vec![0u8; 0x1000];
+        if dbg.read_memory(esp, &mut stack).is_ok() {
+            for (i, w) in stack.chunks_exact(4).enumerate() {
+                let v = u32::from_le_bytes(w.try_into().unwrap()) as usize;
+                if v >= image_base && v < image_base + 0x400_000 {
+                    info!(
+                        off = i * 4,
+                        value = format!("{v:#x}"),
+                        rva = format!("{:#x}", v - image_base),
+                        "V2 BAIL SCENE: stack value inside image"
+                    );
+                    image_sites.push(v);
+                }
+            }
+        }
+    }
+    image_sites.sort_unstable();
+    image_sites.dedup();
+    let mut code_blob = Vec::new();
+    for &site in &image_sites {
+        let mut bytes = [0u8; 128];
+        if dbg.read_memory(site, &mut bytes).is_ok() {
+            code_blob.extend_from_slice(&(site as u32).to_le_bytes());
+            code_blob.extend_from_slice(&128u32.to_le_bytes());
+            code_blob.extend_from_slice(&bytes);
+            info!(
+                addr = format!("{site:#x}"),
+                rva = format!("{:#x}", site - image_base),
+                head = format!("{:02x?}", &bytes[..16]),
+                "V2 BAIL SCENE: code at return address"
+            );
+        }
+    }
+    if !code_blob.is_empty() {
+        let path = out_dir.join(format!("{stem}.v2bail_code.bin"));
+        match std::fs::write(&path, &code_blob) {
+            Ok(()) => info!(path = %path.display(), "V2 BAIL SCENE: code at return addresses dumped"),
+            Err(e) => warn!(error = %e, "V2 BAIL SCENE: code dump write failed"),
+        }
+    }
+    // The direct caller of ExitProcess — 2 KB centred on the topmost
+    // return address, whole-function context for offline disassembly.
+    if let Some(&first) = image_sites.first() {
+        let start = first.saturating_sub(0x400);
+        if let Some(path) = dump("v2bail_caller.bin", start, 0x800) {
+            info!(path = %path.display(), base = format!("{start:#x}"), "V2 BAIL SCENE: caller region dumped");
+        }
+    }
+    for (name, rva) in [("v2bail_check1.bin", 0x75_000usize), ("v2bail_check2.bin", 0x102_000)] {
+        match dump(name, image_base + rva, 0x1000) {
+            Some(path) => info!(path = %path.display(), rva = format!("{rva:#x}"), "V2 BAIL SCENE: check-site region dumped"),
+            None => warn!(rva = format!("{rva:#x}"), "V2 BAIL SCENE: check-site region unreadable"),
+        }
+    }
+
+    // Module list at freeze time — identifies late-loaded DLLs the shell
+    // executes through (the RIPSAMPLE trajectory showed the exit path
+    // running inside 0x62f00000-0x63200000, a module no early scan sees).
+    {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, MODULEENTRY32W,
+            TH32CS_SNAPMODULE,
+        };
+        // SAFETY: pid is the live target's; handle closed below.
+        if let Ok(h_snap) = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, dbg.pid()) } {
+            let mut me = MODULEENTRY32W::default();
+            me.dwSize = std::mem::size_of::<MODULEENTRY32W>() as u32;
+            // SAFETY: h_snap is a valid snapshot handle; me is sized.
+            if unsafe { Module32FirstW(h_snap, &mut me) }.is_ok() {
+                loop {
+                    let name = String::from_utf16_lossy(&me.szModule)
+                        .trim_end_matches('\0')
+                        .to_string();
+                    info!(
+                        base = format!("{:#x}", me.modBaseAddr as usize),
+                        size = me.modBaseSize,
+                        name = %name,
+                        "V2 BAIL SCENE: module"
+                    );
+                    // SAFETY: h_snap is a valid snapshot handle; me is sized.
+                    if unsafe { Module32NextW(h_snap, &mut me) }.is_err() {
+                        break;
+                    }
+                }
+            }
+            // SAFETY: handle from CreateToolhelp32Snapshot.
+            unsafe {
+                let _ = CloseHandle(h_snap);
+            }
+        }
+    }
+}
+
+/// V2 bail-scene diagnostics via the ExitProcess trap: called on every
+/// post-attach poll tick while a trap is armed.  Samples the main thread;
+/// when RIP sits on a trap address the bail is in progress — the scene is
+/// dumped while the thread stays suspended, the process is terminated, and
+/// the caller ends the run.
+#[cfg(target_arch = "x86")]
+pub(super) fn check_v2_exit_trap(
+    dbg: &mut ProcessSession,
+    trap_addrs: &[usize],
+    output_path: &Path,
+    image_base: usize,
+) -> bool {
+    use windows::Win32::System::Threading::{ResumeThread, SuspendThread, TerminateProcess};
+
+    let tid = dbg.main_thread_id();
+    let Ok(h) = dbg.thread_handle(tid) else {
+        return false;
+    };
+    // SAFETY: thread handle from the debugger's own map.
+    let prev = unsafe { SuspendThread(h) };
+    if prev == u32::MAX {
+        return false;
+    }
+    let ctx = match dbg.get_thread_context_control(tid) {
+        Ok(c) => c,
+        Err(_) => {
+            // SAFETY: thread was suspended above.
+            unsafe {
+                let _ = ResumeThread(h);
+            }
+            return false;
+        }
+    };
+    let rip = ctx.Eip as usize;
+    if !trap_addrs.iter().any(|&t| rip >= t && rip <= t + 2) {
+        // SAFETY: thread was suspended above.
+        unsafe {
+            let _ = ResumeThread(h);
+        }
+        return false;
+    }
+    dump_v2_bail_scene(dbg, &ctx, output_path, image_base);
+    // The scene is on disk; the trapped process has nothing more to give.
+    // SAFETY: live PROCESS_ALL_ACCESS handle.
+    unsafe {
+        let _ = TerminateProcess(dbg.process_handle(), 0x2B);
+    }
+    true
+}
+
 // ---------------------------------------------------------------------------
 // Data section bounds
 // ---------------------------------------------------------------------------
@@ -806,30 +1301,36 @@ pub(super) fn handle_hw_breakpoint(
             // then compares the fake date against the expiry — a date
             // inside the 2008 eval window passes.  MAGICMIDA_V2_NO_SHIM=1
             // keeps the plain RF-continue (the observation-only mode).
-            // NOTE (measured 2026-10-29): the shell's SYSTEMTIME buffer IS
-            // the check code's own block (self-modifying design) — the
-            // external write_memory shape destroys the check code and the
-            // shell dies in a 1024-hit AccessViolation loop at 0x1075404
-            // (the shim's fake overwrote the check instruction at the
-            // buffer's address).  The API-level injection below patches
-            // GetLocalTime's entry into a fake-writer: the API itself
-            // writes the fake SYSTEMTIME into the buffer, which is the
-            // exact flow the shell's design expects (the API's write
-            // overwrites the check block; the shell re-decodes it).
+            // CORRECTED (2026-10-30): the earlier "self-modifying check
+            // block" reading was wrong.  The 1024-hit AccessViolation loop
+            // at 0x1075404 was the first FAKE_WRITER draft's own return
+            // path: `add esp,4; ret` popped the ARGUMENT VALUE into EIP,
+            // so the shell executed the SYSTEMTIME buffer (address
+            // 0x1075404).  The current stub uses the stdcall `ret 4` and
+            // points at the buffer through EAX instead of callee-saved EDI.
+            // The API-level injection below patches GetLocalTime's entry
+            // into a fake-writer: the API itself writes the fake SYSTEMTIME
+            // into the buffer, which is the exact flow the shell expects.
             #[cfg(target_arch = "x86")]
             if slot == 1 && std::env::var("MAGICMIDA_V2_NO_SHIM").is_err() {
-                // The fake-writer patch (39 B): reads the stdcall arg
-                // from [esp+4], writes the fake SYSTEMTIME
-                // (2008-06-15 12:00:00.000), pops the arg, returns 1.
-                const FAKE_WRITER: [u8; 40] = [
-                    0x8B, 0x7C, 0x24, 0x04,             // mov edi, [esp+4]
-                    0xC7, 0x07, 0x07, 0xD0, 0x06, 0x00, // mov [edi], 0x0006D007
-                    0xC7, 0x47, 0x04, 0x00, 0x0F, 0x00, 0x00, // mov [edi+4], 0x000F0000
-                    0xC7, 0x47, 0x08, 0x00, 0x0C, 0x00, 0x00, // mov [edi+8], 0x000C0000
-                    0xC7, 0x47, 0x0C, 0x00, 0x00, 0x00, 0x00, // mov [edi+12], 0
-                    0xB8, 0x01, 0x00, 0x00, 0x00,       // mov eax, 1
-                    0x83, 0xC4, 0x04,                   // add esp, 4
-                    0xC3,                               // ret
+                // The fake-writer patch (34 B): reads the stdcall arg
+                // from [esp+4] into EAX (volatile — the first draft used
+                // EDI, a callee-saved register, and corrupted the shell's
+                // state), writes the fake SYSTEMTIME
+                // (2008-06-15 12:00:00.000 — the first draft had the year
+                // immediate byte-swapped: 0xD007 = 53255, not 2008), and
+                // returns with the stdcall `ret 4`.  The first draft's
+                // `add esp,4; ret` popped the *argument value* into EIP —
+                // the shell "executed" the SYSTEMTIME buffer, producing the
+                // 1024-AV loop at 0x1075404 that was first misread as a
+                // self-modifying check block.
+                const FAKE_WRITER: [u8; 34] = [
+                    0x8B, 0x44, 0x24, 0x04,                   // mov eax, [esp+4]
+                    0xC7, 0x00, 0xD8, 0x07, 0x06, 0x00,       // mov [eax], {wYear=2008, wMonth=6}
+                    0xC7, 0x40, 0x04, 0x00, 0x00, 0x0F, 0x00, // mov [eax+4], {wDayOfWeek=0, wDay=15}
+                    0xC7, 0x40, 0x08, 0x00, 0x00, 0x0C, 0x00, // mov [eax+8], {wHour=0, wMinute=12}
+                    0xC7, 0x40, 0x0C, 0x00, 0x00, 0x00, 0x00, // mov [eax+12], {wSecond=0, wMilliseconds=0}
+                    0xC2, 0x04, 0x00,                         // ret 4
                 ];
                 if dbg.write_memory(rip, &FAKE_WRITER).is_ok() {
                     info!(

@@ -329,11 +329,23 @@ pub fn unpack(
     }
 
     // ---- step 4: create debug process ----
+    // Post-attach mode for V2 (SecureEngine 2.x) samples (upstream MagicMida
+    // vNext pattern): the process is created WITHOUT `DEBUG_ONLY_THIS_PROCESS`
+    // so no debug port exists from t=0.  Measured on the WinLicense 2.0.6.5
+    // family: the debug attach itself triggers the shell's anti-debug (the
+    // upstream's C-8 finding, byte-verified on their xiongxiong sample),
+    // which withholds the `.text` decryption and crashes with AV 0xC0000005 —
+    // the exact exit code our debugged runs produce.  V2 samples therefore
+    // run post-attach: PEB patched while suspended, main thread resumed
+    // explicitly, observation via polling + debug-register BPs.
+    let post_attach = pe_info.themida_version
+        == mida_packers_themida::ThemidaVersion::V2;
     let opts = CreateProcessOptions {
         executable: input.to_path_buf(),
         command_line: None,
         is_dll: input.extension().map(|e| e.eq_ignore_ascii_case("dll")).unwrap_or(false),
         suspended: false,
+        post_attach,
     };
 
     // ---- step 5: initialise Themida state ----
@@ -366,6 +378,114 @@ pub fn unpack(
     );
 
     log::log(LogType::Info, &format!("Process created (PID: {})", dbg.pid()));
+
+    // Post-attach mode (V2 samples): the main thread is still suspended
+    // (CREATE_SUSPENDED without DEBUG_ONLY_THIS_PROCESS).  The PEB was
+    // patched inside WindowsDebugger::new; resume the thread so the shell
+    // runs without a debug port.  After this the process is NOT being
+    // debugged: `wait_event_timeout` returns Timeout every poll and the
+    // loop falls into the scan branches (try_map_scan / watch scans),
+    // which is exactly the upstream post-attach observation shape.
+    // V2 bail-scene trap addresses (empty = not armed); set inside the
+    // post-attach branch below, sampled on every poll tick in the loop.
+    // All armed addresses must be checked — the shell resolved ExitProcess
+    // straight from kernelbase and spun in *its* trap (2026-10-29).
+    #[cfg(target_arch = "x86")]
+    let mut exit_trap_addr = Vec::new();
+    // `MAGICMIDA_V2_TRAP_EXIT` parse: unset = no trap, `1` = arm on the
+    // first tick, `=<seconds>` = arm once the run is that old (dodges the
+    // early integrity checks that catch patches armed at t≈0).
+    #[cfg(target_arch = "x86")]
+    let trap_arm_at: Option<u64> = std::env::var("MAGICMIDA_V2_TRAP_EXIT")
+        .ok()
+        .map(|v| v.trim().parse::<u64>().ok().filter(|&n| n > 1).unwrap_or(0));
+    // V2 freeze-on-RIP (`MAGICMIDA_V2_FREEZE_RVA=<lo>-<hi>`, RVA): when the
+    // main thread's RIP enters the range, the thread is frozen and the full
+    // bail scene dumped — the unpatched alternative to the ExitProcess trap
+    // (which the shell's integrity checks detect).  The range comes from a
+    // RIPSAMPLE trajectory run.
+    #[cfg(target_arch = "x86")]
+    let freeze_range: Option<(usize, usize)> =
+        std::env::var("MAGICMIDA_V2_FREEZE_RVA").ok().and_then(|v| {
+            let mut it = v.trim().split('-');
+            let lo = usize::from_str_radix(it.next()?.trim().trim_start_matches("0x"), 16).ok()?;
+            let hi = usize::from_str_radix(it.next()?.trim().trim_start_matches("0x"), 16).ok()?;
+            (lo < hi).then_some((lo, hi))
+        });
+    // V2 RIP sampling (`MAGICMIDA_V2_RIPSAMPLE=1`): every poll tick,
+    // SuspendThread+GetThreadContext the main thread and record
+    // (t, rip, esp, 256B stack).  No bytes are modified in the target, so
+    // the integrity checks see nothing.  The trajectory (region
+    // transitions + the tail) locates the license check for a follow-up
+    // FREEZE_RVA run.
+    #[cfg(target_arch = "x86")]
+    let rip_sample_on = std::env::var("MAGICMIDA_V2_RIPSAMPLE").is_ok();
+    #[cfg(target_arch = "x86")]
+    let mut rip_samples: Vec<(f64, usize, usize, Vec<u8>)> = Vec::new();
+    // V2 phase recorder (`MAGICMIDA_V2_RECORD_PHASE=<secs>`): from t=<secs>
+    // on, sample RIP + 64 B of code at every poll tick when the main thread
+    // executes inside the engine pool (RVA 0x28000-0x40000 — measured
+    // 2026-10-30: the hardware-lock license phase runs t=21.7-22.4s in
+    // exactly that range, right before the failure dialog appears).  The
+    // samples reconstruct the phase's execution offline and locate the
+    // decision code for a catch-and-patch.  Read-only, integrity-invisible.
+    #[cfg(target_arch = "x86")]
+    let record_phase_at: Option<u64> = std::env::var("MAGICMIDA_V2_RECORD_PHASE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    #[cfg(target_arch = "x86")]
+    let mut phase_samples: Vec<(u32, usize, Vec<u8>)> = Vec::new();
+    // Burst window: a 200 Hz SuspendThread rate sustained over the whole
+    // run perturbs the shell until its license phase never completes
+    // (measured 2026-10-30: two 120 s hangs at a flat 5 ms tick vs normal
+    // 9-26 s exits at 50 ms).  Baseline stays 50 ms; a pool hit opens a
+    // 2 s burst at 5 ms, then the baseline resumes.
+    #[cfg(target_arch = "x86")]
+    let mut burst_until_ms: u128 = 0;
+    // x64 hosts never take these paths (no x64 V2 sample in the corpus):
+    // the tick computation reads `rip_sample_on` on both architectures,
+    // `freeze_range` is consumed only by the x86-gated branches.
+    #[cfg(not(target_arch = "x86"))]
+    let (_freeze_range, rip_sample_on): (Option<(usize, usize)>, bool) = (None, false);
+    if post_attach {
+        dbg.resume_post_attach_main_thread()
+            .context("post-attach: failed to resume main thread")?;
+        // No CREATE_PROCESS debug event arrives in post-attach mode, so
+        // the V2 watch must be armed here (it normally arms in the
+        // CreateProcess event handler's V2 branch).
+        state.v2_watch = true;
+        info!("V2 post-attach: watch armed, shell running without a debug port");
+        // Fake-time injection (diagnostic, `MAGICMIDA_V2_FAKE_TIME=1` or
+        // `YYYY-MM-DD`): post-attach gets the shell past the decode-time
+        // anti-debug (zero AVs, measured), but the WinLicense eval-expiry
+        // check then fails and the shell exits 2 before `.text` decrypts.
+        // The patch rewrites kernelbase!GetLocalTime/GetSystemTime in the
+        // target so the check reads a pre-expiry date.  x86 stub only.
+        #[cfg(target_arch = "x86")]
+        if std::env::var("MAGICMIDA_V2_FAKE_TIME").is_ok() {
+            if helpers::patch_v2_fake_time(&mut dbg) {
+                info!(
+                    "V2 post-attach: fake-time patch applied — target time reads return the fixed date"
+                );
+            }
+        }
+        // V2 bail-scene trap (`MAGICMIDA_V2_TRAP_EXIT`, diagnostic): an
+        // un-debugged exit is invisible from outside — the poll loop only
+        // sees the exit code, never the reason.  This rewrites ExitProcess
+        // with `jmp $` so the bail spins at a known address and the scene
+        // (registers, stack, code at the live return addresses) can be
+        // dumped while still live.
+        //
+        // `=1` arms immediately; `=<seconds>` arms that many seconds in.
+        // The delay matters: the shell integrity-checks system DLLs, and a
+        // patch armed at ~50 ms is caught within seconds (measured
+        // 2026-10-29: fake-time patch → 4-14 s bail, ExitProcess patch →
+        // 22 s bail, vs 211 s unpatched).  Arming *after* the early checks
+        // should reach the real license bail — the scene of the 22 s run
+        // is the integrity check's own exit path, not the license check.
+        // A trapped run must NOT also patch time APIs.  (Arming happens on
+        // the poll ticks below, once `trap_arm_at` is due.)
+    }
 
     let mut ls = LoopState {
         guard_installed: false,
@@ -405,7 +525,29 @@ pub fn unpack(
         } else {
             pe_image_boundary
         };
-        let event = match dbg.wait_event_timeout(500) {
+        // Adaptive tick: the phase recorder tightens to 5 ms once its
+        // window opens (the license phase spans ~0.7 s — measured
+        // 2026-10-30); RIP sampling tightens to 50 ms after the decode;
+        // everything else keeps the 500 ms cadence.  All reads are
+        // external (RPM / thread-context) and visible to no check.
+        #[cfg(target_arch = "x86")]
+        let recording_now = matches!(record_phase_at, Some(rec_at) if started.elapsed().as_secs() >= rec_at);
+        #[cfg(not(target_arch = "x86"))]
+        let recording_now = false;
+        #[cfg(target_arch = "x86")]
+        let in_burst = recording_now && started.elapsed().as_millis() < burst_until_ms;
+        #[cfg(not(target_arch = "x86"))]
+        let in_burst = false;
+        let tick_ms: u32 = if in_burst {
+            5
+        } else if recording_now
+            || (post_attach && rip_sample_on && started.elapsed().as_secs() >= 15)
+        {
+            50
+        } else {
+            500
+        };
+        let event = match dbg.wait_event_timeout(tick_ms) {
             Ok(ev) => ev,
             // Periodic wake-up: the classic shells go silent while
             // decompressing (no debug events), and the materialised image
@@ -413,9 +555,196 @@ pub fn unpack(
             // would miss it (measured: the CloseHandle hit never fired and
             // the image existed only during the quiet phase).
             Err(mida_core::CoreError::Timeout) => {
-                try_map_scan(&mut dbg, &mut state, image_base_usize, &output_path);
-                try_ancient_watch_scan(&mut dbg, &mut state, image_base_usize, &output_path);
-                try_v2_watch_scan(&mut dbg, &mut state, image_base_usize, &output_path, started.elapsed().as_millis() as u64);
+                // Post-attach mode (V2 samples): the process is not being
+                // debugged, so there are no debug events at all — every
+                // poll lands here.  Check whether the shell has already
+                // exited (license check → exit 2): without this the loop
+                // would poll a dead process forever.
+                #[cfg(target_arch = "x86")]
+                {
+                    // Delayed arming: once `MAGICMIDA_V2_TRAP_EXIT=<secs>`
+                    // is due, rewrite the exit APIs so the *next* bail
+                    // spins in our trap instead of exiting silently.
+                    if let Some(arm_at) = trap_arm_at {
+                        if post_attach
+                            && exit_trap_addr.is_empty()
+                            && started.elapsed().as_secs() >= arm_at
+                        {
+                            exit_trap_addr = helpers::arm_v2_exit_trap(&mut dbg);
+                        }
+                    }
+                }
+                #[cfg(target_arch = "x86")]
+                if !exit_trap_addr.is_empty()
+                    && helpers::check_v2_exit_trap(
+                        &mut dbg,
+                        &exit_trap_addr,
+                        &output_path,
+                        image_base_usize,
+                    )
+                {
+                    // Scene dumped, process terminated — end the run.
+                    break;
+                }
+                // Freeze-on-RIP: unpatched scene capture when the main
+                // thread enters the requested range (checked before plain
+                // sampling — both suspend the same thread).
+                #[cfg(target_arch = "x86")]
+                if let Some(range) = freeze_range {
+                    if post_attach
+                        && helpers::freeze_v2_on_rip(
+                            &mut dbg,
+                            range,
+                            &output_path,
+                            image_base_usize,
+                        )
+                    {
+                        break;
+                    }
+                } else if rip_sample_on && post_attach {
+                    if let Some((rip, esp, _code, stack)) = helpers::sample_main_rip(&mut dbg) {
+                        rip_samples.push((started.elapsed().as_secs_f64(), rip, esp, stack));
+                    }
+                }
+                // Phase recorder: engine-pool executions during the license
+                // window, with the plaintext code bytes at RIP.  Two stages:
+                // a non-suspending stale-context probe (zero disruption) at
+                // the baseline tick, and — only while the probe reports the
+                // thread inside the engine pool — a 2 s suspending burst at
+                // 5 ms that reads the code bytes.  The exit timing varies
+                // wildly (measured 9 s — 211 s), so the blob is rewritten
+                // every 1000 samples.
+                #[cfg(target_arch = "x86")]
+                if recording_now && post_attach {
+                    if in_burst {
+                        if let Some((rip, _esp, code, _stack)) = helpers::sample_main_rip(&mut dbg)
+                        {
+                            let rva = rip.wrapping_sub(image_base_usize);
+                            if (0x28000..0x40000).contains(&rva) {
+                                phase_samples
+                                    .push((started.elapsed().as_millis() as u32, rip, code));
+                                burst_until_ms = started.elapsed().as_millis() + 2000;
+                                if phase_samples.len() % 1000 == 0 {
+                                    let mut blob = Vec::new();
+                                    for (ms, rip, code) in &phase_samples {
+                                        blob.extend_from_slice(&ms.to_le_bytes());
+                                        blob.extend_from_slice(&(*rip as u32).to_le_bytes());
+                                        blob.extend_from_slice(code);
+                                    }
+                                    let pname = output_path
+                                        .file_stem()
+                                        .map(|s| s.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| "v2phase".to_string());
+                                    let ppath = output_path
+                                        .parent()
+                                        .unwrap_or(std::path::Path::new("."))
+                                        .join(format!("{pname}.v2phase.bin"));
+                                    let _ = std::fs::write(&ppath, &blob);
+                                }
+                            }
+                        }
+                    } else if let Some(rip) = helpers::probe_main_rip_nosuspend(&mut dbg) {
+                        let rva = rip.wrapping_sub(image_base_usize);
+                        if (0x28000..0x40000).contains(&rva) {
+                            burst_until_ms = started.elapsed().as_millis() + 2000;
+                        }
+                    }
+                }
+                if post_attach {
+                    use windows::Win32::Foundation::STILL_ACTIVE;
+                    use windows::Win32::System::Threading::GetExitCodeProcess;
+                    let mut code: u32 = STILL_ACTIVE.0 as u32;
+                    // SAFETY: h_process is a live PROCESS_ALL_ACCESS handle.
+                    let rc = unsafe { GetExitCodeProcess(h_process, &mut code) };
+                    if rc.is_ok() && code != STILL_ACTIVE.0 as u32 {
+                        info!(
+                            exit_code = code,
+                            "V2 post-attach: shell exited (license check result) — ending poll loop"
+                        );
+                        // RIP trajectory: region transitions give the
+                        // execution map, the tail samples show where the
+                        // shell was within the last ticks before exit.
+                        #[cfg(target_arch = "x86")]
+                        if !rip_samples.is_empty() {
+                            let mut last_region = u64::MAX;
+                            for (t, rip, _esp, _stack) in &rip_samples {
+                                let region = (*rip as u64) >> 12;
+                                if region != last_region {
+                                    info!(
+                                        t = format!("{t:.2}"),
+                                        rip = format!("{rip:#x}"),
+                                        rva = format!("{:#x}", rip.saturating_sub(image_base_usize)),
+                                        "V2 RIPSAMPLE: region change"
+                                    );
+                                    last_region = region;
+                                }
+                            }
+                            let n = rip_samples.len();
+                            for (t, rip, esp, _stack) in rip_samples.iter().rev().take(6).rev() {
+                                info!(
+                                    t = format!("{t:.2}"),
+                                    rip = format!("{rip:#x}"),
+                                    esp = format!("{esp:#x}"),
+                                    "V2 RIPSAMPLE: tail sample"
+                                );
+                            }
+                            if let Some((_t, _rip, _esp, stack)) = rip_samples.last() {
+                                let name = output_path
+                                    .file_stem()
+                                    .map(|s| s.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| "v2rip".to_string());
+                                let path = output_path
+                                    .parent()
+                                    .unwrap_or(std::path::Path::new("."))
+                                    .join(format!("{name}.v2riptail.bin"));
+                                match std::fs::write(&path, stack) {
+                                    Ok(()) => info!(path = %path.display(), samples = n, "V2 RIPSAMPLE: last stack dumped"),
+                                    Err(e) => warn!(error = %e, "V2 RIPSAMPLE: stack write failed"),
+                                }
+                            }
+                        }
+                        // Phase-recorder dump: (t_ms, rip, 64B code) per
+                        // engine-pool sample during the license window.
+                        #[cfg(target_arch = "x86")]
+                        if !phase_samples.is_empty() {
+                            let mut blob = Vec::new();
+                            let mut sites: std::collections::BTreeMap<usize, usize> = Default::default();
+                            for (ms, rip, code) in &phase_samples {
+                                blob.extend_from_slice(&ms.to_le_bytes());
+                                blob.extend_from_slice(&(*rip as u32).to_le_bytes());
+                                blob.extend_from_slice(code);
+                                *sites.entry(rip & !0xF).or_insert(0) += 1;
+                            }
+                            let name = output_path
+                                .file_stem()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| "v2phase".to_string());
+                            let path = output_path
+                                .parent()
+                                .unwrap_or(std::path::Path::new("."))
+                                .join(format!("{name}.v2phase.bin"));
+                            match std::fs::write(&path, &blob) {
+                                Ok(()) => info!(
+                                    path = %path.display(),
+                                    samples = phase_samples.len(),
+                                    sites = sites.len(),
+                                    "V2 PHASE: recorder dump written"
+                                ),
+                                Err(e) => warn!(error = %e, "V2 PHASE: write failed"),
+                            }
+                        }
+                        break;
+                    }
+                }
+                // The watch scans read the whole image per tick — at the
+                // recorder's 5 ms cadence that would be 200 full-image
+                // RPMs/sec of self-inflicted perturbation.  Skip them while
+                // recording (the recorder IS the observation then).
+                if !recording_now {
+                    try_map_scan(&mut dbg, &mut state, image_base_usize, &output_path);
+                    try_ancient_watch_scan(&mut dbg, &mut state, image_base_usize, &output_path);
+                    try_v2_watch_scan(&mut dbg, &mut state, image_base_usize, &output_path, started.elapsed().as_millis() as u64);
+                }
                 // Workspace-stub trap (diagnostic), page-guard variant: at
                 // the first quiet timeout after the decode's probe
                 // exceptions, guard the page containing

@@ -1405,7 +1405,72 @@ GetLocalTime ret=0x107547e）——差异纯在采样频率。
 工作区 dump 全线皆零（壳 bail 前清零工作区）——名字表不可回收，
 代码本身带比较常量（过期日期），走反汇编路线。
 
-## V2：检查点 = 壳自修改块；shim 两条路线实测（2026-10-29，未发布）
+## V2：post-attach 打通 + 硬件锁定案（2026-10-30，未发布）
+
+**post-attach 移植成功（上游 magicmida vNext 模式）**：V2 样本改走
+`CreateProcess(CREATE_SUSPENDED)` **不带** `DEBUG_ONLY_THIS_PROCESS` ——
+无调试端口从 t=0 存在。`WindowsDebugger::new` 里挂起态补 PEB，
+`resume_post_attach_main_thread` 恢复主线程；`WaitForDebugEvent` 对无端口
+进程返回 ERROR_INVALID_HANDLE → post-attach 下映射为 Timeout（轮询形态）。
+**实测：零 AccessViolation** —— 上游 C-8（attach 即触发反调试、.text 拒解）
+被整体绕过。退出检测用 `GetExitCodeProcess`（Timeout 分支），exit 2 干净
+检出，不再挂死。附赠发现：`SuspendThread + GetThreadContext +
+ReadProcessMemory` 在无端口进程上全部可用 = 完整外部观测能力。
+
+**exit 2 = 硬件锁拒绝，不是 eval 过期（截图实锤，eval-expiry 假设死亡）**：
+桌面截图抓到「CALC」对话框——"The current key has been locked to a
+different machine. 1051-BCEC-14F2-0C16-3748-5E66-5E6D-2536" + 确定按钮。
+样本是 LCF-AT 的**授权版**，key 锁在他机器的硬件指纹上；本机指纹不匹配 →
+对话框（1-2 s 自动关）→ ExitProcess(2)。全部时间 shim 实验对"决定"无效
+——决定在比较指纹，不在读时间。2026-10-29 的"WinLicense eval 过期"解释
+正式作废。
+
+**license 相位定案（RIPSAMPLE 轨迹）**：unpatched 跑 9-211 s（方差极大，
+疑似网络形等待 + 机器负载）；相位本体在 **t=21.7-22.4 s，引擎池
+RVA 0x29000-0x3c000**，最后调用 GetLocalTime（0x7747d580+0x185）后线程
+进入 **wetype_tip_core.dll**（0x62f10000，4.7 MB——对话框窗口创建触发
+TSF/WeType 注入，CrashRpt1500/d2d1/input.dll/MSCTF/OLEACC 全套随行），
+消息循环跑完即退出，镜像引擎页全部再加密（熵 7.7-7.9）。
+
+**系统 DLL 补丁 = 秒级死刑（完整性检查实测）**：
+- kernelbase!GetLocalTime/GetSystemTime 补假日期 stub → fake 2000-06-15
+  bail 14 s、fake **当天** bail 4 s——值无关，补丁本身被检；
+- kernelbase/kernel32/ntdll 的 ExitProcess `jmp $` 陷阱 → bail 提前到
+  22 s（完整性与 license 共用 bail 链，场景抓到调用链
+  rva 0xe35a3→0xe03b8→0xb7551/0xb754d→0xe3247→0xa4135→0x21fff→0x964f9，
+  引擎页执行时明文、落盘时已再加密）。
+  **结论：任何代码补丁都必须避开系统 DLL；壳自己的引擎池块是剩余目标**
+  （块用完即再加密，需 catch-and-patch：探针发现块在执行 → 挂起 → 补丁
+  → 恢复）。
+
+**shim 三形状失败根因更正（2026-10-29 的"自修改块"结论推翻）**：旧
+FAKE_WRITER 三个真 bug——①年份立即数字节转置（0xD007=53255，非 2008）；
+②`add esp,4; ret` 弹出的是**实参值** → EIP=SYSTEMTIME 缓冲区
+（0x1075404）→ 1024 次 AV 循环——"检查块自修改"从未存在，AV 是自己
+stub 的返回路径；③用 EDI（callee-saved）做指针践踏壳状态。已修
+（EAX + `ret 4`）。教训钉死：**x86 stdcall stub 的返回要么 `ret n`，
+要么先弹出返回址再跳；写完必查 内存布局 逐字段对 SYSTEMTIME**。
+
+**本轮落地机器（全部 env 门控，默认零行为变化；x86 门控）**：
+- `MAGICMIDA_V2_FAKE_TIME=1|YYYY-MM-DD`——kernelbase 时间 API 假日期
+  （已证被完整性检查拒绝，保留作判别工具）；
+- `MAGICMIDA_V2_TRAP_EXIT=1|<secs>`——ExitProcess `jmp $` 陷阱 +
+  bail 场景 dump（寄存器/栈/返回址代码/检查块/模块清单）；延迟武装
+  （`=<secs>`）躲早期完整性检查；
+- `MAGICMIDA_V2_FREEZE_RVA=<lo>-<hi>`——RIP 入区即挂起 + 全场景 dump
+  （≥0x400000 的值按绝对地址解释）——**无补丁、完整性不可见**；
+- `MAGICMIDA_V2_RIPSAMPLE=1`——50 ms 轨迹采样（区域变化 + 尾部栈）；
+- `MAGICMIDA_V2_RECORD_PHASE=<secs>`——两级采样：免挂起陈旧上下文探针
+  （GetThreadContext on running thread，零扰动）触发 → 2 s @5 ms 突发
+  （挂起 + RIP 处 64 B 明文代码），池命中即录，每 1000 样本落盘。
+  **教训：平坦 5 ms 采样从头挂到尾的三连挂起初判为采样扰动，后经
+  零扰动探针仍挂证伪——是壳自身的等待方差（负载/网络），采样无罪。**
+
+**下一增量**：相位录制（RECORD_PHASE）抓决策分支明文 → capstone 反汇编
+→ 定位指纹比较 → catch-and-patch（freeze + 改分支/操作数 + 恢复）。
+风险已知：引擎池块完整性自检未知；对话框前的窗口只有亚秒级。
+
+## V2：检查点 = 壳自修改块；shim 两条路线实测（2026-10-29，已被上节更正）
 
 **检查点定位（GetLocalTime 命中 dump）**：壳的检查在镜像 RVA 0x75404 附近
 调用 GetLocalTime——ret=0x107547e（thunk 区 push），SYSTEMTIME 缓冲区

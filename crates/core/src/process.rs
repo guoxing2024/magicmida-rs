@@ -49,6 +49,17 @@ pub struct CreateProcessOptions {
     /// `true` to create the process suspended (typically used so the debugger
     /// can set up breakpoints before the entry point runs).
     pub suspended: bool,
+    /// `true` = post-attach mode (upstream MagicMida vNext pattern,
+    /// `CREATE_SUSPENDED` + **no** `DEBUG_ONLY_THIS_PROCESS`): the process
+    /// runs without a debug port from t=0, defeating protectors that read
+    /// `EPROCESS.DebugPort` during early startup.  The caller patches the
+    /// PEB while the main thread is suspended, then explicitly resumes it.
+    /// Measured on the V2 (WinLicense 2.0.6.5) sample family: the debug
+    /// attach itself triggers the shell's anti-debug (upstream C-8), which
+    /// withholds the `.text` decryption and crashes with AV 0xC0000005 —
+    /// the same exit code our debugged runs produce.  Default `false`
+    /// keeps the traditional debug-attach flow untouched.
+    pub post_attach: bool,
 }
 
 /// Handle to a running debuggee process and its main thread.
@@ -263,8 +274,20 @@ pub fn create_debug_process(
     // `GetAppVersion() == "1.1"`.
     let mut flags = CREATE_DEFAULT_ERROR_MODE
         | CREATE_NO_WINDOW
-        | NORMAL_PRIORITY_CLASS
-        | DEBUG_ONLY_THIS_PROCESS;
+        | NORMAL_PRIORITY_CLASS;
+
+    if opts.post_attach {
+        // Post-attach mode (upstream pattern): suspended + NO debug port
+        // from t=0.  The caller patches the PEB while suspended and
+        // explicitly resumes the main thread.  Defeats protectors that
+        // read `EPROCESS.DebugPort` during startup (Themida v3 exits
+        // 0xDEADC0DE when a debug port is present from t=0) and, for the
+        // V2/WinLicense family, avoids the attach-gated anti-debug that
+        // withholds the `.text` decryption (upstream C-8).
+        flags |= CREATE_SUSPENDED;
+    } else {
+        flags |= DEBUG_ONLY_THIS_PROCESS;
+    }
 
     if opts.suspended {
         flags |= CREATE_SUSPENDED;
