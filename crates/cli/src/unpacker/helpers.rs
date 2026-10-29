@@ -419,6 +419,44 @@ pub(super) fn handle_hw_breakpoint(
                         info!(path = %snap.display(), total = format!("{total:#x}"), "V2 BAILTRACE: bail-time image written (shell code decoded, pre-teardown)");
                     }                }
             }
+            // Workspace dump: the shell's runtime engine + API name table
+            // live in VirtualAlloc regions at absolute addresses
+            // 0x122bxxxx-0x1235xxxx (measured from the resolver trace
+            // this boot: 127/129 call continuations land there).  The
+            // image carries zero API names — the name table is in the
+            // workspace — and the workspace is encoded until execution,
+            // so the decoded, name-readable view exists only while the
+            // shell is running: i.e. at this exact frozen moment.
+            {
+                const WS_BASE: u64 = 0x1220_0000;
+                const WS_SIZE: u64 = 0x200_000;
+                let mut ws = vec![0u8; WS_SIZE as usize];
+                let mut ws_ok = 0usize;
+                for off in (0..WS_SIZE).step_by(0x1000) {
+                    let off = off as usize;
+                    let len = std::cmp::min(0x1000, WS_SIZE - off as u64) as usize;
+                    if dbg
+                        .read_memory(WS_BASE as usize + off, &mut ws[off..off + len])
+                        .is_ok()
+                    {
+                        ws_ok += 1;
+                    }
+                }
+                let stem = output_path.with_extension("v2ws_bail");
+                let mut name =
+                    stem.file_name().expect("output path has a file name").to_os_string();
+                name.push(".bin");
+                let ws_path = stem.with_file_name(name);
+                if std::fs::write(&ws_path, &ws).is_ok() {
+                    info!(
+                        path = %ws_path.display(),
+                        pages_ok = ws_ok,
+                        "V2 BAILTRACE: shell workspace dumped at bail (engine + name table)"
+                    );
+                } else {
+                    warn!("V2 BAILTRACE: workspace dump write failed");
+                }
+            }
             let mut stack = [0u8; 0x800];
             if dbg
                 .read_memory(mida_core::debugger::ctx_sp(&ctx), &mut stack)
