@@ -2201,7 +2201,7 @@ fn try_exit_dump(
                 Ok(mods) => mods.iter().map(|m| m.base()).collect(),
                 Err(_) => std::collections::HashSet::new(),
             };
-        scan_v2_headless_regions(dbg, state, image_base_usize, output_path, &module_bases);
+        scan_v2_headless_regions(dbg, state, image_base_usize, output_path, &module_bases, 0);
         // Exit-time image snapshot: paired with the CloseHandle snapshot —
         // a diff between the two says whether the shell wipes or rewrites
         // its image during the payload phase (the Ancient 1.1.1 shell
@@ -2542,6 +2542,7 @@ fn scan_v2_headless_regions(
     image_base_usize: usize,
     output_path: &std::path::Path,
     module_bases: &std::collections::HashSet<u64>,
+    elapsed_ms: u64,
 ) {
     use windows::Win32::System::Memory::{
         MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_PRIVATE, VirtualQueryEx,
@@ -2579,7 +2580,43 @@ fn scan_v2_headless_regions(
                 && !module_bases.contains(&base)
                 && !state.v2_dll_bases.contains(&base)
             {
-                classify_headless_region(dbg, state, region_base, region_size, output_path);
+                classify_headless_region(dbg, state, region_base, region_size, output_path, elapsed_ms);
+            }
+        }
+        // Revisit density-failed regions after 10 s: the shell's
+        // decode-phase workspace materialises when the scan may not be
+        // running, and gets recorded as "scanned" before the code lands.
+        let mut revisited: Vec<(u64, usize, usize)> = Vec::new();
+        for (&base, &probe_ms) in state.v2_headless_revisit.iter() {
+            if elapsed_ms > probe_ms && elapsed_ms - probe_ms >= 10_000 {
+                // Re-probe the region's current state by base.
+                use windows::Win32::System::Memory::{
+                    MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_PRIVATE, VirtualQueryEx,
+                };
+                let mut mbi2 = MEMORY_BASIC_INFORMATION::default();
+                let rc = unsafe {
+                    VirtualQueryEx(
+                        dbg.process_handle(),
+                        Some(base as *const _),
+                        &mut mbi2,
+                        std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                    )
+                };
+                if rc == std::mem::size_of::<MEMORY_BASIC_INFORMATION>()
+                    && mbi2.State == MEM_COMMIT
+                    && mbi2.Type == MEM_PRIVATE
+                    && mbi2.RegionSize >= 0x8000
+                {
+                    revisited.push((base, base as usize, mbi2.RegionSize as usize));
+                }
+            }
+        }
+        for (base, region_base, region_size) in revisited {
+            state.v2_headless_revisit.remove(&base);
+            if !state.v2_headless_bases.contains(&base)
+                && !state.v2_headless_noise_bases.contains(&base)
+            {
+                classify_headless_region(dbg, state, region_base, region_size, output_path, elapsed_ms);
             }
         }
         addr = next_region;
@@ -2594,6 +2631,7 @@ fn classify_headless_region(
     region_base: usize,
     region_size: usize,
     output_path: &std::path::Path,
+    elapsed_ms: u64,
 ) {
     let base = region_base as u64;
     // Head MZ check: MZ-bearing regions belong to the PE-image scans
@@ -2632,7 +2670,9 @@ fn classify_headless_region(
             calls,
             "V2 headless: region below code-density threshold"
         );
-        state.v2_headless_bases.insert(base);
+        // Not a permanent skip: the region may not be decoded yet (the
+        // shell materialises its workspace lazily).  Revisit in 10 s.
+        state.v2_headless_revisit.insert(base, elapsed_ms);
         return;
     }
     // Full region read (16 MB cap) and import-profile classification.
@@ -2880,7 +2920,7 @@ fn try_v2_watch_scan(
         // must still run: MZ-less private code regions are its exclusive
         // territory (measured 2026-10-29: the pre-fix early return here
         // silently disabled the headless scan on every quiet tick).
-        scan_v2_headless_regions(dbg, state, image_base_usize, output_path, &module_bases);
+        scan_v2_headless_regions(dbg, state, image_base_usize, output_path, &module_bases, elapsed_ms);
         return;
     }
     // Log all candidates at INFO for diagnostics.
@@ -2960,7 +3000,7 @@ fn try_v2_watch_scan(
     // and is invisible to every MZ-based scan — if the original program
     // materialises the same way, this is what finds it.  Shares the watch
     // scan's 500 ms cooldown and module snapshot; dedups by base per run.
-    scan_v2_headless_regions(dbg, state, image_base_usize, output_path, &module_bases);
+    scan_v2_headless_regions(dbg, state, image_base_usize, output_path, &module_bases, elapsed_ms);
 }
 
 /// Try to dump the materialised mapped image (Themida 1.1.1 file-mapping

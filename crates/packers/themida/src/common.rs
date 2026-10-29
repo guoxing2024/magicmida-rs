@@ -161,6 +161,12 @@ pub struct ThemidaState {
     /// invisible to the headless scan and the packed base is excluded from
     /// every candidate filter.
     pub v2_image_snapshot_taken: bool,
+    /// Headless regions whose density prefilter failed once — revisited
+    /// after 10 s.  Measured: the shell's decode-phase workspace materialises
+    /// while the scan is not running, passes the filter at a moment when
+    /// the first 64 KB is still zero/undecoded, gets recorded as "scanned"
+    /// and is then skipped forever — even after the code lands in it.
+    pub v2_headless_revisit: std::collections::HashMap<u64, u64>,
     /// Module bases cached when the ancient watch started (the watch filter is
     /// "not the packed image and not a registered module"; re-taking the
     /// module snapshot at every event is too slow for the exit window).
@@ -242,6 +248,7 @@ impl ThemidaState {
             v2_headless_noise_bases: std::collections::HashSet::new(),
             v2_headless_dump_count: 0,
             v2_image_snapshot_taken: false,
+            v2_headless_revisit: std::collections::HashMap::new(),
             ancient_module_bases: std::collections::HashSet::new(),
             ancient_snapshots: 0,
             idle_diag_done: false,
