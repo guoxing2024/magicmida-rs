@@ -730,7 +730,7 @@ pub(super) fn handle_hw_breakpoint(
                     }
                 }
             }
-            // Time shim (bailtrace): the shell reads the clock exactly
+            // Time shim (bailtrace, x86): the shell reads the clock exactly
             // once during the decode phase (measured: one GetLocalTime
             // call, ret=0x107547e; registers all zero — the SYSTEMTIME
             // pointer is the stdcall stack arg at [esp+4]) and bails
@@ -742,6 +742,13 @@ pub(super) fn handle_hw_breakpoint(
             // then compares the fake date against the expiry — a date
             // inside the 2008 eval window passes.  MAGICMIDA_V2_NO_SHIM=1
             // keeps the plain RF-continue (the observation-only mode).
+            // NOTE (measured 2026-10-29): the shell's SYSTEMTIME buffer IS
+            // the check code's own block (self-modifying design) — the
+            // patch-ret shape below destroys the check code and the shell
+            // dies in a 1024-hit AccessViolation loop at 0x1075404.  The
+            // shim is kept as a diagnostic; the check hunt needs the API
+            // to write the fake itself (see POSTMORTEMS).
+            #[cfg(target_arch = "x86")]
             if slot == 1 && std::env::var("MAGICMIDA_V2_NO_SHIM").is_err() {
                 let mut stack2 = [0u8; 4];
                 let ret = if dbg.read_memory(sp, &mut stack2).is_ok() {
