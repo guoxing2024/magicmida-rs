@@ -3170,6 +3170,18 @@ fn try_mapped_dump(
         }
         return Ok(false);
     }
+    // The immediate scan + step-into-image tail is Ancient-only machinery.
+    // Measured on V2 (CISC-1.exe): the tail's scan finds the packed image's
+    // runtime copy (base 0x3690000 — ASLR'd; the packed_base exclusion
+    // compares against a different base), sets pending_mapped_dump, then
+    // step_until_in_image fails ("OEP not found inside mapped image") and
+    // the fallback dumps raw.bin + dies with E_INVALIDARG — BEFORE the
+    // shell ever reaches its bail, killing every bailtrace run at
+    // CloseHandle+300 ms.  Gate it: non-Ancient versions fall through to
+    // the caller untouched.
+    if state.pe_info.themida_version != mida_packers_themida::ThemidaVersion::Ancient {
+        return Ok(false);
+    }
     // If the periodic scan hasn't found the image yet, run an immediate
     // scan at the CloseHandle hit.  The shell jumps into the image at this
     // moment, so the image is guaranteed to be present.  In the no-hook
