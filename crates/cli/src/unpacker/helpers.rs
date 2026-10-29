@@ -696,6 +696,70 @@ pub(super) fn handle_hw_breakpoint(
                         );
                     }
                 }
+                // Workspace region diagnostic: the full 2 MB dump above
+                // read pages_ok=0 — every page failed.  Query the region
+                // states and probe direct reads at the continuation
+                // addresses to see whether the engine region is
+                // uncommitted, PAGE_NOACCESS, or moved elsewhere.
+                {
+                    use windows::Win32::System::Memory::{
+                        MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_PRIVATE, VirtualQueryEx,
+                    };
+                    let h_proc = dbg.process_handle();
+                    for probe in [0x1220_0000u64, 0x122b_0000, 0x1230_0000, 0x123b_0000] {
+                        let mut mbi = MEMORY_BASIC_INFORMATION::default();
+                        let rc = unsafe {
+                            VirtualQueryEx(
+                                h_proc,
+                                Some(probe as *const _),
+                                &mut mbi,
+                                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                            )
+                        };
+                        if rc == std::mem::size_of::<MEMORY_BASIC_INFORMATION>() {
+                            info!(
+                                probe = format!("{probe:#x}"),
+                                state = ?mbi.State,
+                                r#type = ?mbi.Type,
+                                protect = ?mbi.Protect,
+                                region_size = format!("{:#x}", mbi.RegionSize),
+                                "V2 BAILTRACE: workspace region state"
+                            );
+                        } else {
+                            info!(
+                                probe = format!("{probe:#x}"),
+                                "V2 BAILTRACE: workspace region query failed (unmapped?)"
+                            );
+                        }
+                    }
+                    // Direct probe reads: the engine continuations (the
+                    // check code lives there — the violation site is the
+                    // IMAGE's RVA 0x75404, the engine code is in the
+                    // workspace) and the check block in the image.
+                    for (label, addr) in [
+                        ("engine-cont", 0x122b_6057u64),
+                        ("engine-cont2", 0x122b_5474u64),
+                        ("check-block", 0x1075_404u64),
+                    ] {
+                        let mut buf = [0u8; 0x200];
+                        match dbg.read_memory(addr as usize, &mut buf) {
+                            Ok(n) => info!(
+                                label,
+                                addr = format!("{addr:#x}"),
+                                read = n,
+                                head = ?String::from_utf8_lossy(&buf[..16]),
+                                "V2 BAILTRACE: probe read OK"
+                            ),
+                            Err(e) => info!(
+                                label,
+                                addr = format!("{addr:#x}"),
+                                error = %e,
+                                "V2 BAILTRACE: probe read FAILED"
+                            ),
+                        }
+                    }
+                    let _ = (MEM_COMMIT, MEM_PRIVATE); // keep the imports honest
+                }
                 // Per-hit engine code capture: at resolver hits whose
                 // continuation lies inside the packed image, the engine
                 // block there is decoded (it is executing) — dump 0x400 B
