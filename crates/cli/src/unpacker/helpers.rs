@@ -547,6 +547,14 @@ pub(super) fn handle_hw_breakpoint(
         })
         .unwrap_or(None);
     if let Some((slot, label)) = time_hit {
+        // Image size (max section end) — used by both dump sites below.
+        let img_total = state
+            .pe_info
+            .pe_sections
+            .iter()
+            .map(|s| s.virtual_address as usize + s.virtual_size as usize)
+            .max()
+            .unwrap_or(0);
         if let Ok(ctx) = dbg.get_thread_context_control(_thread_id) {
             let sp = mida_core::debugger::ctx_sp(&ctx);
             let mut stack = [0u8; 8];
@@ -615,6 +623,178 @@ pub(super) fn handle_hw_breakpoint(
                         );
                     }
                 }
+                // Image dump at the GetLocalTime hit: the shell's engine
+                // code blocks are decoded only while executing and are
+                // re-encrypted after use (measured: the bail-time snapshot
+                // has the whole engine back at entropy ~7.9), so the check
+                // site's code (the continuation RVA 0x7547e + the
+                // comparison/conditional right after it) is readable ONLY
+                // at this exact frozen moment.  One full-image dump.
+                if slot == 1 {
+                    let total = img_total;
+                    if total > 0 {
+                        let mut buf = vec![0u8; total];
+                        for off in (0..total).step_by(0x1000) {
+                            let len = std::cmp::min(0x1000, total - off);
+                            let _ = dbg.read_memory(image_base_usize + off, &mut buf[off..off + len]);
+                        }
+                        let stem = output_path.with_extension("v2image_getlocaltime");
+                        let mut name = stem
+                            .file_name()
+                            .expect("output path has a file name")
+                            .to_os_string();
+                        name.push(".bin");
+                        let snap = stem.with_file_name(name);
+                        if std::fs::write(&snap, &buf).is_ok() {
+                            info!(
+                                path = %snap.display(),
+                                total = format!("{total:#x}"),
+                                ret = format!("{ret:#x}"),
+                                "V2 BAILTRACE: image dumped at GetLocalTime hit (check site decoded)"
+                            );
+                        }
+                    }
+                }
+                // Workspace dump at the GetLocalTime hit: the engine's
+                // check code is NOT in the packed image — the call chain
+                // is `engine (workspace) -> thunk (image, push <续址>;
+                // jmp resolver) -> API`, so the continuation after the
+                // GetLocalTime call (measured: ret 0x107547e is the
+                // thunk's next push; the true continuation 0x122b6057 is
+                // in the workspace) carries the comparison and the
+                // conditional jump.  The workspace is zeroed before bail
+                // (measured: all v2ws_* dumps are empty), so this hit is
+                // the only capture point for the decoded check code.
+                if slot == 1 {
+                    const WS_BASE: u64 = 0x1220_0000;
+                    const WS_SIZE: u64 = 0x200_000;
+                    let mut ws = vec![0u8; WS_SIZE as usize];
+                    let mut ws_ok = 0usize;
+                    for off in (0..WS_SIZE).step_by(0x1000) {
+                        let off = off as usize;
+                        let len = std::cmp::min(0x1000, WS_SIZE - off as u64) as usize;
+                        if dbg
+                            .read_memory(WS_BASE as usize + off, &mut ws[off..off + len])
+                            .is_ok()
+                        {
+                            ws_ok += 1;
+                        }
+                    }
+                    let stem = output_path.with_extension("v2ws_getlocaltime");
+                    let mut name = stem
+                        .file_name()
+                        .expect("output path has a file name")
+                        .to_os_string();
+                    name.push(".bin");
+                    let ws_path = stem.with_file_name(name);
+                    if std::fs::write(&ws_path, &ws).is_ok() {
+                        info!(
+                            path = %ws_path.display(),
+                            pages_ok = ws_ok,
+                            ret = format!("{ret:#x}"),
+                            "V2 BAILTRACE: workspace dumped at GetLocalTime hit (check code decoded)"
+                        );
+                    }
+                }
+                // Per-hit engine code capture: at resolver hits whose
+                // continuation lies inside the packed image, the engine
+                // block there is decoded (it is executing) — dump 0x400 B
+                // per hit, numbered in call order, so the ordered API
+                // sequence maps to code offline (the names stay encoded;
+                // the code itself carries the comparison constants).
+                if slot == 2
+                    && ret >= image_base_usize
+                    && ret < image_base_usize + img_total
+                    && state.v2_cont_dumps < 200
+                {
+                    state.v2_cont_dumps += 1;
+                    let mut cont = [0u8; 0x400];
+                    if dbg.read_memory(ret, &mut cont).is_ok() {
+                        let stem = output_path.with_extension(format!(
+                            "v2cont_{:03}",
+                            state.v2_cont_dumps
+                        ));
+                        let mut name = stem
+                            .file_name()
+                            .expect("output path has a file name")
+                            .to_os_string();
+                        name.push(".bin");
+                        let path = stem.with_file_name(name);
+                        if std::fs::write(&path, &cont).is_ok() {
+                            debug!(
+                                ret = format!("{ret:#x}"),
+                                path = %path.display(),
+                                "V2 BAILTRACE: engine block dumped at resolver continuation"
+                            );
+                        }
+                    }
+                }
+            }
+            // Time shim (bailtrace): the shell reads the clock exactly
+            // once during the decode phase (measured: one GetLocalTime
+            // call, ret=0x107547e; registers all zero — the SYSTEMTIME
+            // pointer is the stdcall stack arg at [esp+4]) and bails
+            // when the date is past the license expiry — the bare run
+            // exits 2, same as debugged, so it is the license/environment
+            // check, not anti-debug.  Write a fake SYSTEMTIME into the
+            // caller's buffer and skip the real call: pop the return
+            // address + the stack arg, return to the caller.  The check
+            // then compares the fake date against the expiry — a date
+            // inside the 2008 eval window passes.  MAGICMIDA_V2_NO_SHIM=1
+            // keeps the plain RF-continue (the observation-only mode).
+            if slot == 1 && std::env::var("MAGICMIDA_V2_NO_SHIM").is_err() {
+                let mut stack2 = [0u8; 4];
+                let ret = if dbg.read_memory(sp, &mut stack2).is_ok() {
+                    u32::from_le_bytes(stack2.try_into().unwrap()) as usize
+                } else {
+                    0
+                };
+                // The SYSTEMTIME pointer is the stdcall stack arg: [esp+4].
+                let mut arg = [0u8; 4];
+                let arg_ptr = if dbg.read_memory(sp + 4, &mut arg).is_ok() {
+                    u32::from_le_bytes(arg.try_into().unwrap()) as usize
+                } else {
+                    0
+                };
+                if arg_ptr != 0 {
+                    // 2008-06-15 12:00:00.000 (SYSTEMTIME, 8 u16 LE)
+                    let fake: [u8; 16] = [
+                        0x07, 0xD0, 0x06, 0x00, 0x00, 0x00, 0x0F, 0x00, 0x0C, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x00,
+                    ];
+                    if dbg.write_memory(arg_ptr, &fake).is_ok() {
+                        info!(
+                            st = format!("{arg_ptr:#x}"),
+                            "V2 BAILTRACE: GetLocalTime shimmed — fake SYSTEMTIME (2008-06-15) written"
+                        );
+                    }
+                }
+                // Patch-ret shim: replace the API's first instruction with
+                // `ret` so the real GetLocalTime never runs (the fake
+                // stays in the buffer) while the API's normal return path
+                // (the dispatcher's return address, popped by the ret) is
+                // preserved.  The skip-style shim (esp+=8, rip=ret) broke
+                // the shell's resolver state after the two real check
+                // calls — measured: 154 garbage re-hits with return
+                // addresses like 0x62d81111.  Pop the stack arg here
+                // (the patched ret only pops the return address) and set
+                // eax=1 (the resolver reads the API's return value).
+                if dbg.write_memory(rip, &[0xC3]).is_ok() {
+                    info!(
+                        api = format!("{rip:#x}"),
+                        "V2 BAILTRACE: GetLocalTime entry patched to ret"
+                    );
+                }
+                let mut ctx2 = ctx;
+                ctx2.Eax = 1;
+                mida_core::debugger::set_ctx_sp(&mut ctx2, sp + 4);
+                ctx2.EFlags |= 0x0001_0000;
+                super::session::set_thread_context_control(dbg, _thread_id, &ctx2)?;
+                info!(
+                    ret = format!("{ret:#x}"),
+                    "V2 BAILTRACE: GetLocalTime patched-ret — API returns immediately"
+                );
+                return Ok(());
             }
             let mut ctx2 = ctx;
             ctx2.EFlags |= 0x0001_0000;

@@ -1378,6 +1378,33 @@ Themida 阶梯样本裸跑能活、WinLicense 2.0.6.5 裸跑死——差的就�
   条件跳转翻转）→ .text 解密 → 快照抓解码后 calc（XP calc 公开可对账）
   → 重建产品。**devirt 不需要**——calc 从未被虚拟化。
 
+## V2：运行时"副本"= 加壳文件的空拷贝；检查 hunt 改走 GetLocalTime 命中 dump（2026-10-29，未发布）
+
+**副本追踪定案（4 轮重试 + 旧 run 对比）**：05:27 那次 run（Ancient 闸之前）
+的 immediate scan 在 resolver 风暴末（15.571）抓到过 base 0x3690000 /
+size 0x372000 / EP 0x371000 的"运行时副本"。离线分析 `CISC-1U21.raw.bin`：
+**副本 = 加壳文件本身的内存拷贝**——PE 头逐字段相同（EP RVA 0x1000000
+就是盘上文件的 EP，此前日志的 "Entry point RVA: 0x371000" 是另一处读法）、
+段表同构（6 段、同名同 VA），但**大节（omxsqdds）全零、.rsrc 仍加密
+（熵 7.61）**——壳从未往里解码任何东西。它是壳为原程序准备的**全新
+分配**（风暴末才创建，晚于 GetLocalTime 检查调用），检查失败 → bail →
+原程序永不落进副本。**对产品是红鲱鱼**；"壳解码进副本"的旧假设作废。
+
+**采样频率教训**：旧 build 的 immediate scan 在**每次 resolver 命中**上跑
+（无冷却），副本在风暴末出现的瞬间被抓住；新 build 的 watch scan 有
+500ms 冷却，4 轮重试 ~70 次扫描全部错过（副本瞬态 <500ms）。两轮壳行为
+完全一致（同样异常点 0x108b4ee/0x108b6ad、同样 ~24 线程爆发节奏、同样
+GetLocalTime ret=0x107547e）——差异纯在采样频率。
+
+**引擎代码瞬态明文 → 检查 hunt 仪器**：bail 快照里引擎代码已重新加密
+（整镜像熵 ~7.9，只有 RVA 0x10000 与 0x370000 低熵），检查点（GetLocalTime
+续址 RVA 0x7547e）在 bail 时不可读。但**命中瞬间代码是解码的**（正在执行）
+——新 instrumentation：GetLocalTime 命中时全镜像 dump
+（`<stem>.v2image_getlocaltime.bin`）+ resolver 命中时镜像内 continuation
+的逐点 0x400B dump（`v2cont_{:03}.bin`，按调用序编号，上限 200）。
+工作区 dump 全线皆零（壳 bail 前清零工作区）——名字表不可回收，
+代码本身带比较常量（过期日期），走反汇编路线。
+
 ## V2 (SecureEngine 2.x) 战役：历史小节（均已推翻，仅供追溯）
 
 **"载荷区探测 + 诚实收束"（2026-10-28）**：A/B 定责壳方差大、hang 非管线
