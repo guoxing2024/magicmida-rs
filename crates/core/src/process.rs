@@ -79,9 +79,10 @@ pub struct CreateProcessOptions {
     pub isolated_desktop: bool,
 }
 
-/// Window station name used by [`CreateProcessOptions::isolated_desktop`].
-const ISOLATED_STATION: &str = "MagicmidaV2Station";
 /// Desktop name used by [`CreateProcessOptions::isolated_desktop`].
+///
+/// It lives on `WinSta0` (the interactive station), not on a station of its
+/// own — see [`create_isolated_desktop`].
 const ISOLATED_DESKTOP: &str = "MagicmidaV2Desktop";
 
 /// Create (or re-open) the private window station and desktop, returning the
@@ -94,46 +95,31 @@ const ISOLATED_DESKTOP: &str = "MagicmidaV2Desktop";
 /// Returns `None` when creation fails, so the caller falls back to the
 /// interactive desktop instead of failing the run.
 pub fn create_isolated_desktop() -> Option<String> {
-    use windows::Win32::System::StationsAndDesktops::{
-        CreateDesktopW, CreateWindowStationW, DESKTOP_CONTROL_FLAGS,
-    };
+    use windows::Win32::System::StationsAndDesktops::{CreateDesktopW, DESKTOP_CONTROL_FLAGS};
 
-    // Access masks are not exported by windows-0.58 for these objects; the
-    // values are from winuser.h and are stable ABI.
-    const WINSTA_ALL_ACCESS: u32 = 0x000F_037F;
+    // Access masks are not exported by windows-0.58; values from winuser.h.
     const DESKTOP_ALL_ACCESS: u32 = 0x000F_01FF;
     const ZERO_DESKTOP_FLAGS: DESKTOP_CONTROL_FLAGS = DESKTOP_CONTROL_FLAGS(0);
 
     let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
-    let station_name = wide(ISOLATED_STATION);
     let desktop_name = wide(ISOLATED_DESKTOP);
 
-    // SAFETY: names are valid null-terminated wide strings; the handle is
-    // intentionally kept alive (see the doc comment).
-    let h_sta = unsafe {
-        CreateWindowStationW(
-            PCWSTR::from_raw(station_name.as_ptr()),
-            0,
-            WINSTA_ALL_ACCESS,
-            None,
-        )
-    };
-    let h_sta = match h_sta {
-        Ok(h) => h,
-        Err(e) => {
-            warn!(
-                error = %e,
-                "isolated desktop: CreateWindowStationW failed — \
-                 target will use the interactive desktop"
-            );
-            return None;
-        }
-    };
-
-    // SAFETY: h_sta is a valid station handle; names are valid wide strings.
-    // `lpszDevice` must be NULL (not the desktop name — that is a different
-    // parameter and passing it returns ERROR_INVALID_PARAMETER 0x80070057,
-    // measured 2026-10-30).
+    // `CreateDesktopW` creates the desktop **in the calling process's current
+    // window station**, which for an interactive session is `WinSta0`.  That
+    // is deliberately where this lives:
+    //
+    // * A brand-new *station* was the first attempt and it broke the target.
+    //   Measured 2026-10-30: on a fresh station the sample exits 0 in 0.5 s
+    //   and never reaches its decoder — the loader entry is in `.rdata2` and
+    //   the shell probes the station/session/DWM as part of startup.
+    // * A second **desktop on WinSta0** keeps everything it probes (same
+    //   station, same session, DWM reachable) while the windows still land
+    //   off-screen, because a desktop that is not the *input* desktop is
+    //   never composed to the display.
+    //
+    // `lpszDevice` must be NULL — passing the desktop name returns
+    // ERROR_INVALID_PARAMETER (0x80070057), measured 2026-10-30.
+    // SAFETY: desktop_name is a valid null-terminated wide string.
     let h_desk = unsafe {
         CreateDesktopW(
             PCWSTR::from_raw(desktop_name.as_ptr()),
@@ -144,24 +130,22 @@ pub fn create_isolated_desktop() -> Option<String> {
             None,
         )
     };
-    // Kept for the process lifetime; see the doc comment.
-    let _ = h_sta;
 
     match h_desk {
-        Ok(_) => {
+        Ok(h) => {
+            // Kept for the process lifetime: closing it would destroy the
+            // desktop under a running target.
+            let _ = h;
             info!(
-                station = ISOLATED_STATION,
                 desktop = ISOLATED_DESKTOP,
-                "isolated desktop created — target windows cannot reach the \
-                 interactive screen"
+                "hidden desktop created on WinSta0 — target windows land off-screen"
             );
-            Some(format!("{ISOLATED_STATION}\\{ISOLATED_DESKTOP}"))
+            Some(format!("WinSta0\\{ISOLATED_DESKTOP}"))
         }
         Err(e) => {
             warn!(
                 error = %e,
-                "isolated desktop: CreateDesktopW failed — falling back to the \
-                 interactive desktop"
+                "hidden desktop: CreateDesktopW failed — falling back to the                  interactive desktop"
             );
             None
         }

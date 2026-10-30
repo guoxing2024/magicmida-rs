@@ -346,16 +346,22 @@ pub fn unpack(
         is_dll: input.extension().map(|e| e.eq_ignore_ascii_case("dll")).unwrap_or(false),
         suspended: false,
         post_attach,
-        // V2 samples pop a modal licence dialog (titled `CALC`) that lands on
-        // the operator's screen — measured 2026-10-30, one per attempt, so a
-        // retry loop becomes a popup storm.  Running the target on a private
-        // window station/desktop keeps the GUI environment complete (the shell
-        // parks in `win32u!NtBindCompositionSurface` without one) while
-        // nothing it draws can reach the visible screen.  Opt out with
-        // `MAGICMIDA_NO_ISOLATED_DESKTOP=1` when the window is wanted for a
-        // screenshot.
+        // V2 samples pop a modal licence dialog (titled `CALC`) that lands on the
+        // operator's screen.  Measured 2026-10-30:
+        //
+        // * interactive desktop  — dialog appears, shell runs deep (5.6 s seen)
+        // * isolated station     — no dialog, but shell gives up in 0.5 s
+        // * hidden desktop on `WinSta0` — no dialog (0 windows on screen),
+        //   shell alive 12-60 s, but only reaches the decode phase (<=376 ms
+        //   in 8 runs)
+        //
+        // Default is therefore the `WinSta0` hidden desktop: it is the only
+        // shape that is both quiet and long-lived, which is what unattended
+        // batches need.  `MAGICMIDA_INTERACTIVE_DESKTOP=1` opts back in when
+        // the license-phase capture is what is being hunted (the dialog will
+        // appear on screen in that mode).
         isolated_desktop: post_attach
-            && std::env::var("MAGICMIDA_NO_ISOLATED_DESKTOP").is_err(),
+            && std::env::var("MAGICMIDA_INTERACTIVE_DESKTOP").is_err(),
     };
 
     // ---- step 5: initialise Themida state ----
