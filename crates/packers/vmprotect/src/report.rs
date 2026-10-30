@@ -23,9 +23,9 @@ use mida_packer_api::VmProtectMode;
 use mida_pe::PeHeader;
 
 use crate::detect::{
-    classify_mode, fptable_section, is_executable, is_not_paged, packed_sections,
-    plausible_runtime_function_triples, runtime_sections, scrambled_pdata, section_bytes,
-    section_name,
+    classify_mode, find_stub_prologues, fptable_section, is_executable, is_not_paged,
+    is_vm_carrier, packed_sections, plausible_runtime_function_triples, runtime_sections,
+    scrambled_pdata, section_bytes, section_name,
 };
 use crate::resources::{large_resources, LargeResource};
 
@@ -86,6 +86,14 @@ pub struct VmProtectReport {
     pub entry_point_in_file: bool,
     /// Virtualised-function stubs found in ordinary code.
     pub trampolines: Vec<Trampoline>,
+    /// Every VMProtect stub prologue in the file, by byte signature.
+    ///
+    /// This is the count to report.  [`Self::trampolines`] is kept because
+    /// it is the historically-measured shape for `.vmp0` samples, but it
+    /// reads as zero on families whose stubs are not `jmp`-shaped.
+    pub vm_stubs: Vec<VmStub>,
+    /// How much of the export surface is virtualised, when there is one.
+    pub export_coverage: Option<ExportCoverage>,
     /// `(plausible, sampled)` triples in `.pdata`, when it has file bytes.
     pub scrambled_pdata: Option<(usize, usize)>,
     /// The relocated exception table, when there is one.
@@ -123,7 +131,12 @@ pub fn section_of(pe: &PeHeader, rva: u32) -> Option<String> {
 /// `jmp rel32` stubs in ordinary code that land in a runtime section.
 ///
 /// The runtime section itself is skipped: its contents are VM bytecode, and
-/// decoding it as x86 produces noise rather than facts.
+/// decoding it as x86 produces noise rather than facts.  **Sections that
+/// carry VM bytes are skipped too** — measured 2026-10-30 on the launcher
+/// payload, `.rdata0` is a 6.4 MiB mutated-code carrier whose
+/// characteristics (`0x60000020`) pass `is_executable && !is_not_paged`, so
+/// it was scanned as ordinary code and its stray `jmp`s into `.rdata2`
+/// produced **6 phantom stubs**.  See [`vm_stubs`] for the correct count.
 pub fn trampolines(pe: &PeHeader, image: &[u8]) -> Vec<Trampoline> {
     let runtime: Vec<(u32, u32)> = runtime_sections(pe, image)
         .iter()
@@ -142,7 +155,7 @@ pub fn trampolines(pe: &PeHeader, image: &[u8]) -> Vec<Trampoline> {
     let bitness: u32 = if pe.is_64bit { 64 } else { 32 };
     let mut out: Vec<Trampoline> = Vec::new();
     for s in pe.sections.iter() {
-        if !is_executable(s) || is_not_paged(s) {
+        if !is_executable(s) || is_not_paged(s) || is_vm_carrier(s, image) {
             continue;
         }
         let Some(bytes) = section_bytes(s, image) else {
@@ -184,8 +197,202 @@ pub fn trampolines(pe: &PeHeader, image: &[u8]) -> Vec<Trampoline> {
     out
 }
 
-/// The exception table, and whether it is in the file.
+/// One VMProtect stub found by byte signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmStub {
+    /// RVA of the stub's first byte (the `push r10`).
+    pub rva: u32,
+    /// Section the stub lives in.
+    pub section: String,
+}
+
+/// Every VMProtect stub prologue in the file, found by byte signature.
 ///
+/// This is the **only** count that survives scrutiny.  The `jmp rel32` scan
+/// in [`trampolines`] undercounts on this family (0 real hits: the stubs do
+/// not start with a `jmp`, they start with `push r10; pushfq; movabs r10`),
+/// and overcounts whenever a VM code carrier is mistakenly scanned as
+/// ordinary code (6 phantom hits on the launcher payload before
+/// [`is_vm_carrier`] was introduced).
+///
+/// Measured 2026-10-30 on `vcomp140.dll` (launcher family decoded payload):
+/// **50** stubs — 45 in `.rdata0`, 4 in `.rdata2`, 1 in `.text`.  The DllMain
+/// entry point is one of them.
+///
+/// Honest limit: a stub whose prologue has been re-encoded (VMProtect can
+/// mutate the stub itself) will not match this signature, so the count is a
+/// floor, not a ceiling.  On the measured corpus it matched the
+/// independently-derived count exactly.
+pub fn vm_stubs(pe: &PeHeader, image: &[u8]) -> Vec<VmStub> {
+    let mut out = Vec::new();
+    for s in pe.sections.iter() {
+        let Some(bytes) = section_bytes(s, image) else {
+            continue;
+        };
+        for off in find_stub_prologues(bytes) {
+            out.push(VmStub {
+                rva: s.virtual_address.saturating_add(off as u32),
+                section: section_name(s).to_string(),
+            });
+        }
+    }
+    out.sort_by_key(|s| s.rva);
+    out
+}
+
+/// How much of the export surface is virtualised.
+///
+/// The question this answers: "if I only read the native code, do I have the
+/// whole program?"  For the launcher family's *decoded* payload the answer is
+/// yes — measured **0 of 58** unique export RVAs begin with a `jmp` into a
+/// runtime section; every one starts with an ordinary prologue
+/// (`push`/`mov`/`sub`/`test`), and the 50 stubs all sit outside the export
+/// range.
+///
+/// **Only meaningful on bytes that are actually in the clear.**  On a
+/// `Packed` file `.text` has no file bytes and the export slots point into
+/// encrypted carriers, so decoding them says nothing about virtualisation;
+/// [`Self::meaningful`] is `false` there and the report says so instead of
+/// printing a verdict that a reader would take as evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportCoverage {
+    /// Unique export RVAs with a real address.
+    pub unique_exports: usize,
+    /// Export RVAs whose first instruction jumps into a runtime section.
+    pub virtualised: usize,
+    /// Export RVAs that could not be read or decoded.
+    pub unreadable: usize,
+    /// Export RVAs whose bytes live in a high-entropy (encrypted) carrier.
+    ///
+    /// When this is non-zero the counts above describe ciphertext.
+    pub in_encrypted_carrier: usize,
+}
+
+impl ExportCoverage {
+    /// `true` when nothing on the export surface is virtualised **and** the
+    /// bytes examined were in the clear, i.e. the native code really is the
+    /// whole program surface.
+    pub fn fully_native(&self) -> bool {
+        self.meaningful() && self.unique_exports > 0 && self.virtualised == 0 && self.unreadable == 0
+    }
+
+    /// `false` when the export bodies are ciphertext, so the counts must not
+    /// be read as a verdict.
+    pub fn meaningful(&self) -> bool {
+        self.in_encrypted_carrier == 0
+    }
+}
+
+/// Measure [`ExportCoverage`] for the exports actually present in `image`.
+///
+/// Returns `None` when the file has no export directory (plain EXEs).
+pub fn export_coverage(pe: &PeHeader, image: &[u8]) -> Option<ExportCoverage> {
+    // Hand-rolled walk of the export directory: mida-pe's header carries the
+    // data directories, and we only need `AddressOfFunctions` + `NumberOfFunctions`.
+    const EXPORT_DIRECTORY_INDEX: usize = 0;
+    let dd = &pe.nt_headers.optional_header.data_directory[EXPORT_DIRECTORY_INDEX];
+    if dd.virtual_address == 0 || dd.size == 0 {
+        return None;
+    }
+    let off = pe.rva_to_offset(dd.virtual_address)? as usize;
+    // IMAGE_EXPORT_DIRECTORY: Name(4) TimeDateStamp(4) Major(2) Minor(2)
+    //   Name RVA(4) OrdinalBase(4) NumberOfFunctions(4) NumberOfNames(4)
+    //   AddressOfFunctions(4) AddressOfNames(4) AddressOfNameOrdinals(4)
+    let funcs_rva = read_u32(image, off + 0x1C)?;
+    let n_funcs = read_u32(image, off + 0x14)? as usize;
+    if n_funcs == 0 {
+        return Some(ExportCoverage {
+            unique_exports: 0,
+            virtualised: 0,
+            unreadable: 0,
+            in_encrypted_carrier: 0,
+        });
+    }
+    let funcs_off = pe.rva_to_offset(funcs_rva)? as usize;
+
+    let runtime: Vec<(u32, u32)> = runtime_sections(pe, image)
+        .iter()
+        .map(|s| {
+            (
+                s.virtual_address,
+                s.virtual_address
+                    .saturating_add(s.virtual_size.max(s.raw_size)),
+            )
+        })
+        .collect();
+
+    let bitness: u32 = if pe.is_64bit { 64 } else { 32 };
+    let mut seen: std::collections::BTreeSet<u32> = Default::default();
+    let mut virtualised = 0usize;
+    let mut unreadable = 0usize;
+    let mut in_encrypted_carrier = 0usize;
+    for i in 0..n_funcs {
+        let Some(rva) = read_u32(image, funcs_off + i * 4) else {
+            unreadable += 1;
+            continue;
+        };
+        if rva == 0 || !seen.insert(rva) {
+            continue;
+        }
+        // Classify the *carrier* first: on a `Packed` file the export bodies
+        // live in high-entropy sections, so decoding them measures ciphertext.
+        if let Some(sec) = pe.sections.iter().find(|s| {
+            let end = s.virtual_address.saturating_add(s.virtual_size.max(s.raw_size));
+            rva >= s.virtual_address && rva < end
+        }) {
+            if is_vm_carrier(sec, image) {
+                in_encrypted_carrier += 1;
+                continue;
+            }
+        }
+        let Some(bytes) = rva_bytes(pe, image, rva, 16) else {
+            unreadable += 1;
+            continue;
+        };
+        let ip = pe.image_base + rva as u64;
+        let mut dec = Decoder::with_ip(bitness, bytes, ip, DecoderOptions::NONE);
+        let mut ins = Instruction::default();
+        dec.decode_out(&mut ins);
+        if ins.is_invalid() {
+            unreadable += 1;
+            continue;
+        }
+        if ins.mnemonic() == Mnemonic::Jmp
+            && matches!(
+                ins.op0_kind(),
+                OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
+            )
+        {
+            let t = ins.near_branch_target();
+            if t >= pe.image_base {
+                let trva = (t - pe.image_base) as u32;
+                if runtime.iter().any(|(lo, hi)| trva >= *lo && trva < *hi) {
+                    virtualised += 1;
+                }
+            }
+        }
+    }
+    Some(ExportCoverage {
+        unique_exports: seen.len(),
+        virtualised,
+        unreadable,
+        in_encrypted_carrier,
+    })
+}
+
+/// Little-endian `u32` at `off`, or `None` when it leaves `image`.
+fn read_u32(image: &[u8], off: usize) -> Option<u32> {
+    let b = image.get(off..off + 4)?;
+    Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// `n` file bytes starting at `rva`, or `None` when the range is not present.
+fn rva_bytes<'a>(pe: &PeHeader, image: &'a [u8], rva: u32, n: usize) -> Option<&'a [u8]> {
+    let off = pe.rva_to_offset(rva)? as usize;
+    image.get(off..off.checked_add(n)?)
+}
+
+/// The exception table, and whether it is in the file.
 /// Measured: both samples relocate it into their runtime section
 /// (`0x2b2e50` in `.vmp0`, `0x1b99770` in `.rdata2`) with 64/64 plausible
 /// triples, while `.pdata` measures `0/64` (`MinProtection`) or is absent
@@ -243,6 +450,8 @@ pub fn analyze(pe: &PeHeader, image: &[u8]) -> VmProtectReport {
         entry_point_section: section_of(pe, pe.entry_point),
         entry_point_in_file,
         trampolines: trampolines(pe, image),
+        vm_stubs: vm_stubs(pe, image),
+        export_coverage: export_coverage(pe, image),
         scrambled_pdata: scrambled_pdata(pe, image),
         exception_directory: exception_directory(pe, image),
         large_resources: large_resources(pe, image),
@@ -286,17 +495,63 @@ impl fmt::Display for VmProtectReport {
             "  .fptable            {}",
             self.fptable.as_deref().unwrap_or("absent")
         )?;
-        if self.trampolines.is_empty() {
+        // Byte-signature count first: it is the number that holds up.
+        if self.vm_stubs.is_empty() {
             let why = if self.requires_runtime_dump() {
-                "none (code sections have no file bytes — runtime dump required)"
+                "none found (code sections have no file bytes — runtime dump required)"
             } else {
-                "none"
+                "none found by signature"
             };
-            writeln!(f, "  virtualised stubs   {why}")?;
+            writeln!(f, "  vm stubs (sig)      {why}")?;
+        } else {
+            let mut by_section: std::collections::BTreeMap<&str, usize> = Default::default();
+            for s in &self.vm_stubs {
+                *by_section.entry(s.section.as_str()).or_insert(0) += 1;
+            }
+            let parts: Vec<String> = by_section
+                .iter()
+                .map(|(k, v)| format!("{k} {v}"))
+                .collect();
+            writeln!(
+                f,
+                "  vm stubs (sig)      {} ({} … {}) — {}",
+                self.vm_stubs.len(),
+                format!("{:#x}", self.vm_stubs.first().map(|s| s.rva).unwrap_or(0)),
+                format!("{:#x}", self.vm_stubs.last().map(|s| s.rva).unwrap_or(0)),
+                parts.join(", ")
+            )?;
+        }
+        if let Some(c) = &self.export_coverage {
+            if !c.meaningful() {
+                // Export bodies inside encrypted carriers: decoding them
+                // measures ciphertext, so "0/N virtualised" would be a false
+                // conclusion rather than a finding.
+                writeln!(
+                    f,
+                    "  export surface      {} exports, {} in encrypted carriers — UNDETERMINED (bytes are ciphertext; judge from a runtime dump)",
+                    c.unique_exports, c.in_encrypted_carrier
+                )?;
+            } else {
+                writeln!(
+                    f,
+                    "  export surface      {}/{} virtualised, {} unreadable{}",
+                    c.virtualised,
+                    c.unique_exports,
+                    c.unreadable,
+                    if c.fully_native() {
+                        " — native code is the whole export surface"
+                    } else {
+                        ""
+                    }
+                )?;
+            }
+        }
+        if self.trampolines.is_empty() {
+            writeln!(f, "  jmp trampolines     none")?;
         } else {
             writeln!(
                 f,
-                "  virtualised stubs   {} ({} … {})",
+                "  jmp trampolines     {} ({} … {})",
                 self.trampolines.len(),
                 self.trampolines
                     .first()
@@ -449,7 +704,12 @@ mod tests {
         assert_eq!(r.trampolines.len(), 1);
         let text = r.to_string();
         assert!(text.contains("VMProtect (min-protection)"), "{text}");
-        assert!(text.contains("virtualised stubs   1"), "{text}");
+        // The trampoline count moved to its own line when the byte-signature
+        // count (`vm stubs (sig)`) was introduced — the `.vmp0` family's
+        // stubs are `jmp`-shaped, so the fixture has a trampoline but no
+        // signature match.
+        assert!(text.contains("jmp trampolines     1"), "{text}");
+        assert!(text.contains("vm stubs (sig)"), "{text}");
 
         // Packed: code absent, so the report has to say a runtime dump is
         // required rather than implying there is nothing to unpack.

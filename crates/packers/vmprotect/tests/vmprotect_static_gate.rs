@@ -204,9 +204,21 @@ fn packed_sample_reports_absent_code_and_a_memory_only_payload() {
     // *why*, which is asserted through the rendered text.
     assert!(r.trampolines.is_empty());
     let text = r.to_string();
+    // The trampoline scan still finds nothing (it skips the carriers), so the
+    // empty-list explanation moved to the `jmp trampolines` line.
     assert!(
-        text.contains("runtime dump required"),
-        "the empty stub list must be explained:\n{text}"
+        text.contains("jmp trampolines     none"),
+        "the empty trampoline list must be stated:\n{text}"
+    );
+    // The byte-signature count has its own line.  On this sample it finds
+    // stubs *inside the packed* `.rdata2` (measured: 3 signatures in the
+    // packed file, 4 in the decoded one) — `.rdata2` is only partially
+    // encrypted, so the stub prologues survive into the shipped file.  The
+    // assertion is therefore that the line carries a count, not that it is
+    // empty.
+    assert!(
+        text.contains("vm stubs (sig)      ") && !text.contains("vm stubs (sig)      none found"),
+        "the signature count must be reported:\n{text}"
     );
 
     let exc = r.exception_directory.as_ref().expect("exception directory");

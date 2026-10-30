@@ -1405,6 +1405,59 @@ GetLocalTime ret=0x107547e）——差异纯在采样频率。
 工作区 dump 全线皆零（壳 bail 前清零工作区）——名字表不可回收，
 代码本身带比较常量（过期日期），走反汇编路线。
 
+## VMProtect：stub 误报 6→50，及"导出字节是密文时不得下结论"（2026-10-30，未发布）
+
+**样本**：`E:\Download\启动器10.9\vcomp140.dll`（12,782,080 B，sha256
+`c6bc91f1…`）——启动器家族 `启动器10.9.exe`（`804fd7c1…`，与
+`D:\Projects\zz_test.exe` 逐字节同）的**解码载荷明文版**。它伪装成 MSVC
+OpenMP 运行库（正版 System32 只有 193,152 B，它是 66 倍），pefile 实读
+导出表名为 `vcomp140.dll`，60 个导出**全部无名称纯序号**，5 个导入全是
+敏感 API（`WriteProcessMemory`/`SendInput`/`GetPixel`/`RegOpenKeyExW`/
+`WinHttpReceiveResponse`）。
+
+**缺陷①：`/analyze` 报 6 个虚拟化 stub，真值 50。** 根因是
+`trampolines()` 只排除 `is_not_paged` 段；样本的 `.rdata0`（6.4 MiB 变异
+VM 码，特征 `0x60000020`）不满足 `is_not_paged`，于是被当**普通代码**线性
+反汇编（实测解出 1,674,701 条指令，绝大多数是噪声），其零散 `jmp` 落进
+`.rdata2` 就被计成 trampoline。6 个地址逐个反汇编确认是 `jmp` 接垃圾。
+
+修法两层：**（a）** `is_vm_carrier(sec, image)` = 可执行 && 熵 ≥ 7.1
+（实测 `.rdata0`/`.rdata2` 7.35，同文件真代码 `.text` 6.97），
+`trampolines()` 跳过载体段；**（b）** 新增 **字节特征码**计数
+`vm_stubs()`，扫描 x64 stub 序言 `41 52 9C 49 BA`
+（`push r10; pushfq; movabs r10, imm64`）。真值 50 =
+`.rdata0` 45 + `.rdata2` 4 + `.text` 1，与 Python 独立测量逐项一致。
+`/analyze` 现分两行输出（`vm stubs (sig)` / `jmp trampolines`），不再混用。
+
+**缺陷②（新发现，比①重要）：打包态下"0/17 virtualised"是假结论。**
+加了导出覆盖率后，`启动器10.9.exe`（Packed、`.text` 无文件字节）报出
+`0/17 virtualised`——但那些导出 RVAs 指向**加密载体**，解码的是密文，
+"0 个虚拟化"是假阳性结论。修：`ExportCoverage.in_encrypted_carrier` +
+`meaningful()`，非明码时改报
+`17 exports, 16 in encrypted carriers — UNDETERMINED`。**规则钉死：
+静态判定只在字节处于明文的段上做；密文上量出来的数只能标 UNDETERMINED。**
+
+**交叉验证**：Rust `0/58 virtualised` 与 C 探针
+`EXPORT_PROLOGUE ok=60 bad_rva=0 bad_first_byte=0 jmp_rel32=3
+jmp_into_vm=0` 一致——3 个 `E9` 首字节的导出目标全在 `.text` 内
+（0x13dc0 / 0x8b40 / 0x14000），**没有一个跳进 VM 区**。只数裸 `E9` 会
+误导，必须分类落点。探针 `vmp_load_probe_v2.exe` 为此新增
+`jmp_into_vm` 计数。
+
+**同一文件的续期测量（补正上一轮的错数）**：上轮报"`.text` 514 条指令"
+是 capstone 遇无效字节即停的产物；开 `skipdata` 后真值是 **40,864 条**。
+结论未翻转：`.text` 仍**零处**引用 stub（`.rdata0` 167 万条里 10 处、
+`.rdata2` 150 万条里 1 处）。
+
+**保护边界（本样本定案）**：50 个 stub 全部在导出范围之外（导出 RVA
+0x1740–0x15cd0，stub 首达 0x50e7 但**无一个是导出入口**）；58 个唯一导出
+RVA **0 个**以 VM `jmp` 开头。**功能面 100% 原生明文，VM 只锁初始化/校验。**
+
+**运行时不加密（新增测量）**：把该 DLL 载入进程后逐段与磁盘对比——熵
+`.rdata0` 7.35→7.35、`.rdata2` 7.35→7.35，变化字节仅 3901 / 116 个；
+`.fptable` 磁盘全零 → 运行时 18 非零字节（跳表运行时构建）。**VM 字节码
+全生命周期无明文时刻**，这是"完全明码"不可达的实证依据。
+
 ## V2：post-attach 忙转缺陷 + 对话框停车定案（2026-10-30 深夜，未发布）
 
 **真缺陷：post-attach 轮询从不等待（忙转 2 kHz）**——`WaitForDebugEvent`

@@ -165,6 +165,70 @@ pub fn shannon_entropy(data: &[u8]) -> f32 {
     e
 }
 
+/// The x64 VMProtect stub prologue: `push r10; pushfq; movabs r10, imm64`.
+///
+/// Measured 2026-10-30 on the launcher family's decoded payload
+/// (`vcomp140.dll`, sha256 `c6bc91f1…`): **50** occurrences — 45 in
+/// `.rdata0`, 4 in `.rdata2`, 1 in `.text` — each followed by a `call` into
+/// the dispatcher.  The DllMain entry point itself (`0x75630e`) is one.
+///
+/// This is the only reliable count.  Finding stubs by decoding ordinary
+/// code and looking for `jmp rel32` into the runtime section produced
+/// **6 bogus hits** on the same file (`0xf5f95 … 0x2ab33f`): `.rdata0`
+/// (6.4 MiB of mutated VM code, characteristics `0x60000020`) passes
+/// `is_executable && !is_not_paged` and is therefore scanned as if it were
+/// ordinary code, so its stray `jmp`s landing inside `.rdata2` were counted
+/// as virtualised-function stubs.  A byte-signature scan cannot be fooled
+/// that way: only a real stub prologue has this pattern.
+pub const VMP_X64_STUB_PROLOGUE: [u8; 5] = [0x41, 0x52, 0x9c, 0x49, 0xba];
+
+/// Offsets of every VMProtect stub prologue in `bytes`.
+pub fn find_stub_prologues(bytes: &[u8]) -> Vec<usize> {
+    let pat = VMP_X64_STUB_PROLOGUE;
+    if bytes.len() < pat.len() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + pat.len() <= bytes.len() {
+        if bytes[i..i + pat.len()] == pat {
+            out.push(i);
+            i += pat.len();
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Entropy floor for [`is_vm_carrier`].  Measured: `.rdata0`/`.rdata2` sit at
+/// **7.35** on the launcher payload; genuine native code on the same file
+/// (`.text`) is **6.97**, and ordinary application code is usually below 6.5.
+const VM_CARRIER_MIN_ENTROPY: f32 = 7.1;
+
+/// `true` when the section carries VMProtect's own bytes rather than
+/// ordinary code.
+///
+/// `.rdata0`/`.rdata2` hold mutation output and bytecode; decoding them as
+/// x86 yields millions of meaningless instructions (measured: 1,674,701 and
+/// 1,504,365 respectively), and any `jmp` found there is a disassembler
+/// artefact, not a stub.
+///
+/// The test is deliberately narrow — high entropy *and* executable.  Real
+/// code is never at 7.1+ bits/byte; VM carriers always are executable.
+/// `.pdata` is high-entropy but not executable, so it is not excluded.
+pub fn is_vm_carrier(sec: &PeSection, image: &[u8]) -> bool {
+    if !is_executable(sec) {
+        return false;
+    }
+    match section_bytes(sec, image) {
+        Some(bytes) => shannon_entropy(bytes) >= VM_CARRIER_MIN_ENTROPY,
+        // No file bytes: nothing decodes anyway, so calling it a carrier
+        // keeps the scan honest for `Packed` shapes.
+        None => true,
+    }
+}
+
 /// `(plausible, sampled)` `RUNTIME_FUNCTION` triples in `data`.
 ///
 /// Real `.pdata` tables are near-100 % plausible; VMProtect's scrambled
@@ -575,5 +639,45 @@ mod tests {
         assert!(absent.contains(&"vmp-section"));
         assert!(!d.absent.iter().any(|e| e.code == "fptable-section"));
         assert!(detect(&pe_with(vec![sec(".text", 0x400, 0x400, 0x6000_0020)]), &img).is_none());
+    }
+
+    #[test]
+    fn find_stub_prologues_matches_the_measured_launcher_signature() {
+        // The exact prologue of the launcher family's DllMain stub
+        // (`0x18075630e`: push r10; pushfq; movabs r10, imm64).
+        let mut code = Vec::new();
+        code.extend_from_slice(&VMP_X64_STUB_PROLOGUE);
+        code.extend_from_slice(&[0x88, 0xd3, 0xa0, 0x44, 0x0d, 0x88]); // imm64 tail
+        code.extend_from_slice(&[0x41, 0x52]); // different: push r10; push rdx
+        code.extend_from_slice(&VMP_X64_STUB_PROLOGUE);
+        let hits = find_stub_prologues(&code);
+        assert_eq!(hits, vec![0, 13], "only the real prologue matches");
+        // A truncated buffer must not panic or match.
+        assert!(find_stub_prologues(&[0x41, 0x52, 0x9c]).is_empty());
+    }
+
+    #[test]
+    fn is_vm_carrier_excludes_high_entropy_executable_sections_only() {
+        // Build 4 KiB of pseudo-random bytes: entropy ≈ 8.0.
+        let mut img = vec![0u8; 0x2000];
+        let mut x: u32 = 0x1234_5678;
+        for i in 0..0x1000 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            img[0x1000 + i] = (x & 0xFF) as u8;
+        }
+        // `.rdata0`-shaped carrier: executable, at file offset 0x1000.
+        let carrier = sec_at(".rdata0", 0x1000, 0x1000, 0x6000_0020, 0x1000);
+        // Same bytes, but not executable → not a carrier (`.pdata` shape).
+        let data = sec_at(".pdata", 0x1000, 0x1000, 0x4000_0040, 0x1000);
+        // Executable but zero-filled → low entropy → ordinary code section.
+        let code = sec_at(".text", 0x1000, 0x1000, 0x6000_0020, 0x0);
+        assert!(is_vm_carrier(&carrier, &img));
+        assert!(!is_vm_carrier(&data, &img), "not executable");
+        assert!(!is_vm_carrier(&code, &img), "low entropy is real code");
+        // No file bytes → treated as a carrier (nothing can be decoded).
+        let absent = sec(".text", 0, 0x12b05c, 0x6000_0020);
+        assert!(is_vm_carrier(&absent, &img));
     }
 }
