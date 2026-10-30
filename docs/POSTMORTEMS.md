@@ -1420,6 +1420,41 @@ run；但 8 次 run 全部只到解码期（≤376 ms），**没有一次进入 
 CLI 默认值因此改为：V2 post-attach 下**默认隐藏桌面**（不打扰操作者），
 需要相位数据时显式 `MAGICMIDA_INTERACTIVE_DESKTOP=1`。
 
+## V2：license 检查 = VM 虚拟化（主项目当前边界，2026-10-30，未发布）
+
+**快跑形态（sleep 修复后的重大变化）**：整个壳生命周期在 **1 秒内**完成——
+解码 ~0.4 s → license 检查 ~0.4 s → CALC 对话框 ~1 s。旧测的 15-22 s 全是
+忙转扰动时代的数字。每次实验的壳时间成本从 20 s+ 降到 1 s。
+
+**本轮机器（全部落地并验证）**：
+- **dialog-killer**（`MAGICMIDA_V2_DIALOG_KILL=1`）：50 ms 轮询
+  `EnumWindows`，发现目标的 `#32770` 即 `TerminateProcess`——交互桌面
+  license 狩猎时弹窗可见 ≤1-2 帧；相位样本靠周期落盘幸存。回调提升为模块
+  级 `extern "system" fn`（`WNDENUMPROC::Some(inline fn)` 语法不可用）。
+- **worker 轮转采样**：post-attach 看不到 CREATE_THREAD 事件，worker 对
+  调试器不可见——`list_target_thread_ids`（ToolHelp）+
+  `sample_worker_rip`（OpenThread 直采）。每 tick 主线程 + 4 个 worker
+  轮转。样本结构扩为 (t_ms, rip, tid, 64B)。
+- **指纹狩猎**（`MAGICMIDA_V2_FPHUNT=1`）：VirtualQueryEx 走查全部已提交
+  内存（64 MB/tick 上限），搜 `BCEC-14F2`（ASCII/UTF-16/LE 二进制三形态）。
+  命中即冻结 + dump 256 KB 邻域 + 全场景 + 终止（弹窗前完成）。
+  windows-0.58 的 `GetThreadContext`-族签名是泛型（`P0: Param<HWND>` +
+  `Option<*mut u32>`），与 0.48 不同。
+
+**决定性负结果 ×2**：
+1. **指纹串从不以可扫描形态存在**（ASCII/UTF-16/二进制三形态 × 25 ms 扫描
+   全空）——检查比较的可能是哈希，或串只在对话框格式化的瞬间存在。
+2. **检查是 VM 虚拟化的**：K6 捕获（5 ms 密度，覆盖 5-455 ms 全生命周期）
+   的最后 10 个池样本全是 VM 解释器的变异块（`jmp` 链 + 变异指令 + EBP
+   相对工作区寻址），无原生比较逻辑。**决策在字节码里，catch-and-patch
+   需要先重建 VM 上下文（寄存器银行/PC/handler 表）= mini-devirt。**
+
+**当前边界**：license 检查通过 → `.text` 才解密（实测 bail 时 `.text`
+仍加密）。检查在 VM 里 = 三条路：**A.** mini-devirt 这个检查（重建 VM
+上下文——工程量大但有界，只此一个检查）；**B.** 假造硬件指纹输入（API
+补丁被完整性检查封死）；**C.** 接受边界（授权保护按设计工作）。主项目
+的 V2 线在 A/C 之间待用户决策。
+
 ## V2：隔离桌面停掉 CALC 弹窗，但壳随即放弃检查（2026-10-30，未发布）
 
 **动机**：V2 样本在 license 检查失败时弹「CALC」硬件锁对话框，弹在当前

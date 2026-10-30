@@ -350,6 +350,98 @@ pub(super) fn arm_v2_exit_trap(dbg: &mut ProcessSession) -> Vec<usize> {
 /// byte of the target is modified, unlike the ExitProcess/time-API patches
 /// it detects within seconds (measured 2026-10-29).
 #[cfg(target_arch = "x86")]
+/// All thread IDs of `pid` via a ToolHelp thread snapshot.
+///
+/// Post-attach mode never sees CREATE_THREAD debug events, so the debugger's
+/// thread map only knows the main thread — the workers that actually run the
+/// licence check (measured 2026-10-30: main thread leaves the image at
+/// ~0.36 s, dialog at ~1 s) are invisible to it.  This walks the system
+/// snapshot instead.
+#[cfg(target_arch = "x86")]
+pub(super) fn list_target_thread_ids(pid: u32) -> Vec<u32> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, THREADENTRY32, TH32CS_SNAPTHREAD,
+    };
+    // SAFETY: pid 0 = system-wide thread snapshot; handle closed below.
+    let Ok(h_snap) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }) else {
+        return Vec::new();
+    };
+    let mut te = THREADENTRY32::default();
+    te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+    let mut out = Vec::new();
+    // SAFETY: h_snap is a valid snapshot handle; te is sized.
+    if unsafe { Thread32First(h_snap, &mut te) }.is_ok() {
+        loop {
+            if te.th32OwnerProcessID == pid {
+                out.push(te.th32ThreadID);
+            }
+            // SAFETY: h_snap is a valid snapshot handle; te is sized.
+            if unsafe { Thread32Next(h_snap, &mut te) }.is_err() {
+                break;
+            }
+        }
+    }
+    // SAFETY: handle from CreateToolhelp32Snapshot.
+    unsafe {
+        let _ = CloseHandle(h_snap);
+    }
+    out
+}
+
+/// Sample one worker thread's RIP + 64 B of code at RIP, by raw `tid`
+/// (OpenThread — the debugger's thread map does not know post-attach
+/// workers).  Suspend → context → read → resume; microseconds of stall.
+#[cfg(target_arch = "x86")]
+pub(super) fn sample_worker_rip(dbg: &ProcessSession, tid: u32) -> Option<(usize, Vec<u8>)> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::Debug::{GetThreadContext, CONTEXT};
+    use windows::Win32::System::Threading::{
+        OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_SUSPEND_RESUME,
+    };
+
+    // SAFETY: tid from the snapshot; handle closed below.
+    let h = unsafe {
+        OpenThread(
+            THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME,
+            false,
+            tid,
+        )
+    }
+    .ok()?;
+    // SAFETY: valid thread handle.
+    let prev = unsafe { SuspendThread(h) };
+    if prev == u32::MAX {
+        // SAFETY: no-op when the open failed the suspend.
+        unsafe {
+            let _ = CloseHandle(h);
+        }
+        return None;
+    }
+    let mut ctx = CONTEXT::default();
+    ctx.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_FLAGS(0x0001_0003);
+    // SAFETY: valid handle and sized CONTEXT.
+    let got = unsafe { GetThreadContext(h, &mut ctx) }.is_ok();
+    let mut code = vec![0u8; 64];
+    if got {
+        let _ = dbg.read_memory(ctx.Eip as usize, &mut code);
+    }
+    // SAFETY: thread suspended above.
+    unsafe {
+        let _ = ResumeThread(h);
+    }
+    // SAFETY: handle from OpenThread.
+    unsafe {
+        let _ = CloseHandle(h);
+    }
+    if got {
+        Some((ctx.Eip as usize, code))
+    } else {
+        None
+    }
+}
+
+#[cfg(target_arch = "x86")]
 pub(super) fn sample_main_rip(dbg: &mut ProcessSession) -> Option<(usize, usize, Vec<u8>, Vec<u8>)> {
     use windows::Win32::System::Threading::{ResumeThread, SuspendThread};
 
@@ -714,6 +806,240 @@ pub(super) fn check_v2_exit_trap(
 // ---------------------------------------------------------------------------
 // Data section bounds
 // ---------------------------------------------------------------------------
+
+/// Statics shared with the dialog-killer's `WNDENUMPROC` callback.  The
+/// callback cannot capture, and only one killer thread runs per session, so
+/// process-global slots are the simplest correct wiring.
+#[cfg(target_arch = "x86")]
+static DIALOG_KILL_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+#[cfg(target_arch = "x86")]
+static DIALOG_KILL_FOUND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `EnumWindows` callback for [`spawn_dialog_killer`]: flag the first `#32770`
+/// window owned by the target PID and stop the walk.
+/// SAFETY: called by the OS enumerator; reads only its own statics and the
+/// window API.
+#[cfg(target_arch = "x86")]
+unsafe extern "system" fn dialog_kill_enumproc(hwnd: windows::Win32::Foundation::HWND, _l: windows::Win32::Foundation::LPARAM) -> windows::Win32::Foundation::BOOL {
+    use std::sync::atomic::Ordering;
+    use windows::Win32::Foundation::BOOL;
+    use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetWindowThreadProcessId};
+    let mut owner = 0u32;
+    // SAFETY: hwnd comes from the enumerator.
+    unsafe {
+        GetWindowThreadProcessId(hwnd, Some(&mut owner));
+    }
+    if owner != DIALOG_KILL_PID.load(Ordering::Relaxed) {
+        return BOOL::from(true);
+    }
+    let mut name = [0u16; 16];
+    // SAFETY: name buffer sized for `#32770`.
+    let n = unsafe { GetClassNameW(hwnd, &mut name) };
+    let cls = String::from_utf16_lossy(&name[..n.max(0) as usize]);
+    if cls == "#32770" {
+        DIALOG_KILL_FOUND.store(true, Ordering::SeqCst);
+        return BOOL::from(false);
+    }
+    BOOL::from(true)
+}
+
+/// Spawn the dialog-killer thread: poll (50 ms) for a `#32770` dialog that
+/// belongs to the target and terminate the target the moment one appears.
+///
+/// Why: on the interactive desktop the licence check ends by showing the
+/// "CALC" hardware-lock dialog on the operator's screen.  The phase recorder
+/// needs the interactive desktop to reach the check at all (the hidden
+/// desktop parks the shell before the check), but the *check itself* runs
+/// before the dialog — so the run is killed the instant the dialog exists.
+/// Visible lifetime of the popup: one or two frames.
+///
+/// Gated by `MAGICMIDA_V2_DIALOG_KILL=1`.  Returns the join handle; the
+/// thread self-terminates after killing, when the target dies first, or
+/// after a 10-minute cap.
+#[cfg(target_arch = "x86")]
+pub(super) fn spawn_dialog_killer(
+    pid: u32,
+    h_process: HANDLE,
+) -> Option<std::thread::JoinHandle<()>> {
+    use std::sync::atomic::Ordering;
+
+    if std::env::var("MAGICMIDA_V2_DIALOG_KILL").is_err() {
+        return None;
+    }
+    DIALOG_KILL_PID.store(pid, Ordering::SeqCst);
+    DIALOG_KILL_FOUND.store(false, Ordering::SeqCst);
+    let handle_raw = h_process.0 as isize;
+    let join = std::thread::spawn(move || {
+        use windows::Win32::Foundation::LPARAM;
+        use windows::Win32::System::Threading::TerminateProcess;
+        use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, WNDENUMPROC};
+        // SAFETY: statics are set before the thread starts; the callback only
+        // reads them and the window API.
+        let cb = WNDENUMPROC::Some(dialog_kill_enumproc);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        loop {
+            if DIALOG_KILL_FOUND.load(Ordering::SeqCst) {
+                // SAFETY: live PROCESS_ALL_ACCESS handle captured at spawn.
+                unsafe {
+                    let _ = TerminateProcess(
+                        windows::Win32::Foundation::HANDLE(handle_raw as *mut core::ffi::c_void),
+                        0x2C,
+                    );
+                }
+                info!("DIALOG-KILL: licence dialog appeared — target terminated");
+                return;
+            }
+            if std::time::Instant::now() > deadline {
+                return;
+            }
+            // SAFETY: valid callback and lparam.
+            unsafe {
+                let _ = EnumWindows(cb, LPARAM(0));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    });
+    Some(join)
+}
+
+/// Fingerprint hunt (`MAGICMIDA_V2_FPHUNT=1`): scan the target image for
+/// the hardware-fingerprint string the licence dialog prints ("BCEC-14F2…").
+///
+/// The check must materialise that string in memory while it runs, so the
+/// first tick the scan finds it is a tick the check (or its data stage) is
+/// live.  On a hit: the main thread is frozen (left suspended), the 256 KiB
+/// around the hit plus the full bail scene are dumped, and the process is
+/// terminated — all before the dialog can be created, so nothing reaches the
+/// operator's screen.
+///
+/// Returns `true` when a hit was processed (caller ends the run).
+#[cfg(target_arch = "x86")]
+pub(super) fn fingerprint_hunt_tick(
+    dbg: &mut ProcessSession,
+    image_base: usize,
+    output_path: &Path,
+) -> bool {
+    use windows::Win32::System::Memory::{
+        VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_NOACCESS,
+    };
+    use windows::Win32::System::Threading::{SuspendThread, TerminateProcess};
+
+    const NEEDLE: &[u8] = b"BCEC-14F2";
+    // The same fingerprint in UTF-16 (dialogs are usually built wide).
+    const NEEDLE_W: &[u8] = &[
+        b'B', 0x00, b'C', 0x00, b'E', 0x00, b'C', 0x00, b'-', 0x00,
+        b'1', 0x00, b'4', 0x00, b'F', 0x00, b'2', 0x00,
+    ];
+    // The fingerprint as raw little-endian WORDs (BCEC-14F2-0C16 …) — the
+    // form the *check* most likely compares.  The dialog string is formatted
+    // only at dialog time, which is why the ASCII scan never caught the
+    // check itself.
+    const NEEDLE_BIN: &[u8] = &[0xec, 0xbc, 0xf2, 0x14, 0x16, 0x0c];
+    const SCAN_CAP: usize = 64 << 20; // 64 MiB per scan — bounds the RPM cost
+    const CHUNK: usize = 1 << 20;
+
+    let h_process = dbg.process_handle();
+    let mut buf = vec![0u8; CHUNK];
+    let mut scanned = 0usize;
+    let mut hit_addr: Option<usize> = None;
+    let mut hit_is_wide = false;
+    let mut addr = 0x1_0000usize;
+    while addr < 0x7FFF_0000 && hit_addr.is_none() && scanned < SCAN_CAP {
+        let mut mbi = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: valid process handle and sized MBI.
+        let ok = unsafe {
+            VirtualQueryEx(
+                h_process,
+                Some(addr as *const core::ffi::c_void),
+                &mut mbi,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if ok == 0 {
+            break;
+        }
+        let region = mbi.RegionSize as usize;
+        let base = mbi.BaseAddress as usize;
+        let committed = mbi.State == MEM_COMMIT;
+        let readable = mbi.Protect != PAGE_NOACCESS && mbi.Protect.0 != 0;
+        if committed && readable && region >= NEEDLE.len() {
+            let mut roff = 0usize;
+            while roff + NEEDLE.len() <= region && hit_addr.is_none() && scanned < SCAN_CAP {
+                let len = CHUNK.min(region - roff);
+                let got = dbg
+                    .read_memory(base + roff, &mut buf[..len])
+                    .unwrap_or(0);
+                if got >= NEEDLE.len() {
+                    let slice = &buf[..got];
+                    let pos_a = slice.windows(NEEDLE.len()).position(|w| w == NEEDLE);
+                    let pos_w = slice.windows(NEEDLE_W.len()).position(|w| w == NEEDLE_W);
+                    let pos_b = slice.windows(NEEDLE_BIN.len()).position(|w| w == NEEDLE_BIN);
+                    if let Some(pos) = pos_a.or(pos_w).or(pos_b) {
+                        hit_addr = Some(base + roff + pos);
+                        hit_is_wide = pos_w.is_some() && pos_a.is_none();
+                    }
+                }
+                scanned += got;
+                roff += CHUNK;
+            }
+        }
+        addr = base.saturating_add(region);
+    }
+    let _ = image_base;
+    let Some(hit_addr) = hit_addr else {
+        return false;
+    };
+    info!(
+        addr = format!("{hit_addr:#x}"),
+        wide = hit_is_wide,
+        scanned_mb = scanned >> 20,
+        "FP-HUNT: fingerprint string materialised — freezing and dumping"
+    );
+
+    // Freeze the main thread and keep it suspended for the scene dump.
+    let tid = dbg.main_thread_id();
+    let Ok(h) = dbg.thread_handle(tid) else {
+        return false;
+    };
+    // SAFETY: thread handle from the debugger's own map.
+    let prev = unsafe { SuspendThread(h) };
+    if prev == u32::MAX {
+        return false;
+    }
+    let ctx = dbg.get_thread_context_control(tid).ok();
+
+    // 256 KiB around the hit — the check code and its data stage.
+    let dump_lo = hit_addr.saturating_sub(0x2_0000);
+    let mut blob = vec![0u8; 0x4_0000];
+    let got = dbg.read_memory(dump_lo, &mut blob).unwrap_or(0);
+    blob.truncate(got);
+    let out_dir = output_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let stem = output_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "v2fp".to_string());
+    let path = out_dir.join(format!("{stem}.v2fphunt.bin"));
+    match std::fs::write(&path, &blob) {
+        Ok(()) => info!(
+            path = %path.display(),
+            base = format!("{dump_lo:#x}"),
+            bytes = got,
+            "FP-HUNT: check neighbourhood dumped"
+        ),
+        Err(e) => warn!(error = %e, "FP-HUNT: dump write failed"),
+    }
+    if let Some(ctx) = &ctx {
+        dump_v2_bail_scene(dbg, ctx, output_path, image_base);
+    }
+    // SAFETY: live PROCESS_ALL_ACCESS handle.
+    unsafe {
+        let _ = TerminateProcess(dbg.process_handle(), 0x2D);
+    }
+    true
+}
 
 /// Compute the data-section boundaries for the IAT guard-address fallback.
 pub(super) fn compute_data_section_bounds(

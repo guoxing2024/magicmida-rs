@@ -450,14 +450,20 @@ pub fn unpack(
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok());
     #[cfg(target_arch = "x86")]
-    let mut phase_samples: Vec<(u32, usize, Vec<u8>)> = Vec::new();
-    // Burst window: a 200 Hz SuspendThread rate sustained over the whole
-    // run perturbs the shell until its license phase never completes
-    // (measured 2026-10-30: two 120 s hangs at a flat 5 ms tick vs normal
-    // 9-26 s exits at 50 ms).  Baseline stays 50 ms; a pool hit opens a
-    // 2 s burst at 5 ms, then the baseline resumes.
+    let mut phase_samples: Vec<(u32, usize, u32, Vec<u8>)> = Vec::new();
+    // Worker round-robin: the licence check runs on a WORKER thread
+    // (measured 2026-10-30, K3/K4: main thread leaves the image at ~0.36 s
+    // while the dialog appears at ~1 s), so the recorder rotates through the
+    // target's thread list one worker per tick.  The list refreshes
+    // periodically because post-attach spawns workers continuously.
     #[cfg(target_arch = "x86")]
-    let mut burst_until_ms: u128 = 0;
+    let mut worker_idx: usize = 0;
+    #[cfg(target_arch = "x86")]
+    let mut worker_list: Vec<u32> = Vec::new();
+    #[cfg(target_arch = "x86")]
+    let mut worker_list_refreshed: u128 = 0;
+    #[cfg(target_arch = "x86")]
+    let mut fp_scan_tick: u64 = 0;
     // x64 hosts never take these paths (no x64 V2 sample in the corpus):
     // the tick computation reads `rip_sample_on` on both architectures,
     // `freeze_range` is consumed only by the x86-gated branches.
@@ -466,6 +472,23 @@ pub fn unpack(
     if post_attach {
         dbg.resume_post_attach_main_thread()
             .context("post-attach: failed to resume main thread")?;
+        // Interactive-desktop licence hunts: the recorder needs the
+        // interactive desktop (the hidden one parks the shell before the
+        // check), but the check ends by showing the CALC dialog on the
+        // operator's screen.  `MAGICMIDA_V2_DIALOG_KILL=1` spawns a 50 ms
+        // poller that terminates the target the instant the dialog exists —
+        // the popup is visible for a frame or two, and the phase samples
+        // survive via their periodic dump.
+        #[cfg(target_arch = "x86")]
+        if std::env::var("MAGICMIDA_INTERACTIVE_DESKTOP").is_ok()
+            && std::env::var("MAGICMIDA_V2_RECORD_PHASE").is_ok()
+            && std::env::var("MAGICMIDA_V2_DIALOG_KILL").is_ok()
+        {
+            if let Some(join) = helpers::spawn_dialog_killer(dbg.pid(), dbg.process_handle()) {
+                let _ = join; // self-terminating
+                info!("interactive licence hunt: dialog-killer armed (50 ms poll)");
+            }
+        }
         // No CREATE_PROCESS debug event arrives in post-attach mode, so
         // the V2 watch must be armed here (it normally arms in the
         // CreateProcess event handler's V2 branch).
@@ -559,11 +582,16 @@ pub fn unpack(
         let recording_now = matches!(record_phase_at, Some(rec_at) if started.elapsed().as_secs() >= rec_at);
         #[cfg(not(target_arch = "x86"))]
         let recording_now = false;
+        // Recording runs tighten to 5 ms for the first 3 s: the fast-run shape
+        // completes decode + licence check in **under 1 s** (measured 2026-10-30,
+        // K1: dialog at 0.98 s, last decode sample at 0.40 s), so the whole
+        // interesting lifecycle fits in a bounded 600-sample window.  The old
+        // full-run 5 ms tick hung the shell; 3 s bounded does not.
         #[cfg(target_arch = "x86")]
-        let in_burst = recording_now && started.elapsed().as_millis() < burst_until_ms;
+        let early_record = recording_now && started.elapsed().as_millis() < 3000;
         #[cfg(not(target_arch = "x86"))]
-        let in_burst = false;
-        let tick_ms: u32 = if in_burst {
+        let early_record = false;
+        let tick_ms: u32 = if early_record {
             5
         } else if recording_now || (post_attach && rip_sample_on) {
             50
@@ -650,41 +678,95 @@ pub fn unpack(
                         }
                     }
                 }
-                // Phase recorder: engine-pool executions during the license
-                // window, with the plaintext code bytes at RIP.  Real
-                // suspending samples at the baseline tick (50 ms ≈ 20 Hz —
-                // ~0.1% overhead, versus the pre-sleep-fix busy-spin that
-                // sampled at ~2 kHz and stalled the shell); a pool hit
-                // opens a 2 s burst at 5 ms.  The stale-context probe was
-                // removed: for CPU-bound threads the kernel-saved EIP
-                // never refreshes (measured: the probe fired only during
-                // the first 0.5 s, then went blind exactly when the decode
-                // started running flat out).
+                // Phase recorder: engine executions during the license window, with the
+                // plaintext code bytes at RIP.  Real suspending samples at the
+                // baseline tick (50 ms ≈ 20 Hz — ~0.1% overhead, versus the
+                // pre-sleep-fix busy-spin that sampled at ~2 kHz and stalled
+                // the shell); a burst hit opens a 2 s burst at 5 ms.
+                //
+                // Window: **0x20000-0x100000**, not just the decode pool
+                // (0x28000-0x40000).  The ExitProcess-trap scene put the bail
+                // call chain at rva 0x964f9/0xa4135/0xb7551/0xb754d/0xe03b8/
+                // 0xe35a3/0xe3247 (plus 0x21fff) — all OUTSIDE the decode
+                // pool.  Eight hidden-desktop runs recorded decode-only
+                // samples because the licence check runs in the higher
+                // ranges the window never covered.  Bursts open only for
+                // late hits (t ≥ 8 s, post-decode) or high-range hits
+                // (≥ 0x90000) — decode-phase hits stay at the baseline tick
+                // so the burst machinery doesn't perturb the decode.
                 #[cfg(target_arch = "x86")]
                 if recording_now && post_attach {
+                    // Fingerprint hunt (`MAGICMIDA_V2_FPHUNT=1`): every 10th
+                    // tick scan the image for the licence-fingerprint string;
+                    // a hit means the check is live — freeze, dump, end the
+                    // run before the dialog can be created.
+                    #[cfg(target_arch = "x86")]
+                    {
+                        fp_scan_tick += 1;
+                        if std::env::var("MAGICMIDA_V2_FPHUNT").is_ok()
+                            && fp_scan_tick % 5 == 0
+                            && helpers::fingerprint_hunt_tick(
+                                &mut dbg,
+                                image_base_usize,
+                                &output_path,
+                            )
+                        {
+                            break;
+                        }
+                    }
+                    let now_ms = started.elapsed().as_millis() as u32;
+                    let mut push = |tid: u32, rip: usize, code: &[u8]| {
+                        phase_samples.push((now_ms, rip, tid, code.to_vec()));
+                        if phase_samples.len() % 100 == 0 {
+                            let mut blob = Vec::new();
+                            for (ms, rip, tid, code) in &phase_samples {
+                                blob.extend_from_slice(&ms.to_le_bytes());
+                                blob.extend_from_slice(&(*rip as u32).to_le_bytes());
+                                blob.extend_from_slice(&tid.to_le_bytes());
+                                blob.extend_from_slice(code);
+                            }
+                            let pname = output_path
+                                .file_stem()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| "v2phase".to_string());
+                            let ppath = output_path
+                                .parent()
+                                .unwrap_or(std::path::Path::new("."))
+                                .join(format!("{pname}.v2phase.bin"));
+                            let _ = std::fs::write(&ppath, &blob);
+                        }
+                    };
+                    // Main thread.
                     if let Some((rip, _esp, code, _stack)) = helpers::sample_main_rip(&mut dbg) {
-                        let rva = rip.wrapping_sub(image_base_usize);
-                        if (0x28000..0x40000).contains(&rva) {
-                            phase_samples.push((started.elapsed().as_millis() as u32, rip, code));
-                            burst_until_ms = started.elapsed().as_millis() + 2000;
-                            if phase_samples.len() % 100 == 0 {
-                                let mut blob = Vec::new();
-                                for (ms, rip, code) in &phase_samples {
-                                    blob.extend_from_slice(&ms.to_le_bytes());
-                                    blob.extend_from_slice(&(*rip as u32).to_le_bytes());
-                                    blob.extend_from_slice(code);
+                        push(0, rip, &code);
+                    }
+                    // One worker per tick, round-robin.  Every worker in the
+                    // image window gets recorded; the licence check lives on
+                    // one of them.
+                    if started.elapsed().as_millis() > worker_list_refreshed + 500
+                        || worker_list.is_empty()
+                    {
+                        worker_list = helpers::list_target_thread_ids(dbg.pid());
+                        worker_list.retain(|&t| t != dbg.main_thread_id());
+                        worker_idx = 0;
+                        worker_list_refreshed = started.elapsed().as_millis();
+                    }
+                    if !worker_list.is_empty() {
+                        // Four workers per tick: at the 5 ms early tick that
+                        // covers a 29-thread process in ~35 ms, dense enough
+                        // to catch the licence check even when it runs on a
+                        // worker for under 100 ms (K5: check window
+                        // 0.36-0.45 s, one worker/tick missed it).
+                        for k in 0..4 {
+                            let tid = worker_list[(worker_idx + k) % worker_list.len()];
+                            if let Some((rip, code)) = helpers::sample_worker_rip(&dbg, tid) {
+                                let rva = rip.wrapping_sub(image_base_usize);
+                                if (0x1000..0x372000).contains(&rva) {
+                                    push(tid, rip, &code);
                                 }
-                                let pname = output_path
-                                    .file_stem()
-                                    .map(|s| s.to_string_lossy().into_owned())
-                                    .unwrap_or_else(|| "v2phase".to_string());
-                                let ppath = output_path
-                                    .parent()
-                                    .unwrap_or(std::path::Path::new("."))
-                                    .join(format!("{pname}.v2phase.bin"));
-                                let _ = std::fs::write(&ppath, &blob);
                             }
                         }
+                        worker_idx = (worker_idx + 4) % worker_list.len().max(1);
                     }
                 }
                 if post_attach {
@@ -746,9 +828,10 @@ pub fn unpack(
                         if !phase_samples.is_empty() {
                             let mut blob = Vec::new();
                             let mut sites: std::collections::BTreeMap<usize, usize> = Default::default();
-                            for (ms, rip, code) in &phase_samples {
+                            for (ms, rip, tid, code) in &phase_samples {
                                 blob.extend_from_slice(&ms.to_le_bytes());
                                 blob.extend_from_slice(&(*rip as u32).to_le_bytes());
+                                blob.extend_from_slice(&tid.to_le_bytes());
                                 blob.extend_from_slice(code);
                                 *sites.entry(rip & !0xF).or_insert(0) += 1;
                             }
