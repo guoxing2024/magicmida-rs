@@ -1041,6 +1041,142 @@ pub(super) fn fingerprint_hunt_tick(
     true
 }
 
+/// VM state snapshot (`MAGICMIDA_V2_VMSNAP[=<ms>]`): the mini-devirt data
+/// collector.  Called from the recorder when a sample lands in the engine
+/// pool at t ≥ gate (default 250 ms — the measured licence-check window is
+/// ~298-371 ms).  Freezes the main thread **leaving it suspended**, dumps
+/// everything the VM can plausibly be using, terminates the process, and
+/// returns `true` (caller ends the run).
+///
+/// Dump layout (`<stem>.v2vmsnap.bin`), sequential tagged sections:
+///   `REGS`  — the full x86 CONTEXT
+///   `STACK` — 16 KiB at Esp
+///   `EBP`   — 256 KiB at Ebp (the VM context base candidate)
+///   `ESI`   — 64 KiB at Esi
+///   `EDI`   — 64 KiB at Edi
+///   `WS`    — 128 KiB at the known workspace 0x12200000
+/// Each section: 4-byte tag, 4-byte address, 4-byte length, bytes.
+///
+/// One run = one slice of the check.  Several runs at different depths give
+/// the diffs that locate the bytecode PC and the register bank.
+#[cfg(target_arch = "x86")]
+pub(super) fn vm_snapshot_tick(
+    dbg: &mut ProcessSession,
+    image_base: usize,
+    output_path: &Path,
+    snap_idx: usize,
+) -> Option<Vec<u8>> {
+    use windows::Win32::System::Threading::SuspendThread;
+
+    const WS_BASE: usize = 0x1220_0000;
+    const WS_LEN: usize = 0x2_0000;
+
+    // Freeze and hold.
+    let tid = dbg.main_thread_id();
+    let Ok(h) = dbg.thread_handle(tid) else {
+        return None;
+    };
+    // SAFETY: thread handle from the debugger's own map.
+    let prev = unsafe { SuspendThread(h) };
+    if prev == u32::MAX {
+        return None;
+    }
+    let Ok(ctx) = dbg.get_thread_context_control(tid) else {
+        // SAFETY: thread suspended above.
+        unsafe {
+            let _ = windows::Win32::System::Threading::ResumeThread(h);
+        }
+        return None;
+    };
+
+    let out_dir = output_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let stem = output_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "v2vm".to_string());
+    let path = out_dir.join(format!("{stem}.v2vmsnap_{snap_idx:03}.bin"));
+
+    let mut file = match std::fs::File::create(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            warn!(error = %e, "VMSNAP: create failed");
+            // SAFETY: thread suspended above.
+            unsafe {
+                let _ = windows::Win32::System::Threading::ResumeThread(h);
+            }
+            return None;
+        }
+    };
+    use std::io::Write;
+    let sec = |f: &mut std::fs::File, tag: &[u8; 4], addr: usize, data: &[u8]| {
+        let _ = f.write_all(tag);
+        let _ = f.write_all(&(addr as u32).to_le_bytes());
+        let _ = f.write_all(&(data.len() as u32).to_le_bytes());
+        let _ = f.write_all(data);
+    };
+
+    // The check-phase code bytes at EIP — the caller records them.
+    let mut code_at_eip = vec![0u8; 64];
+    let _ = dbg.read_memory(ctx.Eip as usize, &mut code_at_eip);
+
+    // REGS: the raw CONTEXT is the fastest honest capture.
+    let regs_bytes = unsafe {
+        std::slice::from_raw_parts(
+            (&ctx as *const windows::Win32::System::Diagnostics::Debug::CONTEXT)
+                as *const u8,
+            std::mem::size_of::<windows::Win32::System::Diagnostics::Debug::CONTEXT>(),
+        )
+    };
+    let _ = file.write_all(b"VMSN");
+    let _ = file.write_all(&(regs_bytes.len() as u32).to_le_bytes());
+    let _ = file.write_all(regs_bytes);
+
+    let esp = ctx.Esp as usize;
+    let mut stack = vec![0u8; 0x4000];
+    let got = dbg.read_memory(esp, &mut stack).unwrap_or(0);
+    stack.truncate(got);
+    sec(&mut file, b"STCK", esp, &stack);
+
+    // Full image dump.  The VM addressing is EBP-relative with wrap-around:
+    // EBP = 0xEEDC0014 (measured) and displacements like 0x122624E5 sum back
+    // into the image (0xEEDC0014 + 0x122624E5 mod 2^32 = 0x010224F9) — the
+    // VM context/workspace lives at low image RVAs, so one image dump covers
+    // the register bank, the bytecode, and the data stage in one file.
+    let mut img = vec![0u8; 0x371_000];
+    let got = dbg.read_memory(image_base + 0x1000, &mut img).unwrap_or(0);
+    if got > 0 {
+        img.truncate(got);
+        sec(&mut file, b"IMAG", image_base + 0x1000, &img);
+    }
+
+    let mut ws = vec![0u8; WS_LEN];
+    let got = dbg.read_memory(WS_BASE, &mut ws).unwrap_or(0);
+    if got > 0 {
+        ws.truncate(got);
+        sec(&mut file, b"WKSP", WS_BASE, &ws);
+    }
+
+    drop(file);
+    info!(
+        path = %path.display(),
+        idx = snap_idx,
+        ebp = format!("{:#x}", ctx.Ebp),
+        eip = format!("{:#x}", ctx.Eip),
+        esp = format!("{:#x}", ctx.Esp),
+        "VMSNAP: VM state captured (thread resumed)"
+    );
+    // Resume — one run yields a *sequence* of slices on one timeline, which
+    // is what makes the diffs clean (cross-run diffs are time-skewed).
+    // SAFETY: thread suspended above.
+    unsafe {
+        let _ = windows::Win32::System::Threading::ResumeThread(h);
+    }
+    Some(code_at_eip)
+}
+
 /// Compute the data-section boundaries for the IAT guard-address fallback.
 pub(super) fn compute_data_section_bounds(
     image_base: usize,

@@ -464,6 +464,8 @@ pub fn unpack(
     let mut worker_list_refreshed: u128 = 0;
     #[cfg(target_arch = "x86")]
     let mut fp_scan_tick: u64 = 0;
+    #[cfg(target_arch = "x86")]
+    let mut vm_snap_count: usize = 0;
     // x64 hosts never take these paths (no x64 V2 sample in the corpus):
     // the tick computation reads `rip_sample_on` on both architectures,
     // `freeze_range` is consumed only by the x86-gated branches.
@@ -738,6 +740,33 @@ pub fn unpack(
                     };
                     // Main thread.
                     if let Some((rip, _esp, code, _stack)) = helpers::sample_main_rip(&mut dbg) {
+                        // VM snapshot gate (`MAGICMIDA_V2_VMSNAP[=<ms>]`): the
+                        // first in-pool hit at/after the gate freezes the
+                        // thread and captures the whole VM state — one slice
+                        // of the licence check per run.
+                        let snap_gate: u64 = std::env::var("MAGICMIDA_V2_VMSNAP")
+                            .ok()
+                            .and_then(|v| v.trim().parse::<u64>().ok())
+                            .unwrap_or(0);
+                        if std::env::var("MAGICMIDA_V2_VMSNAP").is_ok()
+                            && now_ms as u64 >= snap_gate
+                            && (0x28000..0x40000).contains(
+                                &(rip.wrapping_sub(image_base_usize)),
+                            )
+                            && vm_snap_count < 32
+                        {
+                            vm_snap_count += 1;
+                            if let Some(code_bytes) = helpers::vm_snapshot_tick(
+                                &mut dbg,
+                                image_base_usize,
+                                &output_path,
+                                vm_snap_count,
+                            ) {
+                                // Record the snapshot site too (it is a
+                                // check-phase execution point).
+                                push(0, rip, &code_bytes);
+                            }
+                        }
                         push(0, rip, &code);
                     }
                     // One worker per tick, round-robin.  Every worker in the
