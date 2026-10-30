@@ -1405,6 +1405,39 @@ GetLocalTime ret=0x107547e）——差异纯在采样频率。
 工作区 dump 全线皆零（壳 bail 前清零工作区）——名字表不可回收，
 代码本身带比较常量（过期日期），走反汇编路线。
 
+## V2：隔离桌面停掉 CALC 弹窗，但壳随即放弃检查（2026-10-30，未发布）
+
+**动机**：V2 样本在 license 检查失败时弹「CALC」硬件锁对话框，弹在当前
+用户交互桌面上——每次 attempt 一次，重试循环变成**弹窗风暴**，干扰操作者。
+
+**实现**：`CreateProcessOptions.isolated_desktop` →
+`create_isolated_desktop()` 建 `MagicmidaV2Station` / `MagicmidaV2Desktop`
+（`CreateWindowStationW` + `CreateDesktopW`），`STARTUPINFOW::lpDesktop`
+注入 `"station\\desktop"`。CLI 在 post-attach 下默认开，env
+`MAGICMIDA_NO_ISOLATED_DESKTOP=1` 可关。
+两个 Windows 0.58 特有的坑：① `DESKTOP_ALL_ACCESS`/`WINSTA_ALL_ACCESS`
+**不在 crate 里**（用 winuser.h 字面值 `0x000F_01FF` / `0x000F_037F`）；
+② `CreateDesktopW` 的 **`lpszDevice` 必须 NULL**——第一次错传了桌面名，
+返回 `0x80070057`（ERROR_INVALID_PARAMETER），修后成功。
+
+**结果（诚实的负结果）**：弹窗**确实不再上屏**（交互桌面 `EnumWindows`
+按 PID 过滤为 0 个窗口），但壳的行为整个变了：
+
+| 桌面 | 行为（同一 exe，各 3+ 次） | 弹窗 |
+|---|---|---|
+| 交互 | ~50% 挂死在 `win32u!NtBindCompositionSurface`；否则 license | **有** |
+| 隔离 | **稳定 0.5 s exit 0**，连解码期都不过 | 无 |
+
+`exit_code=0` 且**无 v2phase 文件** = 壳在隔离桌面上直接放弃，根本没跑到
+license 相位。**结论：隔离桌面解决了弹窗，但毁掉了被测行为；此形态下不能
+用来推进 V2。** 保留实现（它是唯一能保证不打扰操作者的开关），V2 实跑仍需
+交互桌面 + 人工在场。
+
+**顺带确定的一条**：交互桌面下的停车由壳自身随机分支决定，与
+`CREATE_SUSPENDED`/PEB 补丁/本仓轮询无关——纯 `CreateProcessW` 最小启动器
+（`OUT/vmp_launcher/launch_test.ps1`，不含本仓任何代码）两种 flag 组合都
+40 s 仍活着、CPU 0.3 s、29 线程。
+
 ## V2：采样窗盲区（RIPSAMPLE 从 t=15s 才加密）+ 停车是壳自身行为（2026-10-30 重启后，未发布）
 
 **缺陷：RIPSAMPLE 的 tick 收紧门控在 15 s，系统性错过镜像执行窗。**

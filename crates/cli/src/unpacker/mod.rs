@@ -346,6 +346,16 @@ pub fn unpack(
         is_dll: input.extension().map(|e| e.eq_ignore_ascii_case("dll")).unwrap_or(false),
         suspended: false,
         post_attach,
+        // V2 samples pop a modal licence dialog (titled `CALC`) that lands on
+        // the operator's screen — measured 2026-10-30, one per attempt, so a
+        // retry loop becomes a popup storm.  Running the target on a private
+        // window station/desktop keeps the GUI environment complete (the shell
+        // parks in `win32u!NtBindCompositionSurface` without one) while
+        // nothing it draws can reach the visible screen.  Opt out with
+        // `MAGICMIDA_NO_ISOLATED_DESKTOP=1` when the window is wanted for a
+        // screenshot.
+        isolated_desktop: post_attach
+            && std::env::var("MAGICMIDA_NO_ISOLATED_DESKTOP").is_err(),
     };
 
     // ---- step 5: initialise Themida state ----

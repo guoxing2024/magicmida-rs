@@ -6,8 +6,8 @@
 
 use std::path::{Path, PathBuf};
 
-use tracing::{debug, info};
-use windows::core::PCWSTR;
+use tracing::{debug, info, warn};
+use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     BOOL, GetLastError, HANDLE, NTSTATUS, STATUS_SUCCESS,
 };
@@ -60,6 +60,112 @@ pub struct CreateProcessOptions {
     /// the same exit code our debugged runs produce.  Default `false`
     /// keeps the traditional debug-attach flow untouched.
     pub post_attach: bool,
+    /// Run the target on a **private, invisible window station and desktop**
+    /// instead of the interactive one.
+    ///
+    /// Why: protected samples pop a modal message box during the licence
+    /// check (measured: the WinLicense 2.0.6.5 family's "The current key has
+    /// been locked to a different machine" dialog, titled `CALC`).  On the
+    /// interactive desktop that window lands on the operator's screen — once
+    /// per attempt, so a retry loop becomes a popup storm.  A private desktop
+    /// keeps the GUI environment complete (window creation, message queues,
+    /// DWM composition all work — the shell needs that, it otherwise parks
+    /// inside `win32u!NtBindCompositionSurface`) while nothing it draws can
+    /// reach the visible screen.
+    ///
+    /// Creation must happen before `CreateProcessW`; see
+    /// [`create_isolated_desktop`].  Default `false` keeps every existing
+    /// flow untouched.
+    pub isolated_desktop: bool,
+}
+
+/// Window station name used by [`CreateProcessOptions::isolated_desktop`].
+const ISOLATED_STATION: &str = "MagicmidaV2Station";
+/// Desktop name used by [`CreateProcessOptions::isolated_desktop`].
+const ISOLATED_DESKTOP: &str = "MagicmidaV2Desktop";
+
+/// Create (or re-open) the private window station and desktop, returning the
+/// `"station\\desktop"` string for `STARTUPINFOW::lpDesktop`.
+///
+/// Both objects are deliberately kept for the process lifetime: closing the
+/// station while a target is alive would destroy the desktop under it, and
+/// the OS reclaims everything on exit.
+///
+/// Returns `None` when creation fails, so the caller falls back to the
+/// interactive desktop instead of failing the run.
+pub fn create_isolated_desktop() -> Option<String> {
+    use windows::Win32::System::StationsAndDesktops::{
+        CreateDesktopW, CreateWindowStationW, DESKTOP_CONTROL_FLAGS,
+    };
+
+    // Access masks are not exported by windows-0.58 for these objects; the
+    // values are from winuser.h and are stable ABI.
+    const WINSTA_ALL_ACCESS: u32 = 0x000F_037F;
+    const DESKTOP_ALL_ACCESS: u32 = 0x000F_01FF;
+    const ZERO_DESKTOP_FLAGS: DESKTOP_CONTROL_FLAGS = DESKTOP_CONTROL_FLAGS(0);
+
+    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+    let station_name = wide(ISOLATED_STATION);
+    let desktop_name = wide(ISOLATED_DESKTOP);
+
+    // SAFETY: names are valid null-terminated wide strings; the handle is
+    // intentionally kept alive (see the doc comment).
+    let h_sta = unsafe {
+        CreateWindowStationW(
+            PCWSTR::from_raw(station_name.as_ptr()),
+            0,
+            WINSTA_ALL_ACCESS,
+            None,
+        )
+    };
+    let h_sta = match h_sta {
+        Ok(h) => h,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "isolated desktop: CreateWindowStationW failed — \
+                 target will use the interactive desktop"
+            );
+            return None;
+        }
+    };
+
+    // SAFETY: h_sta is a valid station handle; names are valid wide strings.
+    // `lpszDevice` must be NULL (not the desktop name — that is a different
+    // parameter and passing it returns ERROR_INVALID_PARAMETER 0x80070057,
+    // measured 2026-10-30).
+    let h_desk = unsafe {
+        CreateDesktopW(
+            PCWSTR::from_raw(desktop_name.as_ptr()),
+            PCWSTR::null(),
+            None,
+            ZERO_DESKTOP_FLAGS,
+            DESKTOP_ALL_ACCESS,
+            None,
+        )
+    };
+    // Kept for the process lifetime; see the doc comment.
+    let _ = h_sta;
+
+    match h_desk {
+        Ok(_) => {
+            info!(
+                station = ISOLATED_STATION,
+                desktop = ISOLATED_DESKTOP,
+                "isolated desktop created — target windows cannot reach the \
+                 interactive screen"
+            );
+            Some(format!("{ISOLATED_STATION}\\{ISOLATED_DESKTOP}"))
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                "isolated desktop: CreateDesktopW failed — falling back to the \
+                 interactive desktop"
+            );
+            None
+        }
+    }
 }
 
 /// Handle to a running debuggee process and its main thread.
@@ -299,6 +405,19 @@ pub fn create_debug_process(
     si.cb = size_of::<STARTUPINFOW>() as u32;
     si.dwFlags = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_SHOW.0 as u16;
+
+    // Isolated desktop: keep the wide string alive for the whole
+    // CreateProcessW call — `lpDesktop` is read during it.
+    let mut isolated_desktop_wide: Option<Vec<u16>> = None;
+    if opts.isolated_desktop {
+        if let Some(name) = create_isolated_desktop() {
+            let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+            // SAFETY: lpDesktop accepts a null-terminated wide string.
+            si.lpDesktop = PWSTR::from_raw(wide.as_ptr() as *mut u16);
+            isolated_desktop_wide = Some(wide);
+        }
+    }
+    let _ = &isolated_desktop_wide;
 
     let mut pi = PROCESS_INFORMATION::default();
 
