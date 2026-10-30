@@ -527,9 +527,18 @@ pub fn unpack(
         };
         // Adaptive tick: the phase recorder tightens to 5 ms once its
         // window opens (the license phase spans ~0.7 s — measured
-        // 2026-10-30); RIP sampling tightens to 50 ms after the decode;
-        // everything else keeps the 500 ms cadence.  All reads are
-        // external (RPM / thread-context) and visible to no check.
+        // 2026-10-30); RIP sampling runs at 50 ms **from t=0**; everything
+        // else keeps the 500 ms cadence.  All reads are external (RPM /
+        // thread-context) and visible to no check.
+        //
+        // Why RIP sampling starts at 0 rather than after the decode: the
+        // main thread's first pass through the engine pool is only
+        // **150-370 ms** wide (measured 2026-10-30, 20 samples in
+        // `CISC-1U60.v2phase.bin`).  A 500 ms tick cannot see it at all —
+        // three runs with the old `>= 15 s` gate produced **0 image
+        // samples apiece** even though the thread demonstrably executed
+        // image code inside that window.  Sampling is what has to be
+        // dense; the *recording* window is what can start late.
         #[cfg(target_arch = "x86")]
         let recording_now = matches!(record_phase_at, Some(rec_at) if started.elapsed().as_secs() >= rec_at);
         #[cfg(not(target_arch = "x86"))]
@@ -540,9 +549,7 @@ pub fn unpack(
         let in_burst = false;
         let tick_ms: u32 = if in_burst {
             5
-        } else if recording_now
-            || (post_attach && rip_sample_on && started.elapsed().as_secs() >= 15)
-        {
+        } else if recording_now || (post_attach && rip_sample_on) {
             50
         } else {
             500
