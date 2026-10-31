@@ -1471,6 +1471,17 @@ RPM 轮询该签名（5ms，无挂起）、命中即终止 = 弹窗从未存在�
 （`spawn_dialog_killer` 重写，窗口枚举删除）。4 次验证 run 全是停车型
 （签名未出现即无弹窗，静默）——完成型 run 的零弹窗验证待停车潮解除。
 
+**停车点精确定性 + 唤醒实验（2026-10-31）**：syscall 读数更正——停车桩
+RVA 0x1230 的 syscall 是 **0x1100a = NtUserWaitMessage**（此前漏一位误读
+0x110a；win32u 导出表实测：NtUserGetMessage=0x1004、NtUserWaitMessage=
+0x1100a）。WaitMessage = **等线程消息**的 API（无窗口线程专用）。
+- 唤醒实验（`MAGICMIDA_V2_WAKE=1`，PostThreadMessage WM_TIMER/WM_NULL
+  每 200ms）：线程确实被周期唤醒（WaitMessage 返回→重新等待），但壳无
+  进展——**它在等特定的消息**（worker 完成检查后的结果消息），不是任意
+  消息。消息猜测路线（WM_USER 扫描）风险大于收益，搁置。
+- 数据指针环绕常量的静态推导失败（0xEEDB0000+RVA 假设与差分区不完全
+  吻合）——银行的访问是动态计算，继续指向指令级分析。
+
 **停车潮与鼠标 wiggle 实验（2026-10-31 深夜）**：今晚交互桌面停车率
 ~100%（对照：无 banktrace 也全停车——RPM 追踪非扰动源）。合成鼠标移动
 （mouse_event MOVE，300 次/3s）不解除停车，且产生**新退出码 1**（非
