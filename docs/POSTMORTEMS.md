@@ -1950,3 +1950,52 @@ res3 的值还出现在池内代码块（0x117DA79 的立即数）。
 (b) 预开句柄冻结抓比较中态；(c) 直接试补丁哨兵槽（命中值 = 0 或
 索引——语义未证，低优先）。所有场景/状态环文件：
 `OUT\Y{2,4,5,6,7}test.v2failfreeze.bin` + `Y7test.v2statering.bin`。
+
+## V2 指纹机制簇现形 + 快冻结命中（2026-11-01 续 2，未发布）
+
+**① 快冻结（预开主线程句柄）命中镜像内**：`spawn_dialog_killer` 增加
+main_tid 参数，watcher 启动时 OpenThread 预存句柄；触发时先
+`SuspendThread(h_main)`（~2µs）再做 ToolHelp 走查。实测（Y8test）：
+主线程 **eip=0x10296D5（镜像内派发点）**、ebp=0xEEDC0014、
+**edi=0x102859E = 银行 contA 槽指针**（正要读写银行）。failfreeze 的
+STCK 加宽到 [0xEF800, 0xF7800)（0xEFC00-0xEFD00 曾漏抓）。
+
+**② 重大更正：POSTMORTEMS 的 disp 锚点公式算错并传播**。真实锚 =
+**0x1223FFEC**（disp = RVA + 0x1223FFEC；验证：块内
+`lea edi,[ebp+0x12262885]` → rva 0x22899 ✓，且
+`0x122624E5 - 0x24F9 = 0x1223FFEC`——旧记录 0x1225FFEC 是减法错）。
+据此 disp 字节搜索重跑：pathslot(0x22899) 有 **9 个跨 run 恒定的引用
+点**；哨兵/computed/stored 槽零命中——它们走运行时数据指针（dp 值
+0xEEDC0000|off，off+0x1FFEC=rva；t=371 的 dp=0xEEDC0583 → rva 0x2056F
+= 存储 blob，读法证实）。dp 槽本身的装载 disp 也搜不到 = **变异引擎
+逐 run 重写立即数**，静态 disp 搜索对多数数据访问无效。
+
+**③ contA = 字节码程序计数器**（不再是"当前块"）：0x102114D 处是
+数据（字节码流）非代码——**字节码存在 VMCTX (0x20000-0x28000)**，
+原生 handler 块解释它。字节码级补丁（改条件跳转字节）成为可能路线。
+
+**④ 指纹机制簇（全部明文、跨 run 恒定）**：
+- **rva 0xE3198**：`push [ebp+0x122607B1]; call eax（API thunk）;
+  push 0x22899 槽; push 0x104(=MAX_PATH); call ebx` =
+  **GetModuleFileName——指纹输入之一 = 被保护文件自身路径**；
+  随后 `push 0x8307F8BF`（哈希常量）。
+- **rva 0x963B7 / 0x13EC33**：pathslot 的逐字节处理循环
+  （pushal; lea edi,[ebp+0x12262885]; lodsb...）= 哈希循环本体。
+- **rva 0x110344F 簇**：自修改续延机制（`lea ebx,[ebp+disp]` 指向
+  自己的 push 立即数，`mov [ebx+1],eax` 把下一块地址写进跳转指令）；
+  **0x1103465 = `rep stosd` 清零 0x22899 起 256B**（fail 路径擦指纹
+  缓冲——与 0x22899 处 "This application has been registered…" 文案
+  替换路径的观测吻合）；**0x1103477 = `cmp [eax+0xA], 0x6863614D
+  ("Mach") + push 0x80000002 (HKEY_LOCAL_MACHINE)` = 注册表机器数据
+  读取**。API 经 `call [ebp+0x1233E07A]` 式 thunk 表（→rva 0xFE08E）。
+- 结论：**指纹 = f(模块路径, HKLM 注册表机器数据)**，哈希循环在
+  0x963xx/0x13ECxx，三个 {-1, value} 哨兵 = 三次比较（路径哈希 /
+  注册表哈希 / key 校验的形状）。
+
+**⑤ 下一增量**：(a) 从 0x963xx/0x13ECxx 的哈希循环恢复算法（明文在
+手，capstone 可推），离线验证 f(本机路径+注册表) == 0x7DC80DE6/0x224ED
+值之一 → 得到完整比较模型；(b) 或直接字节码级补丁：contA(PC) 在
+VMCTX，把判定点的条件跳转字节翻面（pass 路径的目标未知是唯一缺口）；
+(c) 哨兵语义实验（补丁 -1 → 0）风险最低可先试。所有实验产物：
+`OUT\Y{2,4,5,6,7,8}test.*`；快冻结代码已在 helpers.rs
+（main_tid 预开 + SuspendThread-first + STCK 加宽）。回归 x64 415/0。

@@ -828,6 +828,7 @@ pub(super) fn spawn_dialog_killer(
     h_process: HANDLE,
     image_base: usize,
     output_path: &Path,
+    main_tid: u32,
 ) -> Option<std::thread::JoinHandle<()>> {
 
     if std::env::var("MAGICMIDA_V2_DIALOG_KILL").is_err()
@@ -842,7 +843,7 @@ pub(super) fn spawn_dialog_killer(
     let join = std::thread::spawn(move || {
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
-        use windows::Win32::System::Threading::TerminateProcess;
+        use windows::Win32::System::Threading::{SuspendThread, TerminateProcess};
         use windows::Win32::System::Diagnostics::Debug::WriteProcessMemory;
         // The bail signature, measured 2026-10-31 (S1 snapshot 14, the
         // dialog-preceding state): the two fail-continuations written into
@@ -893,6 +894,25 @@ pub(super) fn spawn_dialog_killer(
         let stored_addr = image_base + STORED_RVA;
         let mut stored = [0u8; 8];
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        // Hot path: pre-open the main thread so a trigger suspends the VM
+        // with ONE SuspendThread (~2 µs) before the ToolHelp walk for the
+        // remaining threads (~300 µs) — the compare op lives 2-20 µs, so
+        // freeze latency is the whole race (µs ring, 2026-11-01).
+        let h_main = (|| {
+            use windows::Win32::System::Threading::{
+                OpenThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION,
+                THREAD_SUSPEND_RESUME,
+            };
+            // SAFETY: tid from the debugger's own main-thread record.
+            unsafe {
+                OpenThread(
+                    THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION,
+                    false,
+                    main_tid,
+                )
+            }
+            .ok()
+        })();
         loop {
             // Hash patch: fire once, the instant the stored blob appears.
             if hashpatch {
@@ -1018,6 +1038,12 @@ pub(super) fn spawn_dialog_killer(
                     }
                     if ca == PRE_CONTA && cb == PRE_CONTB {
                         info!(t_us, "PREFREEZE: pre-decision state hit");
+                        // SAFETY: pre-opened main-thread handle.
+                        if let Some(h) = h_main {
+                            unsafe {
+                                let _ = SuspendThread(h);
+                            }
+                        }
                         dump_failfreeze_scene(
                             pid,
                             HANDLE(handle_raw as *mut core::ffi::c_void),
@@ -1207,10 +1233,13 @@ fn dump_failfreeze_scene(
         sec(&mut file, b"BANK", image_base + 0x28580, &bank);
     }
     // VM stack region (bank vmsp is corrupted post-write; the region is
-    // stable at 0xefd00-0xf0000 across every observation).
-    let mut vmstk = vec![0u8; 0x3000];
-    if rpm(0xefd00, &mut vmstk) {
-        sec(&mut file, b"STCK", 0xefd00, &vmstk);
+    // stable at 0xefd00-0xf0000 across every observation).  2026-11-01
+    // (Y7test): the real thread stack reaches BELOW 0xEFD00 — the main
+    // thread's esp at freeze was 0xEFB34, and the compare frame's deeper
+    // part sits at 0xEFC00-0xEFD00.  Widen to [0xEF800, 0xF7800).
+    let mut vmstk = vec![0u8; 0x8000];
+    if rpm(0xef800, &mut vmstk) {
+        sec(&mut file, b"STCK", 0xef800, &vmstk);
     }
     // VMCTX / VM register file.
     let mut vmctx = vec![0u8; 0x8000];

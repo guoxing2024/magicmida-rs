@@ -504,6 +504,7 @@ pub fn unpack(
                 dbg.process_handle(),
                 dbg.image_base() as usize,
                 &output_path,
+                dbg.main_thread_id(),
             ) {
                 let _ = join; // self-terminating
             }
