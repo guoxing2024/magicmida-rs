@@ -832,6 +832,8 @@ pub(super) fn spawn_dialog_killer(
 
     if std::env::var("MAGICMIDA_V2_DIALOG_KILL").is_err()
         && std::env::var("MAGICMIDA_V2_FAILFREEZE").is_err()
+        && std::env::var("MAGICMIDA_V2_HASHPATCH").is_err()
+        && std::env::var("MAGICMIDA_V2_PREFREEZE").is_err()
     {
         return None;
     }
@@ -841,6 +843,7 @@ pub(super) fn spawn_dialog_killer(
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
         use windows::Win32::System::Threading::TerminateProcess;
+        use windows::Win32::System::Diagnostics::Debug::WriteProcessMemory;
         // The bail signature, measured 2026-10-31 (S1 snapshot 14, the
         // dialog-preceding state): the two fail-continuations written into
         // the state bank the moment the licence comparison fails.  The dialog
@@ -861,8 +864,71 @@ pub(super) fn spawn_dialog_killer(
         let bank_addr = image_base + BANK_RVA;
         let mut bank = [0u8; 64];
         let freeze_mode = std::env::var("MAGICMIDA_V2_FAILFREEZE").is_ok();
+        // Licence-hash patch (`MAGICMIDA_V2_HASHPATCH=1`): the check's two
+        // comparison operands, measured 2026-11-01 across independent runs
+        // (S1 snapshot 14 vs Y2test failfreeze — byte-identical, i.e.
+        // machine-derived and deterministic):
+        //   computed fingerprint hash (this machine) = 50 fc 39 64 05 31 66 a5
+        //     — written at the decision moment into the 0x9898-marked slot
+        //     at RVA 0x224ED;
+        //   stored licence hash = 2e 15 77 e5 1f ef 05 b3 ... (constant in
+        //     every snapshot of every run) at RVA 0x2056F — the data pointer
+        //     dwells exactly there (banktrace t=371) right before the
+        //     compare.  Overwrite the stored value with the computed one the
+        //     moment the blob materialises (post-decode, ~100 ms before the
+        //     compare reads it) and the check passes on its own path.
+        let hashpatch = std::env::var("MAGICMIDA_V2_HASHPATCH").is_ok();
+        // Pre-freeze (`MAGICMIDA_V2_PREFREEZE=1`): freeze on the LAST
+        // pre-decision bank state (Y1test banktrace t=399: contA=0x0102114d,
+        // contB=0x0110344f) — the thread is then still inside the compare
+        // op, registers/stack pointing at the live operands.  The fail
+        // write follows ~1-2 ms later; the fail-marker branch below stays
+        // as the fallback when this state is missed.
+        let prefreeze = std::env::var("MAGICMIDA_V2_PREFREEZE").is_ok();
+        const PRE_CONTA: u32 = 0x0102_114d;
+        const PRE_CONTB: u32 = 0x0110_344f;
+        const STORED_SIG: [u8; 8] = [0x2e, 0x15, 0x77, 0xe5, 0x1f, 0xef, 0x05, 0xb3];
+        const COMPUTED: [u8; 8] = [0x50, 0xfc, 0x39, 0x64, 0x05, 0x31, 0x66, 0xa5];
+        const STORED_RVA: usize = 0x2056F;
+        let stored_addr = image_base + STORED_RVA;
+        let mut stored = [0u8; 8];
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
         loop {
+            // Hash patch: fire once, the instant the stored blob appears.
+            if hashpatch {
+                // SAFETY: live PROCESS_ALL_ACCESS handle.
+                let got = unsafe {
+                    let mut read: usize = 0;
+                    let ok = ReadProcessMemory(
+                        HANDLE(handle_raw as *mut core::ffi::c_void),
+                        stored_addr as *const core::ffi::c_void,
+                        stored.as_mut_ptr() as *mut core::ffi::c_void,
+                        8,
+                        Some(&mut read),
+                    );
+                    ok.is_ok() && read == 8
+                };
+                if got && stored == STORED_SIG {
+                    // SAFETY: live handle; the target region is the shell's
+                    // own decoded data slot (RW in the VMCTX page).
+                    let wok = unsafe {
+                        let mut written: usize = 0;
+                        let ok = WriteProcessMemory(
+                            HANDLE(handle_raw as *mut core::ffi::c_void),
+                            stored_addr as *mut core::ffi::c_void,
+                            COMPUTED.as_ptr() as *const core::ffi::c_void,
+                            8,
+                            Some(&mut written),
+                        );
+                        ok.is_ok() && written == 8
+                    };
+                    info!(
+                        addr = format!("{stored_addr:#x}"),
+                        ok = wok,
+                        "HASHPATCH: stored licence hash replaced with this machine's computed hash"
+                    );
+                }
+            }
             // SAFETY: live PROCESS_ALL_ACCESS handle captured at spawn.
             let got = unsafe {
                 let mut read: usize = 0;
@@ -875,10 +941,23 @@ pub(super) fn spawn_dialog_killer(
                 );
                 ok.is_ok() && read == bank.len()
             };
-            let mark = got && (bank.windows(8).any(|w| w == BAIL_SIG)
-                || u32::from_le_bytes(bank[0x1e..0x22].try_into().unwrap()) == FAIL_MARK);
+            let cont_a = u32::from_le_bytes(bank[0x1e..0x22].try_into().unwrap());
+            let cont_b = u32::from_le_bytes(bank[0x22..0x26].try_into().unwrap());
+            let pre_hit = prefreeze && got && cont_a == PRE_CONTA && cont_b == PRE_CONTB;
+            let mark = got && (bank.windows(8).any(|w| w == BAIL_SIG) || cont_a == FAIL_MARK);
+            if pre_hit {
+                dump_failfreeze_scene(
+                    pid,
+                    HANDLE(handle_raw as *mut core::ffi::c_void),
+                    image_base,
+                    &out_path,
+                );
+                info!("PREFREEZE: compare-op scene dumped (thread still inside the check)");
+                // Leave suspended; the outer timeout reaps the process.
+                return;
+            }
             if mark {
-                if freeze_mode {
+                if freeze_mode || prefreeze {
                     dump_failfreeze_scene(
                         pid,
                         HANDLE(handle_raw as *mut core::ffi::c_void),
@@ -902,10 +981,106 @@ pub(super) fn spawn_dialog_killer(
             if std::time::Instant::now() > deadline {
                 return;
             }
+            if prefreeze {
+                // µs-resolution state recorder: no sleep — the pre-decision
+                // window is shorter than the 1 ms poll (Y6test missed it).
+                // Ring of (t_us, contA, contB, opidx) is dumped with the
+                // scene so the state sequence around the compare is ground
+                // truth either way.
+                use std::time::Instant;
+                let t0 = Instant::now();
+                let mut ring: Vec<(u32, u32, u32, u16)> = Vec::with_capacity(4096);
+                loop {
+                    // SAFETY: live PROCESS_ALL_ACCESS handle.
+                    let got = unsafe {
+                        let mut read: usize = 0;
+                        let ok = ReadProcessMemory(
+                            HANDLE(handle_raw as *mut core::ffi::c_void),
+                            bank_addr as *const core::ffi::c_void,
+                            bank.as_mut_ptr() as *mut core::ffi::c_void,
+                            bank.len(),
+                            Some(&mut read),
+                        );
+                        ok.is_ok() && read == bank.len()
+                    };
+                    if !got {
+                        break; // process died
+                    }
+                    let ca = u32::from_le_bytes(bank[0x1e..0x22].try_into().unwrap());
+                    let cb = u32::from_le_bytes(bank[0x22..0x26].try_into().unwrap());
+                    let oi = u16::from_le_bytes(bank[0x3a..0x3c].try_into().unwrap());
+                    let t_us = t0.elapsed().as_micros() as u32;
+                    if ring.last().map(|r| (r.1, r.2, r.3)) != Some((ca, cb, oi)) {
+                        ring.push((t_us, ca, cb, oi));
+                        if ring.len() > 8192 {
+                            ring.remove(0);
+                        }
+                    }
+                    if ca == PRE_CONTA && cb == PRE_CONTB {
+                        info!(t_us, "PREFREEZE: pre-decision state hit");
+                        dump_failfreeze_scene(
+                            pid,
+                            HANDLE(handle_raw as *mut core::ffi::c_void),
+                            image_base,
+                            &out_path,
+                        );
+                        dump_state_ring(&out_path, &ring);
+                        // Leave suspended; the outer timeout reaps the process.
+                        return;
+                    }
+                    if bank.windows(8).any(|w| w == BAIL_SIG) || ca == FAIL_MARK {
+                        info!(t_us, "PREFREEZE: fail marker first (pre-state missed) — dumping with ring");
+                        dump_failfreeze_scene(
+                            pid,
+                            HANDLE(handle_raw as *mut core::ffi::c_void),
+                            image_base,
+                            &out_path,
+                        );
+                        dump_state_ring(&out_path, &ring);
+                        // SAFETY: live handle.
+                        unsafe {
+                            let _ = TerminateProcess(
+                                HANDLE(handle_raw as *mut core::ffi::c_void),
+                                0x2C,
+                            );
+                        }
+                        return;
+                    }
+                    if t0.elapsed().as_secs() > 120 {
+                        return;
+                    }
+                }
+                return;
+            }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     });
     Some(join)
+}
+
+/// µs-resolution state ring (`MAGICMIDA_V2_PREFREEZE`): the observed bank
+/// continuation sequence around the licence decision — the ground truth
+/// for picking a freeze point the next round.
+#[cfg(target_arch = "x86")]
+fn dump_state_ring(output_path: &Path, ring: &[(u32, u32, u32, u16)]) {
+    let stem = output_path.with_extension("v2statering");
+    let mut name = match stem.file_name() {
+        Some(n) => n.to_os_string(),
+        None => return,
+    };
+    name.push(".bin");
+    let path = stem.with_file_name(name);
+    let mut blob = Vec::with_capacity(ring.len() * 14);
+    for (t, ca, cb, oi) in ring {
+        blob.extend_from_slice(&t.to_le_bytes());
+        blob.extend_from_slice(&ca.to_le_bytes());
+        blob.extend_from_slice(&cb.to_le_bytes());
+        blob.extend_from_slice(&oi.to_le_bytes());
+    }
+    match std::fs::write(&path, &blob) {
+        Ok(()) => info!(path = %path.display(), records = ring.len(), "PREFREEZE: state ring written"),
+        Err(e) => warn!(error = %e, "PREFREEZE: ring write failed"),
+    }
 }
 
 /// Fail-freeze scene dump (`MAGICMIDA_V2_FAILFREEZE=1`): the licence
