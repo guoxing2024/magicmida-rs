@@ -1821,3 +1821,83 @@ XOR 编码——**全部是 dd[0]/dd[1] 假阳性 + 错误基址归因的产物*
 实跑在策略解除前无法进行。离线资产全部在（bail 镜像、127 个解析器调用
 点、WeType 判定、XP calc 定案）。**V2 实跑战役暂停，等待策略放行**。
 策略归属组织，解封路径需用户侧决定。
+
+## V2 路线甲：银行解剖 + fail-freeze 机器（2026-11-01，未发布）
+
+mini-devirt 路线甲（解释器块全反汇编）的全离线战果 + 一件新实跑机器。
+全部在既有语料上完成（31 个 phase 捕获 824 样本、20 个 vmsnap、27 个
+banktrace），仅 4 次验证 run，零弹窗（bank-kill 全程兜底）。
+
+**① "解释器" = 原生混淆块，不是字节码取指环**。每个 EIP 处都是
+`push imm; mov [esp],reg; jmp 下一块` 形式的混淆原生码 + `pop esp` 栈旋转
+（snap_001 链尾在 0xefeb4 于 VM 栈上执行 `loopne` 自旋 = 延时环真实存在）。
+指令词汇：push/pop/mov/xchg/add/sub/xor/shl/lea/jmp + pushad/popad/lodsb
+（0x10288d1 的 lodsb = 真字节码取指点，esi = VM 程序计数器）+ 16/32 位
+混合 push/pop（66 前缀，esp 步长 2/4 混用——模拟器最初在这里全错位）。
+
+**② 状态银行字段图（64 B @ RVA 0x28580，banktrace u32 解剖）**：
+- +0x00..+0x1B：常量 VM key（28 B，全 run 不变）
+- +0x1E：**continuation A**（code VA；检查期间在微派发区 0x1021a1c-0x1021a5b
+  循环；bail 时变 0xFFFFA595）
+- +0x22：**continuation B**（code VA；检查期间 0x10dcd5x 一带轮换）
+- +0x2A：VM 栈指针（0xefe78-0xefeb4，与快照真实 esp 吻合；bail 后被
+  0x9eee18eb 破坏）
+- +0x32：EBP 锚（0xEEDC0014，恒定）
+- +0x36/+0x3A：c2（旋转值流：56f9b8c4→6f9b8c45→b8c456f9，密钥流）与
+  opcode index（0x202/0x206/0x246/0x286/0x282/0xa12）
+- **银行访问走 VM 栈，不走 ebp 相对**：全空间指针狩猎只在栈上找到银行
+  字段地址（bank+0x22/bank+0x1e 被当值推栈），零 ebp 相对命中——VM 把
+  esp 旋转进银行后用 push/pop 读写。27 个 VMCTX 目标（0x201fd 计数器、
+  0x22cf5 等）是 VM 寄存器堆。
+
+**③ 失败分支机制（本轮最大定案）**：
+- **判定发生在 t≈401 ms，每次 run 都一样**（Y1test 全程 banktrace +
+  H6 + S1_014 三方一致）——此前"license 相位 t=21.7 s"量的是判定后的
+  余留（弹窗/停车），不是检查本身。停车 run 也已走完全部检查。
+- fail write = 银行写入失败路径续延对 (0x01182519, 0x0117e9ef)（瞬态
+  1-2 ms），稳定态散落为 +0x2e=0x0117e9ef、+0x36=0x01182522；
+  contA=0xFFFFA595（负计数器）。
+- **可靠的 bail 标记 = contA==0xFFFFA595**（三个独立观测全出现、稳定态
+  持存）；连续 8 字节签名只在瞬态存在，5 ms 轮询约 60% 概率错过
+  （Y1test 实测 kill 未触发）。
+- fail 处理器区域 = 0x1182436/0x1182519/0x117e9ef（IMG-HI，池窗外）；
+  bail 链帧序 0xe35a3→0xe03b8→0xb7551/0xb754d→0xe3247→0xa4135→0x21fff
+  →0x964f9 与 ExitProcess 陷阱场景逐项吻合；VM 栈帧 = {续延对, EBP 锚,
+  保存的 vmsp} 三元组（0x20 步距），failfreeze 栈上新帧对
+  (0x01182523, 0x010208a9)。
+
+**④ 新机器（全部 env 门控，x86 门控，默认零变化）**：
+- `MAGICMIDA_V2_FAILFREEZE=1`：bank-kill 升级版——1 ms RPM 轮询银行，
+  标记命中 → ToolHelp 枚举全部线程挂起 → 自包含 dump（CTX×N/BANK/
+  STCK 0xefd00+0x3000/CTXM 0x1020000+0x8000/IMAG 全镜像）→ 终止。
+  实测 Y2test：28 线程、3.67 MB、判定后 ~1-2 ms 冻结、零弹窗。
+  （两个实现坑：ToolHelp 线程过滤必须用 pid 不能用 HANDLE 截断；
+  Python 改写的源文件 mtime 不触发 cargo 重编——touch 后新代码才进
+  二进制，第一轮 FAILSNAP/banktrace 验证全部跑在旧代码上。）
+- banktrace 全程化：1 ms × 1000 条（解码期）后转 5 ms 直到 60k 条
+  （旧 1000 条上限只覆盖前 2 s，license 判定从未被录过）；
+  刷盘每 1000 条（防 O(n²) 全量重写）。
+- `MAGICMIDA_V2_FAILSNAP=1`：VMSNAP 门换区域到失败处理器
+  (0x117E000-0x1183000)。
+- vm_snapshot_tick 栈窗改 [esp-0x4000, esp+0x4000)（STCK 段地址记录
+  读取起点）：旧抓法只抓 esp 上方，VM 弹栈复用模式引用的 esp 下方
+  数据缺失——离线模拟器每条链都死在这上面。
+- bank-kill：全银行扫签名（位置漂移实测）+ contA 标记 + 1 ms 轮询。
+
+**⑤ 离线模拟器（OUT/v2_emu.py）**：子集 x86 解释器（~40 条指令白名单 +
+真实 vmsnap 状态），代码源 = 同 run phase 库 ∪ 快照 EIP 块 ∪ 19 个 IMAG
+并集（明文校验）。链长 100-300 条常规、snap_010 达 53k 条；未映射读改
+记 0 继续后仍止于数据墙 = esp 下方栈字节（已由 ④ 修掉下次 run 的采集）。
+**⑥ 快车教训：`-o` 绝对 Windows 路径在本机管线报 os error 3（快照写出
+失败连坐 banktrace 全空），相对 Windows 形式（`OUT\X.exe`）必成**——
+与旧记录"-o 必须 C:\ 形式"相反，以本轮为准。
+
+**下一增量（数据已就绪）**：fail-freeze 场景里比较的两 operand
+（算出的指纹哈希 vs 存储哈希）在判定前 ~2 ms 才物质化。两条路：
+(a) PRE-fail 冻结——把 FAILFREEZE 的触发条件改成"bank opidx 进入
+0x246 且 contB==0x0110344f（fail 前最后状态）"提前 ~2 ms 挂起，全场景
+dump 出来直接读 VM 栈/VMCTX 上的两个操作数；(b) S1_001-013（判定前
+快照）栈上找重复 14 B 窗口（本轮 342 命中里 0xf2xxx 全是模板重复，
+0xefe8e 的帧对是已知结构——需要按帧结构过滤再缩小）。operand 定位后
+= 把存储哈希补丁成本机指纹哈希 → 检查合法通过 → VM 自己走 pass 路径
+→ .text 解密 → OEP → 产物。

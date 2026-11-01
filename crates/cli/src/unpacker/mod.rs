@@ -466,11 +466,22 @@ pub fn unpack(
     let mut fp_scan_tick: u64 = 0;
     #[cfg(target_arch = "x86")]
     let mut vm_snap_count: usize = 0;
+    // Bank trace (`MAGICMIDA_V2_BANKTRACE=1`): from t≥200 ms, 1 ms tick with
+    // (t, EIP, 64 B state bank @ RVA 0x28580) per record — the millisecond
+    // evolution of the VM state through the licence check.  The decision
+    // (bank switch to bail continuations) is a 15-25 ms window; 1 ms puts
+    // 15-25 records inside it.  Cap 1000 records; periodic dump every 200.
+    #[cfg(target_arch = "x86")]
+    let banktrace_on = std::env::var("MAGICMIDA_V2_BANKTRACE").is_ok();
+    #[cfg(target_arch = "x86")]
+    let mut bank_trace: Vec<(u32, u32, [u8; 64])> = Vec::new();
     // x64 hosts never take these paths (no x64 V2 sample in the corpus):
     // the tick computation reads `rip_sample_on` on both architectures,
     // `freeze_range` is consumed only by the x86-gated branches.
     #[cfg(not(target_arch = "x86"))]
     let (_freeze_range, rip_sample_on): (Option<(usize, usize)>, bool) = (None, false);
+    #[cfg(not(target_arch = "x86"))]
+    let banktrace_on = false;
     if post_attach {
         dbg.resume_post_attach_main_thread()
             .context("post-attach: failed to resume main thread")?;
@@ -482,13 +493,25 @@ pub fn unpack(
         // the popup is visible for a frame or two, and the phase samples
         // survive via their periodic dump.
         #[cfg(target_arch = "x86")]
-        if std::env::var("MAGICMIDA_INTERACTIVE_DESKTOP").is_ok()
-            && std::env::var("MAGICMIDA_V2_RECORD_PHASE").is_ok()
-            && std::env::var("MAGICMIDA_V2_DIALOG_KILL").is_ok()
         {
-            if let Some(join) = helpers::spawn_dialog_killer(dbg.pid(), dbg.process_handle()) {
+            // Bail watcher: kills the target on the bank's fail-continuation
+            // signature (before MessageBox exists — zero popups).
+            // MAGICMIDA_V2_FAILFREEZE=1 switches it to suspend-all + scene
+            // dump (the licence comparison's operands are materialised in
+            // the 2 ms window around the fail write) before terminating.
+            if let Some(join) = helpers::spawn_dialog_killer(
+                dbg.pid(),
+                dbg.process_handle(),
+                dbg.image_base() as usize,
+                &output_path,
+            ) {
                 let _ = join; // self-terminating
-                info!("interactive licence hunt: dialog-killer armed (50 ms poll)");
+            }
+            // Message waker: the main thread parks in NtUserWaitMessage
+            // (thread-message wait) — post thread messages to drive it.
+            if let Some(join) = helpers::spawn_message_waker(dbg.main_thread_id()) {
+                let _ = join;
+                info!("message waker armed (WM_TIMER/WM_NULL every 200 ms)");
             }
         }
         // No CREATE_PROCESS debug event arrives in post-attach mode, so
@@ -593,7 +616,34 @@ pub fn unpack(
         let early_record = recording_now && started.elapsed().as_millis() < 3000;
         #[cfg(not(target_arch = "x86"))]
         let early_record = false;
-        let tick_ms: u32 = if early_record {
+        // Bank trace: 1 ms cadence for the first 1000 records (decode
+        // phase), then 5 ms for the rest of the run.  The old 1000-record
+        // cap stopped recording after ~2 s — the licence phase (t ≈ 21.7 s
+        // in the bail runs) never got traced, which is exactly the window
+        // the state-bank decision happens in.  The bank read is RPM-only
+        // (no suspension), measured zero-perturbation, so recording for the
+        // whole run costs nothing but file size.
+        #[cfg(target_arch = "x86")]
+        let bank_1ms = banktrace_on
+            && post_attach
+            && started.elapsed().as_millis() >= 200
+            && (bank_trace.len() as u32) < 1000;
+        #[cfg(not(target_arch = "x86"))]
+        let bank_1ms = false;
+        #[cfg(target_arch = "x86")]
+        let banktrace_tick = banktrace_on
+            && post_attach
+            && started.elapsed().as_millis() >= 200
+            && (bank_trace.len() as u32) < 60_000;
+        #[cfg(not(target_arch = "x86"))]
+        let banktrace_tick = false;
+        let tick_ms: u32 = if bank_1ms {
+            1
+        } else if banktrace_tick || (banktrace_on && post_attach) {
+            // Post-gate: 5 ms so the trace keeps covering the licence phase;
+            // the 1 ms cadence covered the decode start.
+            5
+        } else if early_record {
             5
         } else if recording_now || (post_attach && rip_sample_on) {
             50
@@ -697,7 +747,7 @@ pub fn unpack(
                 // (≥ 0x90000) — decode-phase hits stay at the baseline tick
                 // so the burst machinery doesn't perturb the decode.
                 #[cfg(target_arch = "x86")]
-                if recording_now && post_attach {
+                if (recording_now || banktrace_tick) && post_attach {
                     // Fingerprint hunt (`MAGICMIDA_V2_FPHUNT=1`): every 10th
                     // tick scan the image for the licence-fingerprint string;
                     // a hit means the check is live — freeze, dump, end the
@@ -738,8 +788,43 @@ pub fn unpack(
                             let _ = std::fs::write(&ppath, &blob);
                         }
                     };
+                    // Bank trace: (t, EIP, 64 B bank).  The bank read is
+                    // pure RPM — NO thread suspension — because the 1 ms
+                    // SuspendThread cadence perturbs the check into its park
+                    // path (measured 2026-10-31: five BT runs all parked at
+                    // ~391 ms vs completing runs at 5 ms).  EIP comes from
+                    // the coarse 5 ms phase samples; the bank evolves at
+                    // 1 ms unperturbed.
+                    #[cfg(target_arch = "x86")]
+                    if banktrace_tick {
+                        {
+                            let mut bank = [0u8; 64];
+                            let _ = dbg.read_memory(image_base_usize + 0x28580, &mut bank);
+                            bank_trace.push((now_ms, 0, bank));
+                            // Flush cadence 1000 (not 200): the blob is a
+                            // full rewrite, and a 60k-record run would turn
+                            // every 1 s into a 7 MB rewrite otherwise.
+                            if bank_trace.len() % 1000 == 0 {
+                                let mut blob = Vec::new();
+                                for (ms, eip, bk) in &bank_trace {
+                                    blob.extend_from_slice(&ms.to_le_bytes());
+                                    blob.extend_from_slice(eip.to_le_bytes().as_slice());
+                                    blob.extend_from_slice(bk);
+                                }
+                                let bname = output_path
+                                    .file_stem()
+                                    .map(|s| s.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| "v2bank".to_string());
+                                let bpath = output_path
+                                    .parent()
+                                    .unwrap_or(std::path::Path::new("."))
+                                    .join(format!("{bname}.v2banktrace.bin"));
+                                let _ = std::fs::write(&bpath, &blob);
+                            }
+                        }
+                    }
                     // Main thread.
-                    if let Some((rip, _esp, code, _stack)) = helpers::sample_main_rip(&mut dbg) {
+                    if let Some((rip, _esp, _code, _stack)) = helpers::sample_main_rip(&mut dbg) {
                         // VM snapshot gate (`MAGICMIDA_V2_VMSNAP[=<ms>]`): the
                         // first in-pool hit at/after the gate freezes the
                         // thread and captures the whole VM state — one slice
@@ -748,11 +833,29 @@ pub fn unpack(
                             .ok()
                             .and_then(|v| v.trim().parse::<u64>().ok())
                             .unwrap_or(0);
-                        if std::env::var("MAGICMIDA_V2_VMSNAP").is_ok()
-                            && now_ms as u64 >= snap_gate
-                            && (0x28000..0x40000).contains(
-                                &(rip.wrapping_sub(image_base_usize)),
-                            )
+                        // MAGICMIDA_V2_FAILSNAP=1 freezes on the fail-handler
+                        // region instead of the engine pool.  The fail
+                        // continuations (0x1182436 / 0x1182519 / 0x117e9ef,
+                        // pushed on the VM stack the moment the licence
+                        // comparison fails — S1 snapshot 14 stack, 2026-11-01)
+                        // live outside the pool window, so their blocks are
+                        // never decrypted inside 0x28000-0x40000 and the pool
+                        // gate never sees them.
+                        let failsnap = std::env::var("MAGICMIDA_V2_FAILSNAP").is_ok();
+                        let snap_region: (usize, usize) = if failsnap {
+                            (0x117E000, 0x1183000)
+                        } else {
+                            (0x28000, 0x40000)
+                        };
+                        let snap_env_ok = if failsnap {
+                            true
+                        } else {
+                            std::env::var("MAGICMIDA_V2_VMSNAP").is_ok()
+                        };
+                        let snap_rva = rip.wrapping_sub(image_base_usize);
+                        if snap_env_ok
+                            && (failsnap || now_ms as u64 >= snap_gate)
+                            && (snap_region.0..snap_region.1).contains(&snap_rva)
                             && vm_snap_count < 32
                         {
                             vm_snap_count += 1;
@@ -767,7 +870,12 @@ pub fn unpack(
                                 push(0, rip, &code_bytes);
                             }
                         }
-                        push(0, rip, &code);
+                        // Bank-trace runs record the EIP via the bank trace
+                        // above; the phase-sample push stays for non-bank
+                        // runs.
+                        if !banktrace_on {
+                            push(0, rip, &_code);
+                        }
                     }
                     // One worker per tick, round-robin.  Every worker in the
                     // image window gets recorded; the licence check lives on

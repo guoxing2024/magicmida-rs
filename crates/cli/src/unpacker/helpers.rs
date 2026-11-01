@@ -807,41 +807,7 @@ pub(super) fn check_v2_exit_trap(
 // Data section bounds
 // ---------------------------------------------------------------------------
 
-/// Statics shared with the dialog-killer's `WNDENUMPROC` callback.  The
-/// callback cannot capture, and only one killer thread runs per session, so
-/// process-global slots are the simplest correct wiring.
-#[cfg(target_arch = "x86")]
-static DIALOG_KILL_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-#[cfg(target_arch = "x86")]
-static DIALOG_KILL_FOUND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// `EnumWindows` callback for [`spawn_dialog_killer`]: flag the first `#32770`
-/// window owned by the target PID and stop the walk.
-/// SAFETY: called by the OS enumerator; reads only its own statics and the
-/// window API.
-#[cfg(target_arch = "x86")]
-unsafe extern "system" fn dialog_kill_enumproc(hwnd: windows::Win32::Foundation::HWND, _l: windows::Win32::Foundation::LPARAM) -> windows::Win32::Foundation::BOOL {
-    use std::sync::atomic::Ordering;
-    use windows::Win32::Foundation::BOOL;
-    use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetWindowThreadProcessId};
-    let mut owner = 0u32;
-    // SAFETY: hwnd comes from the enumerator.
-    unsafe {
-        GetWindowThreadProcessId(hwnd, Some(&mut owner));
-    }
-    if owner != DIALOG_KILL_PID.load(Ordering::Relaxed) {
-        return BOOL::from(true);
-    }
-    let mut name = [0u16; 16];
-    // SAFETY: name buffer sized for `#32770`.
-    let n = unsafe { GetClassNameW(hwnd, &mut name) };
-    let cls = String::from_utf16_lossy(&name[..n.max(0) as usize]);
-    if cls == "#32770" {
-        DIALOG_KILL_FOUND.store(true, Ordering::SeqCst);
-        return BOOL::from(false);
-    }
-    BOOL::from(true)
-}
 
 /// Spawn the dialog-killer thread: poll (50 ms) for a `#32770` dialog that
 /// belongs to the target and terminate the target the moment one appears.
@@ -860,46 +826,236 @@ unsafe extern "system" fn dialog_kill_enumproc(hwnd: windows::Win32::Foundation:
 pub(super) fn spawn_dialog_killer(
     pid: u32,
     h_process: HANDLE,
+    image_base: usize,
+    output_path: &Path,
 ) -> Option<std::thread::JoinHandle<()>> {
-    use std::sync::atomic::Ordering;
 
-    if std::env::var("MAGICMIDA_V2_DIALOG_KILL").is_err() {
+    if std::env::var("MAGICMIDA_V2_DIALOG_KILL").is_err()
+        && std::env::var("MAGICMIDA_V2_FAILFREEZE").is_err()
+    {
         return None;
     }
-    DIALOG_KILL_PID.store(pid, Ordering::SeqCst);
-    DIALOG_KILL_FOUND.store(false, Ordering::SeqCst);
     let handle_raw = h_process.0 as isize;
+    let out_path = output_path.to_path_buf();
     let join = std::thread::spawn(move || {
-        use windows::Win32::Foundation::LPARAM;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
         use windows::Win32::System::Threading::TerminateProcess;
-        use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, WNDENUMPROC};
-        // SAFETY: statics are set before the thread starts; the callback only
-        // reads them and the window API.
-        let cb = WNDENUMPROC::Some(dialog_kill_enumproc);
+        // The bail signature, measured 2026-10-31 (S1 snapshot 14, the
+        // dialog-preceding state): the two fail-continuations written into
+        // the state bank the moment the licence comparison fails.  The dialog
+        // is created only AFTER the bail path runs, so killing on this
+        // signature happens **before the window exists** — the operator sees
+        // nothing, ever.
+        //
+        // 2026-11-01 (H6 banktrace + Y1test full-run banktrace): the 8-byte
+        // pattern exists contiguously only for a 1-2 ms transient (H6 t=384);
+        // the settled bail state scatters its halves (`ef e9 17 01` at +0x2e,
+        // `22 25 18 01` at +0x36).  The stable marker across every
+        // observation (H6 t=384/386, S1 snap_014, Y1test t=401) is
+        // **contA == 0xFFFFA595** (bank+0x1E) — a negative counter the fail
+        // write installs and nothing else produces.  Trigger on either.
+        const BAIL_SIG: [u8; 8] = [0x19, 0x25, 0x18, 0x01, 0xef, 0xe9, 0x17, 0x01];
+        const FAIL_MARK: u32 = 0xFFFF_A595;
+        const BANK_RVA: usize = 0x28580;
+        let bank_addr = image_base + BANK_RVA;
+        let mut bank = [0u8; 64];
+        let freeze_mode = std::env::var("MAGICMIDA_V2_FAILFREEZE").is_ok();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
         loop {
-            if DIALOG_KILL_FOUND.load(Ordering::SeqCst) {
-                // SAFETY: live PROCESS_ALL_ACCESS handle captured at spawn.
+            // SAFETY: live PROCESS_ALL_ACCESS handle captured at spawn.
+            let got = unsafe {
+                let mut read: usize = 0;
+                let ok = ReadProcessMemory(
+                    HANDLE(handle_raw as *mut core::ffi::c_void),
+                    bank_addr as *const core::ffi::c_void,
+                    bank.as_mut_ptr() as *mut core::ffi::c_void,
+                    bank.len(),
+                    Some(&mut read),
+                );
+                ok.is_ok() && read == bank.len()
+            };
+            let mark = got && (bank.windows(8).any(|w| w == BAIL_SIG)
+                || u32::from_le_bytes(bank[0x1e..0x22].try_into().unwrap()) == FAIL_MARK);
+            if mark {
+                if freeze_mode {
+                    dump_failfreeze_scene(
+                        pid,
+                        HANDLE(handle_raw as *mut core::ffi::c_void),
+                        image_base,
+                        &out_path,
+                    );
+                }
+                // SAFETY: live handle.
                 unsafe {
                     let _ = TerminateProcess(
-                        windows::Win32::Foundation::HANDLE(handle_raw as *mut core::ffi::c_void),
+                        HANDLE(handle_raw as *mut core::ffi::c_void),
                         0x2C,
                     );
                 }
-                info!("DIALOG-KILL: licence dialog appeared — target terminated");
+                info!(
+                    failfreeze = freeze_mode,
+                    "BAIL-KILL: licence check failed (bank marker) — target handled before the dialog"
+                );
                 return;
             }
             if std::time::Instant::now() > deadline {
                 return;
             }
-            // SAFETY: valid callback and lparam.
-            unsafe {
-                let _ = EnumWindows(cb, LPARAM(0));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
     });
     Some(join)
+}
+
+/// Fail-freeze scene dump (`MAGICMIDA_V2_FAILFREEZE=1`): the licence
+/// comparison's two operands (computed fingerprint hash vs the hash stored
+/// in the licence key) are materialised on the VM stack / VMCTX in the
+/// 2 ms window around the fail-continuation write (banktrace 2026-11-01:
+/// decision at t=399→401 ms in EVERY run, parked or not).  The watcher
+/// thread catches the marker at 1 ms, suspends every target thread, and
+/// this dumps everything the offline analysis needs — full image, state
+/// bank, the VM stack region, VMCTX, and every thread's CONTEXT — then the
+/// caller terminates.  Popup-free by construction (the dialog is seconds
+/// away and the process never gets there).
+#[cfg(target_arch = "x86")]
+fn dump_failfreeze_scene(
+    pid: u32,
+    h_process: HANDLE,
+    image_base: usize,
+    output_path: &Path,
+) -> Option<()> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::Debug::{GetThreadContext, CONTEXT, ReadProcessMemory};
+    use windows::Win32::System::Threading::{
+        OpenThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION,
+        THREAD_SUSPEND_RESUME,
+    };
+    use std::io::Write;
+
+    let rpm = |addr: usize, buf: &mut [u8]| -> bool {
+        // SAFETY: live PROCESS_ALL_ACCESS handle.
+        unsafe {
+            let mut read: usize = 0;
+            let ok = ReadProcessMemory(
+                h_process,
+                addr as *const core::ffi::c_void,
+                buf.as_mut_ptr() as *mut core::ffi::c_void,
+                buf.len(),
+                Some(&mut read),
+            );
+            ok.is_ok() && read == buf.len()
+        }
+    };
+
+    // Suspend every thread of the target first (ToolHelp snapshot; the
+    // debugger's thread map does not know post-attach workers).
+    let mut handles = Vec::new();
+    unsafe {
+        use windows::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+        };
+        if let Ok(h_snap) = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) {
+            let mut te = THREADENTRY32::default();
+            te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+            if Thread32First(h_snap, &mut te).is_ok() {
+                loop {
+                    if te.th32OwnerProcessID == pid {
+                        if let Ok(h) = OpenThread(
+                            THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION,
+                            false,
+                            te.th32ThreadID,
+                        ) {
+                            let _ = SuspendThread(h);
+                            handles.push((te.th32ThreadID, h));
+                        }
+                    }
+                    if Thread32Next(h_snap, &mut te).is_err() {
+                        break;
+                    }
+                }
+            }
+            let _ = CloseHandle(h_snap);
+        }
+    }
+    info!(threads = handles.len(), "FAILFREEZE: threads suspended");
+    if handles.is_empty() {
+        return None;
+    }
+
+    let stem = output_path.with_extension("v2failfreeze");
+    let mut name = match stem.file_name() {
+        Some(n) => n.to_os_string(),
+        None => {
+            warn!("FAILFREEZE: no file name in output path");
+            return None;
+        }
+    };
+    name.push(".bin");
+    let snap = stem.with_file_name(name);
+    let mut file = match std::fs::File::create(&snap) {
+        Ok(f) => f,
+        Err(e) => {
+            warn!(error = %e, path = %snap.display(), "FAILFREEZE: create failed");
+            return None;
+        }
+    };
+    let sec = |f: &mut std::fs::File, tag: &[u8; 4], addr: usize, data: &[u8]| {
+        let _ = f.write_all(tag);
+        let _ = f.write_all(&(addr as u32).to_le_bytes());
+        let _ = f.write_all(&(data.len() as u32).to_le_bytes());
+        let _ = f.write_all(data);
+    };
+
+    // Thread contexts (raw, tagged per tid).
+    for (tid, h) in &handles {
+        let mut ctx = CONTEXT::default();
+        ctx.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_FLAGS(0x0001_0003);
+        // SAFETY: suspended thread handle opened above.
+        if unsafe { GetThreadContext(*h, &mut ctx) }.is_ok() {
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    (&ctx as *const CONTEXT) as *const u8,
+                    std::mem::size_of::<CONTEXT>(),
+                )
+            };
+            let _ = file.write_all(b"CTX ");
+            let _ = file.write_all(&tid.to_le_bytes());
+            let _ = file.write_all(&(bytes.len() as u32).to_le_bytes());
+            let _ = file.write_all(bytes);
+        }
+    }
+
+    // State bank.
+    let mut bank = [0u8; 64];
+    if rpm(image_base + 0x28580, &mut bank) {
+        sec(&mut file, b"BANK", image_base + 0x28580, &bank);
+    }
+    // VM stack region (bank vmsp is corrupted post-write; the region is
+    // stable at 0xefd00-0xf0000 across every observation).
+    let mut vmstk = vec![0u8; 0x3000];
+    if rpm(0xefd00, &mut vmstk) {
+        sec(&mut file, b"STCK", 0xefd00, &vmstk);
+    }
+    // VMCTX / VM register file.
+    let mut vmctx = vec![0u8; 0x8000];
+    if rpm(image_base + 0x20000, &mut vmctx) {
+        sec(&mut file, b"CTXM", image_base + 0x20000, &vmctx);
+    }
+    // Full image.
+    let mut img = vec![0u8; 0x371_000];
+    if rpm(image_base + 0x1000, &mut img) {
+        sec(&mut file, b"IMAG", image_base + 0x1000, &img);
+    }
+
+    info!(path = %snap.display(), threads = handles.len(), "FAILFREEZE: scene dumped");
+    // SAFETY: handles opened above.
+    unsafe {
+        for (_, h) in &handles {
+            let _ = CloseHandle(*h);
+        }
+    }
+    Some(())
 }
 
 /// Fingerprint hunt (`MAGICMIDA_V2_FPHUNT=1`): scan the target image for
@@ -1134,11 +1290,17 @@ pub(super) fn vm_snapshot_tick(
     let _ = file.write_all(&(regs_bytes.len() as u32).to_le_bytes());
     let _ = file.write_all(regs_bytes);
 
+    // Stack window straddles esp: [esp-0x4000, esp+0x4000).  The VM pops
+    // values and re-references them below the current esp (measured
+    // 2026-11-01: every emulation of a freeze state diverged on exactly
+    // those bytes — the above-esp-only capture left popped-but-alive data
+    // uncaptured).  The STCK section address records where the read began.
     let esp = ctx.Esp as usize;
-    let mut stack = vec![0u8; 0x4000];
-    let got = dbg.read_memory(esp, &mut stack).unwrap_or(0);
+    let stk_base = esp.saturating_sub(0x4000);
+    let mut stack = vec![0u8; 0x8000];
+    let got = dbg.read_memory(stk_base, &mut stack).unwrap_or(0);
     stack.truncate(got);
-    sec(&mut file, b"STCK", esp, &stack);
+    sec(&mut file, b"STCK", stk_base, &stack);
 
     // Full image dump.  The VM addressing is EBP-relative with wrap-around:
     // EBP = 0xEEDC0014 (measured) and displacements like 0x122624E5 sum back
@@ -1175,6 +1337,48 @@ pub(super) fn vm_snapshot_tick(
         let _ = windows::Win32::System::Threading::ResumeThread(h);
     }
     Some(code_at_eip)
+}
+
+/// Message waker (`MAGICMIDA_V2_WAKE=1`): the V2 main thread parks in
+/// `win32u!NtUserWaitMessage` (syscall 0x1100a — verified 2026-10-31 by
+/// reading the stub's syscall number; earlier misread as 0x110a) — the
+/// "wait for a thread message" API.  Posting **thread** messages (not
+/// window messages — park runs have no window) should wake it and, if the
+/// shell's engine is message-driven, let it continue.  WM_TIMER and WM_NULL
+/// alternate; both are harmless to a dispatcher that ignores them.
+///
+/// Runs for the session lifetime (600 s cap); posts every 200 ms.
+#[cfg(target_arch = "x86")]
+pub(super) fn spawn_message_waker(main_tid: u32) -> Option<std::thread::JoinHandle<()>> {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW;
+
+    if std::env::var("MAGICMIDA_V2_WAKE").is_err() {
+        return None;
+    }
+    let join = std::thread::spawn(move || {
+        const WM_NULL: u32 = 0x0000;
+        const WM_TIMER: u32 = 0x0113;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        let mut tick = 0u64;
+        while std::time::Instant::now() < deadline {
+            let msg = if tick % 2 == 0 { WM_TIMER } else { WM_NULL };
+            // SAFETY: valid thread id captured at spawn; the call fails
+            // harmlessly (ERROR_INVALID_THREAD_ID) once the thread is gone.
+            let ok = unsafe { PostThreadMessageW(main_tid, msg, WPARAM(0), LPARAM(0)) };
+            if tick % 25 == 0 {
+                debug!(
+                    tick,
+                    msg = format!("{msg:#x}"),
+                    posted = ok.is_ok(),
+                    "message waker"
+                );
+            }
+            tick += 1;
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    });
+    Some(join)
 }
 
 /// Compute the data-section boundaries for the IAT guard-address fallback.
