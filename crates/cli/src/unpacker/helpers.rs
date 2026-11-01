@@ -831,12 +831,34 @@ pub(super) fn spawn_dialog_killer(
     main_tid: u32,
 ) -> Option<std::thread::JoinHandle<()>> {
 
+    let strpatch_arg = std::env::var("MAGICMIDA_V2_STRPATCH").ok();
+    let sp_groups: Option<([u8; 4], [u8; 4])> = strpatch_arg.as_ref().and_then(|v| {
+        let parts: Vec<&str> = v.split('|').collect();
+        if parts.len() == 2 && parts[0].len() == 4 && parts[1].len() == 4 {
+            let mut a = [0u8; 4];
+            let mut b = [0u8; 4];
+            for (i, ch) in parts[0].chars().enumerate() {
+                a[i] = ch as u8;
+            }
+            for (i, ch) in parts[1].chars().enumerate() {
+                b[i] = ch as u8;
+            }
+            Some((a, b))
+        } else {
+            None
+        }
+    });
+    if strpatch_arg.is_some() && sp_groups.is_none() {
+        info!("STRPATCH: bad argument, expected <4hex>|<4hex>");
+        return None;
+    }
     if std::env::var("MAGICMIDA_V2_DIALOG_KILL").is_err()
         && std::env::var("MAGICMIDA_V2_FAILFREEZE").is_err()
         && std::env::var("MAGICMIDA_V2_HASHPATCH").is_err()
         && std::env::var("MAGICMIDA_V2_PREFREEZE").is_err()
         && std::env::var("MAGICMIDA_V2_JNEPATCH").is_err()
         && std::env::var("MAGICMIDA_V2_REFTRACE").is_err()
+        && sp_groups.is_none()
     {
         return None;
     }
@@ -896,6 +918,15 @@ pub(super) fn spawn_dialog_killer(
         // the 0x2056F blob) through the decision window.  Ring-records
         // every change; the bail-marker dump includes the ring.
         let reftrace = std::env::var("MAGICMIDA_V2_REFTRACE").is_ok();
+        // String patch (`MAGICMIDA_V2_STRPATCH=<4hex>|<4hex>`): the licence
+        // check's pass condition is rolchk(formatted fingerprint)[:16] == 0
+        // (compare block 0x13ECC0-0x13ED06, cmp target measured 0).  The
+        // argument holds two 4-char hex groups replacing groups 1 and 3 of
+        // the fingerprint string, solved offline (numpy two-group search)
+        // so the checksum's high word zeroes.  Patched into BOTH copies
+        // (0x2056D display, 0x22899 checked); the formatter never revisits
+        // early groups, so writing once the first four dashes show is
+        // race-free (format completes ~1 ms after group 1).
         const JNE_RVA: usize = 0x13ECF1;
         let jne_addr = image_base + JNE_RVA;
         let mut jne_buf = [0u8; 2];
@@ -1106,6 +1137,109 @@ pub(super) fn spawn_dialog_killer(
                 }
             }
             if std::time::Instant::now() > deadline {
+                return;
+            }
+            if let Some((sp_g1, sp_g2)) = sp_groups {
+                if watch_t0.elapsed().as_millis() >= 300 {
+                    // Tight loop: watch both string buffers; the moment the
+                    // formatted fingerprint shows its first four dashes,
+                    // write the solved groups.  Keep the bail-marker check
+                    // alive so popup protection never stalls (YAtest).
+                    // Load matters: the heavy 130-byte-per-iteration loops
+                    // (YAtest/YFtest) pushed the shell into its park path;
+                    // the light reftrace loops never did.  Read contA only
+                    // (8 B) for the marker and alternate 24 B string reads.
+                    let targets = [0x2056Dusize, 0x22899usize];
+                    let mut buf = [0u8; 24];
+                    let mut cont_buf = [0u8; 8];
+                    let mut flip = 0usize;
+                    loop {
+                        // SAFETY: live PROCESS_ALL_ACCESS handle.
+                        let ok_bank = unsafe {
+                            let mut read: usize = 0;
+                            let ok = ReadProcessMemory(
+                                HANDLE(handle_raw as *mut core::ffi::c_void),
+                                (bank_addr + 0x1E) as *const core::ffi::c_void,
+                                cont_buf.as_mut_ptr() as *mut core::ffi::c_void,
+                                8,
+                                Some(&mut read),
+                            );
+                            ok.is_ok() && read == 8
+                        };
+                        if !ok_bank {
+                            break;
+                        }
+                        flip ^= 1;
+                        let tgt = targets[flip];
+                        // SAFETY: live handle.
+                        let ok = unsafe {
+                            let mut n = 0;
+                            ReadProcessMemory(
+                                HANDLE(handle_raw as *mut core::ffi::c_void),
+                                (image_base + tgt) as *const core::ffi::c_void,
+                                buf.as_mut_ptr() as *mut core::ffi::c_void,
+                                buf.len(),
+                                Some(&mut n),
+                            )
+                            .is_ok()
+                                && n == buf.len()
+                        };
+                        if ok {
+                            let dashes = buf[4] == b'-' && buf[9] == b'-'
+                                && buf[14] == b'-' && buf[19] == b'-';
+                            let already = buf[0..4] == sp_g1 && buf[10..14] == sp_g2;
+                            if dashes && !already {
+                                // SAFETY: live handle; shell string scratch.
+                                let wok = unsafe {
+                                    let mut w1 = 0usize;
+                                    let ok1 = WriteProcessMemory(
+                                        HANDLE(handle_raw as *mut core::ffi::c_void),
+                                        (image_base + tgt) as *mut core::ffi::c_void,
+                                        sp_g1.as_ptr() as *const core::ffi::c_void,
+                                        4,
+                                        Some(&mut w1),
+                                    );
+                                    let mut w2 = 0usize;
+                                    let ok2 = WriteProcessMemory(
+                                        HANDLE(handle_raw as *mut core::ffi::c_void),
+                                        (image_base + tgt + 10) as *mut core::ffi::c_void,
+                                        sp_g2.as_ptr() as *const core::ffi::c_void,
+                                        4,
+                                        Some(&mut w2),
+                                    );
+                                    ok1.is_ok() && w1 == 4 && ok2.is_ok() && w2 == 4
+                                };
+                                info!(
+                                    addr = format!("{:#x}", image_base + tgt),
+                                    ok = wok,
+                                    "STRPATCH: solved groups written"
+                                );
+                            }
+                        }
+                        let ca = u32::from_le_bytes(cont_buf[0..4].try_into().unwrap());
+                        if ca == FAIL_MARK {
+                            info!("STRPATCH: bail marker still fired — dumping scene");
+                            dump_failfreeze_scene(
+                                pid,
+                                HANDLE(handle_raw as *mut core::ffi::c_void),
+                                image_base,
+                                &out_path,
+                            );
+                            // SAFETY: live handle.
+                            unsafe {
+                                let _ = TerminateProcess(
+                                    HANDLE(handle_raw as *mut core::ffi::c_void),
+                                    0x2C,
+                                );
+                            }
+                            return;
+                        }
+                        if watch_t0.elapsed().as_millis() > 600 {
+                            info!("STRPATCH: window over (no marker) — shell survived the check");
+                            return;
+                        }
+                    }
+                }
                 return;
             }
             if reftrace && watch_t0.elapsed().as_millis() >= 300 {

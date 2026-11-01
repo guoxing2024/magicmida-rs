@@ -2137,3 +2137,24 @@ pass = rolchk(串) 高 16 位为零**。
 16 位 = 0 → mov eax,1 → 本关通过；(3) 三哨兵观察其余两关。
 风险：本串补丁改变显示指纹（对话洉可见）——检查若另有指纹-vs-license
 比较（哨兵 2/3），会 fail——实验即知。
+
+## V2 STRPATCH 实装 + 求解解到手（2026-11-01 续 8，未发布）
+
+**① numpy 双组搜索（40M 候选，2M 即中 5 解）**：替换组 1+组 3 使
+rolchk 高 16 位为零——**解 = `6A7F|AFF9`**，替换后串
+`6A7F-BCEC-AFF9-0C18-3745-5E66-5E6D-2536`，标量验证
+eax=0x0000009E ✓（np 安装：本机 pip 直连可用）。
+**② STRPATCH 实装**（`MAGICMIDA_V2_STRPATCH=<g1>|<g2>`）：watcher
+300ms 起紧循环，双缓冲（0x2056D 显示 / 0x22899 checked）任一出现
+4 连横杠即写解组（格式化不回头 = 零竞态）；contA 标记兜底 +
+failfreeze 场景。**③ 负载-停车关系证伪**：YAtest/YFtest 的重循环
+与停车相关是**巧合**——reftrace（更重的 72B/迭代）从没诱发；
+06:33 起的 4+ 连停车 = 潮汐回归（2026-10-31 深夜同形状），环境性。
+**④ 状态**：STRPATCH 机器就绪、解就绪，等潮退窗口（06:03-06:23
+证明潮会退）。后台重试循环在跑（OUT/strpatch_bg_status.txt）。
+**⑤ 判读表**（下次实验看日志）：
+- `STRPATCH: solved groups written` + `window over (no marker)` =
+  本关通过（无弹窗、无 bail）——下一步看 .text 是否解密/管线走向
+- `solved groups written` + `bail marker still fired` = 本关通过但
+  另两道哨兵拦住 → 场景里看哨兵状态定下一步
+- 无写入 = 潮（停车），重试即可
