@@ -835,6 +835,7 @@ pub(super) fn spawn_dialog_killer(
         && std::env::var("MAGICMIDA_V2_FAILFREEZE").is_err()
         && std::env::var("MAGICMIDA_V2_HASHPATCH").is_err()
         && std::env::var("MAGICMIDA_V2_PREFREEZE").is_err()
+        && std::env::var("MAGICMIDA_V2_JNEPATCH").is_err()
     {
         return None;
     }
@@ -879,6 +880,17 @@ pub(super) fn spawn_dialog_killer(
         //     moment the blob materialises (post-decode, ~100 ms before the
         //     compare reads it) and the check passes on its own path.
         let hashpatch = std::env::var("MAGICMIDA_V2_HASHPATCH").is_ok();
+        // JNE patch (`MAGICMIDA_V2_JNEPATCH=1`): the fingerprint checksum
+        // comparison at rva 0x13ECF1 (`jne fail` = 75 0E) sits in a block
+        // the engine decrypts just-in-time.  Poll the two bytes every tick;
+        // the instant the block materialises, NOP the branch so the check
+        // falls through to `mov eax, 1` (pass).  Race: decrypt→execute gap
+        // unknown — measured by whether the bail marker still appears.
+        let jnepatch = std::env::var("MAGICMIDA_V2_JNEPATCH").is_ok();
+        const JNE_RVA: usize = 0x13ECF1;
+        let jne_addr = image_base + JNE_RVA;
+        let mut jne_buf = [0u8; 2];
+        let mut jne_done = false;
         // Pre-freeze (`MAGICMIDA_V2_PREFREEZE=1`): freeze on the LAST
         // pre-decision bank state (Y1test banktrace t=399: contA=0x0102114d,
         // contB=0x0110344f) — the thread is then still inside the compare
@@ -997,6 +1009,92 @@ pub(super) fn spawn_dialog_killer(
                     "BAIL-KILL: licence check failed (bank marker) — target handled before the dialog"
                 );
                 return;
+            }
+            // JNE patch: fire once, the instant the block decrypts.
+            // 1 ms polling lost the race (Y9test: the block decrypts and
+            // executes within <1 tick) — run a NO-SLEEP tight poll: RPM of
+            // 2 bytes is ~1-2 µs, so the decrypt→execute gap only has to
+            // exceed one RPM round-trip.
+            if jnepatch && !jne_done {
+                loop {
+                    // SAFETY: live PROCESS_ALL_ACCESS handle.
+                    let got = unsafe {
+                        let mut read: usize = 0;
+                        let ok = ReadProcessMemory(
+                            HANDLE(handle_raw as *mut core::ffi::c_void),
+                            jne_addr as *const core::ffi::c_void,
+                            jne_buf.as_mut_ptr() as *mut core::ffi::c_void,
+                            2,
+                            Some(&mut read),
+                        );
+                        ok.is_ok() && read == 2
+                    };
+                    if !got {
+                        break; // process died
+                    }
+                    if jne_buf == [0x75, 0x0E] {
+                        const NOP2: [u8; 2] = [0x90, 0x90];
+                        // SAFETY: live handle; target = the engine's own
+                        // decrypted handler block (RW while executing).
+                        let wok = unsafe {
+                            let mut written: usize = 0;
+                            let ok = WriteProcessMemory(
+                                HANDLE(handle_raw as *mut core::ffi::c_void),
+                                jne_addr as *mut core::ffi::c_void,
+                                NOP2.as_ptr() as *const core::ffi::c_void,
+                                2,
+                                Some(&mut written),
+                            );
+                            ok.is_ok() && written == 2
+                        };
+                        info!(
+                            addr = format!("{jne_addr:#x}"),
+                            ok = wok,
+                            "JNEPATCH: fingerprint-check jne nop'd (75 0E -> 90 90)"
+                        );
+                        jne_done = true;
+                        break;
+                    }
+                    if std::time::Instant::now() > deadline {
+                        return;
+                    }
+                }
+            }
+            if jnepatch && !jne_done {
+                // SAFETY: live PROCESS_ALL_ACCESS handle.
+                let got = unsafe {
+                    let mut read: usize = 0;
+                    let ok = ReadProcessMemory(
+                        HANDLE(handle_raw as *mut core::ffi::c_void),
+                        jne_addr as *const core::ffi::c_void,
+                        jne_buf.as_mut_ptr() as *mut core::ffi::c_void,
+                        2,
+                        Some(&mut read),
+                    );
+                    ok.is_ok() && read == 2
+                };
+                if got && jne_buf == [0x75, 0x0E] {
+                    const NOP2: [u8; 2] = [0x90, 0x90];
+                    // SAFETY: live handle; target = the engine's own
+                    // decrypted handler block (RW while executing).
+                    let wok = unsafe {
+                        let mut written: usize = 0;
+                        let ok = WriteProcessMemory(
+                            HANDLE(handle_raw as *mut core::ffi::c_void),
+                            jne_addr as *mut core::ffi::c_void,
+                            NOP2.as_ptr() as *const core::ffi::c_void,
+                            2,
+                            Some(&mut written),
+                        );
+                        ok.is_ok() && written == 2
+                    };
+                    info!(
+                        addr = format!("{jne_addr:#x}"),
+                        ok = wok,
+                        "JNEPATCH: fingerprint-check jne nop'd (75 0E -> 90 90)"
+                    );
+                    jne_done = true;
+                }
             }
             if std::time::Instant::now() > deadline {
                 return;
@@ -1240,6 +1338,13 @@ fn dump_failfreeze_scene(
     let mut vmstk = vec![0u8; 0x8000];
     if rpm(0xef800, &mut vmstk) {
         sec(&mut file, b"STCK", 0xef800, &vmstk);
+    } else {
+        // 0xEF800 is not always mapped (Y9test: RPM failed and the section
+        // was silently skipped).  Fall back to the known-good window.
+        let mut vmstk2 = vec![0u8; 0x3000];
+        if rpm(0xefd00, &mut vmstk2) {
+            sec(&mut file, b"STCK", 0xefd00, &vmstk2);
+        }
     }
     // VMCTX / VM register file.
     let mut vmctx = vec![0u8; 0x8000];

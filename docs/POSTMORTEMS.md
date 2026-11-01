@@ -2036,3 +2036,27 @@ VMCTX，把判定点的条件跳转字节翻面（pass 路径的目标未知是�
 另：Y8test.v2failfreeze.bin 文件被截断（IMAG 头声明 0x371000 但文件
 只有 ~0x37E004，STCK/CTX 段丢失；此前读过的分析结果全部有效，从
 S1_013/Y2test 补读即可）。教训：场景写盘后无完整性校验。
+
+## V2 补丁面收敛：代码签名/字节码补丁双双证死（2026-11-01 续 4，未发布）
+
+**① JNE 竞速两轮全败**：1ms 轮询（Y9test）和零睡眠紧循环（YAtest）都
+没抓到 rva 0x13ECF1 的 `75 0E`——块解密→执行的间隔 < 一次 RPM 往返，
+或**签名本身逐 run 变异**（变异引擎重写代码字节，Y8test 的 `75 0E`
+不等于 YAtest 的）。**代码签名补丁 = 死路**。
+YAtest 教训：紧循环卡死后 watcher 不再查 bail 标记——紧循环必须保
+留标记检查或有界（本次靠隐藏桌面兜底，无弹窗）。
+**② "字节码"区域 = 动态草稿**：0x2114D 在 S1_001-003 全零、S1_004+
+才填 `6a 00 00 78…`；0x21A1B 在不同快照分别是零/`ta_09166490`/
+`egistry\Machine\`（注册表路径串！）——contA 走的工作区被引擎逐 run
+清零重写，**不是稳定字节码**。字节码静态补丁（候选 c）= 死路。
+**③ STCK 段回退修掉**（0xEF800 未映射时 RPM 失败静默跳段 → 回退
+0xEFD00+0x3000）；此前"Y8test 文件截断"是误报——调试走查只打印非
+CTX 段，28 个 CTX 都在。
+**④ 补丁面收敛定案**：唯一可行 = **数据输入面**（license blob
+0x2056F / 机器数据），前提 = 恢复算法：
+`rolchk(format(fingerprint_hex)) == reference(license 数据)`。
+下一轮的完整链条：(1) 从明文恢复格式化+rolchk 算法（语义跨 run 稳定，
+编码逐 run 变异——按语义恢复）；(2) 判定瞬间 dump 拿格式化串算本机
+rolchk；(3) 反汇编 reference 函数链（0xCE78B → call eax）找 license
+输入字节；(4) HASHPATCH 式提前改 license 输入 → reference = 本机
+rolchk → pass。
