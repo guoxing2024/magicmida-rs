@@ -1130,10 +1130,52 @@ pub(super) fn spawn_dialog_killer(
                     if !ok_bank {
                         break;
                     }
-                    // v3: the string read tripled the loop period and the
-                    // reference transient slipped between samples — read
-                    // ONLY the 8-byte reference slot (~2-3 µs/iter).
+                    // v4: the string read tripled the loop period and the
+                    // reference transient slipped between samples — but the
+                    // string-completion moment IS the compare window (264µs
+                    // wide, YCtest): when the 39-char string is complete,
+                    // freeze immediately.  The scene then holds the run's
+                    // own mutated compare block (plaintext) + the reference
+                    // in a register or its per-run slot.
                     let mut r = [0u8; 8];
+                    let mut st = [0u8; 48];
+                    // SAFETY: live handle.
+                    let ok_str = unsafe {
+                        let mut n = 0;
+                        ReadProcessMemory(
+                            HANDLE(handle_raw as *mut core::ffi::c_void),
+                            (image_base + 0x2056D) as *const core::ffi::c_void,
+                            st.as_mut_ptr() as *mut core::ffi::c_void,
+                            48,
+                            Some(&mut n),
+                        )
+                        .is_ok()
+                            && n == 48
+                    };
+                    if ok_str
+                        && st[0..4] == *b"1051"
+                        && st[35..39] == *b"2536"
+                    {
+                        info!(
+                            t_us = t0.elapsed().as_micros() as u32,
+                            "REFTRACE: fingerprint string complete — freezing mid-compare"
+                        );
+                        // SAFETY: pre-opened main-thread handle.
+                        if let Some(h) = h_main {
+                            unsafe {
+                                let _ = SuspendThread(h);
+                            }
+                        }
+                        dump_failfreeze_scene(
+                            pid,
+                            HANDLE(handle_raw as *mut core::ffi::c_void),
+                            image_base,
+                            &out_path,
+                        );
+                        dump_reftrace(&out_path, &ring);
+                        // Leave suspended; the outer timeout reaps.
+                        return;
+                    }
                     // SAFETY: live handle.
                     let ok1 = unsafe {
                         let mut n = 0;
