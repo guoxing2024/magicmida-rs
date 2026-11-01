@@ -836,11 +836,13 @@ pub(super) fn spawn_dialog_killer(
         && std::env::var("MAGICMIDA_V2_HASHPATCH").is_err()
         && std::env::var("MAGICMIDA_V2_PREFREEZE").is_err()
         && std::env::var("MAGICMIDA_V2_JNEPATCH").is_err()
+        && std::env::var("MAGICMIDA_V2_REFTRACE").is_err()
     {
         return None;
     }
     let handle_raw = h_process.0 as isize;
     let out_path = output_path.to_path_buf();
+    let watch_t0 = std::time::Instant::now();
     let join = std::thread::spawn(move || {
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
@@ -887,6 +889,14 @@ pub(super) fn spawn_dialog_killer(
         // falls through to `mov eax, 1` (pass).  Race: decrypt→execute gap
         // unknown — measured by whether the bail marker still appears.
         let jnepatch = std::env::var("MAGICMIDA_V2_JNEPATCH").is_ok();
+        // Reference trace (`MAGICMIDA_V2_REFTRACE=1`): tight-loop the
+        // checksum-reference slot (rva 0x13ED07) and the fingerprint string
+        // buffer (rva 0x22899) through the decision window — every state so
+        // far read them as 0 (pre) or overwritten (post); the value exists
+        // only mid-compare.  Ring-records every change; the bail-marker
+        // dump includes the ring, giving both the formatted fingerprint
+        // string and the reference (the patch target).
+        let reftrace = std::env::var("MAGICMIDA_V2_REFTRACE").is_ok();
         const JNE_RVA: usize = 0x13ECF1;
         let jne_addr = image_base + JNE_RVA;
         let mut jne_buf = [0u8; 2];
@@ -1099,6 +1109,100 @@ pub(super) fn spawn_dialog_killer(
             if std::time::Instant::now() > deadline {
                 return;
             }
+            if reftrace && watch_t0.elapsed().as_millis() >= 300 {
+                use std::time::Instant;
+                let t0 = Instant::now();
+                let mut ring: Vec<(u32, [u8; 8], [u8; 48])> = Vec::with_capacity(512);
+                let mut last_ref = [0u8; 8];
+                let mut last_str = [0u8; 48];
+                loop {
+                    // SAFETY: live PROCESS_ALL_ACCESS handle.
+                    let ok_bank = unsafe {
+                        let mut read: usize = 0;
+                        let ok = ReadProcessMemory(
+                            HANDLE(handle_raw as *mut core::ffi::c_void),
+                            bank_addr as *const core::ffi::c_void,
+                            bank.as_mut_ptr() as *mut core::ffi::c_void,
+                            bank.len(),
+                            Some(&mut read),
+                        );
+                        ok.is_ok() && read == bank.len()
+                    };
+                    if !ok_bank {
+                        break;
+                    }
+                    let mut r = [0u8; 8];
+                    let mut st = [0u8; 48];
+                    // SAFETY: live handle.
+                    let ok1 = unsafe {
+                        let mut n = 0;
+                        ReadProcessMemory(
+                            HANDLE(handle_raw as *mut core::ffi::c_void),
+                            (image_base + 0x13ED07) as *const core::ffi::c_void,
+                            r.as_mut_ptr() as *mut core::ffi::c_void,
+                            8,
+                            Some(&mut n),
+                        )
+                        .is_ok()
+                            && n == 8
+                    };
+                    // SAFETY: live handle.
+                    let ok2 = unsafe {
+                        let mut n = 0;
+                        ReadProcessMemory(
+                            HANDLE(handle_raw as *mut core::ffi::c_void),
+                            (image_base + 0x22899) as *const core::ffi::c_void,
+                            st.as_mut_ptr() as *mut core::ffi::c_void,
+                            48,
+                            Some(&mut n),
+                        )
+                        .is_ok()
+                            && n == 48
+                    };
+                    if ok1 && ok2 && (r != last_ref || st != last_str) {
+                        ring.push((t0.elapsed().as_micros() as u32, r, st));
+                        last_ref = r;
+                        last_str = st;
+                        if ring.len() >= 4096 {
+                            ring.remove(0);
+                        }
+                    }
+                    let ca = u32::from_le_bytes(bank[0x1e..0x22].try_into().unwrap());
+                    if ca == FAIL_MARK || bank.windows(8).any(|w| w == BAIL_SIG) {
+                        info!(
+                            t_us = t0.elapsed().as_micros() as u32,
+                            records = ring.len(),
+                            "REFTRACE: decision reached"
+                        );
+                        dump_failfreeze_scene(
+                            pid,
+                            HANDLE(handle_raw as *mut core::ffi::c_void),
+                            image_base,
+                            &out_path,
+                        );
+                        dump_reftrace(&out_path, &ring);
+                        // SAFETY: live handle.
+                        unsafe {
+                            let _ = TerminateProcess(
+                                HANDLE(handle_raw as *mut core::ffi::c_void),
+                                0x2C,
+                            );
+                        }
+                        return;
+                    }
+                    if t0.elapsed().as_millis() > 500 {
+                        info!(
+                            records = ring.len(),
+                            "REFTRACE: window ended without marker (run parked?)"
+                        );
+                        if !ring.is_empty() {
+                            dump_reftrace(&out_path, &ring);
+                        }
+                        return;
+                    }
+                }
+                return;
+            }
             if prefreeze {
                 // µs-resolution state recorder: no sleep — the pre-decision
                 // window is shorter than the 1 ms poll (Y6test missed it).
@@ -1180,6 +1284,29 @@ pub(super) fn spawn_dialog_killer(
         }
     });
     Some(join)
+}
+
+/// Reference-trace ring (`MAGICMIDA_V2_REFTRACE`): (t_us, ref@0x13ED07,
+/// string@0x22899) changes through the decision window.
+#[cfg(target_arch = "x86")]
+fn dump_reftrace(output_path: &Path, ring: &[(u32, [u8; 8], [u8; 48])]) {
+    let stem = output_path.with_extension("v2reftrace");
+    let mut name = match stem.file_name() {
+        Some(n) => n.to_os_string(),
+        None => return,
+    };
+    name.push(".bin");
+    let path = stem.with_file_name(name);
+    let mut blob = Vec::with_capacity(ring.len() * 60);
+    for (t, r, st) in ring {
+        blob.extend_from_slice(&t.to_le_bytes());
+        blob.extend_from_slice(r);
+        blob.extend_from_slice(st);
+    }
+    match std::fs::write(&path, &blob) {
+        Ok(()) => info!(path = %path.display(), records = ring.len(), "REFTRACE: ring written"),
+        Err(e) => warn!(error = %e, "REFTRACE: ring write failed"),
+    }
 }
 
 /// µs-resolution state ring (`MAGICMIDA_V2_PREFREEZE`): the observed bank

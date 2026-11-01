@@ -2060,3 +2060,29 @@ CTX 段，28 个 CTX 都在。
 rolchk；(3) 反汇编 reference 函数链（0xCE78B → call eax）找 license
 输入字节；(4) HASHPATCH 式提前改 license 输入 → reference = 本机
 rolchk → pass。
+
+## V2 格式化指纹串现形 + 零校验和攻击模型（2026-11-01 续 5，未发布）
+
+**① REFTRACE（`MAGICMIDA_V2_REFTRACE=1`）**：紧循环追 0x13ED07+0x22899
+110ms（~2 万次读）——两槽全程不变（ref=0、str=原始路径）。YBtest 的
+判定瞬态 < 单次轮询间隔（3 次 RPM ≈ 15µs）。
+**② 关键发现：格式化指纹串在 rva 0x2056D**（不是 0x22899！）——
+S1_009 抓到**书写进行中**：`1051-BCEC-14F2-0C18-`（4 组 + 尾横杠）+
+后面还是旧 blob 字节。该缓冲 = 与 0x2056F"blob"同一块（串覆盖 blob 头，
+之后被清回）。串在检查期间持久（S1_009→S1_013 之间存活）。
+**③ cmp-vs-zero 攻击模型**：所有状态 0x13ED07 恒 0 + 块内
+`and [slot],0xffff0000` → 比较实际 = `cmp eax, 0`——**pass 条件 =
+rolchk(格式化串) 高 16 位 == 0**。licensed 指纹的某组 = 校正位
+（自校验串设计，类比 IBAN）。
+**④ 零竞态补丁设计**：rolchk 每字节贡献可离线暴力求解（1 字节 256
+候选）；把校正字节放**第一组**（"1051"→改后值）——格式化先写第一组、
+不再回头、rolchk 在格式化全部完成后才读 → watcher 见串出现即写第一组
+= 零竞态。前提：拿到完整 39 字符串（REFTRACE 改追 0x2056D）。
+**⑤ 下一轮**：(1) REFTRACE v2 追 0x2056D 48B → 完整串 + 存活窗口；
+(2) 离线暴破第一组校正值（需 rolchk 语义精确对齐——含 `cmp` 之前
+`and eax,0xffff0000` 与可能的进位细节，用 S1_009 部分串验证）；(3)
+`MAGICMIDA_V2_STRPATCH`：见 "1051-" 即写校正后第一组 + bail-kill
+兜底 → 跑通则 .text 解密。风险：三个哨兵 = 三道检查，本串补丁只关
+其一，其余两道（可能含指纹-vs-license 比较）可能仍 fail——观察
+failfreeze 场景哨兵状态即知。
+产物：`OUT\YBtest.v2reftrace.bin`（60B/条 ring）。
