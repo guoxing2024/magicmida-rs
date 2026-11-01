@@ -890,12 +890,11 @@ pub(super) fn spawn_dialog_killer(
         // unknown — measured by whether the bail marker still appears.
         let jnepatch = std::env::var("MAGICMIDA_V2_JNEPATCH").is_ok();
         // Reference trace (`MAGICMIDA_V2_REFTRACE=1`): tight-loop the
-        // checksum-reference slot (rva 0x13ED07) and the fingerprint string
-        // buffer (rva 0x22899) through the decision window — every state so
-        // far read them as 0 (pre) or overwritten (post); the value exists
-        // only mid-compare.  Ring-records every change; the bail-marker
-        // dump includes the ring, giving both the formatted fingerprint
-        // string and the reference (the patch target).
+        // checksum-reference slot (rva 0x13ED07) and the formatted
+        // fingerprint string buffer (rva 0x2056D — S1_009 caught the
+        // formatter mid-write there, "1051-BCEC-14F2-0C18-", same buffer as
+        // the 0x2056F blob) through the decision window.  Ring-records
+        // every change; the bail-marker dump includes the ring.
         let reftrace = std::env::var("MAGICMIDA_V2_REFTRACE").is_ok();
         const JNE_RVA: usize = 0x13ECF1;
         let jne_addr = image_base + JNE_RVA;
@@ -1131,8 +1130,10 @@ pub(super) fn spawn_dialog_killer(
                     if !ok_bank {
                         break;
                     }
+                    // v3: the string read tripled the loop period and the
+                    // reference transient slipped between samples — read
+                    // ONLY the 8-byte reference slot (~2-3 µs/iter).
                     let mut r = [0u8; 8];
-                    let mut st = [0u8; 48];
                     // SAFETY: live handle.
                     let ok1 = unsafe {
                         let mut n = 0;
@@ -1146,23 +1147,9 @@ pub(super) fn spawn_dialog_killer(
                         .is_ok()
                             && n == 8
                     };
-                    // SAFETY: live handle.
-                    let ok2 = unsafe {
-                        let mut n = 0;
-                        ReadProcessMemory(
-                            HANDLE(handle_raw as *mut core::ffi::c_void),
-                            (image_base + 0x22899) as *const core::ffi::c_void,
-                            st.as_mut_ptr() as *mut core::ffi::c_void,
-                            48,
-                            Some(&mut n),
-                        )
-                        .is_ok()
-                            && n == 48
-                    };
-                    if ok1 && ok2 && (r != last_ref || st != last_str) {
-                        ring.push((t0.elapsed().as_micros() as u32, r, st));
+                    if ok1 && r != last_ref {
+                        ring.push((t0.elapsed().as_micros() as u32, r, last_str));
                         last_ref = r;
-                        last_str = st;
                         if ring.len() >= 4096 {
                             ring.remove(0);
                         }
