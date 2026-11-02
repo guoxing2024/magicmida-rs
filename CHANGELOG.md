@@ -8,6 +8,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Themida V3 DLL→EXE wrapper shapes: deterministic DLL-twin reconstruction** —
+  a V3 x64 sample (`core.dllMM.exe`, 6,038,032 B) whose entry stub is a
+  DLL→EXE wrapper (`call` landing in a same-size DLL twin's entry, the
+  twin recoverable by flipping 4 fields / clearing 30 stub bytes,
+  **byte-deterministic**: the rebuilt twin's sha256 matched the 2026-10-23
+  working copy exactly).  The wrapper shape is EXE-path-unfixable (the
+  `.text` never decrypts in EXE mode — two `/dump-process` runs 32 s apart
+  were byte-identical to the packed on-disk `.text`); routed through the
+  twin's DLL path the full `DLL_PROCESS_ATTACH` bootstrap decrypts `.text`
+  (0x1017C0 B) and the pipeline produces a loadable product
+  (`core.dllU.dll`, 1,737,216 B, 3,283 IAT slots / 12 modules / 289
+  thunks, exit 0 `Done.`, behaviour gate `LOADED=1 VERSION=1.1
+  WINDOW_VISIBLE=1 RUN_THREAD_ALIVE=1`); `.text` is 1,054,656 B identical
+  to the prior golden.  Two `dll_dump.rs` defects fixed en route (host-log
+  path; OEP scan crossing functions).  Five new VM-dispatch-storm unit
+  tests; `av_handler.rs` counts VM-dispatch faults against a 120 s wall
+  clock instead of the 1024-attempt budget and surfaces them as
+  `ExceptionNotHandled` (feeding `DBG_CONTINUE` swallows the shell's own
+  SEH — measured 3,900,446 identical faults / 607 MB of log / no
+  convergence, vs the reference 36,450 faults / ~0.5 s).
+
+- **V2/WinLicense 2.x research tooling (no product claim)** — ten
+  env-gated diagnostic machines around the CISC-1 licence check
+  (`STRPATCH`/`JNEPATCH`/`SENTINEL`/`NOWRITE`/`LICPATCH`/`SFAKE`/
+  `SFREZE`/`REFHUNT`/`STRDIAG`/`VMDIFF`/`DATSCAN`/`DATRIP`): the
+  fingerprint string is licence-carried (path-independent, `.dat`-gated),
+  the decision is register-level (a miss queues the fail continuation
+  atomically inside the search handler — every in-memory patch route is
+  exhausted, see POSTMORTEMS 续 9-15), the "VM" is native obfuscated block
+  chains (no bytecode), and the dispatcher/pointer-relocation machinery
+  is decoded.  Remaining route: licence-file forgery via the `.dat`
+  decrypt routine.  **Unpacking V2 is still not implemented**; these are
+  measurement instruments, all off by default.
 - **Themida 1.1.1 file-mapping shells: dedicated pipeline path (acceptance pending)** —
   1.1.1 shells decompress the program into a file mapping and run it via
   `LoadLibrary`, so the classic `.text` guard chain never fires.  New
