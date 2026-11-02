@@ -858,6 +858,13 @@ pub(super) fn spawn_dialog_killer(
         && std::env::var("MAGICMIDA_V2_PREFREEZE").is_err()
         && std::env::var("MAGICMIDA_V2_JNEPATCH").is_err()
         && std::env::var("MAGICMIDA_V2_REFTRACE").is_err()
+        && std::env::var("MAGICMIDA_V2_REFHUNT").is_err()
+        && std::env::var("MAGICMIDA_V2_SENTINEL").is_err()
+        && std::env::var("MAGICMIDA_V2_NOWRITE").is_err()
+        && std::env::var("MAGICMIDA_V2_VMDIFF").is_err()
+        && std::env::var("MAGICMIDA_V2_LICPATCH").is_err()
+        && std::env::var("MAGICMIDA_V2_SFREZE").is_err()
+        && std::env::var("MAGICMIDA_V2_SFAKE").is_err()
         && sp_groups.is_none()
     {
         return None;
@@ -929,8 +936,88 @@ pub(super) fn spawn_dialog_killer(
         // race-free (format completes ~1 ms after group 1).
         const JNE_RVA: usize = 0x13ECF1;
         let jne_addr = image_base + JNE_RVA;
-        let mut jne_buf = [0u8; 2];
-        let mut jne_done = false;
+        const JNE_SIG: [u8; 6] = [0x0f, 0x85, 0x0a, 0x00, 0x00, 0x00];
+        let mut jne_buf = [0u8; 6];
+        let mut jne_count = 0u32;
+        // Ref hunt (`MAGICMIDA_V2_REFHUNT=1`): the licence compare block
+        // (RVA 0x13ECC0, decrypted JIT) computes rol1-add over a dp-selected
+        // buffer and compares high16 against a reference slot — but every
+        // static address in it is disp+dp and the dp varies per VM op, so
+        // offline models of "which buffer / which ref" keep failing (two
+        // zero-hit solver sweeps, 2026-11-01).  Ground truth instead: the
+        // path builder inside the callee appends a 4-char tail to the module
+        // path at 0x22899 (~byte 100) — a REAL buffer change — right before
+        // the compare.  Tight-loop the ref slots (0x13ED07..0F), the append
+        // window (0x22899+96..+112) and the buffer head; on an append change
+        // or a nonzero ref byte, suspend the main thread (~2 µs) and dump
+        // the full scene — landing inside the callee tail / mid-compare with
+        // the reference still resident.
+        let refhunt = std::env::var("MAGICMIDA_V2_REFHUNT").is_ok();
+        // Sentinel patch (`MAGICMIDA_V2_SENTINEL=1`): the three list-search
+        // result slots (RVA 0x216F5 / 0x22D7D / 0x233FD, each {-1, ptr}) —
+        // YS1 shows {-1,…} at bail, Y8 (2 ms pre-fail) shows {0,…}: the
+        // searches run BETWEEN the rolchk compare and the fail write, and a
+        // miss (-1) is what drives the fail continuation.  Tight-loop the
+        // three slots; the instant a result dword turns 0xFFFFFFFF, write 0
+        // (fake "found at index 0") to outrun the fail write.
+        let sentinel = std::env::var("MAGICMIDA_V2_SENTINEL").is_ok();
+        const SENT_RVAS: [usize; 3] = [0x216F5, 0x22D7D, 0x233FD];
+        // Fail-write interception (`MAGICMIDA_V2_NOWRITE=1`): the fail
+        // values (counter 0xFFFFA595 + the bail continuation pair) are not
+        // static bytecode constants — they are prepared ON THE VM STACK at
+        // 0xEFE70-0xEF000 (YJUtest scene) during the 1-2 ms window between
+        // "compare done" (contA == 0x0102114D) and the fail write.  Rewrite
+        // the prepared values to the bank's CURRENT contents so the write
+        // becomes a no-op and the VM keeps its normal continuation.
+        let nowrite = std::env::var("MAGICMIDA_V2_NOWRITE").is_ok();
+        const STK_LO: usize = 0xEFD00;
+        const STK_LEN: usize = 0xB00;
+        let mut nowrite_patched = false;
+        let mut nowrite_triggers = 0u32;
+        // VM write-map (`MAGICMIDA_V2_VMDIFF=1`): the licence's fields are
+        // decrypted into the VMCTX / private heap BEFORE the pre-decision
+        // state (the E-string blob at 0x2056D is already resident at the
+        // 331 ms freeze, YPF3test) — the patch window is ~100 ms wide, the
+        // only unknown is WHERE the search lists land.  Snapshot both
+        // regions every 10 ms, log (t, region, off, len) change runs, and
+        // dump the log + the final images: the offline replay shows exactly
+        // which ranges are written once and stable — the licence fields.
+        let vmdiff = std::env::var("MAGICMIDA_V2_VMDIFF").is_ok();
+        // Licence-field patch (`MAGICMIDA_V2_LICPATCH=1`): the VMDIFF map
+        // (YVD2test) dated the licence decryption to t=208 ms and exposed
+        // 19 hash-looking 4-byte fields scattered around the three sentinel
+        // slots (0x216F5 / 0x22D7D / 0x233FD) — the search lists.  The
+        // search keys are the post-search sentinel d1 values 0x7DC80DE6 /
+        // 0x022869C8 (run-stable, machine-derived; slot 3's d1 varies per
+        // run).  From t=280 ms (fields resident, searches ~410 ms) keep the
+        // fields filled with both keys, alternating, so every scan hits.
+        let licpatch = std::env::var("MAGICMIDA_V2_LICPATCH").is_ok();
+        // Search-freeze (`MAGICMIDA_V2_SFREZE=1`): the black-box field
+        // patches are exhausted (LICPATCH survives 19/19 and still fails),
+        // so catch a search op LIVE: us-cadence poll of the bank + sentinel
+        // slot 1's result dword; the moment it turns 0xFFFFFFFF (search 1
+        // just wrote its miss) SuspendThread the main thread (~2 us) -- the
+        // freeze lands inside the search handler or 1-2 ops after it, with
+        // the registers / bank / VM stack holding the search's remnants.
+        // Record the bank-state ring through the whole decision window.
+        let sfreze = std::env::var("MAGICMIDA_V2_SFREZE").is_ok();
+        // Search-fake (`MAGICMIDA_V2_SFAKE=1`): the debug-port route is
+        // dead (the V2 attach gate withholds the .text decryption —
+        // upstream C-8), so machine-precision intervention has to be
+        // port-free: a NO-SLEEP loop that reads all three sentinel result
+        // dwords every ~5 us and rewrites any 0xFFFFFFFF to 0 the moment
+        // it appears.  The fail write lands ~60 us after the last search
+        // (SFREZE ring), so a slot-based fail decision loses to this; a
+        // register-based one does not — the run's outcome decides which.
+        let sfake = std::env::var("MAGICMIDA_V2_SFAKE").is_ok();
+        const SFAKE_SLOTS: [usize; 3] = [0x216F5, 0x22D7D, 0x233FD];
+        const LIC_FIELDS: [usize; 19] = [
+            0x20415, 0x20659, 0x21621, 0x21761, 0x21871, 0x2192D, 0x219C1,
+            0x21CE5, 0x22C09, 0x22CF5, 0x22DC9, 0x22E85, 0x22ECD, 0x23001,
+            0x23055, 0x230A5, 0x230D5, 0x23375, 0x235E5,
+        ];
+        const LIC_KEY1: u32 = 0x7DC8_0DE6;
+        const LIC_KEY2: u32 = 0x0228_69C8;
         // Pre-freeze (`MAGICMIDA_V2_PREFREEZE=1`): freeze on the LAST
         // pre-decision bank state (Y1test banktrace t=399: contA=0x0102114d,
         // contB=0x0110344f) — the thread is then still inside the compare
@@ -966,6 +1053,153 @@ pub(super) fn spawn_dialog_killer(
             .ok()
         })();
         loop {
+            // VM write-map: snapshot-diff the VMCTX + private heap through
+            // the licence-decryption window; the change log maps the fields.
+            if vmdiff && watch_t0.elapsed().as_millis() >= 100 {
+                use std::time::Instant;
+                let t0 = Instant::now();
+                let mut cont_buf = [0u8; 8];
+                // (region id, base, len)
+                const REGS: [(u8, usize, usize); 2] =
+                    [(0, 0, 0x8000), (1, 0x1150000, 0x40000)];
+                let mut last: Vec<Vec<u8>> = REGS.iter().map(|(_, _, l)| vec![0u8; *l]).collect();
+                let mut cur = vec![0u8; 0x40000];
+                let mut recs: Vec<(u32, u8, u32, u32, Vec<u8>)> = Vec::new();
+                let mut primed = [false; 2];
+                loop {
+                    // Bail protection: on the fail marker dump the scene and
+                    // the log (the searches have run by then — their lists
+                    // are in the final images).
+                    let ok_m = unsafe {
+                        let mut n = 0;
+                        ReadProcessMemory(
+                            HANDLE(handle_raw as *mut core::ffi::c_void),
+                            (bank_addr + 0x1E) as *const core::ffi::c_void,
+                            cont_buf.as_mut_ptr() as *mut core::ffi::c_void,
+                            8,
+                            Some(&mut n),
+                        )
+                        .is_ok()
+                            && n == 8
+                    };
+                    if !ok_m {
+                        break;
+                    }
+                    let ca = u32::from_le_bytes(cont_buf[0..4].try_into().unwrap());
+                    if ca == FAIL_MARK {
+                        info!("VMDIFF: bail marker — dumping scene + write map");
+                        dump_failfreeze_scene(
+                            pid,
+                            HANDLE(handle_raw as *mut core::ffi::c_void),
+                            image_base,
+                            &out_path,
+                        );
+                        dump_vmdiff(&out_path, &recs, &REGS);
+                        unsafe {
+                            let _ = TerminateProcess(
+                                HANDLE(handle_raw as *mut core::ffi::c_void),
+                                0x2C,
+                            );
+                        }
+                        return;
+                    }
+                    let t_ms = watch_t0.elapsed().as_millis() as u32;
+                    for (rid, base, len) in REGS {
+                        let addr = if base == 0 { image_base + 0x20000 } else { base };
+                        cur[..len].copy_from_slice(&last[rid as usize][..len]);
+                        // SAFETY: live PROCESS_ALL_ACCESS handle.
+                        let ok = unsafe {
+                            let mut n = 0;
+                            ReadProcessMemory(
+                                HANDLE(handle_raw as *mut core::ffi::c_void),
+                                addr as *const core::ffi::c_void,
+                                cur.as_mut_ptr() as *mut core::ffi::c_void,
+                                len,
+                                Some(&mut n),
+                            )
+                            .is_ok()
+                                && n == len
+                        };
+                        if !ok {
+                            continue;
+                        }
+                        if !primed[rid as usize] {
+                            primed[rid as usize] = true;
+                            recs.push((t_ms, rid, 0, len as u32, cur[..len].to_vec()));
+                        } else {
+                            let mut i = 0usize;
+                            while i < len {
+                                if cur[i] != last[rid as usize][i] {
+                                    let start = i;
+                                    while i < len && cur[i] != last[rid as usize][i] {
+                                        i += 1;
+                                    }
+                                    recs.push((
+                                        t_ms,
+                                        rid,
+                                        start as u32,
+                                        (i - start) as u32,
+                                        cur[start..i].to_vec(),
+                                    ));
+                                } else {
+                                    i += 1;
+                                }
+                            }
+                        }
+                        last[rid as usize][..len].copy_from_slice(&cur[..len]);
+                    }
+                    if t0.elapsed().as_millis() > 350 {
+                        info!(
+                            records = recs.len(),
+                            "VMDIFF: window over — writing map, switching to bail watch"
+                        );
+                        dump_vmdiff(&out_path, &recs, &REGS);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                // Light bail watch for the rest of the run (the dialog must
+                // never reach the screen even after the map is written).
+                loop {
+                    let ok_m = unsafe {
+                        let mut n = 0;
+                        ReadProcessMemory(
+                            HANDLE(handle_raw as *mut core::ffi::c_void),
+                            (bank_addr + 0x1E) as *const core::ffi::c_void,
+                            cont_buf.as_mut_ptr() as *mut core::ffi::c_void,
+                            8,
+                            Some(&mut n),
+                        )
+                        .is_ok()
+                            && n == 8
+                    };
+                    if !ok_m {
+                        break;
+                    }
+                    let ca = u32::from_le_bytes(cont_buf[0..4].try_into().unwrap());
+                    if ca == FAIL_MARK {
+                        info!("VMDIFF: bail marker (late) — dumping scene");
+                        dump_failfreeze_scene(
+                            pid,
+                            HANDLE(handle_raw as *mut core::ffi::c_void),
+                            image_base,
+                            &out_path,
+                        );
+                        unsafe {
+                            let _ = TerminateProcess(
+                                HANDLE(handle_raw as *mut core::ffi::c_void),
+                                0x2C,
+                            );
+                        }
+                        return;
+                    }
+                    if std::time::Instant::now() > deadline {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                return;
+            }
             // Hash patch: fire once, the instant the stored blob appears.
             if hashpatch {
                 // SAFETY: live PROCESS_ALL_ACCESS handle.
@@ -1050,12 +1284,92 @@ pub(super) fn spawn_dialog_killer(
                 );
                 return;
             }
-            // JNE patch: fire once, the instant the block decrypts.
-            // 1 ms polling lost the race (Y9test: the block decrypts and
-            // executes within <1 tick) — run a NO-SLEEP tight poll: RPM of
-            // 2 bytes is ~1-2 µs, so the decrypt→execute gap only has to
-            // exceed one RPM round-trip.
-            if jnepatch && !jne_done {
+            // Licence-field patch: keep the search lists filled with the
+            // machine's search keys through the decision window.
+            if licpatch && watch_t0.elapsed().as_millis() >= 280 {
+                let mut cont_buf_l = [0u8; 8];
+                let mut writes = 0u32;
+                loop {
+                    // SAFETY: live PROCESS_ALL_ACCESS handle.
+                    let ok_m = unsafe {
+                        let mut n = 0;
+                        ReadProcessMemory(
+                            HANDLE(handle_raw as *mut core::ffi::c_void),
+                            (bank_addr + 0x1E) as *const core::ffi::c_void,
+                            cont_buf_l.as_mut_ptr() as *mut core::ffi::c_void,
+                            8,
+                            Some(&mut n),
+                        )
+                        .is_ok()
+                            && n == 8
+                    };
+                    if !ok_m {
+                        break;
+                    }
+                    let ca = u32::from_le_bytes(cont_buf_l[0..4].try_into().unwrap());
+                    if ca == FAIL_MARK {
+                        info!(writes, "LICPATCH: bail marker — dumping scene");
+                        dump_failfreeze_scene(
+                            pid,
+                            HANDLE(handle_raw as *mut core::ffi::c_void),
+                            image_base,
+                            &out_path,
+                        );
+                        unsafe {
+                            let _ = TerminateProcess(
+                                HANDLE(handle_raw as *mut core::ffi::c_void),
+                                0x2C,
+                            );
+                        }
+                        return;
+                    }
+                    for (i, rva) in LIC_FIELDS.iter().enumerate() {
+                        let v = if i % 2 == 0 { LIC_KEY1 } else { LIC_KEY2 };
+                        let vb = v.to_le_bytes();
+                        // SAFETY: live handle; the licence's decrypted field.
+                        let wok = unsafe {
+                            let mut w = 0;
+                            WriteProcessMemory(
+                                HANDLE(handle_raw as *mut core::ffi::c_void),
+                                (image_base + rva) as *mut core::ffi::c_void,
+                                vb.as_ptr() as *const core::ffi::c_void,
+                                4,
+                                Some(&mut w),
+                            )
+                            .is_ok()
+                                && w == 4
+                        };
+                        if wok && i == 0 {
+                            writes += 1;
+                        }
+                    }
+                    if watch_t0.elapsed().as_millis() > 450 {
+                        info!(writes, "LICPATCH: window over — check survived the patch");
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                return;
+            }
+            // JNE patch: re-poll for the whole lifetime.  YJPtest (2026-11-01)
+            // proved the patch lands (`ok=true`) yet the bail still fired:
+            // the check runs in TWO rounds and the block re-decrypts per
+            // round, so a fire-once patch only covers round 1.  Keep the
+            // NO-SLEEP tight poll alive (RPM of 6 bytes is ~1-2 µs) and
+            // re-NOP the signature every time it reappears.
+            //
+            // 2026-11-01: the real branch is the 6-byte jne rel32
+            // `0f 85 0a 00 00 00` at 0x13ECF1 (fail = mov eax,0), NOT the
+            // 2-byte `75 0E` this mode originally polled for — that wrong
+            // pattern is why JNEPATCH never fired (every failfreeze dump
+            // shows the same decrypted block).  NOP all 6 bytes so every
+            // instance of the generic rolchk block falls through to
+            // `mov eax, 1` (pass).
+            if jnepatch {
+                use std::time::Instant;
+                let mut s_patched = [false; 3];
+                let mut s_vals = [[0u8; 8]; 3];
+                let mut all_patched_at: Option<Instant> = None;
                 loop {
                     // SAFETY: live PROCESS_ALL_ACCESS handle.
                     let got = unsafe {
@@ -1064,16 +1378,16 @@ pub(super) fn spawn_dialog_killer(
                             HANDLE(handle_raw as *mut core::ffi::c_void),
                             jne_addr as *const core::ffi::c_void,
                             jne_buf.as_mut_ptr() as *mut core::ffi::c_void,
-                            2,
+                            6,
                             Some(&mut read),
                         );
-                        ok.is_ok() && read == 2
+                        ok.is_ok() && read == 6
                     };
                     if !got {
                         break; // process died
                     }
-                    if jne_buf == [0x75, 0x0E] {
-                        const NOP2: [u8; 2] = [0x90, 0x90];
+                    if jne_buf == JNE_SIG {
+                        const NOP6: [u8; 6] = [0x90; 6];
                         // SAFETY: live handle; target = the engine's own
                         // decrypted handler block (RW while executing).
                         let wok = unsafe {
@@ -1081,66 +1395,476 @@ pub(super) fn spawn_dialog_killer(
                             let ok = WriteProcessMemory(
                                 HANDLE(handle_raw as *mut core::ffi::c_void),
                                 jne_addr as *mut core::ffi::c_void,
-                                NOP2.as_ptr() as *const core::ffi::c_void,
-                                2,
+                                NOP6.as_ptr() as *const core::ffi::c_void,
+                                6,
                                 Some(&mut written),
                             );
-                            ok.is_ok() && written == 2
+                            ok.is_ok() && written == 6
                         };
+                        jne_count += 1;
                         info!(
                             addr = format!("{jne_addr:#x}"),
-                            ok = wok,
-                            "JNEPATCH: fingerprint-check jne nop'd (75 0E -> 90 90)"
+                            ok = wok, count = jne_count,
+                            "JNEPATCH: fingerprint-check jne nop'd (0f85 0a -> x6 90)"
                         );
-                        jne_done = true;
-                        break;
+                        // no break: keep watching for re-decrypts
+                    }
+                    // Sentinel checks ride in the SAME loop (YJTtest: a
+                    // handover-based split missed the decision window — the
+                    // searches run ~410 ms after watch_t0, before any
+                    // handover deadline).  Fake every miss to index 0.
+                    if sentinel {
+                        for i in 0..3 {
+                            if s_patched[i] {
+                                continue;
+                            }
+                            let saddr = image_base + SENT_RVAS[i];
+                            // SAFETY: live PROCESS_ALL_ACCESS handle.
+                            let ok = unsafe {
+                                let mut n = 0;
+                                ReadProcessMemory(
+                                    HANDLE(handle_raw as *mut core::ffi::c_void),
+                                    saddr as *const core::ffi::c_void,
+                                    s_vals[i].as_mut_ptr() as *mut core::ffi::c_void,
+                                    8,
+                                    Some(&mut n),
+                                )
+                                .is_ok()
+                                    && n == 8
+                            };
+                            if ok && s_vals[i][0..4] == [0xff, 0xff, 0xff, 0xff] {
+                                let zero = 0u32.to_le_bytes();
+                                // SAFETY: live handle; VM data slot (RW).
+                                let wok = unsafe {
+                                    let mut w = 0;
+                                    WriteProcessMemory(
+                                        HANDLE(handle_raw as *mut core::ffi::c_void),
+                                        saddr as *mut core::ffi::c_void,
+                                        zero.as_ptr() as *const core::ffi::c_void,
+                                        4,
+                                        Some(&mut w),
+                                    )
+                                    .is_ok()
+                                        && w == 4
+                                };
+                                s_patched[i] = wok;
+                                info!(
+                                    rva = format!("{:#x}", SENT_RVAS[i]),
+                                    ok = wok,
+                                    "SENTINEL: miss result faked to index 0"
+                                );
+                            }
+                        }
+                        if s_patched.iter().all(|&p| p) {
+                            if let Some(t) = all_patched_at {
+                                if t.elapsed().as_millis() > 80 {
+                                    info!(
+                                        "SENTINEL: no fail marker after patch — check survived"
+                                    );
+                                    return;
+                                }
+                            } else {
+                                all_patched_at = Some(Instant::now());
+                            }
+                        }
+                    }
+                    // Bail protection inside the tight poll: the outer
+                    // loop's BAIL-KILL never runs while this spins, and the
+                    // dialog must never reach the screen.
+                    let mut cb = [0u8; 8];
+                    let okm = unsafe {
+                        let mut n = 0;
+                        ReadProcessMemory(
+                            HANDLE(handle_raw as *mut core::ffi::c_void),
+                            (bank_addr + 0x1E) as *const core::ffi::c_void,
+                            cb.as_mut_ptr() as *mut core::ffi::c_void,
+                            8,
+                            Some(&mut n),
+                        )
+                        .is_ok()
+                            && n == 8
+                    };
+                    if okm {
+                        let ca = u32::from_le_bytes(cb[0..4].try_into().unwrap());
+                        if ca == FAIL_MARK {
+                            if freeze_mode {
+                                dump_failfreeze_scene(
+                                    pid,
+                                    HANDLE(handle_raw as *mut core::ffi::c_void),
+                                    image_base,
+                                    &out_path,
+                                );
+                            }
+                            unsafe {
+                                let _ = TerminateProcess(
+                                    HANDLE(handle_raw as *mut core::ffi::c_void),
+                                    0x2C,
+                                );
+                            }
+                            info!(
+                                count = jne_count,
+                                patched = ?s_patched,
+                                "BAIL-KILL: licence check failed despite patches"
+                            );
+                            return;
+                        }
                     }
                     if std::time::Instant::now() > deadline {
                         return;
                     }
                 }
+                // fall through to the rest of the outer loop (sentinel etc.)
             }
-            if jnepatch && !jne_done {
-                // SAFETY: live PROCESS_ALL_ACCESS handle.
-                let got = unsafe {
-                    let mut read: usize = 0;
-                    let ok = ReadProcessMemory(
-                        HANDLE(handle_raw as *mut core::ffi::c_void),
-                        jne_addr as *const core::ffi::c_void,
-                        jne_buf.as_mut_ptr() as *mut core::ffi::c_void,
-                        2,
-                        Some(&mut read),
-                    );
-                    ok.is_ok() && read == 2
-                };
-                if got && jne_buf == [0x75, 0x0E] {
-                    const NOP2: [u8; 2] = [0x90, 0x90];
-                    // SAFETY: live handle; target = the engine's own
-                    // decrypted handler block (RW while executing).
-                    let wok = unsafe {
-                        let mut written: usize = 0;
-                        let ok = WriteProcessMemory(
-                            HANDLE(handle_raw as *mut core::ffi::c_void),
-                            jne_addr as *mut core::ffi::c_void,
-                            NOP2.as_ptr() as *const core::ffi::c_void,
-                            2,
-                            Some(&mut written),
-                        );
-                        ok.is_ok() && written == 2
-                    };
+            // Fail-write interception: while the check sits in its pre-fail
+            // window (contA == 0x0102114D, Y8/YJUtest), rewrite the prepared
+            // fail values on the VM stack to the bank's current contents —
+            // the fail write then re-installs what is already there.
+            // Fail-write interception: scan the VM-stack window CONTINUOUSLY
+            // (YNXtest: the prepared values are pushed AFTER the
+            // contA==0x0102114D window ends, so the trigger must be the
+            // pattern itself, not the bank state) and rewrite the prepared
+            // fail values to the bank's current contents the moment they
+            // materialise.
+            if nowrite && got && watch_t0.elapsed().as_millis() >= 300 {
+                nowrite_triggers += 1;
+                if nowrite_triggers <= 3 {
                     info!(
-                        addr = format!("{jne_addr:#x}"),
-                        ok = wok,
-                        "JNEPATCH: fingerprint-check jne nop'd (75 0E -> 90 90)"
+                        t_ms = watch_t0.elapsed().as_millis() as u32,
+                        triggers = nowrite_triggers,
+                        "NOWRITE: scanning stack window"
                     );
-                    jne_done = true;
                 }
+                let mut stk = [0u8; STK_LEN];
+                // SAFETY: live PROCESS_ALL_ACCESS handle; absolute VM-stack
+                // window (stable 0xEFD00-0xF0000 across every observation).
+                let ok_r = unsafe {
+                    let mut n = 0;
+                    ReadProcessMemory(
+                        HANDLE(handle_raw as *mut core::ffi::c_void),
+                        STK_LO as *const core::ffi::c_void,
+                        stk.as_mut_ptr() as *mut core::ffi::c_void,
+                        stk.len(),
+                        Some(&mut n),
+                    )
+                    .is_ok()
+                        && n == stk.len()
+                };
+                if ok_r {
+                    let v36: [u8; 4] = bank[0x36..0x3A].try_into().unwrap();
+                    let v2e: [u8; 4] = bank[0x2E..0x32].try_into().unwrap();
+                    let ca_b = cont_a.to_le_bytes();
+                    let mut n_changes = 0usize;
+                    let mut i = 0usize;
+                    while i + 4 <= stk.len() {
+                        let w = &stk[i..i + 4];
+                        if w == [0x95, 0xa5, 0xff, 0xff] {
+                            stk[i..i + 4].copy_from_slice(&ca_b);
+                            n_changes += 1;
+                        } else if w == [0x23, 0x25, 0x18, 0x01]
+                            || w == [0x22, 0x25, 0x18, 0x01]
+                            || w == [0x19, 0x25, 0x18, 0x01]
+                        {
+                            stk[i..i + 4].copy_from_slice(&v36);
+                            n_changes += 1;
+                        } else if w == [0xef, 0xe9, 0x17, 0x01] {
+                            stk[i..i + 4].copy_from_slice(&v2e);
+                            n_changes += 1;
+                        }
+                        i += 4;
+                    }
+                    if n_changes > 0 {
+                        // SAFETY: live handle; the shell's prepared frame.
+                        let wok = unsafe {
+                            let mut w = 0;
+                            WriteProcessMemory(
+                                HANDLE(handle_raw as *mut core::ffi::c_void),
+                                STK_LO as *mut core::ffi::c_void,
+                                stk.as_ptr() as *const core::ffi::c_void,
+                                stk.len(),
+                                Some(&mut w),
+                            )
+                            .is_ok()
+                                && w == stk.len()
+                        };
+                        info!(
+                            changes = n_changes,
+                            ok = wok,
+                            "NOWRITE: prepared fail values rewritten to current bank state"
+                        );
+                        nowrite_patched = true;
+                    }
+                }
+            }
+            if nowrite && nowrite_patched && watch_t0.elapsed().as_millis() > 500 {
+                info!("NOWRITE: past the decision with no fail marker — check survived");
+                return;
+            }
+            if sentinel && watch_t0.elapsed().as_millis() >= 250 {
+                use std::time::Instant;
+                let t0 = Instant::now();
+                let mut patched = [false; 3];
+                let mut all_patched_at: Option<Instant> = None;
+                let mut vals = [[0u8; 8]; 3];
+                let mut cont_buf = [0u8; 8];
+                loop {
+                    // Bail protection / attribution: the dialog must never
+                    // reach the screen; if the fail write fires anyway the
+                    // scene shows which gate rejected the fake hits.
+                    let ok_m = unsafe {
+                        let mut n = 0;
+                        ReadProcessMemory(
+                            HANDLE(handle_raw as *mut core::ffi::c_void),
+                            (bank_addr + 0x1E) as *const core::ffi::c_void,
+                            cont_buf.as_mut_ptr() as *mut core::ffi::c_void,
+                            8,
+                            Some(&mut n),
+                        )
+                        .is_ok()
+                            && n == 8
+                    };
+                    if !ok_m {
+                        break;
+                    }
+                    let ca = u32::from_le_bytes(cont_buf[0..4].try_into().unwrap());
+                    if ca == FAIL_MARK {
+                        info!("SENTINEL: bail marker fired — dumping scene");
+                        dump_failfreeze_scene(
+                            pid,
+                            HANDLE(handle_raw as *mut core::ffi::c_void),
+                            image_base,
+                            &out_path,
+                        );
+                        unsafe {
+                            let _ = TerminateProcess(
+                                HANDLE(handle_raw as *mut core::ffi::c_void),
+                                0x2C,
+                            );
+                        }
+                        return;
+                    }
+                    for i in 0..3 {
+                        if patched[i] {
+                            continue;
+                        }
+                        let addr = image_base + SENT_RVAS[i];
+                        // SAFETY: live PROCESS_ALL_ACCESS handle.
+                        let ok = unsafe {
+                            let mut n = 0;
+                            ReadProcessMemory(
+                                HANDLE(handle_raw as *mut core::ffi::c_void),
+                                addr as *const core::ffi::c_void,
+                                vals[i].as_mut_ptr() as *mut core::ffi::c_void,
+                                8,
+                                Some(&mut n),
+                            )
+                            .is_ok()
+                                && n == 8
+                        };
+                        if ok && vals[i][0..4] == [0xff, 0xff, 0xff, 0xff] {
+                            let zero = 0u32.to_le_bytes();
+                            // SAFETY: live handle; VM data slot (RW).
+                            let wok = unsafe {
+                                let mut w = 0;
+                                WriteProcessMemory(
+                                    HANDLE(handle_raw as *mut core::ffi::c_void),
+                                    addr as *mut core::ffi::c_void,
+                                    zero.as_ptr() as *const core::ffi::c_void,
+                                    4,
+                                    Some(&mut w),
+                                )
+                                .is_ok()
+                                    && w == 4
+                            };
+                            patched[i] = wok;
+                            info!(
+                                rva = format!("{:#x}", SENT_RVAS[i]),
+                                ok = wok,
+                                "SENTINEL: miss result faked to index 0"
+                            );
+                        }
+                    }
+                    if patched.iter().all(|&p| p) {
+                        if all_patched_at.is_none() {
+                            all_patched_at = Some(Instant::now());
+                        }
+                        // 80 ms without a fail marker = the shell accepted
+                        // the fake hits and moved on; release the target.
+                        if all_patched_at.unwrap().elapsed().as_millis() > 80 {
+                            info!("SENTINEL: no fail marker after patch — check survived");
+                            return;
+                        }
+                    }
+                    if t0.elapsed().as_millis() > 600 {
+                        info!(patched = ?patched, "SENTINEL: window over");
+                        return;
+                    }
+                }
+                return;
             }
             if std::time::Instant::now() > deadline {
                 return;
             }
+            if refhunt && watch_t0.elapsed().as_millis() >= 250 {
+                use std::time::Instant;
+                let t0 = Instant::now();
+                let mut ring: Vec<(u32, u32, u32, [u8; 24])> = Vec::with_capacity(4096);
+                let mut last_ref = [0u8; 8];
+                let mut last_app = [0u8; 16];
+                let mut last_buf = [0u8; 24];
+                loop {
+                    // Bail protection: the dialog must never reach the screen.
+                    let mut cont_buf = [0u8; 8];
+                    let ok_m = unsafe {
+                        let mut n = 0;
+                        ReadProcessMemory(
+                            HANDLE(handle_raw as *mut core::ffi::c_void),
+                            (bank_addr + 0x1E) as *const core::ffi::c_void,
+                            cont_buf.as_mut_ptr() as *mut core::ffi::c_void,
+                            8,
+                            Some(&mut n),
+                        )
+                        .is_ok()
+                            && n == 8
+                    };
+                    if !ok_m {
+                        break;
+                    }
+                    let ca = u32::from_le_bytes(cont_buf[0..4].try_into().unwrap());
+                    if ca == FAIL_MARK {
+                        info!("REFHUNT: bail marker (no ref seen) — dumping scene");
+                        dump_failfreeze_scene(
+                            pid,
+                            HANDLE(handle_raw as *mut core::ffi::c_void),
+                            image_base,
+                            &out_path,
+                        );
+                        dump_refhunt(&out_path, &ring);
+                        unsafe {
+                            let _ = TerminateProcess(
+                                HANDLE(handle_raw as *mut core::ffi::c_void),
+                                0x2C,
+                            );
+                        }
+                        return;
+                    }
+                    // ref slots (two dp candidates), append window, buffer head
+                    let mut r8 = [0u8; 8];
+                    let mut ap = [0u8; 16];
+                    let mut bf = [0u8; 24];
+                    let ok1 = unsafe {
+                        let mut n = 0;
+                        ReadProcessMemory(
+                            HANDLE(handle_raw as *mut core::ffi::c_void),
+                            (image_base + 0x13ED07) as *const core::ffi::c_void,
+                            r8.as_mut_ptr() as *mut core::ffi::c_void,
+                            8,
+                            Some(&mut n),
+                        )
+                        .is_ok()
+                            && n == 8
+                    };
+                    let ok2 = unsafe {
+                        let mut n = 0;
+                        ReadProcessMemory(
+                            HANDLE(handle_raw as *mut core::ffi::c_void),
+                            (image_base + 0x22899 + 96) as *const core::ffi::c_void,
+                            ap.as_mut_ptr() as *mut core::ffi::c_void,
+                            16,
+                            Some(&mut n),
+                        )
+                        .is_ok()
+                            && n == 16
+                    };
+                    let ok3 = unsafe {
+                        let mut n = 0;
+                        ReadProcessMemory(
+                            HANDLE(handle_raw as *mut core::ffi::c_void),
+                            (image_base + 0x22899) as *const core::ffi::c_void,
+                            bf.as_mut_ptr() as *mut core::ffi::c_void,
+                            24,
+                            Some(&mut n),
+                        )
+                        .is_ok()
+                            && n == 24
+                    };
+                    if ok1 && r8 != last_ref {
+                        let mut rec = [0u8; 24];
+                        rec[..8].copy_from_slice(&r8);
+                        ring.push((t0.elapsed().as_micros() as u32, 0x13ED07, 0, rec));
+                        last_ref = r8;
+                    }
+                    if ok2 && ap != last_app {
+                        let mut rec = [0u8; 24];
+                        rec[..16].copy_from_slice(&ap);
+                        ring.push((
+                            t0.elapsed().as_micros() as u32,
+                            0x22899 + 96,
+                            0,
+                            rec,
+                        ));
+                        last_app = ap;
+                    }
+                    if ok3 && bf != last_buf {
+                        ring.push((t0.elapsed().as_micros() as u32, 0x22899, 0, bf));
+                        last_buf = bf;
+                    }
+                    let ref_nonzero = ok1 && r8.iter().any(|&b| b != 0);
+                    // Trigger: the append window just changed (the callee's
+                    // tail write — the last buffer mutation before the
+                    // compare) or the ref went nonzero.
+                    let app_just_changed = ring
+                        .last()
+                        .map(|(_, tg, _, _)| *tg == 0x22899 + 96)
+                        .unwrap_or(false);
+                    if ref_nonzero || app_just_changed {
+                        info!(
+                            t_us = t0.elapsed().as_micros() as u32,
+                            ref_nonzero, append = app_just_changed,
+                            "REFHUNT: trigger — freezing mid-check"
+                        );
+                        if let Some(h) = h_main {
+                            unsafe {
+                                let _ = SuspendThread(h);
+                            }
+                        }
+                        dump_failfreeze_scene(
+                            pid,
+                            HANDLE(handle_raw as *mut core::ffi::c_void),
+                            image_base,
+                            &out_path,
+                        );
+                        dump_refhunt(&out_path, &ring);
+                        unsafe {
+                            let _ = TerminateProcess(
+                                HANDLE(handle_raw as *mut core::ffi::c_void),
+                                0x2C,
+                            );
+                        }
+                        return;
+                    }
+                    if t0.elapsed().as_millis() > 350 {
+                        info!(records = ring.len(), "REFHUNT: window over without trigger");
+                        if !ring.is_empty() {
+                            dump_refhunt(&out_path, &ring);
+                        }
+                        return;
+                    }
+                }
+                return;
+            }
             if let Some((sp_g1, sp_g2)) = sp_groups {
-                if watch_t0.elapsed().as_millis() >= 300 {
+                // Wait out the 300 ms gate.  The first version entered here
+                // at thread start (elapsed ≈ 0), saw the gate unmet and fell
+                // into the `return` below — the watch thread died silently
+                // and all 10 STRPATCH runs never wrote a byte
+                // (strpatch_bg_status.txt, 2026-11-01).  The bail marker
+                // cannot fire before ~400 ms (decision t≈412 ms after
+                // watch_t0, reftrace YCtest), so a sleep-wait needs no
+                // marker polling.
+                while watch_t0.elapsed().as_millis() < 300 {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                {
                     // Tight loop: watch both string buffers; the moment the
                     // formatted fingerprint shows its first four dashes,
                     // write the solved groups.  Keep the bail-marker check
@@ -1153,6 +1877,21 @@ pub(super) fn spawn_dialog_killer(
                     let mut buf = [0u8; 24];
                     let mut cont_buf = [0u8; 8];
                     let mut flip = 0usize;
+                    // Diagnostics (`MAGICMIDA_V2_STRDIAG=1`, with STRPATCH):
+                    // ring-record every buffer change and RPM failure at both
+                    // targets through the window.  Flags: 1 = RPM failed,
+                    // 2 = our written bytes were no longer visible on a later
+                    // read (shell restored/re-encrypted).  Answers directly:
+                    // does the checked copy (0x22899) ever hold the dash
+                    // pattern, and do writes stick.
+                    let strdiag = std::env::var("MAGICMIDA_V2_STRDIAG").is_ok();
+                    let mut diag_ring: Vec<(u32, u32, u32, [u8; 24])> =
+                        Vec::with_capacity(8192);
+                    let mut diag_last = [[0u8; 24]; 2];
+                    let mut diag_pend = [false; 2];
+                    let mut diag_fails = [0u32; 2];
+                    let mut diag_writes = [0u32; 2];
+                    let diag_t0 = std::time::Instant::now();
                     loop {
                         // SAFETY: live PROCESS_ALL_ACCESS handle.
                         let ok_bank = unsafe {
@@ -1167,6 +1906,9 @@ pub(super) fn spawn_dialog_killer(
                             ok.is_ok() && read == 8
                         };
                         if !ok_bank {
+                            if strdiag {
+                                dump_strdiag(&out_path, &diag_ring, diag_fails, diag_writes);
+                            }
                             break;
                         }
                         flip ^= 1;
@@ -1214,11 +1956,37 @@ pub(super) fn spawn_dialog_killer(
                                     ok = wok,
                                     "STRPATCH: solved groups written"
                                 );
+                                if strdiag {
+                                    diag_writes[flip] =
+                                        diag_writes[flip].saturating_add(1);
+                                    diag_pend[flip] = true;
+                                }
+                            }
+                        }
+                        if strdiag {
+                            let t_us = diag_t0.elapsed().as_micros() as u32;
+                            if !ok {
+                                diag_fails[flip] = diag_fails[flip].saturating_add(1);
+                                if diag_ring.len() < 16384 {
+                                    diag_ring.push((t_us, tgt as u32, 1, [0u8; 24]));
+                                }
+                            } else if diag_pend[flip] {
+                                diag_pend[flip] = false;
+                                if buf[0..4] != sp_g1 && diag_ring.len() < 16384 {
+                                    diag_ring.push((t_us, tgt as u32, 2, buf));
+                                    diag_last[flip] = buf;
+                                }
+                            } else if buf != diag_last[flip] && diag_ring.len() < 16384 {
+                                diag_ring.push((t_us, tgt as u32, 0, buf));
+                                diag_last[flip] = buf;
                             }
                         }
                         let ca = u32::from_le_bytes(cont_buf[0..4].try_into().unwrap());
                         if ca == FAIL_MARK {
                             info!("STRPATCH: bail marker still fired — dumping scene");
+                            if strdiag {
+                                dump_strdiag(&out_path, &diag_ring, diag_fails, diag_writes);
+                            }
                             dump_failfreeze_scene(
                                 pid,
                                 HANDLE(handle_raw as *mut core::ffi::c_void),
@@ -1236,6 +2004,9 @@ pub(super) fn spawn_dialog_killer(
                         }
                         if watch_t0.elapsed().as_millis() > 600 {
                             info!("STRPATCH: window over (no marker) — shell survived the check");
+                            if strdiag {
+                                dump_strdiag(&out_path, &diag_ring, diag_fails, diag_writes);
+                            }
                             return;
                         }
                     }
@@ -1247,7 +2018,7 @@ pub(super) fn spawn_dialog_killer(
                 let t0 = Instant::now();
                 let mut ring: Vec<(u32, [u8; 8], [u8; 48])> = Vec::with_capacity(512);
                 let mut last_ref = [0u8; 8];
-                let mut last_str = [0u8; 48];
+                let last_str = [0u8; 48];
                 loop {
                     // SAFETY: live PROCESS_ALL_ACCESS handle.
                     let ok_bank = unsafe {
@@ -1366,6 +2137,235 @@ pub(super) fn spawn_dialog_killer(
                 }
                 return;
             }
+            if sfreze && watch_t0.elapsed().as_millis() >= 280 {
+                use std::time::Instant;
+                let t0 = Instant::now();
+                let mut cont_buf = [0u8; 8];
+                let mut ring: Vec<(u32, u32, u32, u16)> = Vec::with_capacity(8192);
+                let mut last_ca = 0u32;
+                let mut last_cb = 0u32;
+                let mut last_oi = 0u16;
+                let mut s1 = [0u8; 4];
+                loop {
+                    // SAFETY: live PROCESS_ALL_ACCESS handle.
+                    let ok_b = unsafe {
+                        let mut n = 0;
+                        ReadProcessMemory(
+                            HANDLE(handle_raw as *mut core::ffi::c_void),
+                            bank_addr as *const core::ffi::c_void,
+                            bank.as_mut_ptr() as *mut core::ffi::c_void,
+                            bank.len(),
+                            Some(&mut n),
+                        )
+                        .is_ok()
+                            && n == bank.len()
+                    };
+                    if !ok_b {
+                        break;
+                    }
+                    let ca = u32::from_le_bytes(bank[0x1e..0x22].try_into().unwrap());
+                    let cb = u32::from_le_bytes(bank[0x22..0x26].try_into().unwrap());
+                    let oi = u16::from_le_bytes(bank[0x3a..0x3c].try_into().unwrap());
+                    if ca != last_ca || cb != last_cb || oi != last_oi {
+                        ring.push((t0.elapsed().as_micros() as u32, ca, cb, oi));
+                        if ring.len() >= 8192 {
+                            ring.remove(0);
+                        }
+                        last_ca = ca;
+                        last_cb = cb;
+                        last_oi = oi;
+                    }
+                    if ca == FAIL_MARK {
+                        info!(
+                            ring = ring.len(),
+                            "SFREZE: fail marker before the sentinel fired - dumping"
+                        );
+                        dump_failfreeze_scene(
+                            pid,
+                            HANDLE(handle_raw as *mut core::ffi::c_void),
+                            image_base,
+                            &out_path,
+                        );
+                        dump_state_ring(&out_path, &ring);
+                        unsafe {
+                            let _ = TerminateProcess(
+                                HANDLE(handle_raw as *mut core::ffi::c_void),
+                                0x2C,
+                            );
+                        }
+                        return;
+                    }
+                    // sentinel slot 1 (RVA 0x216F5) result dword
+                    // SAFETY: live handle.
+                    let ok_s = unsafe {
+                        let mut n = 0;
+                        ReadProcessMemory(
+                            HANDLE(handle_raw as *mut core::ffi::c_void),
+                            (image_base + 0x216F5) as *const core::ffi::c_void,
+                            s1.as_mut_ptr() as *mut core::ffi::c_void,
+                            4,
+                            Some(&mut n),
+                        )
+                        .is_ok()
+                            && n == 4
+                    };
+                    if ok_s && s1 == [0xff, 0xff, 0xff, 0xff] {
+                        info!(
+                            t_us = t0.elapsed().as_micros() as u32,
+                            ring = ring.len(),
+                            "SFREZE: sentinel miss written - freezing mid-search"
+                        );
+                        if let Some(h) = h_main {
+                            unsafe {
+                                let _ = SuspendThread(h);
+                            }
+                        }
+                        dump_failfreeze_scene(
+                            pid,
+                            HANDLE(handle_raw as *mut core::ffi::c_void),
+                            image_base,
+                            &out_path,
+                        );
+                        dump_state_ring(&out_path, &ring);
+                        unsafe {
+                            let _ = TerminateProcess(
+                                HANDLE(handle_raw as *mut core::ffi::c_void),
+                                0x2C,
+                            );
+                        }
+                        return;
+                    }
+                    if t0.elapsed().as_millis() > 200 {
+                        info!(ring = ring.len(), "SFREZE: window over without trigger");
+                        dump_state_ring(&out_path, &ring);
+                        // keep the bail watch alive (the dialog must never
+                        // reach the screen even after the window)
+                        loop {
+                            // SAFETY: live handle.
+                            let ok_m = unsafe {
+                                let mut n = 0;
+                                ReadProcessMemory(
+                                    HANDLE(handle_raw as *mut core::ffi::c_void),
+                                    (bank_addr + 0x1E) as *const core::ffi::c_void,
+                                    cont_buf.as_mut_ptr() as *mut core::ffi::c_void,
+                                    8,
+                                    Some(&mut n),
+                                )
+                                .is_ok()
+                                    && n == 8
+                            };
+                            if !ok_m {
+                                break;
+                            }
+                            let ca2 =
+                                u32::from_le_bytes(cont_buf[0..4].try_into().unwrap());
+                            if ca2 == FAIL_MARK {
+                                info!("SFREZE: late bail marker - dumping scene");
+                                dump_failfreeze_scene(
+                                    pid,
+                                    HANDLE(handle_raw as *mut core::ffi::c_void),
+                                    image_base,
+                                    &out_path,
+                                );
+                                unsafe {
+                                    let _ = TerminateProcess(
+                                        HANDLE(handle_raw as *mut core::ffi::c_void),
+                                        0x2C,
+                                    );
+                                }
+                                return;
+                            }
+                            if std::time::Instant::now() > deadline {
+                                return;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        return;
+                    }
+                }
+                return;
+            }
+            if sfake && watch_t0.elapsed().as_millis() >= 280 {
+                let mut fakes = 0u32;
+                let mut sval = [0u8; 4];
+                let zero = 0u32.to_le_bytes();
+                let mut cont_buf_s = [0u8; 8];
+                loop {
+                    // Fail-marker check every ~50 us: heavier bank read.
+                    let ok_m = unsafe {
+                        let mut n = 0;
+                        ReadProcessMemory(
+                            HANDLE(handle_raw as *mut core::ffi::c_void),
+                            (bank_addr + 0x1E) as *const core::ffi::c_void,
+                            cont_buf_s.as_mut_ptr() as *mut core::ffi::c_void,
+                            8,
+                            Some(&mut n),
+                        )
+                        .is_ok()
+                            && n == 8
+                    };
+                    if !ok_m {
+                        break;
+                    }
+                    let ca = u32::from_le_bytes(cont_buf_s[0..4].try_into().unwrap());
+                    if ca == FAIL_MARK {
+                        info!(fakes, "SFAKE: bail marker - dumping scene");
+                        dump_failfreeze_scene(
+                            pid,
+                            HANDLE(handle_raw as *mut core::ffi::c_void),
+                            image_base,
+                            &out_path,
+                        );
+                        unsafe {
+                            let _ = TerminateProcess(
+                                HANDLE(handle_raw as *mut core::ffi::c_void),
+                                0x2C,
+                            );
+                        }
+                        return;
+                    }
+                    for rva in SFAKE_SLOTS {
+                        // SAFETY: live PROCESS_ALL_ACCESS handle.
+                        let ok = unsafe {
+                            let mut n = 0;
+                            ReadProcessMemory(
+                                HANDLE(handle_raw as *mut core::ffi::c_void),
+                                (image_base + rva) as *const core::ffi::c_void,
+                                sval.as_mut_ptr() as *mut core::ffi::c_void,
+                                4,
+                                Some(&mut n),
+                            )
+                            .is_ok()
+                                && n == 4
+                        };
+                        if ok && sval == [0xff, 0xff, 0xff, 0xff] {
+                            // SAFETY: live handle; the licence's result slot.
+                            let wok = unsafe {
+                                let mut w = 0;
+                                WriteProcessMemory(
+                                    HANDLE(handle_raw as *mut core::ffi::c_void),
+                                    (image_base + rva) as *mut core::ffi::c_void,
+                                    zero.as_ptr() as *const core::ffi::c_void,
+                                    4,
+                                    Some(&mut w),
+                                )
+                                .is_ok()
+                                    && w == 4
+                            };
+                            if wok {
+                                fakes += 1;
+                            }
+                        }
+                    }
+                    if watch_t0.elapsed().as_millis() > 450 {
+                        info!(
+                            fakes,
+                            "SFAKE: past the decision with no fail marker - check survived"
+                        );
+                        return;
+                    }
+                }
+            }
             if prefreeze {
                 // µs-resolution state recorder: no sleep — the pre-decision
                 // window is shorter than the 1 ms poll (Y6test missed it).
@@ -1447,6 +2447,109 @@ pub(super) fn spawn_dialog_killer(
         }
     });
     Some(join)
+}
+
+/// VM write-map (`MAGICMIDA_V2_VMDIFF`): `VMD1` header + region table +
+/// (t_ms, region, off, len, bytes) change records.  The offline replay
+/// (zeros → records in order) reconstructs each region's state at any time;
+/// ranges written once and stable = licence fields.
+#[cfg(target_arch = "x86")]
+fn dump_vmdiff(
+    output_path: &Path,
+    recs: &[(u32, u8, u32, u32, Vec<u8>)],
+    regs: &[(u8, usize, usize)],
+) {
+    let stem = output_path.with_extension("v2vmdiff");
+    let mut name = match stem.file_name() {
+        Some(n) => n.to_os_string(),
+        None => return,
+    };
+    name.push(".bin");
+    let path = stem.with_file_name(name);
+    let mut blob = Vec::with_capacity(16 + recs.iter().map(|r| r.4.len() + 11).sum::<usize>());
+    blob.extend_from_slice(b"VMD1");
+    blob.extend_from_slice(&(regs.len() as u32).to_le_bytes());
+    for (rid, base, len) in regs {
+        blob.extend_from_slice(&(*rid as u32).to_le_bytes());
+        blob.extend_from_slice(&(*base as u32).to_le_bytes());
+        blob.extend_from_slice(&(*len as u32).to_le_bytes());
+    }
+    for (t, rid, off, len, bytes) in recs {
+        blob.extend_from_slice(&t.to_le_bytes());
+        blob.push(*rid);
+        blob.extend_from_slice(&off.to_le_bytes());
+        blob.extend_from_slice(&len.to_le_bytes());
+        blob.extend_from_slice(bytes);
+    }
+    match std::fs::write(&path, &blob) {
+        Ok(()) => info!(path = %path.display(), records = recs.len(), "VMDIFF: map written"),
+        Err(e) => warn!(error = %e, "VMDIFF: map write failed"),
+    }
+}
+
+/// REFHUNT ring (`MAGICMIDA_V2_REFHUNT`): (t_us, tag, 0, 24 B) changes at
+/// the ref slots (tag 0x13ED07), the append window (tag 0x22899+96) and the
+/// buffer head (tag 0x22899) through the check window.
+#[cfg(target_arch = "x86")]
+fn dump_refhunt(output_path: &Path, ring: &[(u32, u32, u32, [u8; 24])]) {
+    let stem = output_path.with_extension("v2refhunt");
+    let mut name = match stem.file_name() {
+        Some(n) => n.to_os_string(),
+        None => return,
+    };
+    name.push(".bin");
+    let path = stem.with_file_name(name);
+    let mut blob = Vec::with_capacity(8 + ring.len() * 36);
+    blob.extend_from_slice(b"RFG1");
+    blob.extend_from_slice(&(ring.len() as u32).to_le_bytes());
+    for (t, tag, fl, buf) in ring {
+        blob.extend_from_slice(&t.to_le_bytes());
+        blob.extend_from_slice(&tag.to_le_bytes());
+        blob.extend_from_slice(&fl.to_le_bytes());
+        blob.extend_from_slice(buf);
+    }
+    match std::fs::write(&path, &blob) {
+        Ok(()) => info!(path = %path.display(), records = ring.len(), "REFHUNT: ring written"),
+        Err(e) => warn!(error = %e, "REFHUNT: ring write failed"),
+    }
+}
+
+/// STRDIAG ring (`MAGICMIDA_V2_STRDIAG`): buffer activity at the two
+/// STRPATCH targets through the decision window.  Header `SDG1` +
+/// (rpm_fail[2], writes[2], count) then (t_us, tgt, flags, 24 B) records;
+/// flags 1 = RPM failed, 2 = written bytes no longer visible on a later
+/// read, 0 = ordinary change.
+#[cfg(target_arch = "x86")]
+fn dump_strdiag(
+    output_path: &Path,
+    ring: &[(u32, u32, u32, [u8; 24])],
+    fails: [u32; 2],
+    writes: [u32; 2],
+) {
+    let stem = output_path.with_extension("v2strdiag");
+    let mut name = match stem.file_name() {
+        Some(n) => n.to_os_string(),
+        None => return,
+    };
+    name.push(".bin");
+    let path = stem.with_file_name(name);
+    let mut blob = Vec::with_capacity(24 + ring.len() * 36);
+    blob.extend_from_slice(b"SDG1");
+    blob.extend_from_slice(&fails[0].to_le_bytes());
+    blob.extend_from_slice(&fails[1].to_le_bytes());
+    blob.extend_from_slice(&writes[0].to_le_bytes());
+    blob.extend_from_slice(&writes[1].to_le_bytes());
+    blob.extend_from_slice(&(ring.len() as u32).to_le_bytes());
+    for (t, tgt, fl, buf) in ring {
+        blob.extend_from_slice(&t.to_le_bytes());
+        blob.extend_from_slice(&(*tgt as u32).to_le_bytes());
+        blob.extend_from_slice(&fl.to_le_bytes());
+        blob.extend_from_slice(buf);
+    }
+    match std::fs::write(&path, &blob) {
+        Ok(()) => info!(path = %path.display(), records = ring.len(), "STRDIAG: ring written"),
+        Err(e) => warn!(error = %e, "STRDIAG: ring write failed"),
+    }
 }
 
 /// Reference-trace ring (`MAGICMIDA_V2_REFTRACE`): (t_us, ref@0x13ED07,
@@ -1641,11 +2744,96 @@ fn dump_failfreeze_scene(
     if rpm(image_base + 0x20000, &mut vmctx) {
         sec(&mut file, b"CTXM", image_base + 0x20000, &vmctx);
     }
+    // Shell private heap (2026-11-01): the fail-handler / verdict code lives
+    // OUTSIDE the image at ~0x1170000-0x118xxxx (the fail continuations
+    // 0x1182519 / 0x117e9ef point here) — every scene so far missed it,
+    // which is why the verdict block was never disassembled.
+    // 2026-11-02 (YPF2test): the VM stack (vmsp=0x01163803) and the search
+    // data pointer (bank+0x36 = 0x0115D00C) live at 0x115xxxx-0x116xxxx —
+    // widen the window to cover the whole heap span.
+    let mut priv_heap = vec![0u8; 0x40000];
+    if rpm(0x1150000, &mut priv_heap) {
+        sec(&mut file, b"PRIV", 0x1150000, &priv_heap);
+    }
     // Full image.
     let mut img = vec![0u8; 0x371_000];
     if rpm(image_base + 0x1000, &mut img) {
         sec(&mut file, b"IMAG", image_base + 0x1000, &img);
     }
+    // Dynamic high-heap regions (2026-11-02, 续 12): the VM's op blocks
+    // (contA+dp) and stack (vmsp) live in the LargeAddressAware high heap
+    // (0xE-0xFxxxxxxx) — never dumped before, which is why every op block
+    // read looked like garbage.  Compute the ranges from the LIVE bank
+    // (all threads are suspended: stable), read page-wise with a present
+    // bitmap (a single RPM over a range with one unmapped page fails
+    // whole).  Sections: b"HIHE" = the op block ±0x20000, b"HIST" = the
+    // VM stack ±0x80000.
+    const DP_BASE: u32 = 0xEEDC_0014; // 0x01028892 - 0x1226887E, dispatcher-derived
+    let cont_a_hi = u32::from_le_bytes(bank[0x1e..0x22].try_into().unwrap());
+    let vmsp = u32::from_le_bytes(bank[0x2a..0x2e].try_into().unwrap());
+    let sparse = |f: &mut std::fs::File, tag: &[u8; 4], base: u32, span: u32| {
+        let page = 0x1000u32;
+        let npages = (span / page) as usize;
+        let mut bitmap = vec![0u8; npages / 8 + 1];
+        let mut data = Vec::with_capacity(span as usize);
+        let mut present = 0usize;
+        for p in 0..npages {
+            let mut pbuf = [0u8; 0x1000];
+            // SAFETY: live handle; each 4 KB page is probed independently.
+            let ok = unsafe {
+                let mut n = 0;
+                ReadProcessMemory(
+                    h_process,
+                    (base.wrapping_add((p as u32).wrapping_mul(page))) as *const core::ffi::c_void,
+                    pbuf.as_mut_ptr() as *mut core::ffi::c_void,
+                    page as usize,
+                    Some(&mut n),
+                )
+                .is_ok()
+                    && n == page as usize
+            };
+            if ok {
+                bitmap[p / 8] |= 1 << (p % 8);
+                data.extend_from_slice(&pbuf);
+                present += 1;
+            }
+        }
+        let _ = f.write_all(tag);
+        let _ = f.write_all(&base.to_le_bytes());
+        let _ = f.write_all(&span.to_le_bytes());
+        let _ = f.write_all(&(present as u32).to_le_bytes());
+        let _ = f.write_all(&bitmap);
+        let _ = f.write_all(&data);
+    };
+    let block_va = cont_a_hi.wrapping_add(DP_BASE);
+    // Recon: query the two targets so a zero-present dump is attributable
+    // (state/protection/region size) instead of a silent all-fail.
+    {
+        use windows::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQueryEx};
+        for (label, va) in [("block", block_va), ("vmsp", vmsp)] {
+            let mut mbi = MEMORY_BASIC_INFORMATION::default();
+            // SAFETY: live handle; valid MBI.
+            let q = unsafe {
+                VirtualQueryEx(
+                    h_process,
+                    Some(va as *const core::ffi::c_void),
+                    &mut mbi,
+                    std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                )
+            };
+            info!(
+                label,
+                va = format!("{va:08x}"),
+                queried = q,
+                state = format!("{:x}", mbi.State.0),
+                protect = format!("{:x}", mbi.Protect.0),
+                region = format!("{:x}", mbi.RegionSize),
+                "SFREZE-SCENE: high-heap recon"
+            );
+        }
+    }
+    sparse(&mut file, b"HIHE", block_va.wrapping_sub(0x2_0000), 0x4_0000);
+    sparse(&mut file, b"HIST", vmsp.wrapping_sub(0x8_0000), 0x10_0000);
 
     info!(path = %snap.display(), threads = handles.len(), "FAILFREEZE: scene dumped");
     // SAFETY: handles opened above.
@@ -1655,6 +2843,593 @@ fn dump_failfreeze_scene(
         }
     }
     Some(())
+}
+
+/// .dat decrypt-routine hunt (`MAGICMIDA_V2_DATSCAN=1`, 2026-11-02 续 14):
+/// the black-box patch routes are exhausted (the fail decision is
+/// register-level), so the remaining path is licence FORGERY — recover the
+/// .dat cipher.  Multi-needle full-space scan (the range runs to
+/// 0xFFF00000: the LargeAddressAware high heap included; only MEM_PRIVATE
+/// regions are scanned — the system DLLs are MEM_IMAGE and would blow the
+/// budget).  Needles: the raw file head (81f8f14e…, the first 16 B of the
+/// 480-byte licence file), the dashless fingerprint string, the registered
+/// name.  When the file copy lands, its 480 B are SNAPSHOT-TRACKED every
+/// tick — an in-place decrypt shows up as the snapshot morphing from the
+/// raw form to the plaintext licence, which is the cipher's output (diff
+/// vs the raw = the keystream).  Events are appended to
+/// <stem>.v2datscan.bin: (tag u8, t_ms u32, addr u32, len u32, data).
+#[cfg(target_arch = "x86")]
+pub(super) struct DatScanState {
+    pub file_addr: Option<usize>,
+    pub file_raw: Option<Vec<u8>>,
+    pub snaps: u32,
+    pub seen_name: bool,
+    pub seen_str: bool,
+    pub clean_dumped: bool,
+    pub log: Vec<u8>,
+}
+
+#[cfg(target_arch = "x86")]
+impl Default for DatScanState {
+    fn default() -> Self {
+        Self {
+            file_addr: None,
+            file_raw: None,
+            snaps: 0,
+            seen_name: false,
+            seen_str: false,
+            clean_dumped: false,
+            log: Vec::new(),
+        }
+    }
+}
+
+#[cfg(target_arch = "x86")]
+pub(super) fn dat_scan_tick(
+    dbg: &mut ProcessSession,
+    st: &mut DatScanState,
+    output_path: &Path,
+    t_ms: u32,
+) {
+    use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows::Win32::System::Memory::{
+        VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_PRIVATE, PAGE_NOACCESS,
+    };
+
+    // The first 16 bytes of CISC-1.dat (the campaign's fixed sample).
+    const FILE_HEAD: &[u8] = &[
+        0x81, 0xf8, 0xf1, 0x4e, 0xc7, 0x66, 0x56, 0x78, 0x67, 0x57, 0xed,
+        0x71, 0xe0, 0xd7, 0xbd, 0x4c,
+    ];
+    const STR_DASHLESS: &[u8] = b"1051BCEC14F20C1837455E665E6D2536";
+    const NAME: &[u8] = b"This application has been registered";
+    const SCAN_CAP: usize = 256 << 20;
+    const CHUNK: usize = 1 << 20;
+
+    let h_process = dbg.process_handle();
+    let log_event = |st: &mut DatScanState, tag: u8, addr: usize, data: &[u8]| {
+        st.log.extend_from_slice(&[tag]);
+        st.log.extend_from_slice(&t_ms.to_le_bytes());
+        st.log.extend_from_slice(&(addr as u32).to_le_bytes());
+        st.log.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        st.log.extend_from_slice(data);
+    };
+
+    // The file copy: found → snapshot-track it every tick (cheap: 480 B).
+    if let Some(fa) = st.file_addr {
+        let mut snap = vec![0u8; 480];
+        // SAFETY: live PROCESS_ALL_ACCESS handle.
+        let got = unsafe {
+            let mut n = 0;
+            ReadProcessMemory(
+                h_process,
+                fa as *const core::ffi::c_void,
+                snap.as_mut_ptr() as *mut core::ffi::c_void,
+                480,
+                Some(&mut n),
+            )
+            .is_ok()
+                && n == 480
+        };
+        if got {
+            st.snaps += 1;
+            let changed = st.file_raw.as_ref().map(|r| *r != snap).unwrap_or(true);
+            if changed {
+                log_event(st, 2, fa, &snap);
+                st.file_raw = Some(snap);
+            }
+        }
+        // The needle scans continue until both fields are seen.
+        if st.seen_name && st.seen_str {
+            return;
+        }
+    }
+
+    // Full-space multi-needle scan (MEM_PRIVATE, committed, readable).
+    let mut buf = vec![0u8; CHUNK];
+    let mut scanned = 0usize;
+    let mut addr = 0x1_0000usize;
+    let mut found_file = st.file_addr;
+    while addr < 0xFFF0_0000 && scanned < SCAN_CAP {
+        let mut mbi = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: valid process handle and sized MBI.
+        let ok = unsafe {
+            VirtualQueryEx(
+                h_process,
+                Some(addr as *const core::ffi::c_void),
+                &mut mbi,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if ok == 0 {
+            break;
+        }
+        let region = mbi.RegionSize as usize;
+        let base = mbi.BaseAddress as usize;
+        let committed = mbi.State == MEM_COMMIT;
+        let private = mbi.Type == MEM_PRIVATE;
+        let readable = mbi.Protect != PAGE_NOACCESS && mbi.Protect.0 != 0;
+        if committed && private && readable && region >= 16 {
+            let mut roff = 0usize;
+            while roff < region && scanned < SCAN_CAP {
+                let len = CHUNK.min(region - roff);
+                let got = dbg.read_memory(base + roff, &mut buf[..len]).unwrap_or(0);
+                if got >= 16 {
+                    let slice = &buf[..got];
+                    if found_file.is_none() {
+                        if let Some(p) = slice.windows(FILE_HEAD.len()).position(|w| w == FILE_HEAD)
+                        {
+                            let hit = base + roff + p;
+                            found_file = Some(hit);
+                            st.file_addr = Some(hit);
+                            info!(t_ms, addr = format!("{hit:#x}"), "DATSCAN: raw .dat copy found");
+                            let mut snap = vec![0u8; 480];
+                            // SAFETY: live handle.
+                            let okr = unsafe {
+                                let mut n = 0;
+                                ReadProcessMemory(
+                                    h_process,
+                                    hit as *const core::ffi::c_void,
+                                    snap.as_mut_ptr() as *mut core::ffi::c_void,
+                                    480,
+                                    Some(&mut n),
+                                )
+                                .is_ok()
+                                    && n == 480
+                            };
+                            if okr {
+                                st.file_raw = Some(snap.clone());
+                                log_event(st, 1, hit, &snap);
+                            }
+                        }
+                    }
+                    if !st.seen_str {
+                        if let Some(p) =
+                            slice.windows(STR_DASHLESS.len()).position(|w| w == STR_DASHLESS)
+                        {
+                            let hit = base + roff + p;
+                            st.seen_str = true;
+                            info!(t_ms, addr = format!("{hit:#x}"), "DATSCAN: dashless fingerprint (raw) found");
+                            let ctx = slice[p.saturating_sub(64)..(p + 128).min(got)].to_vec();
+                            log_event(st, 4, hit.saturating_sub(64), &ctx);
+                        }
+                    }
+                    if !st.seen_name {
+                        if let Some(p) = slice.windows(NAME.len()).position(|w| w == NAME) {
+                            let hit = base + roff + p;
+                            st.seen_name = true;
+                            info!(t_ms, addr = format!("{hit:#x}"), "DATSCAN: registered name (raw) found");
+                            let ctx = slice[p.saturating_sub(64)..(p + 128).min(got)].to_vec();
+                            log_event(st, 3, hit.saturating_sub(64), &ctx);
+                        }
+                    }
+                }
+                scanned += got;
+                roff += CHUNK;
+            }
+        }
+        addr = base.saturating_add(region);
+    }
+    if found_file.is_none() && st.file_addr.is_none() && t_ms > 0 && t_ms % 200 == 0 {
+        info!(t_ms, scanned_mb = scanned >> 20, "DATSCAN: file copy not found yet");
+    }
+    // One-shot: dump the region containing the CLEAN (unobfuscated) shell
+    // module.  The DATRIP capture found compiler-style code (ebp frames,
+    // plain calls) at 0x00AA42BA — the same worker thread that runs the
+    // licence work — while everything VM-side is obfuscated.  The module
+    // is static code: dumping it once = the licence logic readable
+    // offline.
+    if !st.clean_dumped {
+        use windows::Win32::System::Memory::VirtualQueryEx;
+        let probe = 0x00AA42BAusize;
+        let mut mbi = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: live handle; valid MBI.
+        let q = unsafe {
+            VirtualQueryEx(
+                h_process,
+                Some(probe as *const core::ffi::c_void),
+                &mut mbi,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if q > 0
+            && mbi.State == MEM_COMMIT
+            && mbi.Protect != PAGE_NOACCESS
+            && mbi.Protect.0 != 0
+        {
+            let rbase = mbi.BaseAddress as usize;
+            let rlen = (mbi.RegionSize as usize).min(0x10_0000);
+            let mut mod_buf = vec![0u8; rlen];
+            // SAFETY: live handle; committed region.
+            let okm = unsafe {
+                let mut n = 0;
+                ReadProcessMemory(
+                    h_process,
+                    rbase as *const core::ffi::c_void,
+                    mod_buf.as_mut_ptr() as *mut core::ffi::c_void,
+                    rlen,
+                    Some(&mut n),
+                )
+                .is_ok()
+                    && n == rlen
+            };
+            if okm {
+                log_event(st, 5, rbase, &mod_buf);
+                st.clean_dumped = true;
+                info!(
+                    t_ms,
+                    base = format!("{rbase:#x}"),
+                    len = rlen,
+                    "DATSCAN: clean shell module dumped"
+                );
+            }
+        } else {
+            // Not mapped yet — retry on later ticks.
+        }
+    }
+
+    // Flush the event log every tick (cheap, robust against a hard kill).
+    let stem = output_path.with_extension("v2datscan");
+    if let Some(name) = stem.file_name() {
+        let mut n = name.to_os_string();
+        n.push(".bin");
+        let path = stem.with_file_name(n);
+        let _ = std::fs::write(&path, &st.log);
+    }
+}
+
+/// All-thread RIP sampling inside the .dat transform window
+/// (`MAGICMIDA_V2_DATRIP=1`, 2026-11-02 续 15): the licence decryption
+/// (t=182-208 ms) runs on a WORKER thread — the main-thread-only
+/// RIPSAMPLE is blind here.  Every call samples up to 8 threads
+/// (round-robin via a ToolHelp walk) with Suspend/GetContext/Resume and
+/// records (t, tid, rip, esi, ebp, 64 B code at rip) to
+/// <stem>.v2datrip.bin.  The decrypt routine's RIPs cluster in the
+/// window; the code bytes at rip ARE its instructions.
+#[cfg(target_arch = "x86")]
+pub(super) struct DatRipState {
+    pub threads: Vec<u32>,
+    pub idx: usize,
+    pub refreshed_at: Option<std::time::Instant>,
+    pub clean_dumped: bool,
+    pub written: std::io::BufWriter<std::fs::File>,
+}
+
+#[cfg(target_arch = "x86")]
+pub(super) fn dat_rip_tick(dbg: &mut ProcessSession, st: &mut DatRipState, t_ms: u32) {
+    use std::io::Write;
+    use windows::Win32::System::Diagnostics::Debug::{
+        GetThreadContext, CONTEXT, ReadProcessMemory,
+    };
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    use windows::Win32::System::Threading::{ResumeThread, SuspendThread};
+
+    if !(150..=260).contains(&t_ms) {
+        if t_ms > 260 {
+            // Window over: flush the samples to disk before the run ends.
+            let _ = st.written.flush();
+        }
+        return;
+    }
+    let pid = dbg.pid();
+    let h_process = dbg.process_handle();
+    // Refresh the thread list every ~40 ms (the workers spawn continuously).
+    let refresh = st
+        .refreshed_at
+        .map(|r| r.elapsed().as_millis() >= 40)
+        .unwrap_or(true);
+    if refresh {
+        st.threads.clear();
+        // SAFETY: standard ToolHelp snapshot walk.
+        unsafe {
+            if let Ok(h_snap) = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) {
+                let mut te = THREADENTRY32::default();
+                te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+                // SAFETY: fresh snapshot.
+                if Thread32First(h_snap, &mut te).is_ok() {
+                    loop {
+                        if te.th32OwnerProcessID == pid {
+                            st.threads.push(te.th32ThreadID);
+                        }
+                        if Thread32Next(h_snap, &mut te).is_err() {
+                            break;
+                        }
+                    }
+                }
+                let _ = windows::Win32::Foundation::CloseHandle(h_snap);
+            }
+        }
+        st.refreshed_at = Some(std::time::Instant::now());
+    }
+    // Every thread per tick (the clean-module bursts are short; 8 per tick
+    // missed them in YTR8test — a full sweep is ~27 threads x ~100 us).
+    let n = st.threads.len();
+    if n == 0 {
+        return;
+    }
+    for k in 0..n {
+        let tid = st.threads[(st.idx + k) % n];
+        // The workers are NOT in the debugger's thread map (post-attach =
+        // no debug events) — OpenThread directly, close after each sample.
+        use windows::Win32::System::Threading::{
+            OpenThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION,
+            THREAD_SUSPEND_RESUME,
+        };
+        // SAFETY: tid from the ToolHelp walk of the target's own threads.
+        let Ok(h) = (unsafe {
+            OpenThread(
+                THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION,
+                false,
+                tid,
+            )
+        }) else {
+            continue;
+        };
+        // SAFETY: freshly opened handle.
+        let prev = unsafe { SuspendThread(h) };
+        if prev == u32::MAX {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(h);
+            }
+            continue;
+        }
+        let mut ctx = CONTEXT::default();
+        ctx.ContextFlags =
+            windows::Win32::System::Diagnostics::Debug::CONTEXT_FLAGS(0x0001_0003);
+        // SAFETY: suspended thread handle.
+        let okc = unsafe { GetThreadContext(h, &mut ctx) }.is_ok();
+        // SAFETY: thread was suspended above.
+        unsafe {
+            let _ = ResumeThread(h);
+        }
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(h);
+        }
+        if !okc {
+            continue;
+        }
+        let bytes = unsafe {
+            std::slice::from_raw_parts((&ctx as *const CONTEXT) as *const u8, std::mem::size_of::<CONTEXT>())
+        };
+        let rd = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
+        let (eip, esi, ebp) = (rd(0xB8), rd(0xA0), rd(0xB4));
+        let mut code = vec![0u8; 64];
+        let _ = dbg.read_memory(eip as usize, &mut code);
+        // A sampled RIP outside the image and the system DLLs = the
+        // shell's OWN native module (the clean licence code found at
+        // 0x00AA42BA in YTR5test, compiler-style, same worker thread as
+        // the licence work).  Dump its region once — static code = the
+        // licence logic readable offline.
+        let in_image = (0x1000000..0x1372000).contains(&(eip as usize));
+        let in_sys = (0x77000000..0x78000000).contains(&(eip as usize));
+        if !in_image && !in_sys && !st.clean_dumped {
+            use windows::Win32::System::Memory::{
+                VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_NOACCESS,
+            };
+            let mut mbi = MEMORY_BASIC_INFORMATION::default();
+            // SAFETY: live handle; valid MBI.
+            let q = unsafe {
+                VirtualQueryEx(
+                    h_process,
+                    Some(eip as *const core::ffi::c_void),
+                    &mut mbi,
+                    std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                )
+            };
+            if q > 0 && mbi.State == MEM_COMMIT && mbi.Protect != PAGE_NOACCESS {
+                let rbase = mbi.BaseAddress as usize;
+                let rlen = (mbi.RegionSize as usize).min(0x10_0000);
+                let mut mod_buf = vec![0u8; rlen];
+                // SAFETY: live handle; committed region.
+                let okm = unsafe {
+                    let mut n = 0;
+                    ReadProcessMemory(
+                        h_process,
+                        rbase as *const core::ffi::c_void,
+                        mod_buf.as_mut_ptr() as *mut core::ffi::c_void,
+                        rlen,
+                        Some(&mut n),
+                    )
+                    .is_ok()
+                        && n == rlen
+                };
+                if okm {
+                    let _ = st.written.write_all(&5u8.to_le_bytes());
+                    let _ = st.written.write_all(&t_ms.to_le_bytes());
+                    let _ = st.written.write_all(&(rbase as u32).to_le_bytes());
+                    let _ = st.written.write_all(&(rlen as u32).to_le_bytes());
+                    let _ = st.written.write_all(&mod_buf);
+                    let _ = st.written.flush();
+                    st.clean_dumped = true;
+                    info!(
+                        t_ms,
+                        rip = format!("{eip:08x}"),
+                        base = format!("{rbase:#x}"),
+                        len = rlen,
+                        "DATRIP: clean shell module region dumped"
+                    );
+                }
+            }
+        }
+        // Record: (t, tid, rip, esi, ebp, code[64]).
+        let _ = st.written.write_all(&t_ms.to_le_bytes());
+        let _ = st.written.write_all(&tid.to_le_bytes());
+        let _ = st.written.write_all(&eip.to_le_bytes());
+        let _ = st.written.write_all(&esi.to_le_bytes());
+        let _ = st.written.write_all(&ebp.to_le_bytes());
+        let _ = st.written.write_all(&code);
+    }
+    st.idx = (st.idx + n) % n.max(1);
+}
+
+/// DR write-breakpoint arming (`MAGICMIDA_V2_DRBP=1`, 2026-11-02 续 13):/// DR write-breakpoint arming (`MAGICMIDA_V2_DRBP=1`, 2026-11-02 续 13):/// DR write-breakpoint arming (`MAGICMIDA_V2_DRBP=1`, 2026-11-02 续 13):/// DR write-breakpoint arming (`MAGICMIDA_V2_DRBP=1`, 2026-11-02 续 13):
+/// suspend the main thread and point DR1-DR3 (NOT DR0 — the shell checks
+/// DR0) at the three sentinel-slot result dwords, enabled as WRITE
+/// breakpoints of 4 bytes (DR7 = 0xDDD00054: L1|L2|L3 + R/W=01 + LEN=11
+/// per slot).  A search's miss store then traps at the instruction
+/// boundary inside the search handler, and the debug loop's SingleStep
+/// branch captures the handler's live registers.
+#[cfg(target_arch = "x86")]
+pub(super) fn arm_v2_dr_breakpoints(dbg: &mut ProcessSession, image_base: usize) {
+    use windows::Win32::System::Diagnostics::Debug::{GetThreadContext, SetThreadContext, CONTEXT};
+    use windows::Win32::System::Threading::{ResumeThread, SuspendThread};
+
+    let tid = dbg.main_thread_id();
+    let h = match dbg.thread_handle(tid) {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    // SAFETY: thread handle from the debugger's own map.
+    let prev = unsafe { SuspendThread(h) };
+    if prev == u32::MAX {
+        return;
+    }
+    let mut ctx = CONTEXT::default();
+    // CONTEXT_DEBUG_REGISTERS on i386.
+    ctx.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_FLAGS(0x0001_0010);
+    // SAFETY: suspended thread handle.
+    unsafe {
+        let _ = GetThreadContext(h, &mut ctx);
+    }
+    let bytes = unsafe {
+        std::slice::from_raw_parts_mut((&mut ctx as *mut CONTEXT) as *mut u8, std::mem::size_of::<CONTEXT>())
+    };
+    bytes[0x08..0x0C].copy_from_slice(&((image_base + 0x216F5) as u32).to_le_bytes()); // Dr1
+    bytes[0x0C..0x10].copy_from_slice(&((image_base + 0x22D7D) as u32).to_le_bytes()); // Dr2
+    bytes[0x10..0x14].copy_from_slice(&((image_base + 0x233FD) as u32).to_le_bytes()); // Dr3
+    bytes[0x14..0x18].copy_from_slice(&0u32.to_le_bytes()); // Dr6: clear stale
+    bytes[0x18..0x1C].copy_from_slice(&0xDDD0_0054u32.to_le_bytes()); // Dr7
+    // SAFETY: suspended thread handle.
+    unsafe {
+        let _ = SetThreadContext(h, &ctx);
+    }
+    // SAFETY: thread was suspended above.
+    unsafe {
+        let _ = ResumeThread(h);
+    }
+    info!(
+        dr1 = format!("{:#x}", image_base + 0x216F5),
+        dr2 = format!("{:#x}", image_base + 0x22D7D),
+        dr3 = format!("{:#x}", image_base + 0x233FD),
+        "DRBP: DR1-3 write breakpoints armed on the sentinel slots"
+    );
+}
+
+/// DR write-breakpoint hit (`MAGICMIDA_V2_DRBP`): called from the debug
+/// loop on a SingleStep while armed.  Captures the search handler's live
+/// registers to <stem>.v2drhit.bin, rewrites the triggered sentinel dword
+/// to 0 (fake "hit at index 0" — machine precision, still inside the
+/// handler before the fail continuation is queued), and clears the sticky
+/// DR6 so the next trigger is attributable.
+#[cfg(target_arch = "x86")]
+pub(super) fn handle_v2_dr_hit(
+    dbg: &mut ProcessSession,
+    tid: u32,
+    image_base: usize,
+    output_path: &Path,
+    hits: u32,
+) {
+    use windows::Win32::System::Diagnostics::Debug::{GetThreadContext, SetThreadContext, CONTEXT};
+
+    let h = match dbg.thread_handle(tid) {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    let mut ctx = CONTEXT::default();
+    // CONTROL | INTEGER | DEBUG_REGISTERS on i386.
+    ctx.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_FLAGS(0x0001_0013);
+    // SAFETY: stopped thread handle (the debug exception holds it).
+    unsafe {
+        let _ = GetThreadContext(h, &mut ctx);
+    }
+    let bytes = unsafe {
+        std::slice::from_raw_parts((&ctx as *const CONTEXT) as *const u8, std::mem::size_of::<CONTEXT>())
+    };
+    let rd = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
+    let (eip, eax, ecx, edx, ebx, esp, ebp, esi, edi) =
+        (rd(0xB8), rd(0xB0), rd(0xAC), rd(0xA8), rd(0xA4), rd(0xC4), rd(0xB4), rd(0xA0), rd(0x9C));
+    let dr6 = rd(0x14);
+    let slot_rva: usize = if dr6 & 0x2 != 0 {
+        0x216F5
+    } else if dr6 & 0x4 != 0 {
+        0x22D7D
+    } else if dr6 & 0x8 != 0 {
+        0x233FD
+    } else {
+        0
+    };
+    info!(
+        hits,
+        eip = format!("{eip:08x}"),
+        eax = format!("{eax:08x}"),
+        ecx = format!("{ecx:08x}"),
+        edx = format!("{edx:08x}"),
+        ebx = format!("{ebx:08x}"),
+        esp = format!("{esp:08x}"),
+        ebp = format!("{ebp:08x}"),
+        esi = format!("{esi:08x}"),
+        edi = format!("{edi:08x}"),
+        dr6 = format!("{dr6:08x}"),
+        slot = format!("{slot_rva:x}"),
+        "DRBP: search-handler hit - registers captured, result faked to 0"
+    );
+    // Append the register record for offline semantics analysis.
+    let stem = output_path.with_extension("v2drhit");
+    if let Some(name) = stem.file_name() {
+        let mut n = name.to_os_string();
+        n.push(".bin");
+        let path = stem.with_file_name(n);
+        let mut rec = Vec::with_capacity(13 * 4);
+        for v in [
+            hits, tid, eip, eax, ecx, edx, ebx, esp, ebp, esi, edi, dr6,
+            slot_rva as u32,
+        ] {
+            rec.extend_from_slice(&v.to_le_bytes());
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            use std::io::Write;
+            let _ = f.write_all(&rec);
+        }
+    }
+    // Machine-precision intervention: the miss (-1) is already stored (a
+    // write BP traps after the store) — rewrite it to 0 = "found at index
+    // 0" while the handler is still parked at the instruction boundary.
+    if slot_rva != 0 {
+        let _ = dbg.write_memory(image_base + slot_rva, &0u32.to_le_bytes());
+    }
+    // Clear the sticky DR6 so the next trigger is attributable.
+    let mut c2 = CONTEXT::default();
+    c2.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_FLAGS(0x0001_0010);
+    let b2 = unsafe {
+        std::slice::from_raw_parts_mut((&mut c2 as *mut CONTEXT) as *mut u8, std::mem::size_of::<CONTEXT>())
+    };
+    b2[0x14..0x18].copy_from_slice(&0u32.to_le_bytes());
+    // SAFETY: stopped thread handle.
+    unsafe {
+        let _ = SetThreadContext(h, &c2);
+    }
 }
 
 /// Fingerprint hunt (`MAGICMIDA_V2_FPHUNT=1`): scan the target image for

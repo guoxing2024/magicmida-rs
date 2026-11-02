@@ -2158,3 +2158,415 @@ failfreeze 场景。**③ 负载-停车关系证伪**：YAtest/YFtest 的重循�
 - `solved groups written` + `bail marker still fired` = 本关通过但
   另两道哨兵拦住 → 场景里看哨兵状态定下一步
 - 无写入 = 潮（停车），重试即可
+
+## V2 STRPATCH 首战：等待 bug 修复 + 五个证伪 + 比较块全链路复原（2026-11-01 续 9，未发布）
+
+**① STRPATCH 10 次空转根因 = 等待逻辑 bug**：分支结构
+`if elapsed>=300 { 窗口循环 } return;`——线程首轮 elapsed≈0 落进
+return，窗口循环从未执行（strpatch_bg_status 全 0 的解释）。修为
+sleep-wait 至 300ms 后实测：**写入生效**（10/7/8/6 次/轮，两轮格式化
+间隔 29ms 与 reftrace 吻合）。教训：带门条件的分支若门不满足要等，
+不能落到无条件 return。
+
+**② rolchk 补丁在位、串自洽、检查仍失败——cmp-vs-zero 模型死亡**：
+离线验证 `6A7F-BCEC-AFF9-0C18-3745-5E66-5E6D-2536` 的 rolchk 高 16 位
+= 0（原始串 = 0x5360）。STRDIAG（双缓冲变化 ring + RPM 失败计数）证明：
+写入全部落地（writes=[10,0]，rpm_fails=[0,0]）、第 2 轮格式化器甚至
+把我们的组 3（"AFF9"）回写进串（补丁反馈进管线）。检查仍 bail
+⟹ **决定性比较不读本串/参考值非 0**。
+
+**③ 比较块全链路复原（Y2-YE 十个 dump 逐字节一致）**：
+0x113EC2B `mov ecx,0x27` → 格式化（每 4 字符插 `-`、`[a-f]`→大写、
+拷到 [ebp+0x12262885]）→ `call eax`（[ebp+0x1230E777] → **rva 0xCE78B
+自解密蹦板**：自旋锁 [ebp+0x1230E786] + `call 0x10CE81D` 用
+`ebx=0x12345678` 逐字节 `xorb bl; addb bh; ror ebx,1` 解密
+[rva 0xCE3CA, 0xCE6C6)，逆变换 = `(x-bh)&0xFF ^ bl`，已离线解出
+**路径构建器**：GetModuleFileNameA(0x22899)、WDefaultLicenseName 读
+配置、%APP_NAME% 展开、`<dir>\<name>.dat` 构建、CreateFileA 分支）→
+`and dword [ebp+0x1237ECF3],0xffff0000` → rolchk 35 字节（跳 `-`）→
+`cmp eax,[ebp+0x1237ECF3]` → `jne fail`（**6 字节 0f85 0a**，不是
+旧机器假设的 75 0E）→ `mov eax,1` = pass。
+
+**④ JNEPATCH 修正后补丁落地但仍失败**：字节模式 75 0E→0f85 0a 00
+00 00（6 NOP）、持久重补（count=1，签名只出现一次）——bail 照旧
+⟹ **0x13ECF1 的 jne 不是决定性分支**（rolchk 库的一个实例、可能
+恰是通过的那个：**原串自洽**——rolchk(前 7 组) 高 16 位 = 0x2536
+= 第 8 组 "2536" 的 hex 值！指纹串 = IBAN 式自校验设计，该实例
+天然通过）。
+
+**⑤ dp 逐 op 可变 ⟹ 一切静态有效地址不可靠**：YE 冻结（串完成
+瞬间）ebp=0xEEDC0014（dp 锚）；同一 disp 0x12262885 在 STRDIAG run
+的格式化打到 0x2056D（dp'=0xEEDC0CE8）。0x22899 = 多用途暂存
+（模块路径 → `<exe>.dat` 路径 → 指纹串 → registered-to 消息）；
+**静止态 = 逐位置 XOR 加密**（E("1051")=BA 34 2E 15，键流
+8B 04 1B 24——由 STRPATCH 补丁回写实测证认：E("6A7F")=BD 45 2C 62）。
+0x2056D = 显示副本（S1_009 书写进行中、v4 reftrace 完成即冻）。
+
+**⑥ SENTINEL（三搜索结果槽 -1→0）落地仍失败**：0x216F5/0x22D7D/
+0x233FD 在 bail 后 = {-1,ptr}（未命中）、pre-fail 2ms（Y8）= {0,ptr}；
+三槽补丁全部落地、早于 fail write ~40ms——裁决仍 fail ⟹
+**搜索 op 在 miss 时原子排队 fail 续延，事后改结果槽无效**。
+
+**⑦ fail 值预备区在私有堆栈、轮询赢不了**：fail 三元组
+（0xFFFFA595 + 0x01182523 + 0x17）与续延对只在 STCK 0xEFE7C-0xEFEE8
+有**残影**（写后遗留）；活体（vmsp=0x01163803 私有堆）的预备→写
+间隔 µs 级，NOWRITE 模式（contA==0x0102114D 触发 + 栈窗模式替换，
+窗口实测 t=330-339ms 命中 3 次）改写 0 次——预备值在 contA 窗口
+结束后才压栈，且真身在私有堆。轮询路线证死。
+
+**⑧ fail 处理器 = 私有堆 VM 派发跳板链**：0x1182519 `jmp 0x118273D`
+→ `jmp 0x1183965` → `push 续址; jmp 0x102888A`（解析器 thunk 链）
+——裁决/fail 逻辑在字节码。**PRIV 节已加入场景 dump**
+（0x1170000-0x1190000，128KB）——fail/裁决代码首次可离线分析。
+
+**⑨ 指纹哈希不在路径上**：本机哈希 50fc3964 053166a5（2 dword）
+对路径/目录/文件名的 rol1-add 假设矩阵（含大小写、跳横杠、序、
+nul、len-4/len/35/39/96/100 全长度 × ref{0,0x53DC}）全空
+（62^4/62^5 求解器反向扫同样零解——ref=0/0x53DC 两候选均不可能）。
+0xE3192 块 = 干净的输入链（GetModuleFileName→0x22899 + 目录截断），
+但 call 进 [ebp+0x12263DED] → **rva 0x23E01 = VM 字节码区**——哈希
+逻辑在 VM 里（native 0x963B5 混淆块 = push/ret 链 + 逐字节
+movsb+sub 的 handler，循环由字节码驱动）。0x963B7 块手工解到
+`while([esi]){slot-=eax; movsb}` 形状后停——字节码驱动部分 =
+devirt 沼泽（AGENTS 既定不承诺）。
+
+**⑩ CISC-1.dat（480B，2009 原件）无简单密码学**：与内存 blob
+（0x2056D 39B）无直配、无单字节 XOR、无零富密钥流对齐。许可文件
+变换待破。MachineGuid（本机输入）= `7157539a-0733-4424-ac08-1d977bfa0137`
+（HKLM\SOFTWARE\Microsoft\Cryptography）。
+
+**⑪ 机器资产全部保留**：JNEPATCH（修正模式+持久重补+bail 内检）、
+SENTINEL、NOWRITE、REFHUNT、STRDIAG、PRIV 节。合并轮询教训：
+紧循环若不退出会饿死后续分支（YJStest sentinel 从未运行）→ 合并进
+同一循环（YJUtest 三哨兵齐发）；退出时机要用决策时刻校准（YJTtest
+交接晚了 7ms 错过窗口）。
+
+**⑫ 下一增量**（按性价比）：
+1. **许可文件密码学**：PRIV dump 里找 .dat 的读取/解密例程
+   （CreateFileA 分支 → 读 480B → 变换 → 0x2056D blob），恢复变换后
+   把 blob 内指纹字段换成本机值重加密写回文件——**数据输入面的
+   正道**（续 4 结论的完成形态）。
+2. 若 1 卡死：裁决字节码（VMCTX 0x2114D 邻域 + 私有堆续延链）的
+   格式逆向——三个哨兵的 d1（命中 entry 指针）与裁决读取方式。
+3. 指纹哈希恢复（VM 字节码）只在 1/2 需要时做。
+
+## V2 许可来源定案 + 文件密码第一轮（2026-11-02 续 10，未发布）
+
+**① 指纹串 = 许可携带（provenance 链钉死）**：样本复制到 OUT\sp1\ 换路径跑
+（REFTRACE v4 完成即冻）——串 `1051-BCEC-…` **逐字节不变**（0x22899 的
+.dat 路径已是新目录）；**移走 .dat 再跑：串根本不出现**（窗口结束无
+marker vs 有 .dat 时串完成即冻）。⟹ 串 = LCF-AT 机器的**注册指纹**，
+从许可文件解密而来；对话洉显示的是注册指纹不是本机指纹。
+**攻击模型重定型**：三搜索 = 在许可携带的列表里找本机计算键
+（50fc3964 053166a5 = 其中之一）；通过 = 让列表含本机键（改许可）
+或让键等于注册值（改键槽 0x224ED——需先读列表里的注册值）。
+
+**② 文件密码第一轮 = 全负（含一次假阳性教训）**：CISC-1.dat（480B）
+对已知明文（注册名 67B、指纹串 39/32B）系统测试：周期 XOR p=1..33
+（每偏移）、加/异或常量、ror1 族固定魔数（0x12345678/0x8307F8BF 等
+×4 形态）、RC4（16 个候选键）、exe 流对齐采样——**全负**。
+**假阳性教训**：p=31 周期对 32B 模式只含 1 字节检验（ks[31]==ks[0]），
+448 偏移 × 2^-8 ≈ 期望 1.75 个假阳性——实测恰好 2 个（@0x2/@0x195，
+两键不同、邻域无结构），**均统计噪声**；"layer-1 破解"（K=2b91c07e…，
+明文 `aa 69 1051BCEC…`）同样不可信。**教训：短窗口周期检验必须算
+约束数，1 字节约束的命中 = 噪声。**
+
+**③ 堆窗口修正**：VM 栈（vmsp=0x01163803）与搜索数据指针
+（bank+0x36=0x0115D00C）在 **0x115xxxx-0x116xxxx**——PRIV 节从
+[0x1170000,0x1190000) 加宽到 **[0x1150000,0x1190000)**（256KB）。
+PREFREEZE 重跑（YPF3test）= 搜索时刻 ±2ms + 全堆场景，机器就绪。
+
+**④ 许可内存足迹图**：注册名 @0x1182523（PRIV，fail 路径工作区）+
+@0x2289A（对话缓冲，后随 .dat 路径串）；指纹串缓冲 = 0x2056D/0x22899
+（静止态 XOR 键流 32B 周期 `8b041b24…`，YSP1 冻结在明文态键流全零
+= 解密后状态）；本机计算哈希 @0x224ED 全 dump 单副本；VMCTX 其余
+区域 ≠ 该键流加密（32 相位扫描只有串自身）。
+
+**⑤ 下一增量**（按性价比）：
+1. **搜索 op 机制**（devirt-lite：只逆三个搜索 op，不做全 VM）：
+   键 = 什么、列表 = 哪里、miss→fail 续延怎么排队——YPF3test 场景
+   （全堆 + 搜索时刻）为输入。
+2. **文件解密例程狩猎**：原始文件字节（81f8f14e…）落地的读缓冲 =
+   fphunt 式内存扫描 → 变换前后对照 → 恢复例程。
+3. 若列表 = 文件派生且例程恢复：改许可重加密 = 终局。
+
+## DLL→EXE 包装器壳：`core.dllMM.exe` 的真身是一颗 DLL（2026-11-02）
+
+**症状**：`mida-cli /unpack core.dllMM.exe` 走 EXE 路径 7 分钟后
+`ExitProcess { exit_code: 1 }` + `attempting final raw dump`，**零产物**；
+`.text` 写断点从未命中，OEP 链根本起不来。
+
+**定案**：这颗"EXE"的入口桩是一段 **DLL→EXE 包装器**，不是壳的入口。
+桩区（RVA `0xDB1FD8`，`.reloc` 前的 slack，raw `0x5C21D8`）：
+
+```
+48 83 EC 28        sub  rsp, 0x28
+E8 00 00 00 00     call $+5
+59                 pop  rcx
+48 81 E9 E4 19 DB 00   sub rcx, 0xDB19E4   ; -> image base
+BA 01 00 00 00     mov  edx, 1             ; DLL_PROCESS_ATTACH
+45 31 C0           xor  r8d, r8d           ; reserved
+E8 0B E7 AE FF     call 0x8A0108          ; <-- 真 DllMain
+CC                 int3
+EB FE              jmp  $                 ; 自旋
+```
+
+`call rel32` 落在 `0x8A0108` —— 那正是同尺寸 DLL 孪生体
+（`core.dll`，6,038,032 B，`IMAGE_FILE_DLL` 置位、EP=`0x8A0108`）的
+入口。即：**样本本体是受保护 DLL，EXE 桩只是把它当 DLL 调起来**。
+`/analyze` 报 "Themida V3 / .winlice + .boot" 是对的，但它报的是 DLL 的形状。
+
+**EXE 模式下 `.text` 永不就地解密（实测）**：对独立运行的样本做两次
+`/dump-process`（~8 s 与 ~40 s），1,054,720 B 两份**逐字节相同**，且前
+377,856 B 与磁盘上打包的 `.text` **0 字节差异**（首 32 B 同为
+`272ba3c9…`，非零字节同为 375,900）。⟹ 壳是 VM 解释型，原生镜像从不
+materialise，`.text` 写断点自然没有可触发的对象。EXE 路径对该形状**无解**，
+不是管线缺陷。
+
+**DLL 路径会收敛**：`LoadLibraryW` 走完整 `DLL_PROCESS_ATTACH` 引导，
+`.text` 全量解密（产物首 32 B = `55 57 56 53 48 83 EC 38 …`，真 MSVC
+prologue，0x1017C0 B）。
+
+**可复现的转换**（`core.dllMM.exe` → 等价的 `core.dll` 孪生体，4 步，
+30 字节差异，**确定性**：重建结果与 2026-10-23 的工作副本 sha256
+`09f3dd34…` 逐字节相同）：
+
+1. COFF `Characteristics`（`e_lfanew+0x4+0x12`）`0x022E → 0x222E`
+   （置 `IMAGE_FILE_DLL`）
+2. `AddressOfEntryPoint`（`opt+0x10`）`0xDB19DF → 0x8A0108`
+3. `DllCharacteristics`（`opt+0x46`）`0x0000 → 0x0060`
+4. 桩区 raw `0x5C21D8..0x5C2200` 清零
+
+**产物**：`mida-cli /unpack <twin>.dll`（DLL 分支，走真实 loader host）
+—— IAT 3,283 槽 / 12 模块 / 289 thunks / 3,106 relocations，
+1,737,216 B，exit 0 `Done.`。行为验收（`OUT/dll_gate_harness.exe` 两次
+独立运行）：`LOADED=1 VERSION=1.1 WINDOW_VISIBLE=1
+WINDOW_CLASS=PigToGoLicenseDialog WINDOW_TITLE=授权验证
+RUN_THREAD_ALIVE=1`。`.text` 与 2026-10-23 的 golden 产物
+（`OUT/coreU.dll`）**1,054,656 B 全同**；全文件仅差 3 字节
+（`0x1AF` 段特性 `0x60000020` vs 旧参考的 `0xe0000020`——新值照抄输入
+自己的声明，旧值才是缺陷；`0x141A7A` 2 字节 = IAT 首槽的
+Hint/Name RVA，布局等价）。
+
+**顺带修的两个 `dll_dump.rs` 缺陷**（都只影响这条诊断工具）：
+
+- **host log 路径过期**：`ensure_loader_host` 早已把 host 日志挪到
+  `%TEMP%\magicmida-hosts\host-<pid>.log`，工具还在读
+  `<dll>.host.log`，于是 60 s 超时必然触发（`bootstrap` 永远等不到）。
+- **OEP 扫描跨函数**：`find_oep_rva` 用平坦 64 字节窗口找
+  `cmp edx,1|2`，会**越过本函数的 `ret` 摸到下一个函数**——参考 DLL 上
+  返回 rva `0x13A0`（一个 0x16 B thunk，`ret` 在 +0x15，邻居 `cmp edx,1`
+  在 +0x24），产物能加载但 `DllMain` 根本不跑。现两处收紧：遇
+  `ret`/`int3`/`nop` 终止候选；且要求**同时**出现 `cmp edx,1` 与
+  `cmp edx,2`（只有 ATTACH 的 0x13C0 helper 也被排除）。修后
+  `oep rva = 0x2BB10` = 真 DllMain（`cmp edx,2` → `cmp edx,1` 分派），
+  与 10-23 golden 一致。
+
+**残留差异（不是缺陷）**：`dll_dump` 路径仍只看到 live IMPORT 目录里的
+12 个诱饵描述符（真表在壳的私有 `.winlice` 区），产物 IAT 无效、
+`LoadLibrary` 失败 `1114`。**`mida-cli /unpack` 的 DLL 分支**才走
+3,283 槽的全扫，产物可用。想复用 `dll_dump` 得把 `/unpack` 的 IAT
+定位搬过去，本轮没做。
+
+## V2 VMDIFF 写映射 + LICPATCH：许可字段全图与搜索模型证伪（2026-11-02 续 11，未发布）
+
+**① VMDIFF（`MAGICMIDA_V2_VMDIFF=1`）落地**：VMCTX+私有堆 10ms 快照差分，
+(t, region, off, len u32, bytes) 记录 + bail 保护。**首版 bug：len 用 u16，
+PRIV 基线 0x40000 截断成 0，其后记录全部错位**（YVDtest 报废）——改 u32
+重跑（YVD2test，1567 记录）。教训：长度字段按最大区尺寸选型。
+
+**② 许可解密时刻 = t=208ms**：E-blob（0x2056D）首写 t=208（写 2 次：
+208 解密 + 358 格式循环；字节 8-38 写 4 次 = 循环只动尾部）。**t=208
+共 41 个写入 run**：~19 个 4 字节哈希样字段 + ~10 个 0x0112xxxx 指针 +
+4 个清零。**哈希样字段聚在三个哨兵槽邻域**（0x21621/0x21761/0x21871/
+0x2192D/0x219C1/0x21CE5 靠 0x216F5；0x22C09-0x22ECD 靠 0x22D7D；
+0x23001-0x23375/0x235E5 靠 0x233FD）= 搜索列表区。私有堆只在
+t=100（基线 206KB）/347/380 有写——**许可字段全在 VMCTX**。
+
+**③ 搜索键候选**：哨兵 d1 搜索后 = **0x7DC80DE6 / 0x022869C8（跨 run
+稳定 = 机器派生）**；槽 3 d1 逐 run 变（0xB895D475/0x0EA5E92A/0xDC640BCC
+——另有机制）；决策前态 d1 = 指针（0x0102D6AB/0x01108E1E）。
+**0x9898 之谜解开**：0x224ED 槽决策前 = `98989898` 填充值，决策时刻被
+计算哈希 50fc3964 053166a5 覆盖（哈希写于 331ms pre-fail 冻结之后——
+搜索/比较全在 [331, 412] ms 窗口）。
+
+**④ LICPATCH（`MAGICMIDA_V2_LICPATCH=1`）**：t=280ms 起把 19 个字段
+轮流填两键（每 10ms 重涂）。实测 14 轮涂写、**bail 时 19/19 全部存活**
+——检查仍 fail。⟹ **「键 = d1 值、列表 = 那 19 个字段」模型证伪**：
+搜索键非 d1、或列表另有其处、或搜索不是键入列表形状。字段级黑盒补丁
+路线穷尽（补得上、补不对）。
+
+**⑤ 资产**：VMDIFF/LICPATCH 机器保留（记录格式 u32 len）；写映射
+`OUT\YVD2test.v2vmdiff.bin`（1567 记录，可离线重放任意时刻状态）；
+`OUT\vmdiff_analyze.py` 重放器。
+
+**⑥ 下一增量 = 搜索 op 机制（devirt-lite）**：三个搜索 op 的字节码
+（contA=0x0102114D → RVA 0x2114D 邻域）+ 解释器 handler——键从哪来
+（哪个计算的值）、列表指针怎么取、miss 怎么排 fail 续延。这是黑盒
+穷尽后剩下的唯一一层。次选：文件解密例程狩猎（fphunt 扫 81f8f14e…
+原始文件字节落点 → 变换前后对照）。
+
+## V2 SFREZE 冻结成功 + "VM" 范式级破译：根本没有字节码（2026-11-02 续 12，未发布）
+
+**① SFREZE（`MAGICMIDA_V2_SFREZE=1`）一击命中**：µs 轮询（银行 64B +
+哨兵槽 4B ≈ 3-5µs/轮）+ 穿录取环 + 第一个哨兵槽写 0xFFFFFFFF 瞬间
+SuspendThread——实测 t=134.8ms（决策窗口内）、环 5897 条、场景含活体
+上下文（EIP=0x1033D8F 引擎池、EBP=dp、ESI=0x011723E9 堆、EDI=银行指针）。
+
+**② 范式级定案：没有 VM 字节码**。冻结态银行 contA=0x0116FD15 → 堆里
+该地址的内容 = `83 e9 05 / f3 a4 (rep movsb) / 6a 00 57 e8+3 / 5f c3 /
+89 7c 24 04 / 81 44 24 04 14 00 00 00 / 47 57 c3` = **与 0x963B5 完全
+同款的 push/ret 混淆原生代码**。contA/contB = **原生代码块链的续址**，
+"VM" = 原生块 + 派发蹦板的混淆链。devirt = 反汇编这些块（可补丁的
+真 x86！）。此前"字节码在 VMCTX/动态草稿"的全部表述要按此修正。
+
+**③ 派发器 0x102888A 完全解码**（镜像内、每 dump 可读）：
+```
+pushal/pushfd; call $+0; pop edi
+sub edi, 0x1226887E        ; edi = 0xEEDC0014 = dp 基（EIP 推导、恒定！）
+mov eax, edi; add edi, 0x1226858A   ; edi → RVA 0x2859E = 银行内部！
+cmp eax, [edi+0x2C]        ; dp 变了吗
+mov [edi+0x2C], eax; mov ecx, 0xA8
+add [edi+ecx*4+0x48], eax  ; ★ 按 dp 重定位 168 个指针（RVA 0x285E6 起）
+mov esi, [esp+0x24]        ; thunk 推入的续址（dp 相对偏移）
+mov ebx, esi; add esi, eax ; 真实地址 = 续址 + dp
+lock cmpxchg [edi+0x30], ecx  ; 自旋锁（与 0xCE78B 蹦板同锁）
+lodsb; xor al, bl          ; ★ 块解密：密钥 = 续址低字节
+mov word [esp], bx; jmp 0x102FF28   ; 解释器主循环
+```
+**银行 = ~0x300B 状态结构的头部**（0x28580-0x28886+）：+0x2C = 上次
+dp、+0x30 = 自旋锁、+0x48 起 = **168 指针重定位表**（实测 167/168 =
+镜像内引擎池指针 0x1029xxx-0x103Dxxx，即 op handler/块表）。
+**"dp 逐 op 可变"的机制 = 这张表随 dp 整体重定位**——静态 disp 分析
+无效的根因终于闭环。
+
+**④ 块解密密钥 = 续址本身**：`lodsb; xor al, bl`（bl = 续址低 8 位）
+——续址 = 地址偏移 + 解密密钥二合一。"字节码" = 按续址异或加密的字节
+流，解释器 = 0x102FF28（待解码）。伪造/补丁一个块必须同时满足：偏移
+正确 + 密钥（续址）一致。
+
+**⑤ 堆跨度远超现有 dump**：续址目标 0x1236xxxx（thunk 表的 push 值 +
+dp 后落点在镜像内，但中间层在堆）、VM 栈 vmsp=0x0EDF2C99——PRIV
+[0x1150000,0x1190000) 没盖住。下轮加宽或按活动指针定向转储。
+
+**⑥ 下一增量**：①解码解释器 0x102FF28（块流怎么执行、op 编码）；
+②用续址密钥解密冻结态的块（0x116FD15 的块流，密钥 = 0xFD15 低字节
+0x15）→ 搜索 op 语义；③搜索块的 fail 分支 → 原生补丁 = 终局攻击面
+（块在堆里 = 可写）。
+
+**续 12 修正（python 算术校验后）**：①派发器自推导 `0x01028892 -
+0x1226887E = 0xEEDC0014` ✓（AGENTS 的 dp 值正确，mental-math 曾算错）；
+结构 RVA 0x2859E ✓（167/168 镜像内指针佐证）。②**续址 = dp 相对偏移，
+真实块地址 = 续址 + dp**：contA@freeze 0x0116FD15 + dp = **0xEFF2FD29
+= 高端堆**（进程 LargeAddressAware，用户空间 4GB）——本轮反汇编的
+"0x116FD15 块" = 低地址 raw 值处的内容，**不是 op 块**（push/ret 同款
+形状 = 壳的混淆遍地都是，撞形不算证据）。③**场景 dump 从未覆盖高端堆
+（0xE-0xFxxxxxxx = VM 主工作区：op 块 + VM 栈 vmsp=0x0EDF2C99 同在高
+区）**——下轮 dump_failfreeze_scene 改为**动态区域**：冻结时按银行
+活值取 [vmsp-0x80000, vmsp+0x80000] 与 [(contA+dp)-0x20000, +0x20000]
+等，一次 run 拿全 op 块真身。④搜索 op 语义 = 下轮在真块上解密
+（lodsb/xor al,bl，密钥 = 续址低字节）后即读。
+
+**续 12 补充（动态区域 dump + 侦察修正）**：`dump_failfreeze_scene` 新增
+**HIHE/HIST 动态节**（按冻结时银行活值取 contA+dp±0x20000、vmsp±0x80000，
+4KB 页式稀疏读 + present 位图——整段 RPM 会因单页未映射整体失败）。
+实测侦察（SFREZE-SCENE recon）：**block 地址 = MEM_RESERVE（0x2000，
+未提交）、vmsp 地址 = MEM_FREE（0x10000）**——冻结时刻银行的 contA =
+下一块（引擎按需懒提交）、vmsp = 陈旧值，两目标全空 = present=0 的真因。
+**真正的收获：搜索操作数栈 = 解释器传统栈 @ESP=0xEFEE8——STCK 节早已
+覆盖**：栈顶 = dataptr(0x0116FCD6)+contA(0x0116FD15)，下为 dp
+（0xEEDC0014 反复压栈）、镜像地址（0x010E35A3/0x010E03B8）、哈希样值
+（0x1C4E8ECE/0x892DCC2A）。**下一增量改为：解析解释器栈帧（数据已有）
++ 解码 0x102FF28 主循环**——搜索 op 语义从栈帧+块流双层还原，无需再跑。
+
+## V2 解释器帧链 + 混淆剥皮需求 + DR3 终局设计（2026-11-02 续 13，未发布）
+
+**① 解释器帧链走通（YSF4test，数据已在场景内）**：ESP=0xEFEE8 起帧链
+（重复形状 [hash][镜像返回地址×2][dp][下帧链接]）：内→外 =
+**0xE35A3（最内层 handler，搜索后正在执行）← 0xE03B8 ← 0xB754D/51
+← 0xE3247 ← 0xA4135 ← 0x21FFF（检查块 0x2114D 的返回点，块长 ~0xEB2）
+← 0x964F9（混淆块邻域）← 0x1371000（镜像末帧）**。全部在 IMAG dump 内。
+FAIL_MARK 立即数 **不在镜像**（fail 值 = 运行时计算，与栈上预备一致）。
+
+**② 块流 = 逐 op 易失**：冻结瞬间 contA+dp 区域 = MEM_RESERVE——引擎
+「提交→执行→去提交」逐 op 使用块流，**事后读块读不到**；静态向前反汇编
+返回地址 = push/ret 混淆链（本变体移位 0x19；形状 `call+3/pop/[esp+4]+=
+imm/inc/push/ret` → 真流在 hop 目标）。搜索语义只能活体捕（handler
+寄存器态）。剥皮器（按形状跟 hop 链）= 可选辅助，非必需。
+
+**③ DR3 写断点 = 终局武器设计**：AGENTS 记载壳校验 DR0（执行断点）；
+**DR3 = 数据写断点架哨兵槽（0x216F5 等）**，在 `-1` 存储的指令边界触发
+= 搜索 handler 内部、寄存器持 miss 判定现场的时机。实施要点：
+(a) SetThreadContext 装 DR3（DR7 RW=01 写、LEN=11 4B）——武装时机
+    ~350ms（判定前，壳 SEH 校验窗口外）；
+(b) core 的调试事件循环加 EXCEPTION_SINGLE_STEP 分支：EP+DR6 判来源 →
+    dump CONTEXT（寄存器 = 搜索 op 现场！）→ 可选干预（SetThreadContext
+    翻 miss 标志寄存器 / 重写结果 dword 为 0 = 机器精度零竞态的假命中
+    ——比 10ms 轮询的 SENTINEL 强在「还在 handler 内部、fail 排队未做」）；
+(c) 风险：壳若也查 DR3（未实测）→ 假 bail，场景可归因；重复触发
+    （3 搜索 × 2 dword）按 EP 过滤。
+(d) 该改动碰 core 事件循环（decode_event），单独一个增量做、全 env 门控。
+
+**④ 下一增量顺序**：DR3 机器（上面 a-c）→ 单 run 拿搜索 handler 寄存器
+现场 → 按 miss 标志寄存器定位判定点 → 寄存器干预/原生补丁二选一 →
+检查通过 → .text 解密 → OEP → 产物。
+
+## V2 DR 机器 + SFAKE：黑盒路线穷尽证明（2026-11-02 续 14，未发布）
+
+**① DR 机器实装**（`MAGICMIDA_V2_DRBP=1`：arm_v2_dr_breakpoints 于
+t=200ms 装 DR1-3 写断点（DR7=0xDDD00054，DR0 留空避开壳校验）+ 事件循环
+SingleStep 拦截 + 寄存器捕获 <stem>.v2drhit.bin + 机器精度改写）。首轮
+bug：默认 tick=500ms 错过 410ms 窗口（YDRtest 零 arming）——DRBP 模式
+tick 降 50ms。**但实测零命中零事件**：**V2 post-attach = 故意无调试端口
+（attach 会触发壳反调试扣下 .text 解密，上游 C-8 字节实证），DR 异常无
+接收方、被壳 SEH 吞**——DR 路线在 V2 上架构性死亡。
+
+**② SFAKE（`MAGICMIDA_V2_SFAKE=1`）= 最后的黑盒实验**：无睡眠循环每
+~5µs 读全部三个哨兵结果 dword、-1 即改写 0。实测 **fakes=3（三次 miss
+全部 ~5µs 内改写成功）bail 照旧** ⟹ **fail 判定 = 寄存器级**（miss 在
+搜索 handler 内部原子排队 fail 续延，槽值重写无效）。与 LICPATCH 结论
+合并：**黑盒补丁路线全部穷尽**——STRPATCH/JNEPATCH/SENTINEL/NOWRITE/
+LICPATCH/SFAKE/DR/页守卫类（无端口全被 SEH 吞）。
+
+**③ 修正一个隐患**：LICPATCH 补的 19 个字段 = VMCTX 低地址区；搜索
+handler 实际扫描的列表若在 dp 相对的高端堆（0xE-0xF 区，从未转储），
+则所有字段补丁都打在错误位置——需真块解码才能终结此辩论。
+
+**④ 剩余唯一路线 = 许可文件伪造**：.dat 解密例程狩猎（fphunt 式扫
+`81f8f14e…` 原始文件字节的内存落点 → 变换前后对照 → 恢复例程 →
+字段换本机值重加密写回）。机器全保留（DRBP/SFAKE/SFREZE/VMDIFF/
+LICPATCH/STRPATCH/JNEPATCH/SENTINEL/NOWRITE/REFHUNT/STRDIAG + PRIV/
+HIHE/HIST 动态节）。
+
+## V2 DATSCAN：文件落点定位 + 密码第一轮全负（2026-11-02 续 15，未发布）
+
+**① DATSCAN 机器落地**（`MAGICMIDA_V2_DATSCAN=1`）：多针全空间扫描
+（范围到 0xFFF00000 含 LA 高端堆；**只扫 MEM_PRIVATE**——系统 DLL 是
+MEM_IMAGE，过滤后量级从百 MB 降到几十 MB）+ 文件落点快照追踪 + 事件
+追加 <stem>.v2datscan.bin。集成 bug 一次：mod.rs 补丁脚本声称成功但
+改动丢失（原因未究，重放后加 grep 验证——**补丁脚本必须 grep 验收**）。
+
+**② 文件落点 = 0x3530000，t=182ms**（解密 t=208ms 前 ✓）；快照追踪 =
+**raw 形态驻留不变**——变换不在原地。raw 名字/无横杠串在决策前不存在
+（变换不产生 raw ASCII）；静止态键（32B、全相位）对文件的真键检验全负；
+4 字节周期字段键全负 ⟹ **文件密码 = 真变换**（非 XOR 族/非静止态键/
+非 RC4 已知键）。另一层注意：E-blob = 静止态加密写入 VMCTX（t=208），
+**明文许可可能从未整体存在**——字段级「解密→按静止态加密→入库」，密码
+恢复必须拿例程。
+
+**③ 例程定位的现成机器**：变换窗口 = [182, 208] ms——**RIPSAMPLE 模式
+（现成）把采样窗对准该区间**，RIP 轨迹 = 解析/解密例程地址 → dump/
+反汇编 → 恢复变换。或 REVERSING 路径：文件缓冲 0x3530000 的读取方
+（CreateFileA/ReadFile 调用链 = 路径构建器 CreateFileA 分支已知）。
+
+**续 15 补充（DATRIP 五连跑结论 + 干净模块捕获器设计）**：DATRIP 实装
+（全线程 ToolHelp 走查 + OpenThread 直采——**工作线程不在调试器线程映射
+（post-attach 无事件），必须 OpenThread**；轮转→全扫）。五连跑零
+out-of-image RIP——**YTR5 的 0x00AA42BA 命中 = 主线程**（当时 8 线程
+批次只有主线程 OpenThread 成功），干净模块执行 = <5ms 短脉冲，5ms 采样
+概率错过（1/5+）。**稳健捕获器（下一增量）**：主线程 RIP 的 µs 级
+轮询（单线程 GetThreadContext ≈10µs/次，[150,260]ms 窗口内可行），
+RIP ∉ [镜像 ∪ 系统 DLL] → 冻结全线程 + dump RIP 所在区域（一次命中 =
+干净模块 + 变换现场全拿）。备选：更多 DATRIP 暴力轮（~1/5 命中率）。
+干净模块 = 编译器风格未混淆代码（ebp 帧/call/cmp），许可逻辑可读 =
+密码恢复的钥匙。

@@ -436,6 +436,30 @@ pub fn unpack(
     // FREEZE_RVA run.
     #[cfg(target_arch = "x86")]
     let rip_sample_on = std::env::var("MAGICMIDA_V2_RIPSAMPLE").is_ok();
+    // V2 DR write-breakpoints (`MAGICMIDA_V2_DRBP=1`): at t>=350 ms arm
+    // DR1-DR3 (NOT DR0 — the shell checks DR0) as WRITE breakpoints on the
+    // three sentinel-slot result dwords.  A search's miss store traps at
+    // the instruction boundary INSIDE the search handler; the loop's
+    // SingleStep branch captures the handler's registers and rewrites the
+    // result to 0 (machine-precision fake hit — the 10 ms SENTINEL was too
+    // late because the miss atomically queues the fail continuation).
+    let drbp_on = std::env::var("MAGICMIDA_V2_DRBP").is_ok();
+    #[cfg(target_arch = "x86")]
+    let mut drbp_armed = false;
+    #[cfg(target_arch = "x86")]
+    let mut drbp_hits: u32 = 0;
+    // V2 .dat decrypt-routine hunt (`MAGICMIDA_V2_DATSCAN=1`): see
+    // helpers::dat_scan_tick.  Pure observation - the run continues to the
+    // decision so the transform window is sampled undisturbed.
+    let datscan_on = std::env::var("MAGICMIDA_V2_DATSCAN").is_ok();
+    #[cfg(target_arch = "x86")]
+    let mut datscan_state = helpers::DatScanState::default();
+    // V2 all-thread RIP sampling in the transform window
+    // (`MAGICMIDA_V2_DATRIP=1`): the licence decryption runs on a worker
+    // thread — see helpers::dat_rip_tick.
+    let datrip_on = std::env::var("MAGICMIDA_V2_DATRIP").is_ok();
+    #[cfg(target_arch = "x86")]
+    let mut datrip_state: Option<helpers::DatRipState> = None;
     #[cfg(target_arch = "x86")]
     let mut rip_samples: Vec<(f64, usize, usize, Vec<u8>)> = Vec::new();
     // V2 phase recorder (`MAGICMIDA_V2_RECORD_PHASE=<secs>`): from t=<secs>
@@ -644,6 +668,15 @@ pub fn unpack(
             // Post-gate: 5 ms so the trace keeps covering the licence phase;
             // the 1 ms cadence covered the decode start.
             5
+        } else if cfg!(target_arch = "x86") && datrip_on && post_attach {
+            // DATRIP: the transform window is 26 ms wide ([182, 208] ms) —
+            // a 5 ms tick gives ~5 sweeps with 8 threads each.
+            5
+        } else if cfg!(target_arch = "x86") && (drbp_on || datscan_on) && post_attach {
+            // DRBP/DATSCAN: the arming must land before the searches
+            // (~410 ms) — the default 500 ms tick missed the window
+            // entirely (YDRtest: zero arming, zero hits).
+            50
         } else if early_record {
             5
         } else if recording_now || (post_attach && rip_sample_on) {
@@ -689,6 +722,64 @@ pub fn unpack(
                 {
                     // Scene dumped, process terminated — end the run.
                     break;
+                }
+                // DR write-breakpoint arming (`MAGICMIDA_V2_DRBP=1`): at
+                // t>=350 ms (the shell's early DR checks are past; the
+                // searches run at ~410 ms) arm DR1-DR3 on the sentinel
+                // slots.  DR0 stays clear — the shell checks DR0.
+                #[cfg(target_arch = "x86")]
+                if drbp_on
+                    && post_attach
+                    && !drbp_armed
+                    && started.elapsed().as_millis() >= 200
+                {
+                    helpers::arm_v2_dr_breakpoints(&mut dbg, image_base_usize);
+                    drbp_armed = true;
+                }
+                // .dat decrypt-routine hunt: every tick until both licence
+                // fields are seen raw; the file-copy snapshots bracket the
+                // transform window (~t=208 ms).
+                #[cfg(target_arch = "x86")]
+                if datscan_on && post_attach {
+                    let t_ms = started.elapsed().as_millis() as u32;
+                    helpers::dat_scan_tick(&mut dbg, &mut datscan_state, &output_path, t_ms);
+                }
+                // All-thread RIP sampling inside [150, 260] ms.
+                #[cfg(target_arch = "x86")]
+                if datrip_on && post_attach {
+                    let t_ms = started.elapsed().as_millis() as u32;
+                    if (150..=260).contains(&t_ms) {
+                        if datrip_state.is_none() {
+                            let stem = output_path.with_extension("v2datrip");
+                            let mut name = stem
+                                .file_name()
+                                .map(|s| s.to_os_string())
+                                .unwrap_or_default();
+                            name.push(".bin");
+                            let path = stem.with_file_name(name);
+                            let f = std::fs::OpenOptions::new()
+                                .create(true)
+                                .truncate(true)
+                                .write(true)
+                                .open(&path)
+                                .map(std::io::BufWriter::new);
+                            match f {
+                                Ok(w) => {
+                                    datrip_state = Some(helpers::DatRipState {
+                                        threads: Vec::new(),
+                                        idx: 0,
+                                        refreshed_at: None,
+                                        clean_dumped: false,
+                                        written: w,
+                                    });
+                                }
+                                Err(e) => warn!(error = %e, "DATRIP: dump open failed"),
+                            }
+                        }
+                        if let Some(st) = datrip_state.as_mut() {
+                            helpers::dat_rip_tick(&mut dbg, st, t_ms);
+                        }
+                    }
                 }
                 // Freeze-on-RIP: unpatched scene capture when the main
                 // thread enters the requested range (checked before plain
@@ -1157,6 +1248,26 @@ pub fn unpack(
         };
         state.last_event_at = Some(std::time::Instant::now());
         log::log(LogType::Info, &format!("event received: {event:?}"));
+
+        // DR write-breakpoint hits (`MAGICMIDA_V2_DRBP`): the sentinel miss
+        // stores trap here INSIDE the search handler.  Capture the handler
+        // registers, fake the result to a hit at machine precision, clear
+        // the sticky DR6, continue.
+        #[cfg(target_arch = "x86")]
+        if let DebugEvent::SingleStep { thread_id, .. } = event {
+            if drbp_on && drbp_armed && thread_id == dbg.main_thread_id() {
+                drbp_hits += 1;
+                helpers::handle_v2_dr_hit(
+                    &mut dbg,
+                    thread_id,
+                    image_base_usize,
+                    &output_path,
+                    drbp_hits,
+                );
+                let _ = dbg.continue_event(thread_id, ContinueStatus::Continue);
+                continue;
+            }
+        }
 
         match event {
             // ---------------------------------------------------------------
