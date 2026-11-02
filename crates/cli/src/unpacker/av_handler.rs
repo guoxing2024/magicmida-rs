@@ -163,21 +163,57 @@ const DLL_SETTLE_SECS: u64 = 2;
 /// "Identical" means the same `(faulting address, target address, exception
 /// type)` triple.  Any change resets the counter, so a target that is merely
 /// busy is never killed — only one that is provably repeating itself.
+///
+/// The one exception is the shell's own VM decode (see
+/// [`is_vm_dispatch_fault`]): it repeats one fault tens of thousands of times
+/// *while making progress*, so those faults never count toward the budget and
+/// are held to [`VM_STORM_DEADLINE_SECS`] of uninterrupted identical VM
+/// storming instead.
 #[derive(Default)]
 pub(super) struct AvStorm {
     tuple: Option<(u64, u64, u8)>,
     count: u32,
+    /// Wall-clock start of the current VM-dispatch streak (`None` when the
+    /// current streak is not a VM storm).
+    vm_run_start: Option<std::time::Instant>,
 }
 
 impl AvStorm {
     /// Record one violation.  Returns `true` when the run should be abandoned.
-    fn record(&mut self, exc: u64, target: u64, exc_type: u8) -> bool {
+    ///
+    /// `is_vm_dispatch` marks faults that are the shell's own VM decode loop:
+    /// they are progress, not stuckness, and are judged by the wall-clock
+    /// deadline rather than the fault budget.
+    fn record(
+        &mut self,
+        exc: u64,
+        target: u64,
+        exc_type: u8,
+        is_vm_dispatch: bool,
+        now: std::time::Instant,
+    ) -> bool {
         let t = (exc, target, exc_type);
         if self.tuple == Some(t) {
             self.count = self.count.saturating_add(1);
         } else {
             self.tuple = Some(t);
             self.count = 1;
+            self.vm_run_start = None;
+        }
+        if is_vm_dispatch {
+            let start = match self.vm_run_start {
+                Some(s) => s,
+                None => {
+                    self.vm_run_start = Some(now);
+                    return false;
+                }
+            };
+            if now.duration_since(start) > std::time::Duration::from_secs(VM_STORM_DEADLINE_SECS) {
+                return true;
+            }
+            // Progress: the VM is decoding.  The fault budget must not
+            // accumulate for it.
+            self.count = 0;
         }
         self.count >= AV_STORM_LIMIT
     }
@@ -186,6 +222,7 @@ impl AvStorm {
     fn reset(&mut self) {
         self.tuple = None;
         self.count = 0;
+        self.vm_run_start = None;
     }
 }
 
@@ -239,6 +276,45 @@ fn themida_bounds(state: &ThemidaState, image_base: usize) -> (usize, usize) {
         }
     }
     (0, 0)
+}
+
+/// Wall-clock budget for a VM-dispatch storm before it is declared stuck.
+///
+/// The shell's exception-driven VM decode produces thousands of *identical*
+/// access violations at its dispatch point while making real progress — the
+/// reference `core.dll` converges after 36,450 of them (~0.5 s at the measured
+/// ~13 µs/fault).  Counting those toward the storm budget kills every VM-based
+/// shell before it decodes: measured on `core.dllMM.exe` (the EXE twin of the
+/// reference DLL, same packer build — the storm RVA `.winlice+0x33E22E` is
+/// byte-for-byte the DLL's), the run died at the 1,024-fault limit with the VM
+/// still mid-decode.  So [`AvStorm`] holds VM-dispatch faults to this deadline
+/// instead of the fault budget: a converging VM finishes in well under a
+/// second, a genuinely wedged one is still diagnosed — after the budget
+/// rather than after 1,024 faults.
+const VM_STORM_DEADLINE_SECS: u64 = 120;
+
+/// True when a fault is the shell's own VM decode dispatch.
+///
+/// Signature measured on the reference `core.dll` and its EXE twin
+/// `core.dllMM.exe`: the faulting instruction sits inside a Themida section
+/// (`.winlice`) and the fault target is exactly `0x0` — the VM dispatches by
+/// faulting on a null read, and its SEH handler decodes one bytecode per cycle
+/// before jumping back to the same dispatch point.  The fault triple therefore
+/// stays identical for tens of thousands of cycles while the VM makes real
+/// progress (reference: 36,450 identical faults at `.winlice+0x33E22E`, then
+/// the DLL bootstraps cleanly when left alone — `LoadLibraryW` returns,
+/// exports answer).
+///
+/// The x86 regression case is deliberately *not* covered: its storm faulted at
+/// `.themida+0x538866` reading `0x5` — inside a Themida section but a non-zero
+/// target — and must keep counting toward the fault budget.
+fn is_vm_dispatch_fault(
+    exception_addr: u64,
+    target_address: u64,
+    tm_start: usize,
+    tm_end: usize,
+) -> bool {
+    target_address == 0 && tm_start < tm_end && exception_addr >= tm_start as u64 && exception_addr < tm_end as u64
 }
 
 /// Handle an AccessViolation event in the debug loop.
@@ -321,14 +397,60 @@ fn handle_access_violation(
     // burns the log.  Applies even before the guard is installed, because a
     // packed DLL can storm during its own initialisation (observed on the
     // reference core.dll: 36,450 identical faults at .winlice+0x33E22E).
-    if ls.av_storm.record(exception_addr, target_address, exc_type) {
+    //
+    // That reference storm is the reason the watchdog no longer trusts the
+    // fault count alone: the shell's exception-driven VM decode repeats one
+    // identical fault (inside a Themida section, target 0x0 — see
+    // `is_vm_dispatch_fault`) for tens of thousands of cycles *while making
+    // progress*.  VM-dispatch faults are therefore held to a wall-clock
+    // deadline instead of the fault budget.
+    let (tm_start, tm_end) = themida_bounds(state, image_base_usize);
+    let vm_dispatch = is_vm_dispatch_fault(exception_addr, target_address, tm_start, tm_end);
+    if ls.av_storm.record(
+        exception_addr,
+        target_address,
+        exc_type,
+        vm_dispatch,
+        std::time::Instant::now(),
+    ) {
         let (exc, tgt) = (exception_addr, target_address);
+        let kind = if vm_dispatch {
+            "VM decode storm"
+        } else {
+            "access violation storm"
+        };
         return Err(anyhow!(
-            "Target is stuck: {AV_STORM_LIMIT} consecutive identical access \
-             violations at {exc:#x} (target {tgt:#x}).\n\
+            "Target is stuck: {AV_STORM_LIMIT} consecutive identical {kind} at \
+             {exc:#x} (target {tgt:#x}).\n\
              This is an exception-driven decode loop that never converges; the \
              debuggee cannot be unpacked in this state. No product was written."
         ));
+    }
+
+    // ---- VM decode dispatch: deliver to the shell's own SEH ----------------
+    //
+    // The shell's exception-driven VM decode faults on a null read at its
+    // dispatch point and advances one bytecode per SEH cycle.  The debugger
+    // must PASS the exception to the shell (`DBG_EXCEPTION_NOT_HANDLED`):
+    // `DBG_CONTINUE` resumes at the faulting instruction *without running the
+    // shell's handler*, so the same fault fires again forever and the VM never
+    // decodes — measured on core.dllMM.exe (the EXE twin of the reference
+    // core.dll, same packer build, same storm RVA `.winlice+0x33E22E`):
+    // 3,900,446 identical faults in 120 s with zero convergence, while the
+    // same shell bootstraps in ~0.5 s (36,450 faults) when no debugger
+    // swallows its exceptions.  This is the v3-generation instance of the
+    // Ancient swallow documented at the pre-guard branch below — same
+    // disease, different generation.  The gate is the fault *signature*
+    // (`is_vm_dispatch_fault`), not the version: v3 shells without a
+    // virtualised decode (the x86 golden's `.themida+0x538866` storm, target
+    // 0x5) keep the current `DBG_CONTINUE` behaviour their goldens depend on.
+    //
+    // These faults also stay out of the guard machinery below: Branch 3
+    // (`exception past text_section_end`) would otherwise
+    // `VirtualProtectEx` + trap-flag every one of them.
+    if vm_dispatch {
+        dbg.continue_event(thread_id, ContinueStatus::ExceptionNotHandled)?;
+        return Ok(AvAction::Continue);
     }
 
     // Per-fault logging is a log bomb under the classic flow (the shell's
@@ -1435,8 +1557,9 @@ mod tests {
     #[test]
     fn storm_fires_on_identical_faults() {
         let mut s = AvStorm::default();
+        let now = std::time::Instant::now();
         for i in 0..AV_STORM_LIMIT {
-            let fired = s.record(0x1000, 0x2000, 0);
+            let fired = s.record(0x1000, 0x2000, 0, false, now);
             if i + 1 < AV_STORM_LIMIT {
                 assert!(!fired, "must not fire before the limit (iteration {i})");
             } else {
@@ -1448,23 +1571,28 @@ mod tests {
     #[test]
     fn storm_survives_a_changing_fault() {
         let mut s = AvStorm::default();
+        let now = std::time::Instant::now();
         // A different fault resets the count, so a merely busy target is never
         // killed.
         for _ in 0..(AV_STORM_LIMIT * 2) {
-            assert!(!s.record(0x1000, 0x2000, 0));
-            assert!(!s.record(0x3000, 0x4000, 0), "alternating faults never storm");
+            assert!(!s.record(0x1000, 0x2000, 0, false, now));
+            assert!(
+                !s.record(0x3000, 0x4000, 0, false, now),
+                "alternating faults never storm"
+            );
         }
     }
 
     #[test]
     fn reset_clears_the_streak() {
         let mut s = AvStorm::default();
+        let now = std::time::Instant::now();
         for _ in 0..(AV_STORM_LIMIT - 1) {
-            s.record(0x1000, 0x2000, 0);
+            s.record(0x1000, 0x2000, 0, false, now);
         }
         s.reset();
         assert!(
-            !s.record(0x1000, 0x2000, 0),
+            !s.record(0x1000, 0x2000, 0, false, now),
             "after reset the counter starts over"
         );
     }
@@ -1474,12 +1602,95 @@ mod tests {
     #[test]
     fn exc_type_is_part_of_the_identity() {
         let mut s = AvStorm::default();
+        let now = std::time::Instant::now();
         for _ in 0..(AV_STORM_LIMIT - 1) {
-            s.record(0x1000, 0x2000, 0);
+            s.record(0x1000, 0x2000, 0, false, now);
         }
         assert!(
-            !s.record(0x1000, 0x2000, 8),
+            !s.record(0x1000, 0x2000, 8, false, now),
             "changing exc_type starts a new streak"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // AvStorm — VM-dispatch storms (the shell's own decode engine)
+    // ------------------------------------------------------------------
+
+    /// The reference DLL's measured storm shape: 36,450 identical VM-dispatch
+    /// faults (inside a Themida section, target 0x0), then the VM converges.
+    /// None of them may fire the watchdog — the fault budget must not
+    /// accumulate for the shell's own decode loop.
+    #[test]
+    fn vm_dispatch_storm_never_counts_toward_the_budget() {
+        let mut s = AvStorm::default();
+        let now = std::time::Instant::now();
+        for _ in 0..40_000 {
+            assert!(
+                !s.record(0x1000, 0x0, 0, true, now),
+                "a converging VM storm must not be killed by the fault budget"
+            );
+        }
+    }
+
+    /// A VM storm that outlives the wall-clock deadline is genuinely wedged and
+    /// must still be diagnosed.
+    #[test]
+    fn vm_dispatch_storm_fires_after_the_deadline() {
+        let mut s = AvStorm::default();
+        let start = std::time::Instant::now();
+        for _ in 0..10 {
+            assert!(!s.record(0x1000, 0x0, 0, true, start));
+        }
+        let later = start + std::time::Duration::from_secs(VM_STORM_DEADLINE_SECS + 1);
+        assert!(
+            s.record(0x1000, 0x0, 0, true, later),
+            "a VM storm that outlives the deadline is genuinely stuck"
+        );
+    }
+
+    /// The x86 regression case (`.themida+0x538866` reading `0x5`) is not a
+    /// VM-dispatch fault: a non-zero target keeps counting toward the budget
+    /// even inside a Themida section.
+    #[test]
+    fn non_vm_fault_in_themida_still_counts() {
+        assert!(
+            !is_vm_dispatch_fault(0x538866, 0x5, 0x1000, 0x2000),
+            "target 0x5 is not the VM dispatch signature"
+        );
+        assert!(
+            is_vm_dispatch_fault(0x1500, 0x0, 0x1000, 0x2000),
+            "target 0x0 inside the Themida section is the VM dispatch signature"
+        );
+        assert!(
+            !is_vm_dispatch_fault(0x1500, 0x0, 0, 0),
+            "no Themida bounds — nothing is a VM dispatch fault"
+        );
+        assert!(
+            !is_vm_dispatch_fault(0x0fff, 0x0, 0x1000, 0x2000),
+            "below the Themida section"
+        );
+        assert!(
+            !is_vm_dispatch_fault(0x2000, 0x0, 0x1000, 0x2000),
+            "at/after the end of the Themida section"
+        );
+    }
+
+    /// VM faults must not accumulate budget, but a *different* (non-VM) fault
+    /// starts a fresh normal streak that still fires at the limit.
+    #[test]
+    fn non_vm_fault_after_vm_storm_still_fires() {
+        let mut s = AvStorm::default();
+        let now = std::time::Instant::now();
+        for _ in 0..(AV_STORM_LIMIT * 2) {
+            assert!(!s.record(0x1000, 0x0, 0, true, now));
+        }
+        for i in 0..AV_STORM_LIMIT {
+            let fired = s.record(0x2000, 0x5, 0, false, now);
+            if i + 1 < AV_STORM_LIMIT {
+                assert!(!fired);
+            } else {
+                assert!(fired);
+            }
+        }
     }
 }

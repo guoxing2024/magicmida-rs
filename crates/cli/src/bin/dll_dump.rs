@@ -61,7 +61,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pid = child.id();
     println!("host pid = {pid}");
 
-    let log_path = format!("{dll}.host.log");
+    // The host logs to `%TEMP%\magicmida-hosts\host-<pid>.log` — not next to
+    // the sample.  This used to read `<dll>.host.log`, which stopped existing
+    // when the host moved out of the sample directory (see
+    // `mida_core::ensure_loader_host`), so the wait always timed out.
+    let log_path = std::env::temp_dir()
+        .join("magicmida-hosts")
+        .join(format!("host-{pid}.log"));
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut bootstrapped = false;
     while Instant::now() < deadline {
@@ -321,14 +327,40 @@ fn find_oep_rva(h: HANDLE, base: u64) -> Result<u32, Box<dyn std::error::Error>>
     // 2. A `cmp edx, 1|2` appears within the first 64 bytes.  That is the
     //    `fdwReason` dispatch, which every `DllMain` has and ordinary code does
     //    not.
+    //    The scan must stop at the function's own `ret`.  A flat 64-byte
+    //    window used to run straight past it into the NEXT function: on the
+    //    reference DLL that returned rva `0x13a0` — a 0x16-byte thunk ending
+    //    `ret` at +0x15 whose neighbour at +0x24 opens `cmp edx, 1`.  The
+    //    product then loaded but never ran `DllMain`.  A `ret` (0xC3), or the
+    //    int3/nop padding that follows it, ends the candidate.
+    //
+    // 3. The candidate must dispatch on BOTH `DLL_PROCESS_ATTACH` (1) and
+    //    `DLL_PROCESS_DETACH` (2) inside its own body.  `cmp edx, 1` alone is
+    //    not DllMain: the reference DLL has a 0x16-byte helper at rva 0x13c0
+    //    that tests `edx == 1` and nothing else, and it sorts earlier in the
+    //    section.  The real DllMain at rva 0x2bb10 compares against 2, then 1.
     for i in 8..text.len().saturating_sub(64) {
         if !at_function_boundary(&text, i) || !is_prologue(&text, i) {
             continue;
         }
-        for j in i..(i + 64).min(text.len().saturating_sub(3)) {
-            if text[j] == 0x83 && text[j + 1] == 0xFA && (text[j + 2] == 0x01 || text[j + 2] == 0x02) {
-                return Ok(text_va as u32 + i as u32);
+        let end = (i + 64).min(text.len().saturating_sub(3));
+        let (mut saw_attach, mut saw_detach) = (false, false);
+        for j in i..end {
+            let b = text[j];
+            // Function ended before both dispatches were seen — not it.
+            if b == 0xC3 || (b == 0xCC && j > i) || (b == 0x90 && j > i + 4) {
+                break;
             }
+            if b == 0x83 && text[j + 1] == 0xFA {
+                match text[j + 2] {
+                    0x01 => saw_attach = true,
+                    0x02 => saw_detach = true,
+                    _ => {}
+                }
+            }
+        }
+        if saw_attach && saw_detach {
+            return Ok(text_va as u32 + i as u32);
         }
     }
 
