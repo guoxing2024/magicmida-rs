@@ -29,6 +29,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SEH — measured 3,900,446 identical faults / 607 MB of log / no
   convergence, vs the reference 36,450 faults / ~0.5 s).
 
+- **V2/WinLicense 2.x licence-check bypass demonstrated (KEYFORGE)** — the
+  CISC-1 sample (WinLicense 2.0.6.5) now **passes** the licence check that
+  killed it at ~460 ms with the "key locked to another machine" dialog.  A
+  new env-gated machine (`MAGICMIDA_V2_KEYFORGE=1`) watches the `.dat`
+  licence decode with µs snapshots and injects this machine's keys into the
+  decoded licence fields at the decrypt-completion moment; the shell's own
+  re-encryption and key-search machinery then validates them.  Measured: the
+  failure bail never fires, the process runs indefinitely, and the shell
+  deploys its anti-read protections (it moved into the protected-app phase).
+  Two supporting measurement machines: `LISTWATCH` (µs snapshots of the
+  search-list build) and `DECODEWATCH` (µs snapshots of the whole 480-byte
+  `.dat` decode — byte-fill, per-dword decrypt, two re-encrypt passes, wipe:
+  a full six-phase trace).  **Boundary: this is a licence-gate bypass on one
+  sample, not a V2 unpacker** — no dumped product is produced yet (V2 OEP
+  detection and product assembly are future work); generalisation to other
+  2.x samples is being tested separately.  See POSTMORTEMS 续 17-20.
+
 - **V2/WinLicense 2.x research tooling (no product claim)** — ten
   env-gated diagnostic machines around the CISC-1 licence check
   (`STRPATCH`/`JNEPATCH`/`SENTINEL`/`NOWRITE`/`LICPATCH`/`SFAKE`/
