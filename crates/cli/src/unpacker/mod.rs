@@ -458,6 +458,26 @@ pub fn unpack(
     // (`MAGICMIDA_V2_DATRIP=1`): the licence decryption runs on a worker
     // thread — see helpers::dat_rip_tick.
     let datrip_on = std::env::var("MAGICMIDA_V2_DATRIP").is_ok();
+    // V2 RIP catcher (`MAGICMIDA_V2_RIPCAT=1`): micro-poll the main
+    // thread's EIP; below the image base = the clean licence module -
+    // freeze, dump the region, end the run.  See helpers (ripcat branch).
+    let ripcat_on = std::env::var("MAGICMIDA_V2_RIPCAT").is_ok();
+    // V2 VM block-stream recorder (`MAGICMIDA_V2_BLKSTREAM=1`): µs-polls
+    // the bank's live continuations + dp through the decode window and
+    // snapshots every committed (cont+dp) block — the VM program itself,
+    // which no post-mortem dump can hold.  See helpers (blkstream branch).
+    let blkstream_on = std::env::var("MAGICMIDA_V2_BLKSTREAM").is_ok();
+    // V2 search-list watcher (`MAGICMIDA_V2_LISTWATCH=1`): µs-snapshots the
+    // search-list build at VMCTX [0x20A00,0x20B00) + the live bank through
+    // [150,340] ms.  See helpers (listwatch branch).
+    let listwatch_on = std::env::var("MAGICMIDA_V2_LISTWATCH").is_ok();
+    // V2 .dat decode watcher (`MAGICMIDA_V2_DECODEWATCH=1`): needle-finds
+    // the 480-byte file copy and µs-snapshots the whole buffer + bank
+    // through the decode window.  See helpers (decodewatch branch).
+    let decodewatch_on = std::env::var("MAGICMIDA_V2_DECODEWATCH").is_ok();
+    // V2 key forge (`MAGICMIDA_V2_KEYFORGE=1`): DECODEWATCH + overwrite the
+    // decoded key block with this machine's keys at the decrypt completion.
+    let keyforge_on = std::env::var("MAGICMIDA_V2_KEYFORGE").is_ok();
     #[cfg(target_arch = "x86")]
     let mut datrip_state: Option<helpers::DatRipState> = None;
     #[cfg(target_arch = "x86")]
@@ -667,6 +687,18 @@ pub fn unpack(
         } else if banktrace_tick || (banktrace_on && post_attach) {
             // Post-gate: 5 ms so the trace keeps covering the licence phase;
             // the 1 ms cadence covered the decode start.
+            5
+        } else if cfg!(target_arch = "x86")
+            && (datrip_on
+                || ripcat_on
+                || blkstream_on
+                || listwatch_on
+                || decodewatch_on
+                || keyforge_on)
+            && post_attach
+        {
+            // RIPCAT/BLKSTREAM: a 5 ms tick starves the micro-poll - the
+            // watcher needs the loop back as often as possible.
             5
         } else if cfg!(target_arch = "x86") && datrip_on && post_attach {
             // DATRIP: the transform window is 26 ms wide ([182, 208] ms) —
