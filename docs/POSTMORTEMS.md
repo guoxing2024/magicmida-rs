@@ -3168,3 +3168,19 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   直读路径更短，弃重放。
 - 下一轮：缝合 handler 链（0x1062857/0x1065bcf/…，每 handler ~10-30
   片段），抽出 3 状态 dword 的转移函数 → 全 261 态验证 → f → .dat 重编码。
+
+**续 21 补充 4（同日）——REGSNATCH 补强（esi 页 + 全镜像活体转储）+ 重放定界**：
+- REGSNATCH 增补：每快照 +esi 页 4KB（op 的数据指针在镜像内
+  0x10F0xxx/0x114xxxx——**.dat 工作副本在镜像数据区，不是 needle 找到的
+  堆缓冲**）；VM 线程确认后全镜像活体转储（882 页，`v2regsnatchimg`）。
+- unicorn 重放 v2（活镜像 + 真栈 + 快照寄存器）：**283 条指令走到
+  dispatch**（`movzx eax,al; jmp [edi+eax*4]`，al=0x5f）→ 未建槽崩。
+  分歧在更早的字节变换链——且 esi 非线性字节走线（0x10f0af3→0x10f1407→
+  0x1147db7 跳变）= 通用数据指针，输入字节的读取方式未定。
+- 活状态轨迹提取（`check_traj2.json`）：表窗口 live 字节 = 三组
+  （0xFFAE-0xFFC1 = 20B 状态窗、0xFFC6-0xFFCB、0xFFD2）；t=242.4ms 后
+  换 op 复用表（值变垃圾）——快照窗口 = 校验中段。
+- **定案路线（弃重放）**：handler 直读——168 个唯一 handler 已捕获，
+  逐个缝合 jmp 链（~10-30 片段）抽出 3 状态 dword 的转移函数 → 261 态
+  验证 → f → .dat 重编码。样本 handler 0x1062857（push ebp/esp 起手）、
+  0x1065bcf（lodsd; xor eax,ebx 起手）可读。

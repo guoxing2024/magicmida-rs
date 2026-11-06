@@ -3305,12 +3305,45 @@ pub(super) fn spawn_dialog_killer(
                         blobs.extend_from_slice(&sc[..got_s]);
                         blobs.extend_from_slice(&(got_b as u32).to_le_bytes());
                         blobs.extend_from_slice(&buf480[..got_b]);
+                        // the op reads its input via esi (the .dat work copy
+                        // inside the image data area) — capture 4KB there
+                        let esiva = ctx.Esi as usize;
+                        if esiva >= 0x10000 {
+                            let mut esipage = [0u8; 0x1000];
+                            let got_e = rpm(esiva & !0xFFF, &mut esipage);
+                            blobs.extend_from_slice(&((esiva & !0xFFF) as u32).to_le_bytes());
+                            blobs.extend_from_slice(&(got_e as u32).to_le_bytes());
+                            blobs.extend_from_slice(&esipage[..got_e]);
+                        } else {
+                            blobs.extend_from_slice(&(0u32).to_le_bytes());
+                            blobs.extend_from_slice(&(0u32).to_le_bytes());
+                        }
                         nsnap += 1;
                     }
                     // SAFETY: handle from OpenThread.
                     unsafe {
                         let _ = CloseHandle(h);
                     }
+                }
+                // One full live-image dump (the replay needs un-stale data
+                // regions; ~90 ms of extra freeze after the snapshots).
+                {
+                    let total = 0x372_000usize;
+                    let mut imgbuf = vec![0u8; total];
+                    let mut okp = 0usize;
+                    for off in (0..total).step_by(0x1000) {
+                        let len = 0x1000.min(total - off);
+                        if rpm(image_base + off, &mut imgbuf[off..off + len]) == len {
+                            okp += 1;
+                        }
+                    }
+                    let istem = out_path.with_extension("v2regsnatchimg");
+                    if let Some(name) = istem.file_name() {
+                        let mut n3 = name.to_os_string();
+                        n3.push(".bin");
+                        let _ = std::fs::write(istem.with_file_name(n3), &imgbuf);
+                    }
+                    info!(pages_ok = okp, "REGSNATCH: live image dumped");
                 }
                 let stem = out_path.with_extension("v2regsnatch");
                 if let Some(name) = stem.file_name() {
