@@ -3146,3 +3146,25 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
 - 备选（无注入风险路径）：REGSNATCH 失败时手动缝完 jmp 链
   （0x583cd→0x105d15c→…）或对 0x1020000 系（VMCTX 头，695 记录）与
   0x113f000（16 记录）做同款微扫分析。
+
+**续 21 补充 3（同日）——REGSNATCH 落地 + 结构突破：校验 = 逐字节值线程化解释器**：
+- **REGSNATCH 实装**（`MAGICMIDA_V2_REGSNATCH=1`）：VM 线程检测 =
+  scratch churn + EIP-in-image（main_tid 先扫）；SNATCH = Suspend→
+  GetContext(0x1F)→栈逐页 RPM（整段 RPM 遇未提交页全灭——逐 4KB 页读）
+  →Resume，64 张快照/2.9MB。edx 常持 scratch 指针、edi = 0x105FFAE。
+- **结构定案**：`movzx eax,al; jmp [edi+eax*4]`（edi=0x105FFAE）——
+  「scratch」实为 **256 槽派发表**（非对齐基址！）：**每个字节值一个
+  专属 handler**（校验期写了 168 个，全部唯一、互不共享），handler =
+  web 区 [0x1060000-0x1080000) 的 jmp 缝合静态片段（快照 eip 页已捕获）。
+  活状态 = 表内 3 个 dword：[0x105FFB2]/[0x105FFB6]/[0x105FFCA]（快照间
+  diff 只有这 3 处变——handler 槽全静态）。「831f magic/ctr/acc1/acc2」
+  = 这些表内 dword 的旧读法；布局随 op 相位漂移 = 表前缀被不同 op 复用。
+- **含义**：校验哈希 = 每输入字节经 bl 变换后按【字节值】派发到专属
+  handler，handler 内联更新 3 个状态 dword——g 的真身 = 168 个 handler
+  的语义和。**无需仿真**：handler 已捕获（eip 页 + scene 覆盖），逐个
+  缝合可读出每字节值的状态转移函数。
+- unicorn 重放（replay.py）= 从快照 EIP 跑 73 条后经未建的表槽派发崩
+  （快照态 = 相位中段、表增量构建）——重放需要相位入口起点；handler
+  直读路径更短，弃重放。
+- 下一轮：缝合 handler 链（0x1062857/0x1065bcf/…，每 handler ~10-30
+  片段），抽出 3 状态 dword 的转移函数 → 全 261 态验证 → f → .dat 重编码。

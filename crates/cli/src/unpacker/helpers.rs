@@ -873,6 +873,7 @@ pub(super) fn spawn_dialog_killer(
         && std::env::var("MAGICMIDA_V2_KEYFORGE").is_err()
         && std::env::var("MAGICMIDA_V2_OEPWATCH").is_err()
         && std::env::var("MAGICMIDA_V2_POOLSNIFF").is_err()
+        && std::env::var("MAGICMIDA_V2_REGSNATCH").is_err()
         && sp_groups.is_none()
     {
         return None;
@@ -3005,6 +3006,329 @@ pub(super) fn spawn_dialog_killer(
                 }
                 return;
             }
+            if std::env::var("MAGICMIDA_V2_REGSNATCH").is_ok()
+                && watch_t0.elapsed().as_millis() >= 100
+            {
+                use windows::Win32::Foundation::CloseHandle;
+                use windows::Win32::System::Diagnostics::Debug::{
+                    GetThreadContext, CONTEXT,
+                };
+                use windows::Win32::System::Threading::{
+                    OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT,
+                    THREAD_SUSPEND_RESUME,
+                };
+                let h_process = HANDLE(handle_raw as *mut core::ffi::c_void);
+                // Phase 1: needle find the .dat buffer (for the offline
+                // replay's input bytes).
+                let mut buf_addr: Option<usize> = None;
+                let mut scan_buf = vec![0u8; 1 << 20];
+                while buf_addr.is_none() && watch_t0.elapsed().as_millis() < 260 {
+                    use windows::Win32::System::Memory::{
+                        VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_PRIVATE,
+                        PAGE_NOACCESS,
+                    };
+                    let mut addr = 0x1_0000usize;
+                    while addr < 0x0800_0000 && buf_addr.is_none() {
+                        let mut mbi = MEMORY_BASIC_INFORMATION::default();
+                        // SAFETY: live handle; sized MBI.
+                        let q = unsafe {
+                            VirtualQueryEx(
+                                h_process,
+                                Some(addr as *const core::ffi::c_void),
+                                &mut mbi,
+                                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                            )
+                        };
+                        if q == 0 {
+                            break;
+                        }
+                        let base = mbi.BaseAddress as usize;
+                        let region = mbi.RegionSize as usize;
+                        let committed = mbi.State == MEM_COMMIT;
+                        let private = mbi.Type == MEM_PRIVATE;
+                        let readable = mbi.Protect != PAGE_NOACCESS && mbi.Protect.0 != 0;
+                        if committed && private && readable && region >= 480 {
+                            let mut roff = 0usize;
+                            while roff < region && buf_addr.is_none() {
+                                let len = scan_buf.len().min(region - roff);
+                                // SAFETY: committed readable region.
+                                let got = unsafe {
+                                    let mut n = 0;
+                                    let okr = ReadProcessMemory(
+                                        h_process,
+                                        (base + roff) as *const core::ffi::c_void,
+                                        scan_buf.as_mut_ptr() as *mut core::ffi::c_void,
+                                        len,
+                                        Some(&mut n),
+                                    )
+                                    .is_ok();
+                                    if okr { n } else { 0 }
+                                };
+                                if got >= 16 {
+                                    if let Some(p) = scan_buf[..got]
+                                        .windows(16)
+                                        .position(|w| w == dat_needle)
+                                    {
+                                        buf_addr = Some(base + roff + p);
+                                        info!(
+                                            t_ms = watch_t0.elapsed().as_millis() as u32,
+                                            buf = format!("{:p}", (base + roff + p) as *const core::ffi::c_void),
+                                            "REGSNATCH: .dat buffer located"
+                                        );
+                                        break;
+                                    }
+                                }
+                                roff += len;
+                            }
+                        }
+                        addr = base.saturating_add(region.max(0x1000));
+                    }
+                    if buf_addr.is_none() {
+                        std::thread::yield_now();
+                    }
+                }
+                let ba = buf_addr.unwrap_or(0);
+                let rpm = |va: usize, out: &mut [u8]| -> usize {
+                    // SAFETY: live handle; caller guarantees committed range.
+                    unsafe {
+                        let mut n = 0;
+                        let okr = ReadProcessMemory(
+                            h_process,
+                            va as *const core::ffi::c_void,
+                            out.as_mut_ptr() as *mut core::ffi::c_void,
+                            out.len(),
+                            Some(&mut n),
+                        )
+                        .is_ok();
+                        if okr { n } else { 0 }
+                    }
+                };
+                // Phase 2: find the VM thread.  Trigger = the op scratch
+                // window [0x5FFAE,+64B) CHURNING (the block hosts sequential
+                // ops; the check state need not carry the v3 magic).  Scan
+                // main_tid first (1 suspend), then the rest; candidate =
+                // EIP inside the image, lane-register match preferred.
+                let tids = list_target_thread_ids(pid);
+                let mut sc = [0u8; 64];
+                let mut prev_sc = [0u8; 64];
+                let mut vm_tid: Option<u32> = None;
+                let mut last_scan = std::time::Instant::now();
+                let _ = rpm(image_base + 0x5FFAE, &mut prev_sc);
+                while vm_tid.is_none() && watch_t0.elapsed().as_millis() < 400 {
+                    let got = rpm(image_base + 0x5FFAE, &mut sc);
+                    if got == 64 && sc != prev_sc {
+                        prev_sc = sc;
+                        if last_scan.elapsed().as_micros() < 150 {
+                            std::thread::yield_now();
+                            continue;
+                        }
+                        last_scan = std::time::Instant::now();
+                        let magic = u16::from_le_bytes([sc[0], sc[1]]);
+                        let ctr = u16::from_le_bytes([sc[4], sc[5]]) as u32;
+                        let acc1 = u16::from_le_bytes([sc[8], sc[9]]);
+                        let acc2 = u16::from_le_bytes([sc[0x18], sc[0x19]]);
+                        let acc1b = u16::from_le_bytes([sc[7], sc[8]]);
+                        let acc2b = u16::from_le_bytes([sc[0x17], sc[0x18]]);
+                        let mut scan_order: Vec<u32> = vec![main_tid];
+                        for &tid in &tids {
+                            if tid != main_tid {
+                                scan_order.push(tid);
+                            }
+                        }
+                        let mut lane_hit: Option<(u32, usize)> = None;
+                        let mut any_hit: Option<(u32, usize)> = None;
+                        for &tid in &scan_order {
+                            // SAFETY: tid from the snapshot; handle closed.
+                            let Ok(h) = (unsafe {
+                                OpenThread(
+                                    THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME,
+                                    false,
+                                    tid,
+                                )
+                            }) else {
+                                continue;
+                            };
+                            // SAFETY: valid handle.
+                            let prev = unsafe { SuspendThread(h) };
+                            if prev != u32::MAX {
+                                let mut ctx = CONTEXT::default();
+                                ctx.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_FLAGS(0x0001_0003);
+                                // SAFETY: valid handle; suspended thread.
+                                if unsafe { GetThreadContext(h, &mut ctx) }.is_ok() {
+                                    let eip = ctx.Eip as usize;
+                                    if eip >= image_base && eip < image_base + 0x400_000 {
+                                        let lo_c = (ctx.Ecx & 0xFFFF) as u16;
+                                        let lo_d = (ctx.Edx & 0xFFFF) as u16;
+                                        if lo_c == acc1 && lo_d == acc2 {
+                                            lane_hit = Some((tid, eip));
+                                            break;
+                                        }
+                                        if lo_c == acc1b && lo_d == acc2b {
+                                            lane_hit = Some((tid, eip));
+                                            break;
+                                        }
+                                        if any_hit.is_none() {
+                                            any_hit = Some((tid, eip));
+                                        }
+                                    }
+                                }
+                                // SAFETY: suspended above.
+                                unsafe {
+                                    let _ = ResumeThread(h);
+                                }
+                            }
+                            // SAFETY: handle from OpenThread.
+                            unsafe {
+                                let _ = CloseHandle(h);
+                            }
+                        }
+                        if let Some((tid, eip)) = lane_hit {
+                            vm_tid = Some(tid);
+                            info!(
+                                t_ms = watch_t0.elapsed().as_millis() as u32,
+                                tid,
+                                eip = format!("{eip:#x}"),
+                                magic = format!("{magic:#06x}"),
+                                ctr,
+                                "REGSNATCH: VM thread identified (lane match)"
+                            );
+                        } else if let Some((tid, eip)) = any_hit {
+                            // in-image + scratch churn = the VM thread; take it
+                            vm_tid = Some(tid);
+                            info!(
+                                t_ms = watch_t0.elapsed().as_millis() as u32,
+                                tid,
+                                eip = format!("{eip:#x}"),
+                                magic = format!("{magic:#06x}"),
+                                ctr,
+                                "REGSNATCH: VM thread identified (in-image, no lane match)"
+                            );
+                        }
+                    }
+                    if vm_tid.is_none() {
+                        std::thread::yield_now();
+                    }
+                }
+                // Phase 3: SNATCH loop.
+                let mut blobs: Vec<u8> = Vec::new();
+                let mut nsnap = 0usize;
+                if let Some(tid) = vm_tid {
+                    // SAFETY: tid from the snapshot; handle closed below.
+                    let Ok(h) = (unsafe {
+                        OpenThread(
+                            THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME,
+                            false,
+                            tid,
+                        )
+                    }) else {
+                        warn!("REGSNATCH: OpenThread failed - aborting");
+                        unsafe {
+                            let _ = TerminateProcess(h_process, 0x2C);
+                        }
+                        return;
+                    };
+                    let mut stack = vec![0u8; 0x8000];
+                    let mut eippage = [0u8; 0x1000];
+                    let mut block = [0u8; 0x2000];
+                    let mut buf480 = [0u8; 480];
+                    while nsnap < 64 {
+                        // SAFETY: valid handle.
+                        let prev = unsafe { SuspendThread(h) };
+                        if prev == u32::MAX {
+                            break;
+                        }
+                        let t_us = watch_t0.elapsed().as_micros() as u32;
+                        let mut ctx = CONTEXT::default();
+                        ctx.ContextFlags =
+                            windows::Win32::System::Diagnostics::Debug::CONTEXT_FLAGS(0x0001_001F);
+                        // SAFETY: valid handle; suspended thread.
+                        let got = unsafe { GetThreadContext(h, &mut ctx) }.is_ok();
+                        if !got {
+                            // SAFETY: suspended above.
+                            unsafe {
+                                let _ = ResumeThread(h);
+                            }
+                            break;
+                        }
+                        let eip = ctx.Eip as usize;
+                        let esp = ctx.Esp as usize;
+                        // page-wise stack read (a whole-range RPM dies on
+                        // any uncommitted page): [esp-0x4000, esp+0x4000)
+                        let mut slen = 0usize;
+                        for pg in 0..8u32 {
+                            let pa = (esp & !0xFFF).wrapping_sub(0x4000)
+                                .wrapping_add((pg as usize) * 0x1000);
+                            let _got_p = rpm(pa, &mut stack[slen..slen + 0x1000]);
+                            slen += 0x1000;
+                        }
+                        let mut plen = 0usize;
+                        if eip >= 0x10000 {
+                            plen = rpm(eip & !0xFFF, &mut eippage);
+                        }
+                        let blen = rpm(image_base + 0x5F000, &mut block);
+                        let got_s = rpm(image_base + 0x5FFAE, &mut sc);
+                        let got_b = if ba != 0 { rpm(ba, &mut buf480) } else { 0 };
+                        // SAFETY: suspended above.
+                        unsafe {
+                            let _ = ResumeThread(h);
+                        }
+                        if got_s == 64 {
+                            let ctr = u16::from_le_bytes([sc[4], sc[5]]) as u32;
+                            let magic = u16::from_le_bytes([sc[0], sc[1]]);
+                            if nsnap % 8 == 0 {
+                                info!(
+                                    t_ms = watch_t0.elapsed().as_millis() as u32,
+                                    snap = nsnap,
+                                    eip = format!("{eip:#x}"),
+                                    ctr,
+                                    "REGSNATCH: snapshot"
+                                );
+                            }
+                            let _ = (magic, ctr);
+                        }
+                        blobs.extend_from_slice(&t_us.to_le_bytes());
+                        blobs.extend_from_slice(&tid.to_le_bytes());
+                        blobs.extend_from_slice(&(eip as u32).to_le_bytes());
+                        for v in [
+                            ctx.Eax, ctx.Ebx, ctx.Ecx, ctx.Edx, ctx.Esi, ctx.Edi, ctx.Ebp,
+                            ctx.Esp, ctx.EFlags,
+                        ] {
+                            blobs.extend_from_slice(&v.to_le_bytes());
+                        }
+                        blobs.extend_from_slice(&(slen as u32).to_le_bytes());
+                        blobs.extend_from_slice(&stack[..slen]);
+                        blobs.extend_from_slice(&(plen as u32).to_le_bytes());
+                        blobs.extend_from_slice(&eippage[..plen]);
+                        blobs.extend_from_slice(&(blen as u32).to_le_bytes());
+                        blobs.extend_from_slice(&block[..blen]);
+                        blobs.extend_from_slice(&(got_s as u32).to_le_bytes());
+                        blobs.extend_from_slice(&sc[..got_s]);
+                        blobs.extend_from_slice(&(got_b as u32).to_le_bytes());
+                        blobs.extend_from_slice(&buf480[..got_b]);
+                        nsnap += 1;
+                    }
+                    // SAFETY: handle from OpenThread.
+                    unsafe {
+                        let _ = CloseHandle(h);
+                    }
+                }
+                let stem = out_path.with_extension("v2regsnatch");
+                if let Some(name) = stem.file_name() {
+                    let mut n2 = name.to_os_string();
+                    n2.push(".bin");
+                    let _ = std::fs::write(stem.with_file_name(n2), &blobs);
+                }
+                info!(
+                    snapshots = nsnap,
+                    t_ms = watch_t0.elapsed().as_millis() as u32,
+                    "REGSNATCH: done - log flushed"
+                );
+                dump_failfreeze_scene(pid, h_process, image_base, &out_path);
+                unsafe {
+                    let _ = TerminateProcess(h_process, 0x2C);
+                }
+                return;
+            }
             if std::env::var("MAGICMIDA_V2_POOLSNIFF").is_ok()
                 && watch_t0.elapsed().as_millis() >= 100
             {
@@ -3197,21 +3521,31 @@ pub(super) fn spawn_dialog_killer(
                     t_ms = watch_t0.elapsed().as_millis() as u32,
                     "POOLSNIFF: baselines taken - sweeping"
                 );
-                // Phase 4: sweep loop through t_fill + 400 ms.
+                // Phase 4: adaptive capture — full sweep finds the ACTIVE
+                // region (changed vs its LAST-SWEEP content), then the hot
+                // 8 KB window is micro-swept at ~40 µs/iter recording every
+                // transition.  A mini-sweep every 128 micro-iterations
+                // re-centres the hot window and keeps the coarse map alive.
                 let mut blobs: Vec<u8> = Vec::new();
                 let mut nrec: usize = 0;
                 let mut seen: std::collections::HashSet<(usize, u64)> =
                     std::collections::HashSet::new();
                 let mut sweeps: u64 = 0;
+                let mut micros: u64 = 0;
                 let mut cont_buf = [0u8; 8];
                 let mut dp_buf = [0u8; 4];
                 let mut sweep = Vec::new();
+                let mut hot_buf = Vec::new();
                 let mut last_snap = snap;
+                // per-region last-sweep content (activity = diff vs this)
+                let mut prev: Vec<Vec<u8>> = baselines.clone();
+                let mut hot: Option<(usize, usize)> = None; // (addr, len)
+                let mut hot_prev: Vec<u8> = Vec::new();
+                let mut hot_quiet: u32 = 0;
                 while watch_t0.elapsed().as_micros() < t_fill as u128 + 400_000
-                    && nrec < 4096
+                    && nrec < 8192
                 {
-                    sweeps += 1;
-                    // contA/contB + dp for the record header.
+                    // Bank state for the record header.
                     // SAFETY: live handle; bank slots.
                     unsafe {
                         let mut n = 0;
@@ -3233,64 +3567,186 @@ pub(super) fn spawn_dialog_killer(
                     let ca = u32::from_le_bytes(cont_buf[0..4].try_into().unwrap());
                     let cb = u32::from_le_bytes(cont_buf[4..8].try_into().unwrap());
                     let dp = u32::from_le_bytes(dp_buf);
-                    for (ri, (base, len)) in regions.iter().enumerate() {
-                        if sweep.len() != *len {
-                            sweep.resize(*len, 0);
+                    if ca == FAIL_MARK {
+                        break;
+                    }
+                    let t_us = watch_t0.elapsed().as_micros() as u32;
+                    let do_full = hot.is_none() || micros % 128 == 0;
+                    // ---- micro-sweep the hot window ----
+                    if let Some((ha, hl)) = hot {
+                        micros += 1;
+                        if hot_buf.len() != hl {
+                            hot_buf.resize(hl, 0);
                         }
-                        // SAFETY: live handle; committed readable region.
+                        // SAFETY: live handle; committed readable window.
                         let got = unsafe {
                             let mut n = 0;
                             let okr = ReadProcessMemory(
                                 h_process,
-                                *base as *const core::ffi::c_void,
-                                sweep.as_mut_ptr() as *mut core::ffi::c_void,
-                                *len,
+                                ha as *const core::ffi::c_void,
+                                hot_buf.as_mut_ptr() as *mut core::ffi::c_void,
+                                hl,
                                 Some(&mut n),
                             )
                             .is_ok();
                             if okr { n } else { 0 }
                         };
-                        if got == 0 {
-                            continue;
-                        }
-                        let baseb = &baselines[ri];
-                        // first 64 B chunk that diverges from the baseline
-                        let mut diff = None;
-                        for (ci, (a, b)) in sweep[..got]
-                            .chunks_exact(64)
-                            .zip(baseb[..got].chunks_exact(64))
-                            .enumerate()
-                        {
-                            if a != b {
-                                diff = Some(ci * 64);
-                                break;
+                        if got != hl {
+                            hot_quiet += 4;
+                        } else if hot_buf[..] != hot_prev[..] {
+                            let mut off = 0usize;
+                            for ci in 0..got / 64 {
+                                if hot_buf[ci * 64..ci * 64 + 64]
+                                    != hot_prev[ci * 64..ci * 64 + 64]
+                                {
+                                    off = ci * 64;
+                                    break;
+                                }
                             }
-                        }
-                        if let Some(off) = diff {
                             let body_off = off & !0x3FF;
-                            let body_len = 1024.min(got.saturating_sub(body_off));
-                            if body_len < 256 {
+                            let body_len = 1024.min(got - body_off);
+                            if body_len >= 256 {
+                                let mut h: u64 = 0xCBF1_6CE9_C7A5_5CA9;
+                                for &x in &hot_buf[body_off..body_off + body_len] {
+                                    h ^= x as u64;
+                                    h = h.wrapping_mul(0x0000_0100_0000_01B3);
+                                }
+                                if seen.insert((ha + body_off, h)) {
+                                    blobs.extend_from_slice(&t_us.to_le_bytes());
+                                    blobs.extend_from_slice(
+                                        &((ha + body_off) as u32).to_le_bytes(),
+                                    );
+                                    blobs.extend_from_slice(&(off as u32).to_le_bytes());
+                                    blobs.extend_from_slice(&dp.to_le_bytes());
+                                    blobs.extend_from_slice(&ca.to_le_bytes());
+                                    blobs.extend_from_slice(&cb.to_le_bytes());
+                                    blobs.extend_from_slice(&(body_len as u32).to_le_bytes());
+                                    blobs.extend_from_slice(
+                                        &hot_buf[body_off..body_off + body_len],
+                                    );
+                                    nrec += 1;
+                                }
+                            }
+                            hot_prev.copy_from_slice(&hot_buf);
+                            hot_quiet = 0;
+                        } else {
+                            hot_quiet += 1;
+                        }
+                        if micros % 256 == 0 {
+                            std::thread::yield_now();
+                        }
+                    }
+                    // ---- full / mini sweep: coarse records + hot steering ----
+                    if do_full {
+                        sweeps += 1;
+                        let mut cand: Option<(usize, usize, usize, usize)> = None;
+                        for (ri, (base, len)) in regions.iter().enumerate() {
+                            if sweep.len() != *len {
+                                sweep.resize(*len, 0);
+                            }
+                            // SAFETY: live handle; committed readable region.
+                            let got = unsafe {
+                                let mut n = 0;
+                                let okr = ReadProcessMemory(
+                                    h_process,
+                                    *base as *const core::ffi::c_void,
+                                    sweep.as_mut_ptr() as *mut core::ffi::c_void,
+                                    *len,
+                                    Some(&mut n),
+                                )
+                                .is_ok();
+                                if okr { n } else { 0 }
+                            };
+                            if got == 0 {
                                 continue;
                             }
-                            let mut h: u64 = 0xCBF1_6CE9_C7A5_5CA9;
-                            for &x in &sweep[body_off..body_off + body_len] {
-                                h ^= x as u64;
-                                h = h.wrapping_mul(0x0000_0100_0000_01B3);
+                            // activity = changed vs the LAST sweep
+                            let active = sweep[..got] != prev[ri][..got];
+                            if !active {
+                                continue;
                             }
-                            if seen.insert((ri, h)) {
-                                blobs.extend_from_slice(
-                                    &(watch_t0.elapsed().as_micros() as u32).to_le_bytes(),
-                                );
-                                blobs.extend_from_slice(&(*base + body_off).to_le_bytes());
-                                blobs.extend_from_slice(&(off as u32).to_le_bytes());
-                                blobs.extend_from_slice(&dp.to_le_bytes());
-                                blobs.extend_from_slice(&ca.to_le_bytes());
-                                blobs.extend_from_slice(&cb.to_le_bytes());
-                                let bl = body_len as u32;
-                                blobs.extend_from_slice(&bl.to_le_bytes());
-                                blobs.extend_from_slice(&sweep[body_off..body_off + body_len]);
-                                nrec += 1;
+                            // first changed 64 B chunk
+                            let mut off = 0usize;
+                            for ci in 0..got / 64 {
+                                if sweep[ci * 64..ci * 64 + 64]
+                                    != prev[ri][ci * 64..ci * 64 + 64]
+                                {
+                                    off = ci * 64;
+                                    break;
+                                }
                             }
+                            // coarse record (body around the change), deduped
+                            let body_off = off & !0x3FF;
+                            let body_len = 1024.min(got - body_off);
+                            if body_len >= 256 {
+                                let mut h: u64 = 0xCBF1_6CE9_C7A5_5CA9;
+                                for &x in &sweep[body_off..body_off + body_len] {
+                                    h ^= x as u64;
+                                    h = h.wrapping_mul(0x0000_0100_0000_01B3);
+                                }
+                                if seen.insert((*base + body_off, h)) {
+                                    blobs.extend_from_slice(&t_us.to_le_bytes());
+                                    blobs.extend_from_slice(
+                                        &((*base + body_off) as u32).to_le_bytes(),
+                                    );
+                                    blobs.extend_from_slice(&(off as u32).to_le_bytes());
+                                    blobs.extend_from_slice(&dp.to_le_bytes());
+                                    blobs.extend_from_slice(&ca.to_le_bytes());
+                                    blobs.extend_from_slice(&cb.to_le_bytes());
+                                    blobs.extend_from_slice(&(body_len as u32).to_le_bytes());
+                                    blobs.extend_from_slice(
+                                        &sweep[body_off..body_off + body_len],
+                                    );
+                                    nrec += 1;
+                                }
+                            }
+                            // hot candidate: prefer image chunks (ri < 14),
+                            // keep the earliest in inventory order
+                            let is_image = ri < 14;
+                            if is_image {
+                                let better = match cand {
+                                    None => true,
+                                    Some((_, _, cri, _)) => ri < cri,
+                                };
+                                if better {
+                                    cand = Some((*base + (off & !0xFFF), 0x2000, ri, off));
+                                }
+                            } else if cand.is_none() {
+                                cand = Some((*base + (off & !0xFFF), 0x2000, ri, off));
+                            }
+                            prev[ri][..got].copy_from_slice(&sweep[..got]);
+                        }
+                        // steer: re-centre hot when it is quiet but its
+                        // region is active elsewhere, or when another
+                        // image region is active
+                        if let Some((na, nl, _, _)) = cand {
+                            let take = match hot {
+                                None => true,
+                                Some((ha, _)) => {
+                                    let same = na & !0xFFF == ha & !0xFFF;
+                                    !same && hot_quiet >= 6
+                                }
+                            };
+                            if take {
+                                hot = Some((na, nl));
+                                hot_prev.clear();
+                                hot_prev.resize(nl, 0);
+                                // SAFETY: live handle; committed window.
+                                unsafe {
+                                    let mut n = 0;
+                                    let _ = ReadProcessMemory(
+                                        h_process,
+                                        na as *const core::ffi::c_void,
+                                        hot_prev.as_mut_ptr() as *mut core::ffi::c_void,
+                                        nl,
+                                        Some(&mut n),
+                                    );
+                                }
+                                hot_quiet = 0;
+                            }
+                        }
+                        if hot.is_some() && hot_quiet >= 40 {
+                            hot = None;
                         }
                     }
                     // Buffer boundary log: the check window ends when the
@@ -3317,13 +3773,17 @@ pub(super) fn spawn_dialog_killer(
                         );
                         last_snap = snap;
                     }
-                    if ca == FAIL_MARK {
-                        break;
-                    }
-                    if sweeps % 4 == 0 {
+                    if sweeps % 4 == 0 && hot.is_none() {
                         std::thread::yield_now();
                     }
                 }
+                info!(
+                    sweeps,
+                    micros,
+                    records = nrec,
+                    t_ms = watch_t0.elapsed().as_millis() as u32,
+                    "POOLSNIFF: window over - log flushed"
+                );
                 let stem = out_path.with_extension("v2poolsniff");
                 if let Some(name) = stem.file_name() {
                     let mut n2 = name.to_os_string();
