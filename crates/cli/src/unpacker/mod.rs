@@ -478,6 +478,10 @@ pub fn unpack(
     // V2 key forge (`MAGICMIDA_V2_KEYFORGE=1`): DECODEWATCH + overwrite the
     // decoded key block with this machine's keys at the decrypt completion.
     let keyforge_on = std::env::var("MAGICMIDA_V2_KEYFORGE").is_ok();
+    // V2 OEP watcher (`MAGICMIDA_V2_OEPWATCH=1`): locate the shell's
+    // runtime copy of the original program after the licence pass and dump
+    // it at the control transfer.
+    let oepwatch_on = std::env::var("MAGICMIDA_V2_OEPWATCH").is_ok();
     #[cfg(target_arch = "x86")]
     let mut datrip_state: Option<helpers::DatRipState> = None;
     #[cfg(target_arch = "x86")]
@@ -549,6 +553,7 @@ pub fn unpack(
                 dbg.image_base() as usize,
                 &output_path,
                 dbg.main_thread_id(),
+                input,
             ) {
                 let _ = join; // self-terminating
             }
@@ -694,7 +699,8 @@ pub fn unpack(
                 || blkstream_on
                 || listwatch_on
                 || decodewatch_on
-                || keyforge_on)
+                || keyforge_on
+                || oepwatch_on)
             && post_attach
         {
             // RIPCAT/BLKSTREAM: a 5 ms tick starves the micro-poll - the

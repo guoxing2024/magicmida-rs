@@ -3066,3 +3066,42 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   （CISC-1 230ms 点火 ✓）；OEPWATCH 首版实装（零发现——壳中止未建副本）；
   DECODEWATCH 记录并入列表区快照（+256B）。forge 的 [300,352) 第二块
   补写 + 19 字段连续重写（548 轮）——仍 miss（搜索输入 ≠ 这些区域）。
+
+**续 21（2026-11-06/07）——POOLSNIFF：校验 op 定位 + 状态机捕获**：
+
+- **旧捕获的法证重建**：YDW4/CISC1test 的 DECODEWATCH "blk" 字段读在
+  `ca-0x100`，而 ca = **数据游标**——读到的全是缓冲区（raw .dat 高熵 =
+  「加密垃圾」假象）。瞬态块从未被读过。静默间隙 [190,216)ms（YDW2）=
+  **校验窗口**（缓冲零写入 → dedup 键不变 → 零记录）。
+- **POOLSNIFF v1**（`MAGICMIDA_V2_POOLSNIFF=1`）：fill 完成（nz≥460）时
+  对全部 committed MEM_PRIVATE 区拍基线，µs 扫差异。1089 扫 702 记录——
+  全是堆/数据churn，无 op 代码：**inventory 排除了 image**。
+- **关键推理**：t=228.1（解密活跃）ca=0xfe0130、dp=0xd3807 →
+  ca+dp = 0x10B3937 = **image RVA 0xB3937**——op 从 image 内执行（静
+  态加密、执行期解密）。scene vs 盘上文件的逐页 diff：[0x80000,0x372000)
+  682 页几乎全页不同 = 该区整体在 run 期被解密/重写。
+- **POOLSNIFF v2**：基线 = **整个 image**（256KB 块）+ 私有区，µs 扫。
+  本 run：buffer=0x3530000，fill 完成 191ms，**校验窗口 [196,220)ms**
+  （220 nz=4 擦除起、[221,233] 段写、295 残留 16）——144 扫、176 记录。
+- **校验 op = image RVA 0x5FC00**（op 带尾部！）：[202.5,219.2]ms 16 次
+  捕获**代码逐字节相同**、仅 48B scratch（RVA [0x5FFAE,0x5FFDE)）变化 =
+  自循环 op，每捕获 ~1.1ms 一迭代。同期仅它 + 0x1020000（VMCTX 头）+
+  一次性堆块活跃；0x105FC00 的 87 个体 = 派发/各相 op 流。
+- **状态布局定案**（scratch@0x5FFAE）：`831f` 魔数、**[+4]=u16 已消费字
+  节计数器**（步长 15-21、均值 17——非均匀！数据相关消费）、**[+8]=u16
+  累加器 1**（高字恒 0）、**[+0x18]=u16 累加器 2**、[+0x1c]=flags。
+  op_13 起布局改变（计数器回卷 = 第二遍）。12 个干净转移存
+  `OUT/ps1/check_states.json`（ctr 1→204，acc1 0x007a→0x30c2，
+  acc2 0x0000→0x9ed7）。
+- **op 流形状**（fold+linear disasm）：op 进入共享管线
+  （0x5c3e1→0x57834→0x56915→0x556cb→**0x534f2**）：
+  `lodsb al,[esi]; xor al,bl; … mov byte ptr [edi+eax*4],bh; … 回跳`
+  ——字节流读入 + **256 槽×4B 步长表写**（dispatch 表构建/直方图）。
+  简单假设（sum/xor/组合）对 12 转移全负——真实混合函数在变异代码里，
+  fold 被 `mov cl,0xf7; dec cl; jne` 型 opaque predicate 卡死。
+- **缺口（下一轮）**：最终态 + 比较发生在 t∈[219.2,220.3) 的 1.1ms 扫描
+  间隙里被 dedup 吞掉。**v3 = 热窗微扫**（只重读 [0x105FC00,0x1060000)
+  1KB + 自适应，~200µs 节奏）→ 抓全 ~28 态 + **最终 acc + cmp 期望值**
+  → C 暴力/直读 f → .dat 重编码。或离线续读 op 剩余片段。
+- 工程同轮：POOLSNIFF 实装（helpers +650 行）；OEPWATCH 泛化补丁一并
+  入库；修 `tag` unused 告警（零告警恢复）。

@@ -829,6 +829,7 @@ pub(super) fn spawn_dialog_killer(
     image_base: usize,
     output_path: &Path,
     main_tid: u32,
+    sample_path: &Path,
 ) -> Option<std::thread::JoinHandle<()>> {
 
     let strpatch_arg = std::env::var("MAGICMIDA_V2_STRPATCH").ok();
@@ -870,6 +871,8 @@ pub(super) fn spawn_dialog_killer(
         && std::env::var("MAGICMIDA_V2_LISTWATCH").is_err()
         && std::env::var("MAGICMIDA_V2_DECODEWATCH").is_err()
         && std::env::var("MAGICMIDA_V2_KEYFORGE").is_err()
+        && std::env::var("MAGICMIDA_V2_OEPWATCH").is_err()
+        && std::env::var("MAGICMIDA_V2_POOLSNIFF").is_err()
         && sp_groups.is_none()
     {
         return None;
@@ -877,6 +880,37 @@ pub(super) fn spawn_dialog_killer(
     let handle_raw = h_process.0 as isize;
     let out_path = output_path.to_path_buf();
     let watch_t0 = std::time::Instant::now();
+    // Per-sample .dat reference (the needle + the forge trigger): read the
+    // licence file that sits next to the sample (<stem>.dat) from disk.
+    let dat_path = sample_path.with_extension("dat");
+    let dat_disk = std::fs::read(&dat_path).unwrap_or_default();
+    let dat_needle: [u8; 16] = if dat_disk.len() >= 16 {
+        let mut n = [0u8; 16];
+        n.copy_from_slice(&dat_disk[..16]);
+        n
+    } else {
+        [0u8; 16]
+    };
+    // Per-sample disk EXE reference for OEPWATCH: the header page (4 KB)
+    // and the packed EP from the (fake) on-disk header.
+    let disk_exe = std::fs::read(sample_path).unwrap_or_default();
+    let mut disk_head4k = [0u8; 4096];
+    let take = disk_exe.len().min(4096);
+    disk_head4k[..take].copy_from_slice(&disk_exe[..take]);
+    let packed_ep: u32 = if disk_exe.len() >= 0x40 + 0x100 {
+        // e_lfanew at 0x3c; AddressOfEntryPoint = e_lfanew + 0x28. The
+        // on-disk header is shell-forged but its EP field = the packed EP
+        // the copy starts with.
+        let lfa = u32::from_le_bytes(disk_exe[0x3c..0x40].try_into().unwrap()) as usize;
+        if disk_exe.len() >= lfa + 0x2c {
+            u32::from_le_bytes(disk_exe[lfa + 0x28..lfa + 0x2c].try_into().unwrap())
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    let oepwatch = std::env::var("MAGICMIDA_V2_OEPWATCH").is_ok();
     let join = std::thread::spawn(move || {
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
@@ -1060,10 +1094,9 @@ pub(super) fn spawn_dialog_killer(
         let keyforge = std::env::var("MAGICMIDA_V2_KEYFORGE").is_ok();
         const FORGE_KEY1: u32 = 0x7DC8_0DE6;
         const FORGE_KEY2: u32 = 0x0228_69C8;
-        const DAT_HEAD: [u8; 16] = [
-            0x81, 0xf8, 0xf1, 0x4e, 0xc7, 0x66, 0x56, 0x78, 0x67, 0x57, 0xed,
-            0x71, 0xe0, 0xd7, 0xbd, 0x4c,
-        ];
+        // DAT_HEAD replaced by the per-sample dat_needle (read from
+        // <sample>.dat on disk above).
+        let _ = dat_needle;
         const LIC_FIELDS: [usize; 19] = [
             0x20415, 0x20659, 0x21621, 0x21761, 0x21871, 0x2192D, 0x219C1,
             0x21CE5, 0x22C09, 0x22CF5, 0x22DC9, 0x22E85, 0x22ECD, 0x23001,
@@ -2972,6 +3005,343 @@ pub(super) fn spawn_dialog_killer(
                 }
                 return;
             }
+            if std::env::var("MAGICMIDA_V2_POOLSNIFF").is_ok()
+                && watch_t0.elapsed().as_millis() >= 100
+            {
+                let h_process = HANDLE(handle_raw as *mut core::ffi::c_void);
+                let mut buf_addr: Option<usize> = None;
+                let mut scan_buf = vec![0u8; 1 << 20];
+                let mut snap = [0u8; 480];
+                // Phase 1: needle find the 480 B buffer (same as DECODEWATCH).
+                while buf_addr.is_none() && watch_t0.elapsed().as_millis() < 260 {
+                    use windows::Win32::System::Memory::{
+                        VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_PRIVATE,
+                        PAGE_NOACCESS,
+                    };
+                    let mut addr = 0x1_0000usize;
+                    while addr < 0x0800_0000 && buf_addr.is_none() {
+                        let mut mbi = MEMORY_BASIC_INFORMATION::default();
+                        // SAFETY: live handle; sized MBI.
+                        let q = unsafe {
+                            VirtualQueryEx(
+                                h_process,
+                                Some(addr as *const core::ffi::c_void),
+                                &mut mbi,
+                                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                            )
+                        };
+                        if q == 0 {
+                            break;
+                        }
+                        let base = mbi.BaseAddress as usize;
+                        let region = mbi.RegionSize as usize;
+                        let committed = mbi.State == MEM_COMMIT;
+                        let private = mbi.Type == MEM_PRIVATE;
+                        let readable = mbi.Protect != PAGE_NOACCESS && mbi.Protect.0 != 0;
+                        if committed && private && readable && region >= 480 {
+                            let mut roff = 0usize;
+                            while roff < region && buf_addr.is_none() {
+                                let len = scan_buf.len().min(region - roff);
+                                // SAFETY: committed readable region.
+                                let got = unsafe {
+                                    let mut n = 0;
+                                    let okr = ReadProcessMemory(
+                                        h_process,
+                                        (base + roff) as *const core::ffi::c_void,
+                                        scan_buf.as_mut_ptr() as *mut core::ffi::c_void,
+                                        len,
+                                        Some(&mut n),
+                                    )
+                                    .is_ok();
+                                    if okr { n } else { 0 }
+                                };
+                                if got >= 16 {
+                                    if let Some(p) = scan_buf[..got]
+                                        .windows(16)
+                                        .position(|w| w == dat_needle)
+                                    {
+                                        buf_addr = Some(base + roff + p);
+                                        info!(
+                                            t_ms = watch_t0.elapsed().as_millis() as u32,
+                                            buf = format!("{:p}", (base + roff + p) as *const core::ffi::c_void),
+                                            "POOLSNIFF: .dat buffer located"
+                                        );
+                                        break;
+                                    }
+                                }
+                                roff += len;
+                            }
+                        }
+                        addr = base.saturating_add(region.max(0x1000));
+                    }
+                    if buf_addr.is_none() {
+                        std::thread::yield_now();
+                    }
+                }
+                if buf_addr.is_none() {
+                    warn!("POOLSNIFF: buffer never located - aborting watcher");
+                    unsafe {
+                        let _ = TerminateProcess(h_process, 0x2C);
+                    }
+                    return;
+                }
+                let ba = buf_addr.unwrap();
+                // Phase 2: poll to fill-complete (snap_nz >= 460).
+                loop {
+                    // SAFETY: live handle; the 480 B buffer.
+                    let ok_s = unsafe {
+                        let mut n = 0;
+                        ReadProcessMemory(
+                            h_process,
+                            ba as *const core::ffi::c_void,
+                            snap.as_mut_ptr() as *mut core::ffi::c_void,
+                            480,
+                            Some(&mut n),
+                        )
+                        .is_ok()
+                            && n == 480
+                    };
+                    let nz = if ok_s {
+                        snap.iter().filter(|&&b| b != 0).count()
+                    } else {
+                        0
+                    };
+                    if nz >= 460 {
+                        info!(
+                            t_ms = watch_t0.elapsed().as_millis() as u32,
+                            "POOLSNIFF: fill complete - baseline + sweeps on"
+                        );
+                        break;
+                    }
+                    if watch_t0.elapsed().as_millis() > 400 {
+                        warn!("POOLSNIFF: fill never completed - aborting");
+                        unsafe {
+                            let _ = TerminateProcess(h_process, 0x2C);
+                        }
+                        return;
+                    }
+                    std::thread::yield_now();
+                }
+                let t_fill = watch_t0.elapsed().as_micros() as u32;
+                // Phase 3: inventory = image 256 KB chunks + private regions.
+                let mut regions: Vec<(usize, usize)> = Vec::new();
+                {
+                    use windows::Win32::System::Memory::{
+                        VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_PRIVATE,
+                        PAGE_NOACCESS,
+                    };
+                    // image chunks: [image+0x1000, image+0x372000)
+                    let mut a = 0x1000usize;
+                    while a < 0x372_000 {
+                        let len = 0x40_000usize.min(0x372_000 - a);
+                        regions.push((image_base + a, len));
+                        a += len;
+                    }
+                    let mut addr = 0x1_0000usize;
+                    let mut total = 0usize;
+                    while addr < 0x0800_0000 {
+                        let mut mbi = MEMORY_BASIC_INFORMATION::default();
+                        // SAFETY: live handle; sized MBI.
+                        let q = unsafe {
+                            VirtualQueryEx(
+                                h_process,
+                                Some(addr as *const core::ffi::c_void),
+                                &mut mbi,
+                                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                            )
+                        };
+                        if q == 0 {
+                            break;
+                        }
+                        let base = mbi.BaseAddress as usize;
+                        let region = mbi.RegionSize as usize;
+                        let committed = mbi.State == MEM_COMMIT;
+                        let private = mbi.Type == MEM_PRIVATE;
+                        let readable = mbi.Protect != PAGE_NOACCESS && mbi.Protect.0 != 0;
+                        let in_image =
+                            base >= image_base && base < image_base + 0x400_000;
+                        let holds_buf = ba >= base && ba < base + region;
+                        if committed && private && readable && !in_image && !holds_buf {
+                            let len = region.min(0x1_0000);
+                            if region >= 0x1000 && total + len <= 4 << 20 && regions.len() < 120 {
+                                regions.push((base, len));
+                                total += len;
+                            }
+                        }
+                        addr = base.saturating_add(region.max(0x1000));
+                    }
+                }
+                info!(
+                    regions = regions.len(),
+                    bytes = regions.iter().map(|r| r.1).sum::<usize>(),
+                    t_ms = watch_t0.elapsed().as_millis() as u32,
+                    "POOLSNIFF: inventory built"
+                );
+                let mut baselines: Vec<Vec<u8>> = Vec::with_capacity(regions.len());
+                for (base, len) in &regions {
+                    let mut b = vec![0u8; *len];
+                    // SAFETY: live handle; committed readable region.
+                    unsafe {
+                        let mut n = 0;
+                        let _ = ReadProcessMemory(
+                            h_process,
+                            *base as *const core::ffi::c_void,
+                            b.as_mut_ptr() as *mut core::ffi::c_void,
+                            *len,
+                            Some(&mut n),
+                        );
+                    }
+                    baselines.push(b);
+                }
+                info!(
+                    t_ms = watch_t0.elapsed().as_millis() as u32,
+                    "POOLSNIFF: baselines taken - sweeping"
+                );
+                // Phase 4: sweep loop through t_fill + 400 ms.
+                let mut blobs: Vec<u8> = Vec::new();
+                let mut nrec: usize = 0;
+                let mut seen: std::collections::HashSet<(usize, u64)> =
+                    std::collections::HashSet::new();
+                let mut sweeps: u64 = 0;
+                let mut cont_buf = [0u8; 8];
+                let mut dp_buf = [0u8; 4];
+                let mut sweep = Vec::new();
+                let mut last_snap = snap;
+                while watch_t0.elapsed().as_micros() < t_fill as u128 + 400_000
+                    && nrec < 4096
+                {
+                    sweeps += 1;
+                    // contA/contB + dp for the record header.
+                    // SAFETY: live handle; bank slots.
+                    unsafe {
+                        let mut n = 0;
+                        let _ = ReadProcessMemory(
+                            h_process,
+                            (bank_addr + 0x1E) as *const core::ffi::c_void,
+                            cont_buf.as_mut_ptr() as *mut core::ffi::c_void,
+                            8,
+                            Some(&mut n),
+                        );
+                        let _ = ReadProcessMemory(
+                            h_process,
+                            (bank_addr + 0x2C) as *const core::ffi::c_void,
+                            dp_buf.as_mut_ptr() as *mut core::ffi::c_void,
+                            4,
+                            Some(&mut n),
+                        );
+                    }
+                    let ca = u32::from_le_bytes(cont_buf[0..4].try_into().unwrap());
+                    let cb = u32::from_le_bytes(cont_buf[4..8].try_into().unwrap());
+                    let dp = u32::from_le_bytes(dp_buf);
+                    for (ri, (base, len)) in regions.iter().enumerate() {
+                        if sweep.len() != *len {
+                            sweep.resize(*len, 0);
+                        }
+                        // SAFETY: live handle; committed readable region.
+                        let got = unsafe {
+                            let mut n = 0;
+                            let okr = ReadProcessMemory(
+                                h_process,
+                                *base as *const core::ffi::c_void,
+                                sweep.as_mut_ptr() as *mut core::ffi::c_void,
+                                *len,
+                                Some(&mut n),
+                            )
+                            .is_ok();
+                            if okr { n } else { 0 }
+                        };
+                        if got == 0 {
+                            continue;
+                        }
+                        let baseb = &baselines[ri];
+                        // first 64 B chunk that diverges from the baseline
+                        let mut diff = None;
+                        for (ci, (a, b)) in sweep[..got]
+                            .chunks_exact(64)
+                            .zip(baseb[..got].chunks_exact(64))
+                            .enumerate()
+                        {
+                            if a != b {
+                                diff = Some(ci * 64);
+                                break;
+                            }
+                        }
+                        if let Some(off) = diff {
+                            let body_off = off & !0x3FF;
+                            let body_len = 1024.min(got.saturating_sub(body_off));
+                            if body_len < 256 {
+                                continue;
+                            }
+                            let mut h: u64 = 0xCBF1_6CE9_C7A5_5CA9;
+                            for &x in &sweep[body_off..body_off + body_len] {
+                                h ^= x as u64;
+                                h = h.wrapping_mul(0x0000_0100_0000_01B3);
+                            }
+                            if seen.insert((ri, h)) {
+                                blobs.extend_from_slice(
+                                    &(watch_t0.elapsed().as_micros() as u32).to_le_bytes(),
+                                );
+                                blobs.extend_from_slice(&(*base + body_off).to_le_bytes());
+                                blobs.extend_from_slice(&(off as u32).to_le_bytes());
+                                blobs.extend_from_slice(&dp.to_le_bytes());
+                                blobs.extend_from_slice(&ca.to_le_bytes());
+                                blobs.extend_from_slice(&cb.to_le_bytes());
+                                let bl = body_len as u32;
+                                blobs.extend_from_slice(&bl.to_le_bytes());
+                                blobs.extend_from_slice(&sweep[body_off..body_off + body_len]);
+                                nrec += 1;
+                            }
+                        }
+                    }
+                    // Buffer boundary log: the check window ends when the
+                    // buffer moves again (wipe or decrypt writes).
+                    // SAFETY: live handle; the 480 B buffer.
+                    let ok_s = unsafe {
+                        let mut n = 0;
+                        ReadProcessMemory(
+                            h_process,
+                            ba as *const core::ffi::c_void,
+                            snap.as_mut_ptr() as *mut core::ffi::c_void,
+                            480,
+                            Some(&mut n),
+                        )
+                        .is_ok()
+                            && n == 480
+                    };
+                    if ok_s && snap != last_snap {
+                        let nz = snap.iter().filter(|&&b| b != 0).count();
+                        info!(
+                            t_ms = watch_t0.elapsed().as_millis() as u32,
+                            nz,
+                            "POOLSNIFF: buffer moved"
+                        );
+                        last_snap = snap;
+                    }
+                    if ca == FAIL_MARK {
+                        break;
+                    }
+                    if sweeps % 4 == 0 {
+                        std::thread::yield_now();
+                    }
+                }
+                let stem = out_path.with_extension("v2poolsniff");
+                if let Some(name) = stem.file_name() {
+                    let mut n2 = name.to_os_string();
+                    n2.push(".bin");
+                    let _ = std::fs::write(stem.with_file_name(n2), &blobs);
+                }
+                info!(
+                    sweeps,
+                    records = nrec,
+                    t_ms = watch_t0.elapsed().as_millis() as u32,
+                    "POOLSNIFF: window over - log flushed"
+                );
+                dump_failfreeze_scene(pid, h_process, image_base, &out_path);
+                unsafe {
+                    let _ = TerminateProcess(h_process, 0x2C);
+                }
+                return;
+            }
             if (decodewatch || keyforge) && watch_t0.elapsed().as_millis() >= 100 {
                 let h_process = HANDLE(handle_raw as *mut core::ffi::c_void);
                 let mut buf_addr: Option<usize> = None;
@@ -3033,7 +3403,7 @@ pub(super) fn spawn_dialog_killer(
                                 if got >= 16 {
                                     if let Some(p) = scan_buf[..got]
                                         .windows(16)
-                                        .position(|w| w == DAT_HEAD)
+                                        .position(|w| w == dat_needle)
                                     {
                                         buf_addr = Some(base + roff + p);
                                         info!(
@@ -3106,11 +3476,29 @@ pub(super) fn spawn_dialog_killer(
                         // YDW2 — the decrypt of raw[0]) marks the decrypt
                         // completion for the key block; overwrite the whole
                         // [0,52) dword range with the forge keys once.
-                        if keyforge && forge_armed {
-                            let v0 = u32::from_le_bytes(
-                                snap[0..4].try_into().unwrap(),
-                            );
-                            if v0 == 0x7a9fbc7a {
+                        if keyforge && forge_armed && !dat_disk.is_empty() {
+                            // Generic decrypt-completion trigger: the
+                            // decrypt rewrites the first 13 dwords in place
+                            // (CISC-1 shape; other samples use the same
+                            // first-block layout with different values) —
+                            // count the dwords that diverged from the
+                            // on-disk bytes; >= 8 = the decrypt passed.
+                            let mut div = 0;
+                            for k in 0..13 {
+                                let off = k * 4;
+                                if off + 4 <= dat_disk.len() && off + 4 <= 480 {
+                                    let dsk = u32::from_le_bytes(
+                                        dat_disk[off..off + 4].try_into().unwrap(),
+                                    );
+                                    let cur = u32::from_le_bytes(
+                                        snap[off..off + 4].try_into().unwrap(),
+                                    );
+                                    if dsk != cur {
+                                        div += 1;
+                                    }
+                                }
+                            }
+                            if div >= 8 {
                                 forge_armed = false;
                                 info!(
                                     t_ms = watch_t0.elapsed().as_millis() as u32,
@@ -3137,6 +3525,28 @@ pub(super) fn spawn_dialog_killer(
                                             WriteProcessMemory(
                                                 h_process,
                                                 (ba + (k as usize) * 4)
+                                                    as *mut core::ffi::c_void,
+                                                &kv as *const u32 as *const core::ffi::c_void,
+                                                4,
+                                                Some(&mut n),
+                                            )
+                                            .is_ok()
+                                                && n == 4
+                                        };
+                                        if okw {
+                                            fw += 1;
+                                        }
+                                    }
+                                    // The second live block [300,352): the
+                                    // decode's phase-A output (13 dwords) —
+                                    // the encoder reads BOTH blocks.
+                                    for k in 0..13u32 {
+                                        let kv = if k % 2 == 0 { FORGE_KEY2 } else { FORGE_KEY1 };
+                                        let okw = unsafe {
+                                            let mut n = 0;
+                                            WriteProcessMemory(
+                                                h_process,
+                                                (ba + 300 + (k as usize) * 4)
                                                     as *mut core::ffi::c_void,
                                                 &kv as *const u32 as *const core::ffi::c_void,
                                                 4,
@@ -3205,6 +3615,21 @@ pub(super) fn spawn_dialog_killer(
                             }
                             return;
                         }
+                        // Also capture the search-list build region
+                        // VMCTX [0x20A00,0x20B00): with KEYFORGE this shows
+                        // whether our keys flow into the list encoder.
+                        let mut lst = [0u8; 256];
+                        // SAFETY: live handle; in-image region.
+                        unsafe {
+                            let mut n = 0;
+                            let _ = ReadProcessMemory(
+                                h_process,
+                                (image_base + 0x20A00) as *const core::ffi::c_void,
+                                lst.as_mut_ptr() as *mut core::ffi::c_void,
+                                256,
+                                Some(&mut n),
+                            );
+                        }
                         // Also capture the executing block at cont+dp (the
                         // decode ops live in a transient heap block —
                         // 0x1ECE030 in YDW2 — not in the image).
@@ -3236,6 +3661,10 @@ pub(super) fn spawn_dialog_killer(
                             h ^= (x as u64) << 8;
                             h = h.wrapping_mul(0x0000_0100_0000_01B3);
                         }
+                        for &x in &lst {
+                            h ^= (x as u64) << 16;
+                            h = h.wrapping_mul(0x0000_0100_0000_01B3);
+                        }
                         if h != last {
                             last = h;
                             blobs.extend_from_slice(
@@ -3250,6 +3679,7 @@ pub(super) fn spawn_dialog_killer(
                             blobs.extend_from_slice(&(ba as u32).to_le_bytes());
                             blobs.extend_from_slice(&snap);
                             blobs.extend_from_slice(&blk);
+                            blobs.extend_from_slice(&lst);
                             nrec += 1;
                         }
                         if keyforge {
@@ -3367,6 +3797,210 @@ pub(super) fn spawn_dialog_killer(
                     }
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
+                return;
+            }
+            if oepwatch && watch_t0.elapsed().as_millis() >= 800 {
+                // The shell, with the licence passed, builds a runtime copy
+                // of the original program somewhere in the address space
+                // (CISC-1U21: base 0x3690000, size 0x372000) and transfers
+                // control to it.  Scan for the copy (its header page ==
+                // the on-disk first 4 KB, or the .text head 16 B at its
+                // RVA), then watch the copy's EP field (copy + e_lfanew +
+                // 0x28): when it leaves the packed EP the transfer
+                // happened -> dump everything through OUR handle (the
+                // shell's anti-read blocks fresh OpenProcess calls).
+                use windows::Win32::System::Memory::{
+                    VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_NOACCESS,
+                };
+                let h_process = HANDLE(handle_raw as *mut core::ffi::c_void);
+                // .text head 16 B: read from the disk via the section table
+                // (best-effort; the header = shell-forged, so this needle
+                // may be empty — the header-page needle stays primary).
+                let scan = |h: HANDLE| -> Option<(usize, usize)> {
+                    let mut addr = 0x1_0000usize;
+                    while addr < 0x7FF0_0000 {
+                        let mut mbi = MEMORY_BASIC_INFORMATION::default();
+                        // SAFETY: live handle; sized MBI.
+                        let q = unsafe {
+                            VirtualQueryEx(
+                                h,
+                                Some(addr as *const core::ffi::c_void),
+                                &mut mbi,
+                                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                            )
+                        };
+                        if q == 0 {
+                            break;
+                        }
+                        let base = mbi.BaseAddress as usize;
+                        let region = mbi.RegionSize as usize;
+                        let committed = mbi.State == MEM_COMMIT;
+                        let readable = mbi.Protect != PAGE_NOACCESS && mbi.Protect.0 != 0;
+                        if committed
+                            && readable
+                            && region >= 0x4000
+                            && (region & 0xFFF) == 0
+                        {
+                            // header-page needle
+                            let mut page = [0u8; 4096];
+                            // SAFETY: committed readable region.
+                            let ok = unsafe {
+                                let mut n = 0;
+                                ReadProcessMemory(
+                                    h,
+                                    base as *const core::ffi::c_void,
+                                    page.as_mut_ptr() as *mut core::ffi::c_void,
+                                    4096,
+                                    Some(&mut n),
+                                )
+                                .is_ok()
+                                    && n == 4096
+                            };
+                            if ok && page == disk_head4k && base != image_base {
+                                return Some((base, region));
+                            }
+                        }
+                        addr = base.saturating_add(region.max(0x1000));
+                    }
+                    None
+                };
+                let mut copy: Option<(usize, usize)> = None;
+                let mut ep_watch = false;
+                let mut oep: Option<u32> = None;
+                while watch_t0.elapsed().as_millis() < 60_000 {
+                    if copy.is_none() {
+                        copy = scan(h_process);
+                        if let Some((b, r)) = copy {
+                            info!(
+                                t_ms = watch_t0.elapsed().as_millis() as u32,
+                                base = format!("{b:#x}"),
+                                size = r,
+                                packed_ep = format!("{packed_ep:#x}"),
+                                "OEPWATCH: runtime copy located"
+                            );
+                        }
+                    } else if !ep_watch {
+                        let (b, _r) = copy.unwrap();
+                        // EP field = copy + e_lfanew + 0x28 (the copy's
+                        // header = the disk's; e_lfanew = 0x3c deref).
+                        let mut lfa_b = [0u8; 4];
+                        // SAFETY: live handle; committed copy header.
+                        let okl = unsafe {
+                            let mut n = 0;
+                            ReadProcessMemory(
+                                h_process,
+                                (b + 0x3c) as *const core::ffi::c_void,
+                                lfa_b.as_mut_ptr() as *mut core::ffi::c_void,
+                                4,
+                                Some(&mut n),
+                            )
+                            .is_ok()
+                                && n == 4
+                        };
+                        if okl {
+                            let lfa =
+                                u32::from_le_bytes(lfa_b) as usize;
+                            let mut ep_b = [0u8; 4];
+                            // SAFETY: live handle; committed copy header.
+                            let oke = unsafe {
+                                let mut n = 0;
+                                ReadProcessMemory(
+                                    h_process,
+                                    (b + lfa + 0x28) as *const core::ffi::c_void,
+                                    ep_b.as_mut_ptr() as *mut core::ffi::c_void,
+                                    4,
+                                    Some(&mut n),
+                                )
+                                .is_ok()
+                                    && n == 4
+                            };
+                            if oke {
+                                let ep = u32::from_le_bytes(ep_b);
+                                if packed_ep != 0 && ep != packed_ep && ep != 0 {
+                                    oep = Some(ep);
+                                    ep_watch = true;
+                                    info!(
+                                        t_ms = watch_t0.elapsed().as_millis() as u32,
+                                        oep = format!("{ep:#x}"),
+                                        packed_ep = format!("{packed_ep:#x}"),
+                                        "OEPWATCH: EP field rewritten - transfer imminent"
+                                    );
+                                }
+                            }
+                        }
+                        // The packed EP itself is also a valid transfer
+                        // signal when the header keeps the packed EP: fall
+                        // back to polling the copy's .text first bytes for
+                        // decryption (the original code arriving).
+                        let mut t16 = [0u8; 16];
+                        // SAFETY: live handle; committed copy.
+                        let okt = unsafe {
+                            let mut n = 0;
+                            ReadProcessMemory(
+                                h_process,
+                                (copy.unwrap().0 + 0x1000) as *const core::ffi::c_void,
+                                t16.as_mut_ptr() as *mut core::ffi::c_void,
+                                16,
+                                Some(&mut n),
+                            )
+                            .is_ok()
+                                && n == 16
+                        };
+                        if okt && t16 != [0u8; 16] {
+                            let disk_txt = disk_exe
+                                .get(0x1000..0x1010)
+                                .map(|s| s.to_vec())
+                                .unwrap_or_default();
+                            if !disk_txt.is_empty() && t16[..] != disk_txt[..] {
+                                info!(
+                                    t_ms = watch_t0.elapsed().as_millis() as u32,
+                                    head = t16.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                                    "OEPWATCH: copy .text diverged from disk (decrypted)"
+                                );
+                            }
+                        }
+                    } else {
+                        // Transfer detected: dump the copy + the packed
+                        // image through OUR handle and end the run.
+                        let (b, r) = copy.unwrap();
+                        let dump = |_tag: &[u8; 4], va: usize, len: usize, name: &str| {
+                            let mut data = vec![0u8; len];
+                            // SAFETY: live handle; committed regions.
+                            let ok = unsafe {
+                                let mut n = 0;
+                                ReadProcessMemory(
+                                    h_process,
+                                    va as *const core::ffi::c_void,
+                                    data.as_mut_ptr() as *mut core::ffi::c_void,
+                                    len,
+                                    Some(&mut n),
+                                )
+                                .is_ok()
+                                    && n == len
+                            };
+                            if ok {
+                                let mut path = out_path.clone();
+                                path.set_extension(name);
+                                let _ = std::fs::write(&path, &data);
+                                info!(
+                                    path = %path.display(),
+                                    len,
+                                    "OEPWATCH: dumped"
+                                );
+                            }
+                        };
+                        dump(b"OCPY", b, r, "v2oepcopy.bin");
+                        dump(b"OIMG", image_base, 0x372_000, "v2oepimg.bin");
+                        info!(
+                            t_ms = watch_t0.elapsed().as_millis() as u32,
+                            oep = oep.map(|v| format!("{v:#x}")),
+                            "OEPWATCH: dumps written - run done"
+                        );
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                info!("OEPWATCH: window over");
                 return;
             }
             if prefreeze {
