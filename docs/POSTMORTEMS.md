@@ -3127,3 +3127,22 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
 - **下一轮 = unicorn 仿真**（活体 op 体 + scene image 映射 + 观测态作
   输入）→ 直接读出 g；或手动缝完剩余片段。`0x113f000`（RVA 0x13F000）
   16 记录 = 第二活跃点待查。
+
+**续 21 补充 2（同日）——unicorn 仿真平台搭好，卡在栈，REGSNATCH 定案为下一步**：
+- unicorn 2.1.4 装好。映射修正：IMAG 数据的 VA = 其 addr 字段
+  （0x1001000）——此前把 img[0] 写到 0x1000000 整体偏了 0x1000（第 39 条
+  指令前就读错代码）。
+- 修正后 op 从 0x105FC04 真实执行（scratch 的 `1400dcee` 尾部被仿真写入 ✓
+  ——代码区/数据区对上了），39 条指令后 `UC_ERR_WRITE_UNMAPPED @0x10556c7`：
+  变异代码用 `xchg [esp],edi`/`pop esp`/esp 链存内存——**假栈内容（全零）
+  破坏 esp 杂耍**。寄存器初值（cx/dx=lane、esi=buf+68、bl=滚动键）
+  + 真实栈内容 = 缺失输入。
+- **REGSNATCH 定案（下一轮机器）**：watcher 在细粒度窗口 [204,206]ms
+  `OpenThread(THREAD_SUSPEND_RESUME|THREAD_GET_CONTEXT|THREAD_QUERY_INFORMATION,
+  main_tid)` → SuspendThread → GetThreadContext（cx/dx/esi/edi/ebp/ebx/
+  esp 全拿）→ 栈区 RPM 32KB → ResumeThread（~1ms 冻结，壳无 µs 级自检）。
+  有了真寄存器 + 真栈 → unicorn 从当前 EIP 确定性重放 → 读出 g → 验证
+  全部 261 观测态 → f 完成 → .dat 重编码。
+- 备选（无注入风险路径）：REGSNATCH 失败时手动缝完 jmp 链
+  （0x583cd→0x105d15c→…）或对 0x1020000 系（VMCTX 头，695 记录）与
+  0x113f000（16 记录）做同款微扫分析。
