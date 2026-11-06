@@ -3105,3 +3105,25 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   → C 暴力/直读 f → .dat 重编码。或离线续读 op 剩余片段。
 - 工程同轮：POOLSNIFF 实装（helpers +650 行）；OEPWATCH 泛化补丁一并
   入库；修 `tag` unused 告警（零告警恢复）。
+
+**续 21 补充 1（同日）——POOLSNIFF v3 微扫：逐字节状态机捕获 + vmhash 族证死（对校验）**：
+- **v3 = 热窗微扫**（基线 + 「活跃 = 与上次扫描内容不同」+ 8KB 热窗
+  ~40µs/迭代 + 128 微迭代一次 mini-sweep 重定向）。实跑：**9089 微迭代 /
+  2271 记录**；擦除过程逐 dword 可见（nz=0→4→8→…）。
+- **校验状态机全分辨率**：0x105FC00 × 1381 体；261 个唯一
+  (ctr,acc1,acc2) 态（`check_states_v3.json`/`check_events.json`）。
+  ctr ∈ [23,604]（**越过 480**——哈希输入 > .dat，或计数器语义 ≠ 纯字节
+  位）。节奏：~2ms 块激活（全 4 lane 变）+ [204.5,205.7] 的逐字节慢动作窗。
+- **lane 模型定案**：acc1=[hi|lo]=L1|L0、acc2=[hi|lo]=L3|L2；字节 p 更新
+  lane p%4，**完美 round-robin 15+ 步**；每步仅一个 lane 变（其余冻结）。
+  17 个手工核验的单字节转移存 `check_fine_trans.json`。
+- **vmhash inner-LFSR 族对校验也证死**：byte68 约束
+  inner(0xf9)=(ax=f3a5,bx=bc3a) + 两对齐变体 → C 暴力 4G（`lfsr_check2.exe`）
+  = **hits=0**。affine/CRC-8/rotl/ror/xtime 族（逐 lane + pooled + 对齐
+  搜索）全负。mixing = 非线性（S-box 或多 lane 耦合）。
+- **代码侧**：op 体 [0x5FC00,0x5FFAE] 语义片段（`dl=0x0b^cl; bl=0x9b+dl;
+  al^=bh` 型）+ jmp 缝合进共享带代码（0x583cd/0x5b1e2/0x5bf43…），
+  vm_fold 被 opaque predicate + table-builder 循环卡死。
+- **下一轮 = unicorn 仿真**（活体 op 体 + scene image 映射 + 观测态作
+  输入）→ 直接读出 g；或手动缝完剩余片段。`0x113f000`（RVA 0x13F000）
+  16 记录 = 第二活跃点待查。
