@@ -3065,15 +3065,55 @@ pub(super) fn spawn_dialog_killer(
                     THREAD_SUSPEND_RESUME,
                 };
                 let h_process = HANDLE(handle_raw as *mut core::ffi::c_void);
-                // Wait past the decode (~214 ms) so the window covers the
-                // field-verify op (0x2400D-0x2429D — its execution window
-                // is unknown, somewhere in [215,300)) AND the searches.
-                while watch_t0.elapsed().as_millis() < 215 {
+                // Wait for the VERIFIER window: the field-verify op runs
+                // [340,360]ms (measured 2026-11-07 via the miss counter);
+                // the context there carries esi = the field-table cursor,
+                // edi = the string pointer, and the expected value on the
+                // stack.  2000 snaps over [330,470] also cover the fail
+                // decision (~382ms).  The wait starts at 280 ms so the
+                // thread find (~40 ms, see below) completes before 340.
+                while watch_t0.elapsed().as_millis() < 280 {
                     std::thread::yield_now();
                 }
-                // find the VM thread: EIP inside the image
+                // find the VM thread: EIP inside the image.  The ops run
+                // in TWO worlds: the static op band (check/verifier, in
+                // image) and transient blocks in the VM data area (decode/
+                // list build, EIP NOT in image) — so a single find at
+                // [280,330] fails.  RETRY the fast path (the pre-opened
+                // main thread, ~2 µs/try) every 1 ms until the EIP enters
+                // the image: that is exactly the verifier's 340 ms start.
                 let tids = list_target_thread_ids(pid);
                 let mut vm_tid: Option<u32> = None;
+                while vm_tid.is_none()
+                    && watch_t0.elapsed().as_millis() < 460
+                {
+                    if let Some(hm) = h_main {
+                        // SAFETY: valid pre-opened handle.
+                        let prev = unsafe { SuspendThread(hm) };
+                        if prev != u32::MAX {
+                            let mut ctx = CONTEXT::default();
+                            ctx.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_FLAGS(0x0001_0003);
+                            // SAFETY: suspended thread.
+                            if unsafe { GetThreadContext(hm, &mut ctx) }.is_ok()
+                            {
+                                let eip = ctx.Eip as usize;
+                                if eip >= image_base
+                                    && eip < image_base + 0x400_000
+                                {
+                                    vm_tid = Some(main_tid);
+                                }
+                            }
+                            // SAFETY: suspended above.
+                            unsafe {
+                                let _ = ResumeThread(hm);
+                            }
+                        }
+                    }
+                    if vm_tid.is_none() {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+                if vm_tid.is_none() {
                 for &tid in &tids {
                     // SAFETY: tid from the snapshot; handle closed.
                     let Ok(h) = (unsafe {
@@ -3113,6 +3153,7 @@ pub(super) fn spawn_dialog_killer(
                     if vm_tid.is_some() {
                         break;
                     }
+                }
                 }
                 let Some(tid) = vm_tid else {
                     warn!("SEARCHSNATCH: no in-image thread - aborting");

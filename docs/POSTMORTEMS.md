@@ -3440,3 +3440,29 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   CISC-1U.v2tsnap.pristine2/.v12/.v13.bin、
   CISC-1U.v2searchsnatch.pristine2.bin、check_op_body3.bin、
   probe_rawcopy.py、fold_check.py、analyze_forge.py。
+
+**续 21 补充 18（同日第五轮）——SEARCHSNATCH 重定向：0x201FD = 搜索 miss 计数，80 = 命中提前退出（模型转折）**：
+
+- **仪表修正**：SEARCHSNATCH 等待 330→280ms + **重试查找循环**（快路径
+  h_main 2µs/次、每 1ms 重试直至 EIP 进镜像——ops 分两界：check/verifier
+  = 镜像内静态 op，解码/列表构建 = VM 数据区瞬态块（EIP 不在镜像），
+  单次查找在 [280,330] 必败）。实测 320ms 抓到，[320,359]ms 2000 张 =
+  搜索+比较全窗。
+- **0x2400D-EIP 零命中** → **0x201FD 不是字段校验的 miss——是搜索的
+  逐元素 miss 计数**！[340,360] 全程 EIP = 搜索 op（RVA 0x60000-0x73000）。
+  「verifier 窗口」 = 搜索/比较时代。
+- **比较 = 逐字节 + 变换，累加器 = check scratch**：edx = 0x105ffba/
+  0x105ffb6（0x5FFAE+0xC/+8）= 搜索 op 读 check 的 scratch——VM 共享
+  工作区。寄存器 = 字节尺度状态（0x3e/0x41/0x73/0x18…）= 变换进行时。
+- **模型转折**：622 ≈ 3 搜索 × 207 元素 = 全 miss；**80 = 提前命中退出**
+  ——我们的键在缓冲键块 → 搜索命中我们的键 → miss 骤降。三测量互证：
+  miss 只因缓冲补丁变化（622→80）；列表 pristine vs forged 全同（列表
+  不是被搜方=缓冲才是）；比较 = 逐元素。
+- **判定修正**：搜索 = 命中了我们的键（三个都命中：K1@300 + K2/K3 在
+  [304,352)）。哨兵 [哨兵] = 0xFFFFFFFF ≠「未命中」——是某后续阶段的
+  状态位（语义重定待测）。pristine 622 全 miss → fail；80（命中）→
+  不 fail ✓ 一致。
+- **残留谜题**：命中后壳仍停泊（30MB WS、无部署）——命中后的下一道门
+  （key3 逐 run？名字绑定？后续阶段？）。下一轮：FORGE2+SEARCHSNATCH
+  合流（搜捕命中瞬间的逐字节比较 + 命中后的流）。
+- 工件：CISC-1U.v2searchsnatch.verifier4.bin、ss_verifier*_log.txt。
