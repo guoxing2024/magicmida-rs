@@ -874,6 +874,7 @@ pub(super) fn spawn_dialog_killer(
         && std::env::var("MAGICMIDA_V2_OEPWATCH").is_err()
         && std::env::var("MAGICMIDA_V2_POOLSNIFF").is_err()
         && std::env::var("MAGICMIDA_V2_REGSNATCH").is_err()
+        && std::env::var("MAGICMIDA_V2_SEARCHSNATCH").is_err()
         && sp_groups.is_none()
     {
         return None;
@@ -3046,6 +3047,178 @@ pub(super) fn spawn_dialog_killer(
                         return;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                return;
+            }
+            if std::env::var("MAGICMIDA_V2_SEARCHSNATCH").is_ok() {
+                use windows::Win32::Foundation::CloseHandle;
+                use windows::Win32::System::Diagnostics::Debug::{
+                    GetThreadContext, CONTEXT,
+                };
+                use windows::Win32::System::Threading::{
+                    OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT,
+                    THREAD_SUSPEND_RESUME,
+                };
+                let h_process = HANDLE(handle_raw as *mut core::ffi::c_void);
+                // Wait for the search window (the searches fire ~[280,420]ms).
+                while watch_t0.elapsed().as_millis() < 265 {
+                    std::thread::yield_now();
+                }
+                // find the VM thread: EIP inside the image
+                let tids = list_target_thread_ids(pid);
+                let mut vm_tid: Option<u32> = None;
+                for &tid in &tids {
+                    // SAFETY: tid from the snapshot; handle closed.
+                    let Ok(h) = (unsafe {
+                        OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME, false, tid)
+                    }) else {
+                        continue;
+                    };
+                    // SAFETY: valid handle.
+                    let prev = unsafe { SuspendThread(h) };
+                    if prev != u32::MAX {
+                        let mut ctx = CONTEXT::default();
+                        ctx.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_FLAGS(0x0001_0003);
+                        // SAFETY: valid handle; suspended thread.
+                        if unsafe { GetThreadContext(h, &mut ctx) }.is_ok() {
+                            let eip = ctx.Eip as usize;
+                            // prefer the thread executing in the search
+                            // data region (image+0x21000-0x24000)
+                            if eip >= image_base + 0x21000
+                                && eip < image_base + 0x24000
+                            {
+                                vm_tid = Some(tid);
+                                break;
+                            }
+                            if eip >= image_base && eip < image_base + 0x400_000 {
+                                vm_tid = Some(tid);
+                            }
+                        }
+                        // SAFETY: suspended above.
+                        unsafe {
+                            let _ = ResumeThread(h);
+                        }
+                    }
+                    // SAFETY: handle from OpenThread.
+                    unsafe {
+                        let _ = CloseHandle(h);
+                    }
+                    if vm_tid.is_some() {
+                        break;
+                    }
+                }
+                let Some(tid) = vm_tid else {
+                    warn!("SEARCHSNATCH: no in-image thread - aborting");
+                    unsafe {
+                        let _ = TerminateProcess(h_process, 0x2C);
+                    }
+                    return;
+                };
+                info!(
+                    tid,
+                    t_ms = watch_t0.elapsed().as_millis() as u32,
+                    "SEARCHSNATCH: VM thread found"
+                );
+                // SAFETY: tid from the snapshot; handle closed below.
+                let Ok(h) = (unsafe {
+                    OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME, false, tid)
+                }) else {
+                    unsafe {
+                        let _ = TerminateProcess(h_process, 0x2C);
+                    }
+                    return;
+                };
+                let mut blobs: Vec<u8> = Vec::new();
+                let mut ns = 0usize;
+                while ns < 2000 && watch_t0.elapsed().as_millis() < 470 {
+                    // SAFETY: valid handle.
+                    let prev = unsafe { SuspendThread(h) };
+                    if prev == u32::MAX {
+                        break;
+                    }
+                    let t_us = watch_t0.elapsed().as_micros() as u32;
+                    let mut ctx = CONTEXT::default();
+                    ctx.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_FLAGS(0x0001_0003);
+                    // SAFETY: valid handle; suspended thread.
+                    let got = unsafe { GetThreadContext(h, &mut ctx) }.is_ok();
+                    if !got {
+                        // SAFETY: suspended above.
+                        unsafe {
+                            let _ = ResumeThread(h);
+                        }
+                        break;
+                    }
+                    let eip = ctx.Eip as usize;
+                    let esp = ctx.Esp as usize;
+                    // 2KB stack window, two half-page reads around esp
+                    let mut stack = [0u8; 0x800];
+                    let lo = esp.saturating_sub(0x400);
+                    // SAFETY: live handle; stack pages.
+                    // SAFETY: live handle; stack pages.
+                    unsafe {
+                        let _ = ReadProcessMemory(
+                            h_process,
+                            lo as *const core::ffi::c_void,
+                            stack.as_mut_ptr() as *mut core::ffi::c_void,
+                            0x800,
+                            Some(&mut 0),
+                        );
+                    }
+                    // 256B at EIP
+                    let mut code = [0u8; 0x100];
+                    // SAFETY: live handle; code page.
+                    let clen = unsafe {
+                        let mut n = 0;
+                        let okr = ReadProcessMemory(
+                            h_process,
+                            eip as *const core::ffi::c_void,
+                            code.as_mut_ptr() as *mut core::ffi::c_void,
+                            0x100,
+                            Some(&mut n),
+                        )
+                        .is_ok();
+                        if okr { n } else { 0 }
+                    };
+                    // SAFETY: suspended above.
+                    unsafe {
+                        let _ = ResumeThread(h);
+                    }
+                    blobs.extend_from_slice(&t_us.to_le_bytes());
+                    blobs.extend_from_slice(&(eip as u32).to_le_bytes());
+                    for v in [
+                        ctx.Eax, ctx.Ebx, ctx.Ecx, ctx.Edx, ctx.Esi, ctx.Edi, ctx.Ebp,
+                        ctx.Esp, ctx.EFlags,
+                    ] {
+                        blobs.extend_from_slice(&v.to_le_bytes());
+                    }
+                    blobs.extend_from_slice(&(clen as u32).to_le_bytes());
+                    blobs.extend_from_slice(&code[..clen]);
+                    ns += 1;
+                    if ns % 300 == 0 {
+                        info!(
+                            snap = ns,
+                            t_ms = watch_t0.elapsed().as_millis() as u32,
+                            "SEARCHSNATCH: progressing"
+                        );
+                    }
+                }
+                // SAFETY: handle from OpenThread.
+                unsafe {
+                    let _ = CloseHandle(h);
+                }
+                let stem = out_path.with_extension("v2searchsnatch");
+                if let Some(name) = stem.file_name() {
+                    let mut n2 = name.to_os_string();
+                    n2.push(".bin");
+                    let _ = std::fs::write(stem.with_file_name(n2), &blobs);
+                }
+                info!(
+                    snapshots = ns,
+                    t_ms = watch_t0.elapsed().as_millis() as u32,
+                    "SEARCHSNATCH: done"
+                );
+                unsafe {
+                    let _ = TerminateProcess(h_process, 0x2C);
                 }
                 return;
             }

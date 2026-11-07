@@ -3305,3 +3305,20 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   Suspend+GetContext（~1ms 间隔 ×100）——**cmp 的两个操作数直接在
   寄存器里**：搜索键真身 + 列表元素真身一次拿全。REGSNATCH 机制
   现成（OpenThread+Suspend+Context），只需新触发窗口。
+
+**续 21 补充 13（同日）——SEARCHSNATCH 落地 + 搜索语义推进**：
+- SEARCHSNATCH 实装（`MAGICMIDA_V2_SEARCHSNATCH=1`）：搜索期对 VM
+  线程 Suspend+Context ~20µs 间隔 ×2000（[294.9,339.4]ms，120KB+
+  608KB 两跑）；clen 变长修正。EIP = 26 个站点（top 0x102a800 ×237、
+  0x103c400 ×216…）。
+- **列表位置定案：image+0x10DC000-0x10DD000**（esi 走线
+  0x10dc758-0x10dcaf4；edi = 0x102859e = bank contA 槽恒定、
+  ebp = 0xeedc0014 恒定 = VM 基址）。T 快照的堆区读错了地方。
+- 目标值（0x0102d6ab/0x01108e1e）在列表中零命中（LE/BE）——比较 =
+  **两边都有变换**（T(element) vs key 或 element vs T(key)）。
+- **搜索键 = 「单次搜索内恒定、跨搜索变化」的寄存器值**——
+  时间性分析（跨三次搜索的常量提取）= 下一轮。machine 键 =
+  f(机器, boot) 每 boot 变 = 已定案。
+- 下一轮：SEARCHSNATCH 时序分析（每个寄存器的值-时间曲线 → 搜索
+  边界 → 键真身）+ 列表内容（0x10DC000，pristine 快照）三方对账 →
+  比较语义 → FORGE2 v6。
