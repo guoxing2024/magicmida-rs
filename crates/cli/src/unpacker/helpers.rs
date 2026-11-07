@@ -1093,8 +1093,47 @@ pub(super) fn spawn_dialog_killer(
         // then carry our keys into the search list, and the three searches
         // find them.  The forge never needs the .dat cipher itself.
         let keyforge = std::env::var("MAGICMIDA_V2_KEYFORGE").is_ok();
+        // FORGE2 (`MAGICMIDA_V2_FORGE2=1`): patch the RAW key segments at
+        // FILL-COMPLETE — before the check (which reads the image-area
+        // copy A, not this buffer) and before the decrypt consumes the
+        // raw.  Single patch, nothing else touched (name/strings pristine).
+        // Outcome (a) clean licence flow = the keys are not individually
+        // verified; (b) tamper abort = they are.
+        let forge2 = std::env::var("MAGICMIDA_V2_FORGE2").is_ok();
         const FORGE_KEY1: u32 = 0x7DC8_0DE6;
         const FORGE_KEY2: u32 = 0x0228_69C8;
+        // the .dat field cipher = position-dependent XOR keystream; the 26
+        // field positions' ks measured (v2_pairs.json, 2026-11-07).
+        const FORGE_KS: [(usize, u32); 26] = [
+    (0, 0x346e_44fb),
+    (4, 0x1990_f13b),
+    (8, 0x3090_f108),
+    (12, 0xd354_e62b),
+    (16, 0x55c2_b0b4),
+    (20, 0xa8f3_ee78),
+    (24, 0x6295_2a8a),
+    (28, 0xf8e5_f9f2),
+    (32, 0x2f61_9a0f),
+    (36, 0x36d0_cf18),
+    (40, 0xbe1d_6ec9),
+    (44, 0x92b1_1517),
+    (48, 0x8d7d_5ac9),
+    (300, 0xb668_0fdf),
+    (304, 0x2d06_265a),
+    (308, 0x5b50_a39e),
+    (312, 0xab8c_4ee9),
+    (316, 0x13d_01ca),
+    (320, 0xa227_79ef),
+    (324, 0xee0f_7545),
+    (328, 0xbe8a_55a7),
+    (332, 0x47e1_bb89),
+    (336, 0xb1c5_2641),
+    (340, 0x6341_fb6c),
+    (344, 0xcc15_c7ec),
+    (348, 0x4498_a764),
+];
+        // per-position desired plaintext = the machine keys (alternating);
+        // the search = a membership scan over the decoded list.
         // DAT_HEAD replaced by the per-sample dat_needle (read from
         // <sample>.dat on disk above).
         let _ = dat_needle;
@@ -3847,6 +3886,7 @@ pub(super) fn spawn_dialog_killer(
                 let mut nrec: usize = 0;
                 let mut polls: u64 = 0;
                 let mut forge_armed = keyforge;
+                let mut forge2_done = false;
                 let mut last_sent: [u32; 3] = [0xFFFF_FFFF; 3];
                 let mut last_msg = String::new();
                 // Phase 1: find the file copy (needle scan, MEM_PRIVATE).
@@ -3965,6 +4005,53 @@ pub(super) fn spawn_dialog_killer(
                             continue;
                         }
                         let ca = u32::from_le_bytes(cont_buf[0..4].try_into().unwrap());
+                        // FORGE2: fill-complete = >=460 nonzero bytes; patch
+                        // the raw key segments once, right here.
+                        if forge2 && !forge2_done {
+                            let nz = snap.iter().filter(|&&b| b != 0).count();
+                            if nz >= 460 {
+                                forge2_done = true;
+                                // v2: raw[pos] := key ^ ks[pos] — the field
+                                // cipher is a position-dependent XOR (dec =
+                                // raw ^ ks, 26/26 pairs measured); encoding
+                                // our keys through it makes the decrypt
+                                // produce the real machine keys.
+                                let mut fw = 0u32;
+                                for (i, &(pos, ks)) in FORGE_KS.iter().enumerate() {
+                                    let kv = if pos < 100 {
+                                        // segment B [0,52): alternate K1/K2
+                                        if (pos / 4) % 2 == 0 { FORGE_KEY1 } else { FORGE_KEY2 }
+                                    } else {
+                                        // segment A [300,352): the same
+                                        // alternating pattern continues
+                                        if (pos / 4) % 2 == 0 { FORGE_KEY1 } else { FORGE_KEY2 }
+                                    };
+                                    let enc = kv ^ ks;
+                                    let _ = i;
+                                    // SAFETY: live handle; committed buffer.
+                                    let okw = unsafe {
+                                        let mut n = 0;
+                                        WriteProcessMemory(
+                                            h_process,
+                                            (ba + pos) as *mut core::ffi::c_void,
+                                            &enc as *const u32 as *const core::ffi::c_void,
+                                            4,
+                                            Some(&mut n),
+                                        )
+                                        .is_ok()
+                                            && n == 4
+                                    };
+                                    if okw {
+                                        fw += 1;
+                                    }
+                                }
+                                info!(
+                                    t_ms = watch_t0.elapsed().as_millis() as u32,
+                                    written = fw,
+                                    "FORGE2: raw := key^ks patched (26 positions)"
+                                );
+                            }
+                        }
                         // KEYFORGE: the first decrypted dword (0x7a9fbc7a in
                         // YDW2 — the decrypt of raw[0]) marks the decrypt
                         // completion for the key block; overwrite the whole
@@ -4175,7 +4262,7 @@ pub(super) fn spawn_dialog_killer(
                             blobs.extend_from_slice(&lst);
                             nrec += 1;
                         }
-                        if keyforge {
+                        if keyforge || forge2 {
                             // Sentinel results ([sentinel]=search verdict):
                             // non-(-1) = the search HIT.
                             const SENT: [usize; 3] = [0x216F5, 0x22D7D, 0x233FD];
@@ -4198,9 +4285,27 @@ pub(super) fn spawn_dialog_killer(
                                     let v = u32::from_le_bytes(sb);
                                     if v != last_sent[i] {
                                         last_sent[i] = v;
+                                        // the SEARCHED key = [sentinel+4]
+                                        let mut kb = [0u8; 4];
+                                        // SAFETY: live handle; in-image slot.
+                                        let kok = unsafe {
+                                            let mut n2 = 0;
+                                            ReadProcessMemory(
+                                                h_process,
+                                                (image_base + rva + 4)
+                                                    as *const core::ffi::c_void,
+                                                kb.as_mut_ptr() as *mut core::ffi::c_void,
+                                                4,
+                                                Some(&mut n2),
+                                            )
+                                            .is_ok()
+                                                && n2 == 4
+                                        };
+                                        let searched = u32::from_le_bytes(kb);
                                         info!(
                                             slot = i + 1,
                                             value = format!("{v:#010x}"),
+                                            searched = format!("{searched:#010x}"),
                                             hit = v != 0xFFFF_FFFF,
                                             "KEYFORGE: sentinel result"
                                         );
