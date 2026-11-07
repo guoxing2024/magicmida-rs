@@ -3291,3 +3291,17 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
 - **下一轮**：①pristine 流程的 T 快照（forge2 off、快照 on）→
   pristine 字段+列表 → **T 直接对账**；②FORGE2 v5 = 字段 := T-链。
   T 若为简单 XOR/移位/查表 → 链可构造 → 闭环。
+
+**续 21 补充 12（同日）——TSNAP 解耦 + pristine 对账 = 机器键 = 每 boot**：
+- TSNAP 解耦（`MAGICMIDA_V2_TSNAP=1`，无补丁跑 pristine）。
+- **pristine 搜索键 = 0x0102d6ab/0x01108e1e/0x4886f3d6**——槽 1-2 与
+  forged 跑完全一致 = **跨 run 恒定（同一 boot 会话）**；槽 3 逐 run。
+  与 KEYFORGE 时代（0x7DC80DE6/0x022869C8）不同 = **不同 boot**。
+  →「机器键」 = f(机器, boot 会话)——每 boot 变。
+- v6（字段 := bake 目标，cursor-chase 226ms）仍 miss：快照显示目标值
+  在缓冲/堆/0x20A00 全域零命中——解码竞态（cursor=300 同毫秒）或
+  比较语义还有一层。
+- **下一轮 = SEARCHSNATCH**：搜索期（[280,420]）对 VM 线程
+  Suspend+GetContext（~1ms 间隔 ×100）——**cmp 的两个操作数直接在
+  寄存器里**：搜索键真身 + 列表元素真身一次拿全。REGSNATCH 机制
+  现成（OpenThread+Suspend+Context），只需新触发窗口。

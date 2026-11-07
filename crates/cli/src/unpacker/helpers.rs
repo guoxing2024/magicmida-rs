@@ -1100,6 +1100,10 @@ pub(super) fn spawn_dialog_killer(
         // Outcome (a) clean licence flow = the keys are not individually
         // verified; (b) tamper abort = they are.
         let forge2 = std::env::var("MAGICMIDA_V2_FORGE2").is_ok();
+        // TSNAP (`MAGICMIDA_V2_TSNAP=1`): the multi-timepoint field/list
+        // snapshot WITHOUT any patching — the pristine flow's fields and
+        // T(fields) side by side, for the machine-transform reconciliation.
+        let tsnap_on = std::env::var("MAGICMIDA_V2_TSNAP").is_ok();
         const FORGE_KEY1: u32 = 0x7DC8_0DE6;
         const FORGE_KEY2: u32 = 0x0228_69C8;
         // the .dat field cipher = position-dependent XOR keystream; the 26
@@ -4315,13 +4319,15 @@ pub(super) fn spawn_dialog_killer(
                             blobs.extend_from_slice(&lst);
                             nrec += 1;
                         }
-                        if keyforge || forge2 {
+                        if keyforge || forge2 || tsnap_on {
                             // Multi-timepoint T-extraction: every ~20ms
                             // from t=200 to t=460, plus on every sentinel
                             // change — fields + searched keys + 0x20A00
                             // + the private-heap list area (0x15C000) +
                             // the 26 buffer field positions.
-                            if forge2 && watch_t0.elapsed().as_millis() >= tsnap_next as u128 {
+                            if (forge2 || tsnap_on)
+                                && watch_t0.elapsed().as_millis() >= tsnap_next as u128
+                            {
                                 tsnap_next += 20;
                                 let t_us = watch_t0.elapsed().as_micros() as u32;
                                 let mut tblob: Vec<u8> = Vec::new();
