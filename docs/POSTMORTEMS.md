@@ -3201,3 +3201,13 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   baked 则字段不可自由选）；窗口触发器（state dwords 停变 / ctr→604）。
 - 下一轮：check-end-patch 机器（KEYFORGE 改触发点 + 一致性字段补丁）；
   verifier 期望值位置猎取（oracle：只改字段校验和位置看反应）。
+
+**续 21 补充 6（同日）——verifier 期望值首轮排查**：
+- vmhash.py 实例（0x5041/0x5449，init 全 FF）对 26 个解密字段逐个/分段
+  计算，结果在 .dat raw 中**零命中**（LE/BE 都试过）。期望值 ≠ 明文
+  vmhash(raw)。剩余假设：baked 常数、raw 内加密存储（需字段密码）、
+  或 verifier 的 hash 参数不同（逐字段 init/分段）。
+- 下一轮三线：①FORGE2 机器（segment-A 解密写瞬间补丁 [0,48) raw，
+  字段 only——失败形态定位 verifier 行为）；②verifier op（0x2400D-
+  0x2429D）walker 缝合找期望值加载点；③vmhash 参数变体网格
+  （init/常数/分段）× 26 字段全搜索。
