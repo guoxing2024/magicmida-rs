@@ -1110,36 +1110,13 @@ pub(super) fn spawn_dialog_killer(
         // the pristine raw dword at buffer offset 300 (the decode's first
         // segment-A write leaves this value) — from the on-disk .dat.
         const FORGE_RAW300: u32 = 0x5943_3AC4;
-        // the .dat field cipher = position-dependent XOR keystream; the 26
-        // field positions' ks measured (v2_pairs.json, 2026-11-07).
-        const FORGE_KS: [(usize, u32); 26] = [
-    (0, 0x346e_44fb),
-    (4, 0x1990_f13b),
-    (8, 0x3090_f108),
-    (12, 0xd354_e62b),
-    (16, 0x55c2_b0b4),
-    (20, 0xa8f3_ee78),
-    (24, 0x6295_2a8a),
-    (28, 0xf8e5_f9f2),
-    (32, 0x2f61_9a0f),
-    (36, 0x36d0_cf18),
-    (40, 0xbe1d_6ec9),
-    (44, 0x92b1_1517),
-    (48, 0x8d7d_5ac9),
-    (300, 0xb668_0fdf),
-    (304, 0x2d06_265a),
-    (308, 0x5b50_a39e),
-    (312, 0xab8c_4ee9),
-    (316, 0x13d_01ca),
-    (320, 0xa227_79ef),
-    (324, 0xee0f_7545),
-    (328, 0xbe8a_55a7),
-    (332, 0x47e1_bb89),
-    (336, 0xb1c5_2641),
-    (340, 0x6341_fb6c),
-    (344, 0xcc15_c7ec),
-    (348, 0x4498_a764),
-];
+        // The .dat field cipher ks table (26 (pos,ks) pairs, v2_pairs.json)
+        // is NOT used for the buffer patch any more: the decrypt sources
+        // [4,52) and [304,352) from the image-area copy A, so buffer writes
+        // there are overwritten by the pristine dec (v5 artifacts, measured
+        // 2026-11-07).  The table stays in OUT/v2_pairs.json for the offline
+        // reconciliation (dec = raw ^ ks) — pos300's dec = 0xef2b351b and
+        // the raw disk value FORGE_RAW300 below are all the trigger needs.
         // per-position desired plaintext = the machine keys (alternating);
         // the search = a membership scan over the decoded list.
         // DAT_HEAD replaced by the per-sample dat_needle (read from
@@ -4073,6 +4050,7 @@ pub(super) fn spawn_dialog_killer(
                 let mut tsnap_blobs: Vec<u8> = Vec::new();
                 let mut nsnap_t = 0usize;
                 let mut last_sent: [u32; 3] = [0xFFFF_FFFF; 3];
+                let mut probe_idx = 0usize;
                 let mut last_msg = String::new();
                 // Phase 1: find the file copy (needle scan, MEM_PRIVATE).
                 while buf_addr.is_none() && watch_t0.elapsed().as_millis() < 260 {
@@ -4208,40 +4186,63 @@ pub(super) fn spawn_dialog_killer(
                             let raw300 = FORGE_RAW300;
                             if v300 != raw300 && v300 != 0 {
                                 forge2_done = true;
-                                let mut fw = 0u32;
-                                for &(pos, ks) in FORGE_KS.iter() {
-                                    let key = if pos == 300 {
-                                        forge_targets[0]
+                                // v6: [304,352) as ONE 52 B block write —
+                                // the decode advances ~108 us/dword through
+                                // this range, a single WPM beats it for all
+                                // 13 dwords (the v5 per-dword writes lost
+                                // the race for every position past 304).
+                                // Raw plaintext keys: the block is NOT
+                                // re-encrypted (measured), the search list
+                                // consumes these values as-is.
+                                let mut blk = [0u8; 52];
+                                for (i, k) in blk.chunks_mut(4).enumerate() {
+                                    let key = if i % 2 == 0 {
+                                        forge_targets[1]
                                     } else {
-                                        forge_targets[(pos / 4) % 3]
+                                        forge_targets[2]
                                     };
-                                    let value = if pos == 300 {
-                                        key
-                                    } else {
-                                        key ^ ks
-                                    };
-                                    // SAFETY: live handle; committed buffer.
-                                    let okw = unsafe {
-                                        let mut n = 0;
-                                        WriteProcessMemory(
-                                            h_process,
-                                            (ba + pos) as *mut core::ffi::c_void,
-                                            &value as *const u32 as *const core::ffi::c_void,
-                                            4,
-                                            Some(&mut n),
-                                        )
-                                        .is_ok()
-                                            && n == 4
-                                    };
-                                    if okw {
-                                        fw += 1;
-                                    }
+                                    k.copy_from_slice(&key.to_le_bytes());
                                 }
+                                // SAFETY: live handle; committed buffer.
+                                let w_blk = unsafe {
+                                    let mut n = 0;
+                                    WriteProcessMemory(
+                                        h_process,
+                                        (ba + 304) as *mut core::ffi::c_void,
+                                        blk.as_ptr() as *const core::ffi::c_void,
+                                        52,
+                                        Some(&mut n),
+                                    )
+                                    .is_ok()
+                                        && n == 52
+                                };
+                                // pos300: decoded BEFORE the trigger (the
+                                // trigger = its dec value appeared), never
+                                // rewritten by the decode — the plaintext
+                                // KEY1 lands here and stays.
+                                // SAFETY: live handle; committed buffer.
+                                let w300 = unsafe {
+                                    let mut n = 0;
+                                    WriteProcessMemory(
+                                        h_process,
+                                        (ba + 300) as *mut core::ffi::c_void,
+                                        &forge_targets[0] as *const u32
+                                            as *const core::ffi::c_void,
+                                        4,
+                                        Some(&mut n),
+                                    )
+                                    .is_ok()
+                                        && n == 4
+                                };
                                 info!(
                                     t_ms = watch_t0.elapsed().as_millis() as u32,
                                     v300 = format!("{v300:#010x}"),
-                                    written = fw,
-                                    "FORGE2: keys written on the decode first-write trigger"
+                                    blk = w_blk,
+                                    pos300 = w300,
+                                    t1 = format!("{:#010x}", forge_targets[0]),
+                                    t2 = format!("{:#010x}", forge_targets[1]),
+                                    t3 = format!("{:#010x}", forge_targets[2]),
+                                    "FORGE2 v6: keys written (block [304,352) + pos300)"
                                 );
                             }
                         }
@@ -4673,6 +4674,10 @@ pub(super) fn spawn_dialog_killer(
                                 }
                             }
                         }
+                        // PASS-evidence probe (2026-11-07): lives in the
+                        // bail-watch loop BELOW — the µs-snapshot loop ends
+                        // at the 500 ms window while the licensed shell
+                        // keeps running.
                         if polls % 64 == 0 {
                             std::thread::yield_now();
                         }
@@ -4726,6 +4731,74 @@ pub(super) fn spawn_dialog_killer(
                             let _ = TerminateProcess(h_process, 0x2C);
                         }
                         return;
+                    }
+                    // PASS-evidence probe (2026-11-07): a FRESH OpenProcess
+                    // limited to VM_READ.  Once the shell deploys its
+                    // protected state it strips VM_READ from foreign opens
+                    // (the KEYFORGE-era runs measured the same denial).
+                    // Denied = licence PASS evidence; readable =
+                    // inconclusive (the run may simply be parked before the
+                    // protection deploy).  This loop ticks every 10 ms for
+                    // the whole run, so the marks fire on time.
+                    if (forge2 || keyforge) && probe_idx < 4 {
+                        let tms = watch_t0.elapsed().as_millis();
+                        const PROBE_AT: [u128; 4] = [5000, 20000, 50000, 80000];
+                        if tms >= PROBE_AT[probe_idx] {
+                            let at_s = PROBE_AT[probe_idx] / 1000;
+                            probe_idx += 1;
+                            use windows::Win32::Foundation::CloseHandle as Ch2;
+                            use windows::Win32::System::Threading::{
+                                OpenProcess as OpFresh, PROCESS_QUERY_LIMITED_INFORMATION,
+                                PROCESS_VM_READ,
+                            };
+                            // SAFETY: pid from our own spawn record.
+                            let fresh = unsafe {
+                                OpFresh(
+                                    PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION,
+                                    false,
+                                    pid,
+                                )
+                            };
+                            if fresh.is_err()
+                                || fresh.as_ref().is_ok_and(|h| h.is_invalid())
+                            {
+                                info!(
+                                    t_s = at_s,
+                                    "V2 forge probe: OpenProcess DENIED -> protected state deployed (licence PASS)"
+                                );
+                            } else {
+                                // SAFETY: the check above guarantees a
+                                // valid handle.
+                                let hp = unsafe { fresh.unwrap_unchecked() };
+                                let mut pb = [0u8; 4];
+                                // SAFETY: fresh handle; image base page.
+                                let rr = unsafe {
+                                    let mut n = 0;
+                                    ReadProcessMemory(
+                                        hp,
+                                        image_base as *const core::ffi::c_void,
+                                        pb.as_mut_ptr() as *mut core::ffi::c_void,
+                                        4,
+                                        Some(&mut n),
+                                    )
+                                };
+                                if rr.is_err() {
+                                    info!(
+                                        t_s = at_s,
+                                        "V2 forge probe: RPM DENIED -> protected state deployed (licence PASS)"
+                                    );
+                                } else {
+                                    info!(
+                                        t_s = at_s,
+                                        "V2 forge probe: readable (protection not deployed yet)"
+                                    );
+                                }
+                                // SAFETY: handle from OpenProcess.
+                                unsafe {
+                                    let _ = Ch2(hp);
+                                }
+                            }
+                        }
                     }
                     if std::time::Instant::now() > deadline {
                         return;

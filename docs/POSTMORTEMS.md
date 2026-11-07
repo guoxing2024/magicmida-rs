@@ -3348,3 +3348,51 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   **raw := target ^ ks ^ reenc1 ^ reenc2**。
 - 下一轮：从 YDW 日志提取 reenc1 的 13 对 + reenc2 常数 → 三重编码
   补丁 → FORGE2 v6 → 三搜索命中 → 闭环。
+
+**续 21 补充 16（同日）——FORGE2 v6：机制全测明，PASS 判定再次不可得（按 续20-补3 标准如实撤回）**：
+
+- **离线对账（v5 工件逐字节）推翻「三重编码」前提**（真实机制进展）：
+  1. **解密源 = 镜像区 copy A，不是缓冲**：v5 补丁写进缓冲的
+     [4,52) 与 [304,352) 全部在 ~1.5ms 内被 pristine dec 覆盖
+     （dec[4]=0x61c697fc 等全数回归）——缓冲不是这两段的解密输入。
+  2. **pos0 特殊**：dec[0] = 0x8c775e0a ≠ pristine 0x7a9fbc7a；
+     v9（不写 pos0）复现同一值 ⟹ 链式篡改项 h(dec[300])
+     （pristine dec[300]=0xef2b351b 时 h=0；补丁后 h=0xF6E8E270）
+     ——解码器对 pos300 的值敏感。
+  3. **重加密只盖 [0,52)**：enc2 ^ enc1 = 0x2D188AD3 逐位复核 ✓
+     （pos0/pos4 今日数据）；**[300,352) 无重加密**（dec 后直落擦除）。
+  4. **v5/v6/v9 三跑的有效补丁全部 = pos300 一 dword**（v6 的 52B
+     块写也输解码竞速，~1 记录后全被覆盖）。
+- **v6 实现**：52B 块写 [304,352) + pos300 单写 + PASS 探针
+  （OpenProcess(PROCESS_VM_READ) @5/20/50/80s；放 bail-watch 循环——
+  µs 快照循环 500ms 即退出，首版探针放错循环从未触发，已修）。
+- **v9 实测（8+ 分钟活体）**：无 bail（bail-watch 10ms 轮询全程，
+  pristine = 382ms）；失败对话框从未出现；探针 5/20/50/80s 全
+  readable；进程停泊（CPU 0.44s/8min、31 线程全等待、无窗口）；
+  哨兵搜索后 = 0xFFFFFFFF（三搜索 miss）。
+- **PASS 判定 = 撤回**。按 续20-补3 标准（「无失败」≠「通过」，必须
+  验证成功路径下游标记）逐项检查：**运行时副本 8 分钟未现**（外部
+  4KB 头页扫描，readable 进程直读）、**无搜索命中**（哨兵全 miss）、
+  **无应用 UI/新线程**。与 KEYFORGE 中止的区别只在流程更深（列表区
+  [0x20AA9,0x20AE1] 有构建：109→166 与 pristine 108→175 同步——
+  不是 KEYFORGE 的全零中止点），但**无一成功标记**。最可能 = verifier
+  op（0x2402C 逐字段 vmhash）在更晚点静默拒了我们改动的 pos300
+  字段——中止挂起形状与 KEYFORGE 同类。
+- **[哨兵+4] = 0x7dc80de6/0x022869c8 重解读**：三个独立锻造 run 出现、
+  pristine 无、静态镜像无——最可能 = **verifier 的期望值参考常数**
+  （篡改路径的写），非 pass 标记（KEYFORGE 时代 = 注入值回显的巧合
+  一并修正）。
+- **反读修正**：v9 探针全程 readable——反读 ≠ pass/中止伴随物；
+  KEYFORGE 的 OpenProcess 被拒 = 548 轮连续重写的防篡改响应。
+  U21 副本 = fail-era 工件（副本存在 ≠ pass）维持。
+- **真锻造方程（更新）**：pos300 改动过不了 verifier。运行时路径要
+  过 = **在 verifier 跑完之后、列表构建 [261,303) 之前**的窗口改字段
+  （verifier 对 pristine 字段放行 → 换键 → 搜索吃我们的值）——前提 =
+  定位 verifier op 的执行窗口（POOLSNIFF 变体：解码后基线，扫
+  [230,300) 的 op 执行）。盘上路径照旧被全局校验 f 挡（学术线）。
+- 工件：OUT/ps1/analyze_forge.py（9880B TSNAP + 1268B DECODEWATCH
+  解析器）、*.v5forge.bin / *.v6forge.bin / tsnap_pristine.bin、
+  forge2_v5run_log.txt / forge2_v6run_log.txt。ks 表 26 对独立验证
+  （dec[0]=0x7a9fbc7a = KEYFORGE 标记、dec[300]=0xef2b351b = 触发值、
+  dec[344]=0x77dc7da4 ✓）。双架构零告警（探针 match 守卫 E0004/E0408
+  已修；stash 对照证明 8 条 unused 告警 = 编译错误级联）。
