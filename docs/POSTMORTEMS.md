@@ -3184,3 +3184,20 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   逐个缝合 jmp 链（~10-30 片段）抽出 3 状态 dword 的转移函数 → 261 态
   验证 → f → .dat 重编码。样本 handler 0x1062857（push ebp/esp 起手）、
   0x1065bcf（lodsd; xor eax,ebx 起手）可读。
+
+**续 21 补充 5（同日）——两副本定案 + 免 f 锻造配方**：
+- handler 缝合推进中发现：**校验读副本 A（镜像数据区），解码读副本 B
+  （480B 堆缓冲）——两份独立拷贝**。esi∈镜像（0x10F0xxx/0x114xxxx）=
+  校验的输入；DECODEWATCH 六相 = 堆缓冲。oracle（改盘上 .dat 被拒）=
+  两副本都来自盘上文件；KEYFORGE 补堆缓冲在解密完成后 = 校验已过但
+  **字段校验和（verifier op，逐字段 vmhash vs 期望）抓到字段被改**。
+- **免 f 配方**：①盘上 .dat 保持原样 → 全局校验（副本 A）通过 ✓；
+  ②校验结束→解码开始的窗口内补丁**堆缓冲**：字段 := 本机键 + 字段
+  校验和 := vmhash(新字段)（**verifier 的 hash 实例已捕获**——0x24046
+  常数 0x5041/0x5449 + init/feedback/not/打包全链）；③解码出我们的
+  字段 → verifier 用我们写的校验和验证我们的字段 ✓ → 搜索命中 →
+  **许可通过，无需 f**。
+- 已知缺口：字段校验和的期望值存哪（.dat 内可补丁位置 vs baked——
+  baked 则字段不可自由选）；窗口触发器（state dwords 停变 / ctr→604）。
+- 下一轮：check-end-patch 机器（KEYFORGE 改触发点 + 一致性字段补丁）；
+  verifier 期望值位置猎取（oracle：只改字段校验和位置看反应）。
