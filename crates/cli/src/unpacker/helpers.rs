@@ -3887,6 +3887,8 @@ pub(super) fn spawn_dialog_killer(
                 let mut polls: u64 = 0;
                 let mut forge_armed = keyforge;
                 let mut forge2_done = false;
+                let mut forge2_armed = false;
+                let mut t_snap_done = false;
                 let mut last_sent: [u32; 3] = [0xFFFF_FFFF; 3];
                 let mut last_msg = String::new();
                 // Phase 1: find the file copy (needle scan, MEM_PRIVATE).
@@ -4007,34 +4009,40 @@ pub(super) fn spawn_dialog_killer(
                         let ca = u32::from_le_bytes(cont_buf[0..4].try_into().unwrap());
                         // FORGE2: fill-complete = >=460 nonzero bytes; patch
                         // the raw key segments once, right here.
-                        if forge2 && !forge2_done {
-                            let nz = snap.iter().filter(|&&b| b != 0).count();
-                            if nz >= 460 {
+                        if forge2 && !forge2_done && forge2_armed {
+                            // v3: the decrypt is RUNNING (ca back in the
+                            // buffer = the segment-A walk).  Positions the
+                            // decrypt already consumed get the PLAINTEXT
+                            // key; positions ahead of the cursor get the
+                            // ENCODED form (key ^ ks) — the decrypt then
+                            // converts them itself.  The search = a
+                            // membership scan, so any surviving slot of K1
+                            // / K2 is a hit.
+                            let cau = ca as usize;
+                            let cursor = (cau >= ba && cau < ba + 480)
+                                .then_some(cau - ba)
+                                .unwrap_or(0);
+                            if cursor >= 300 {
                                 forge2_done = true;
-                                // v2: raw[pos] := key ^ ks[pos] — the field
-                                // cipher is a position-dependent XOR (dec =
-                                // raw ^ ks, 26/26 pairs measured); encoding
-                                // our keys through it makes the decrypt
-                                // produce the real machine keys.
                                 let mut fw = 0u32;
-                                for (i, &(pos, ks)) in FORGE_KS.iter().enumerate() {
-                                    let kv = if pos < 100 {
-                                        // segment B [0,52): alternate K1/K2
-                                        if (pos / 4) % 2 == 0 { FORGE_KEY1 } else { FORGE_KEY2 }
+                                for &(pos, ks) in FORGE_KS.iter() {
+                                    let key = if (pos / 4) % 2 == 0 {
+                                        FORGE_KEY1
                                     } else {
-                                        // segment A [300,352): the same
-                                        // alternating pattern continues
-                                        if (pos / 4) % 2 == 0 { FORGE_KEY1 } else { FORGE_KEY2 }
+                                        FORGE_KEY2
                                     };
-                                    let enc = kv ^ ks;
-                                    let _ = i;
+                                    let value = if pos < cursor {
+                                        key
+                                    } else {
+                                        key ^ ks
+                                    };
                                     // SAFETY: live handle; committed buffer.
                                     let okw = unsafe {
                                         let mut n = 0;
                                         WriteProcessMemory(
                                             h_process,
                                             (ba + pos) as *mut core::ffi::c_void,
-                                            &enc as *const u32 as *const core::ffi::c_void,
+                                            &value as *const u32 as *const core::ffi::c_void,
                                             4,
                                             Some(&mut n),
                                         )
@@ -4047,11 +4055,24 @@ pub(super) fn spawn_dialog_killer(
                                 }
                                 info!(
                                     t_ms = watch_t0.elapsed().as_millis() as u32,
+                                    cursor,
                                     written = fw,
-                                    "FORGE2: raw := key^ks patched (26 positions)"
+                                    "FORGE2: keys written against the decode cursor"
                                 );
                             }
                         }
+                        if forge2 && !forge2_armed {
+                            // arm when the check phase is seen (ca in-image)
+                            let cau = ca as usize;
+                            if cau >= image_base && cau < image_base + 0x400_000 {
+                                forge2_armed = true;
+                                info!(
+                                    t_ms = watch_t0.elapsed().as_millis() as u32,
+                                    "FORGE2: check phase seen - armed"
+                                );
+                            }
+                        }
+
                         // KEYFORGE: the first decrypted dword (0x7a9fbc7a in
                         // YDW2 — the decrypt of raw[0]) marks the decrypt
                         // completion for the key block; overwrite the whole
@@ -4263,6 +4284,98 @@ pub(super) fn spawn_dialog_killer(
                             nrec += 1;
                         }
                         if keyforge || forge2 {
+                            // One-shot T-extraction snapshot: the moment the
+                            // FIRST sentinel flips to 0xFFFFFFFF (the search
+                            // fired), grab the 19 licence fields (8B each)
+                            // + the searched keys + the list region — the
+                            // machine transform T = fields vs list.
+                            if !t_snap_done && forge2 {
+                                const SENT0: usize = 0x216F5;
+                                let mut sb0 = [0u8; 4];
+                                // SAFETY: live handle; in-image slot.
+                                let ok0 = unsafe {
+                                    let mut n = 0;
+                                    ReadProcessMemory(
+                                        h_process,
+                                        (image_base + SENT0) as *const core::ffi::c_void,
+                                        sb0.as_mut_ptr() as *mut core::ffi::c_void,
+                                        4,
+                                        Some(&mut n),
+                                    )
+                                    .is_ok()
+                                        && n == 4
+                                };
+                                if ok0
+                                    && u32::from_le_bytes(sb0) == 0xFFFF_FFFF
+                                    && watch_t0.elapsed().as_millis() > 250
+                                {
+                                    t_snap_done = true;
+                                    let mut tblob: Vec<u8> = Vec::new();
+                                    for &frva in LIC_FIELDS.iter() {
+                                        let mut fb = [0u8; 8];
+                                        // SAFETY: live handle; in-image field.
+                                        unsafe {
+                                            let mut n = 0;
+                                            let _ = ReadProcessMemory(
+                                                h_process,
+                                                (image_base + frva)
+                                                    as *const core::ffi::c_void,
+                                                fb.as_mut_ptr() as *mut core::ffi::c_void,
+                                                8,
+                                                Some(&mut n),
+                                            );
+                                        }
+                                        tblob.extend_from_slice(&fb);
+                                    }
+                                    // the searched keys (sentinel+4 x3)
+                                    for &srva in [0x216F9usize, 0x22D81, 0x23401]
+                                        .iter()
+                                    {
+                                        let mut kb = [0u8; 4];
+                                        // SAFETY: live handle; in-image slot.
+                                        unsafe {
+                                            let mut n = 0;
+                                            let _ = ReadProcessMemory(
+                                                h_process,
+                                                (image_base + srva)
+                                                    as *const core::ffi::c_void,
+                                                kb.as_mut_ptr() as *mut core::ffi::c_void,
+                                                4,
+                                                Some(&mut n),
+                                            );
+                                        }
+                                        tblob.extend_from_slice(&kb);
+                                    }
+                                    // the list region (1KB)
+                                    let mut lb = vec![0u8; 0x400];
+                                    // SAFETY: live handle; in-image region.
+                                    unsafe {
+                                        let mut n = 0;
+                                        let _ = ReadProcessMemory(
+                                            h_process,
+                                            (image_base + 0x20A00)
+                                                as *const core::ffi::c_void,
+                                            lb.as_mut_ptr() as *mut core::ffi::c_void,
+                                            0x400,
+                                            Some(&mut n),
+                                        );
+                                    }
+                                    tblob.extend_from_slice(&lb);
+                                    let stem = out_path.with_extension("v2tsnap");
+                                    if let Some(name) = stem.file_name() {
+                                        let mut n2 = name.to_os_string();
+                                        n2.push(".bin");
+                                        let _ = std::fs::write(
+                                            stem.with_file_name(n2),
+                                            &tblob,
+                                        );
+                                    }
+                                    info!(
+                                        t_ms = watch_t0.elapsed().as_millis() as u32,
+                                        "FORGE2: T-snapshot written (fields+keys+list)"
+                                    );
+                                }
+                            }
                             // Sentinel results ([sentinel]=search verdict):
                             // non-(-1) = the search HIT.
                             const SENT: [usize; 3] = [0x216F5, 0x22D7D, 0x233FD];
@@ -4288,7 +4401,7 @@ pub(super) fn spawn_dialog_killer(
                                         // the SEARCHED key = [sentinel+4]
                                         let mut kb = [0u8; 4];
                                         // SAFETY: live handle; in-image slot.
-                                        let kok = unsafe {
+                                        let _kok = unsafe {
                                             let mut n2 = 0;
                                             ReadProcessMemory(
                                                 h_process,
