@@ -1107,6 +1107,9 @@ pub(super) fn spawn_dialog_killer(
         let tsnap_on = std::env::var("MAGICMIDA_V2_TSNAP").is_ok();
         const FORGE_KEY1: u32 = 0x7DC8_0DE6;
         const FORGE_KEY2: u32 = 0x0228_69C8;
+        // the pristine raw dword at buffer offset 300 (the decode's first
+        // segment-A write leaves this value) — from the on-disk .dat.
+        const FORGE_RAW300: u32 = 0x5943_3AC4;
         // the .dat field cipher = position-dependent XOR keystream; the 26
         // field positions' ks measured (v2_pairs.json, 2026-11-07).
         const FORGE_KS: [(usize, u32); 26] = [
@@ -4190,24 +4193,29 @@ pub(super) fn spawn_dialog_killer(
                         // FORGE2: fill-complete = >=460 nonzero bytes; patch
                         // the raw key segments once, right here.
                         if forge2 && !forge2_done && forge2_armed {
-                            // v3: the decrypt is RUNNING (ca back in the
-                            // buffer = the segment-A walk).  Positions the
-                            // decrypt already consumed get the PLAINTEXT
-                            // key; positions ahead of the cursor get the
-                            // ENCODED form (key ^ ks) — the decrypt then
-                            // converts them itself.  The search = a
-                            // membership scan, so any surviving slot of K1
-                            // / K2 is a hit.
-                            let cau = ca as usize;
-                            let cursor = (cau >= ba && cau < ba + 480)
-                                .then_some(cau - ba)
-                                .unwrap_or(0);
-                            if cursor >= 300 {
+                            // v5: the trigger = the decode's FIRST write —
+                            // buf[300,304) leaves the raw value (the decode
+                            // is converting segment A NOW, ~385 µs/dword).
+                            // Patch immediately: pos 300 = the plaintext
+                            // target (already decoded), the rest = the
+                            // encoded form (target ^ ks) — the decode
+                            // converts them itself.  The cursor=300 state
+                            // is ambiguous (the wipe walks there too) and
+                            // loses the race.
+                            let v300 = u32::from_le_bytes(
+                                snap[300..304].try_into().unwrap(),
+                            );
+                            let raw300 = FORGE_RAW300;
+                            if v300 != raw300 && v300 != 0 {
                                 forge2_done = true;
                                 let mut fw = 0u32;
                                 for &(pos, ks) in FORGE_KS.iter() {
-                                    let key = forge_targets[(pos / 4) % 3];
-                                    let value = if pos < cursor {
+                                    let key = if pos == 300 {
+                                        forge_targets[0]
+                                    } else {
+                                        forge_targets[(pos / 4) % 3]
+                                    };
+                                    let value = if pos == 300 {
                                         key
                                     } else {
                                         key ^ ks
@@ -4231,9 +4239,9 @@ pub(super) fn spawn_dialog_killer(
                                 }
                                 info!(
                                     t_ms = watch_t0.elapsed().as_millis() as u32,
-                                    cursor,
+                                    v300 = format!("{v300:#010x}"),
                                     written = fw,
-                                    "FORGE2: keys written against the decode cursor"
+                                    "FORGE2: keys written on the decode first-write trigger"
                                 );
                             }
                         }
