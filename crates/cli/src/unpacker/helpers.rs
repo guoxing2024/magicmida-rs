@@ -1110,13 +1110,38 @@ pub(super) fn spawn_dialog_killer(
         // the pristine raw dword at buffer offset 300 (the decode's first
         // segment-A write leaves this value) — from the on-disk .dat.
         const FORGE_RAW300: u32 = 0x5943_3AC4;
-        // The .dat field cipher ks table (26 (pos,ks) pairs, v2_pairs.json)
-        // is NOT used for the buffer patch any more: the decrypt sources
-        // [4,52) and [304,352) from the image-area copy A, so buffer writes
-        // there are overwritten by the pristine dec (v5 artifacts, measured
-        // 2026-11-07).  The table stays in OUT/v2_pairs.json for the offline
-        // reconciliation (dec = raw ^ ks) — pos300's dec = 0xef2b351b and
-        // the raw disk value FORGE_RAW300 below are all the trigger needs.
+        // The .dat field cipher ks table (26 (pos,ks) pairs, v2_pairs.json):
+        // dec = raw ^ ks.  v7 patches the IMAGE-AREA copy A (the decode's
+        // actual source) so the decode itself produces our keys; the ks
+        // table encodes raw := key ^ ks.
+        const FORGE_KS: [(usize, u32); 26] = [
+    (0, 0x346e_44fb),
+    (4, 0x1990_f13b),
+    (8, 0x3090_f108),
+    (12, 0xd354_e62b),
+    (16, 0x55c2_b0b4),
+    (20, 0xa8f3_ee78),
+    (24, 0x6295_2a8a),
+    (28, 0xf8e5_f9f2),
+    (32, 0x2f61_9a0f),
+    (36, 0x36d0_cf18),
+    (40, 0xbe1d_6ec9),
+    (44, 0x92b1_1517),
+    (48, 0x8d7d_5ac9),
+    (300, 0xb668_0fdf),
+    (304, 0x2d06_265a),
+    (308, 0x5b50_a39e),
+    (312, 0xab8c_4ee9),
+    (316, 0x13d_01ca),
+    (320, 0xa227_79ef),
+    (324, 0xee0f_7545),
+    (328, 0xbe8a_55a7),
+    (332, 0x47e1_bb89),
+    (336, 0xb1c5_2641),
+    (340, 0x6341_fb6c),
+    (344, 0xcc15_c7ec),
+    (348, 0x4498_a764),
+];
         // per-position desired plaintext = the machine keys (alternating);
         // the search = a membership scan over the decoded list.
         // DAT_HEAD replaced by the per-sample dat_needle (read from
@@ -3040,8 +3065,10 @@ pub(super) fn spawn_dialog_killer(
                     THREAD_SUSPEND_RESUME,
                 };
                 let h_process = HANDLE(handle_raw as *mut core::ffi::c_void);
-                // Wait for the search window (the searches fire ~[280,420]ms).
-                while watch_t0.elapsed().as_millis() < 265 {
+                // Wait past the decode (~214 ms) so the window covers the
+                // field-verify op (0x2400D-0x2429D — its execution window
+                // is unknown, somewhere in [215,300)) AND the searches.
+                while watch_t0.elapsed().as_millis() < 215 {
                     std::thread::yield_now();
                 }
                 // find the VM thread: EIP inside the image
@@ -4051,6 +4078,15 @@ pub(super) fn spawn_dialog_killer(
                 let mut nsnap_t = 0usize;
                 let mut last_sent: [u32; 3] = [0xFFFF_FFFF; 3];
                 let mut probe_idx = 0usize;
+                // FORGE2 v7: the image-area .dat copies (source A) + the
+                // check-done trigger state.
+                let mut a_addrs: Vec<usize> = Vec::new();
+                let mut a_patched = false;
+                let mut last_scratch: u32 = 0;
+                // FORGE2 v12: the continuous key-block patch state.
+                let mut f2_blk = [0u8; 52];
+                let mut f2_blk_head = [0u8; 52];
+                let mut f2_last_patch = 0u32;
                 let mut last_msg = String::new();
                 // Phase 1: find the file copy (needle scan, MEM_PRIVATE).
                 while buf_addr.is_none() && watch_t0.elapsed().as_millis() < 260 {
@@ -4168,82 +4204,200 @@ pub(super) fn spawn_dialog_killer(
                             continue;
                         }
                         let ca = u32::from_le_bytes(cont_buf[0..4].try_into().unwrap());
+                        // FORGE2 v7: the check-done trigger.  The check op
+                        // = a 0.4ms burst at ~202.5ms writing its scratch
+                        // u16 @image+0x5FFB2 every ~400ns; two consecutive
+                        // polls reading the SAME nonzero value = the burst
+                        // is over (it cannot fire early).  Patch A in the
+                        // window before the VMCTX field copy (~205-211ms)
+                        // and before the decode reads A ([212,226]ms).
+                        if forge2 && !a_patched && !a_addrs.is_empty() {
+                            let mut sb = [0u8; 4];
+                            // SAFETY: live handle; in-image scratch.
+                            let ok_s = unsafe {
+                                let mut n = 0;
+                                ReadProcessMemory(
+                                    h_process,
+                                    (image_base + 0x5FFB2) as *const core::ffi::c_void,
+                                    sb.as_mut_ptr() as *mut core::ffi::c_void,
+                                    4,
+                                    Some(&mut n),
+                                )
+                                .is_ok()
+                                    && n == 4
+                            };
+                            if ok_s {
+                                let sc = u32::from_le_bytes(sb);
+                                if sc != 0 && sc == last_scratch {
+                                    a_patched = true;
+                                    // [300,352) = 13 dwords, the three
+                                    // machine keys cycled, encoded with
+                                    // the field cipher ks (dec = raw ^ ks).
+                                    let mut blk = [0u8; 52];
+                                    for (i, k) in blk.chunks_mut(4).enumerate() {
+                                        let key = match i % 3 {
+                                            0 => forge_targets[0],
+                                            1 => forge_targets[1],
+                                            _ => forge_targets[2],
+                                        };
+                                        let ks = FORGE_KS[13 + i].1;
+                                        k.copy_from_slice(
+                                            &(key ^ ks).to_le_bytes(),
+                                        );
+                                    }
+                                    let mut wok = 0u32;
+                                    for &aa in &a_addrs {
+                                        // SAFETY: live handle; writable
+                                        // shell data section.
+                                        let ok_w = unsafe {
+                                            let mut n = 0;
+                                            WriteProcessMemory(
+                                                h_process,
+                                                (aa + 300)
+                                                    as *mut core::ffi::c_void,
+                                                blk.as_ptr()
+                                                    as *const core::ffi::c_void,
+                                                52,
+                                                Some(&mut n),
+                                            )
+                                            .is_ok()
+                                                && n == 52
+                                        };
+                                        if ok_w {
+                                            wok += 1;
+                                        }
+                                    }
+                                    info!(
+                                        t_ms = watch_t0.elapsed().as_millis()
+                                            as u32,
+                                        scratch = format!("{sc:#x}"),
+                                        copies = a_addrs.len(),
+                                        written = wok,
+                                        "FORGE2 v7: source-A key block patched on check-done"
+                                    );
+                                }
+                                last_scratch = sc;
+                            }
+                        }
                         // FORGE2: fill-complete = >=460 nonzero bytes; patch
                         // the raw key segments once, right here.
                         if forge2 && !forge2_done && forge2_armed {
                             // v5: the trigger = the decode's FIRST write —
                             // buf[300,304) leaves the raw value (the decode
                             // is converting segment A NOW, ~385 µs/dword).
-                            // Patch immediately: pos 300 = the plaintext
-                            // target (already decoded), the rest = the
-                            // encoded form (target ^ ks) — the decode
-                            // converts them itself.  The cursor=300 state
-                            // is ambiguous (the wipe walks there too) and
-                            // loses the race.
                             let v300 = u32::from_le_bytes(
                                 snap[300..304].try_into().unwrap(),
                             );
                             let raw300 = FORGE_RAW300;
                             if v300 != raw300 && v300 != 0 {
                                 forge2_done = true;
-                                // v6: [304,352) as ONE 52 B block write —
-                                // the decode advances ~108 us/dword through
-                                // this range, a single WPM beats it for all
-                                // 13 dwords (the v5 per-dword writes lost
-                                // the race for every position past 304).
-                                // Raw plaintext keys: the block is NOT
-                                // re-encrypted (measured), the search list
-                                // consumes these values as-is.
-                                let mut blk = [0u8; 52];
-                                for (i, k) in blk.chunks_mut(4).enumerate() {
-                                    let key = if i % 2 == 0 {
+                                // v12 (2026-11-07): the VM re-decodes the
+                                // buffer in MULTIPLE clear+decode cycles
+                                // (v11: pass-1 ~238ms, clear 264ms, pass-2
+                                // 264ms) — a one-shot patch between cycles
+                                // is erased by the next clear (v11's block
+                                // write vanished; the verifier scored
+                                // pristine 0x26e).  The KEYFORGE-proven
+                                // counter = CONTINUOUS re-patch: rewrite
+                                // the plain-key block [300,352) every
+                                // 200 µs until t≈375 ms so the field
+                                // derivation [265,340] and the verifier
+                                // itself read our keys.  [300,352) is NOT
+                                // re-encrypted (measured) — plain keys are
+                                // consumed as-is.
+                                for (i, k) in f2_blk.chunks_mut(4).enumerate() {
+                                    let key = if i == 0 {
+                                        forge_targets[0]
+                                    } else if i % 2 == 1 {
                                         forge_targets[1]
                                     } else {
                                         forge_targets[2]
                                     };
                                     k.copy_from_slice(&key.to_le_bytes());
                                 }
+                                for (i, k) in f2_blk_head.chunks_mut(4).enumerate()
+                                {
+                                    // [0,52): the KEYFORGE layout — the two
+                                    // machine keys alternating over 13 dwords.
+                                    let key = if i % 2 == 0 {
+                                        forge_targets[0]
+                                    } else {
+                                        forge_targets[1]
+                                    };
+                                    k.copy_from_slice(&key.to_le_bytes());
+                                }
                                 // SAFETY: live handle; committed buffer.
-                                let w_blk = unsafe {
+                                let w = unsafe {
                                     let mut n = 0;
                                     WriteProcessMemory(
                                         h_process,
-                                        (ba + 304) as *mut core::ffi::c_void,
-                                        blk.as_ptr() as *const core::ffi::c_void,
+                                        (ba + 300) as *mut core::ffi::c_void,
+                                        f2_blk.as_ptr() as *const core::ffi::c_void,
                                         52,
                                         Some(&mut n),
                                     )
                                     .is_ok()
                                         && n == 52
                                 };
-                                // pos300: decoded BEFORE the trigger (the
-                                // trigger = its dec value appeared), never
-                                // rewritten by the decode — the plaintext
-                                // KEY1 lands here and stays.
                                 // SAFETY: live handle; committed buffer.
-                                let w300 = unsafe {
+                                let wh = unsafe {
                                     let mut n = 0;
                                     WriteProcessMemory(
                                         h_process,
-                                        (ba + 300) as *mut core::ffi::c_void,
-                                        &forge_targets[0] as *const u32
+                                        ba as *mut core::ffi::c_void,
+                                        f2_blk_head.as_ptr()
                                             as *const core::ffi::c_void,
-                                        4,
+                                        52,
                                         Some(&mut n),
                                     )
                                     .is_ok()
-                                        && n == 4
+                                        && n == 52
                                 };
+                                f2_last_patch =
+                                    watch_t0.elapsed().as_micros() as u32;
                                 info!(
                                     t_ms = watch_t0.elapsed().as_millis() as u32,
                                     v300 = format!("{v300:#010x}"),
-                                    blk = w_blk,
-                                    pos300 = w300,
+                                    first = w,
+                                    first_head = wh,
                                     t1 = format!("{:#010x}", forge_targets[0]),
                                     t2 = format!("{:#010x}", forge_targets[1]),
                                     t3 = format!("{:#010x}", forge_targets[2]),
-                                    "FORGE2 v6: keys written (block [304,352) + pos300)"
+                                    "FORGE2 v12: key-block continuous patch started"
                                 );
+                            }
+                        }
+                        // v12: the continuous re-patch (200 µs cadence).
+                        if forge2 && forge2_done && forge2_armed {
+                            let now_us =
+                                watch_t0.elapsed().as_micros() as u32;
+                            if now_us < 375_000
+                                && now_us.wrapping_sub(f2_last_patch) >= 200
+                            {
+                                f2_last_patch = now_us;
+                                // SAFETY: live handle; committed buffer
+                                // (after the wipe the write fails
+                                // silently — n != 52 — and stops mattering).
+                                unsafe {
+                                    let mut n = 0;
+                                    let _ = WriteProcessMemory(
+                                        h_process,
+                                        (ba + 300) as *mut core::ffi::c_void,
+                                        f2_blk.as_ptr()
+                                            as *const core::ffi::c_void,
+                                        52,
+                                        Some(&mut n),
+                                    );
+                                    let mut n2 = 0;
+                                    let _ = WriteProcessMemory(
+                                        h_process,
+                                        ba as *mut core::ffi::c_void,
+                                        f2_blk_head.as_ptr()
+                                            as *const core::ffi::c_void,
+                                        52,
+                                        Some(&mut n2),
+                                    );
+                                }
                             }
                         }
                         if forge2 && !forge2_armed {
@@ -4272,11 +4426,53 @@ pub(super) fn spawn_dialog_killer(
                                     }
                                     forge_targets[i] = u32::from_le_bytes(kb);
                                 }
+                                // v7: locate the image-area .dat copies
+                                // (source A — the check's input and the
+                                // decode's source; REGSNATCH measured them
+                                // at ~0x10F0xxx/0x114xxxx).  Scan the whole
+                                // image for the .dat head needle.
+                                if !dat_needle.is_empty() {
+                                    let mut chunk = [0u8; 0x4_0000];
+                                    let mut scan = image_base;
+                                    while scan < image_base + 0x372_000 {
+                                        let len =
+                                            0x4_0000.min(image_base + 0x372_000 - scan);
+                                        // SAFETY: live handle; image range.
+                                        let got = unsafe {
+                                            let mut n = 0;
+                                            ReadProcessMemory(
+                                                h_process,
+                                                scan as *const core::ffi::c_void,
+                                                chunk.as_mut_ptr() as *mut core::ffi::c_void,
+                                                len,
+                                                Some(&mut n),
+                                            )
+                                            .is_ok()
+                                                && n == len
+                                        };
+                                        if got {
+                                            for w in
+                                                chunk[..len].windows(16)
+                                            {
+                                                if w == dat_needle {
+                                                    a_addrs
+                                                        .push(scan + (w.as_ptr()
+                                                            as usize
+                                                            - chunk.as_ptr()
+                                                                as usize));
+                                                }
+                                            }
+                                        }
+                                        scan += len;
+                                    }
+                                    a_addrs.truncate(8);
+                                }
                                 info!(
                                     t_ms = watch_t0.elapsed().as_millis() as u32,
                                     t1 = format!("{:#010x}", forge_targets[0]),
                                     t2 = format!("{:#010x}", forge_targets[1]),
                                     t3 = format!("{:#010x}", forge_targets[2]),
+                                    a_copies = a_addrs.len(),
                                     "FORGE2: armed - baked search targets read"
                                 );
                             }
@@ -4452,10 +4648,12 @@ pub(super) fn spawn_dialog_killer(
                         // Also capture the executing block at cont+dp (the
                         // decode ops live in a transient heap block —
                         // 0x1ECE030 in YDW2 — not in the image).
-                        // The decode phase's dp = small (0xC3807 in YDW2):
-                        // the continuation there = the ABSOLUTE block
-                        // address, so read AT ca (dp=0) as well as ca+dp.
-                        let block_va = ca;
+                        // 2026-11-07: ca alone is an OFFSET in the decode
+                        // phase (ca=0xc30160, dp=0xb206 → the body read
+                        // landed on zeros); block VA = (ca + dp) & ~0 —
+                        // the same formula the check phase already used.
+                        let block_va = ca
+                            .wrapping_add(u32::from_le_bytes(dp_buf));
                         let mut blk = [0u8; 512];
                         if block_va >= 0x100 {
                             // SAFETY: live handle; an uncommitted block just
@@ -4570,6 +4768,47 @@ pub(super) fn spawn_dialog_killer(
                                     );
                                 }
                                 tblob.extend_from_slice(&hb);
+                                // The search LIST (SEARCHSNATCH: the esi
+                                // walk covers 0x10DC758-0x10DCAF4 = image
+                                // RVA 0xDC000-0xDD000) — never captured
+                                // before; T(fields) is measured from it.
+                                let mut sl = vec![0u8; 0x1000];
+                                // SAFETY: live handle; in-image region.
+                                unsafe {
+                                    let mut n = 0;
+                                    let _ = ReadProcessMemory(
+                                        h_process,
+                                        (image_base + 0xDC000) as *const core::ffi::c_void,
+                                        sl.as_mut_ptr() as *mut core::ffi::c_void,
+                                        0x1000,
+                                        Some(&mut n),
+                                    );
+                                }
+                                tblob.extend_from_slice(&sl);
+                                // The field-verify op's output state
+                                // (静态 op 全读，续 19 ③): miss counter
+                                // 0x201FD, accumulated result 0x20CF1,
+                                // flag 0x22D45, field counter 0x23DEA.
+                                for (vrva, vlen) in [
+                                    (0x201F0usize, 0x20usize),
+                                    (0x20CE0usize, 0x20usize),
+                                    (0x22D40usize, 0x10usize),
+                                    (0x23DE0usize, 0x10usize),
+                                ] {
+                                    let mut vb = vec![0u8; vlen];
+                                    // SAFETY: live handle; in-image region.
+                                    unsafe {
+                                        let mut n = 0;
+                                        let _ = ReadProcessMemory(
+                                            h_process,
+                                            (image_base + vrva) as *const core::ffi::c_void,
+                                            vb.as_mut_ptr() as *mut core::ffi::c_void,
+                                            vlen,
+                                            Some(&mut n),
+                                        );
+                                    }
+                                    tblob.extend_from_slice(&vb);
+                                }
                                 // the 26 buffer field positions (if ba known)
                                 if ba != 0 {
                                     let mut bb = vec![0u8; 480];

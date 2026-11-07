@@ -3396,3 +3396,47 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   （dec[0]=0x7a9fbc7a = KEYFORGE 标记、dec[300]=0xef2b351b = 触发值、
   dec[344]=0x77dc7da4 ✓）。双架构零告警（探针 match 守卫 E0004/E0408
   已修；stash 对照证明 8 条 unused 告警 = 编译错误级联）。
+
+**续 21 补充 17（同日第四轮）——verifier 定位 + miss 计数器 = 锻造进度条（可量化）**：
+
+- **新仪表（TSNAP 扩展，全落地）**：搜索列表区 RVA 0xDC000（4KB）+
+  verifier 输出槽（0x201FD miss 计数 / 0x20CF1 累积结果 / 0x22D45 旗标 /
+  0x23DEA 字段计数器）+ SEARCHSNATCH 起点 265→215ms。
+- **verifier op 执行窗口 = [340,360]ms（搜索之后！）**：miss 0→0x26e
+  （622）、字段计数 0x686→0xe7（处理 1439/1670 个字段，~80 fields/ms）。
+  EIP 扫描 [243,281] 零命中（该窗口 = 列表构建 op，RVA 0x60000-0x73000）。
+- **锻造进度条定案**：pos300 = 本机键 1 → **miss 622→0x50（80）**，
+  -542 = 键 1 衍生字段全部转 hit。verifier 的字段输入 = 缓冲 B 衍生
+  （我们的补丁喂进去了）。
+- **VM 多周期重解码定案（v11）**：pass-1 ~238ms → 清零 264ms → pass-2
+  264ms——一次性补丁落在周期之间 = 被清（v11 的块写消失、verifier 得
+  pristine 分 0x26e）。**KEYFORGE 式连续补丁 = 唯一有效形状**：v12/v13
+  以 200µs 节奏重写 [300,352)（+v13 加 [0,52) K1/K2），键值贯穿
+  [230,420]ms 所有周期 ✓。
+- **miss 地板 = 0x50（80）不变**：[0,52) K1/K2 交替 + [304,352) K2/K3
+  双块补丁零进一步降低——剩余 miss ≠ 缓冲衍生（= 身份/名字/逐 run 键
+  衍生字段）。pristine = 622 = 失败；80 = 不失败但停泊。
+- **搜索列表 = 编码 blob**：RVA 0xDC000 = 1024/1024 dword 全非零，字段
+  原值零命中（T 非平凡）；pristine vs forged 逐字节相同 = 列表不从 B
+  构建（从 VMCTX/镜像侧）→ 缓冲补丁不影响搜索 → 哨兵恒 miss。
+  [哨兵+4] 搜索后 = 0x7dc80de6/0x022869c8 = 壳自产参考常数（每个锻造
+  run 都出现、pristine 无、静态镜像无）。
+- **镜像里没有 .dat 副本**（needle 全图 8 区域 0 命中，全可读）——
+  「copy A」= VM 数据区内的变换形态（非裸 raw）。DECODEWATCH blk 读法
+  修正：block VA = (ca+dp)&0xFFFFFFFF（ca 单独 = 解码相的偏移，0xc30160
+  +dp 0xb206；修正前 blk 读到零页）。VM 代码区 = 每 run 变
+  （0xC3xxxx / 0x136xxxx）。
+- **停泊态画像（v9-v14 全一致）**：30MB WS、30-41 线程全等待、CPU
+  0.44s、无窗口、无运行时副本（外部 4KB 头页扫描多次）、.text 恒为盘上
+  密文、探针 5/20/50/80s 全 readable、无 bail 无对话框。80-miss 态 =
+  壳停泊，部署未发生。
+- **判定**：锻造 = 量化推进（622→80）但通过未演示（部署零标记，按
+  续20-补3 标准 = 未通过）。**下一轮三选一**：① verifier op 体已可捕获
+  （blk 修正后 [340,360] 记录 = 解密态 op 体）→ 字段表地址 → miss 来源
+  分解；② 列表编码 T 重建（searchsnatch (elem,eax,ebx) 25 样本 × 列表
+  blob 字节级）；③ 名字绑定实验（GetModuleFileName 名字 = 许可绑定，
+  改名 oracle）。
+- 工件：CISC-1U.v2decodewatch.prime3/.v12/.v13.bin、
+  CISC-1U.v2tsnap.pristine2/.v12/.v13.bin、
+  CISC-1U.v2searchsnatch.pristine2.bin、check_op_body3.bin、
+  probe_rawcopy.py、fold_check.py、analyze_forge.py。
