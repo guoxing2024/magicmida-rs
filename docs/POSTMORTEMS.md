@@ -3322,3 +3322,16 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
 - 下一轮：SEARCHSNATCH 时序分析（每个寄存器的值-时间曲线 → 搜索
   边界 → 键真身）+ 列表内容（0x10DC000，pristine 快照）三方对账 →
   比较语义 → FORGE2 v6。
+
+**续 21 补充 14（同日）——寄存器时间曲线 + 对比关系数据提取**：
+- SEARCHSNATCH 2000 张的时序分析：esi = 列表走线（多段），eax/ebx =
+  分段常量（**eax = 0x9e7c2a07 连续 50 快照 @296.7ms = 键候选**；
+  ebx = 0x3000011 两次出现 = 标记）；edi/ebp = VM 基址恒定。
+- (esi, elem, eax, ebx, ecx) 五元组提取（25 样本）：eax 有 0x45xx 族
+  （0x459d/0x45f8/0x45ef/0x45ff）、0xd0xx 族；特殊快照
+  (elem=0x6139ee80, eax=0x9e7c2a07, ecx=0x404e282e) = 全 32 位。
+- 比较语义：**逐字节 + 变换**（v3 fine-window 的 lane 模型同源）——
+  eax/ebx = 逐字节变换累加器，elem = 列表元素。
+- 下一轮：字节级变换重建（用 25 样本的 (elem 字节, eax/ebx 字节) 对 +
+  v3 的 17 个 lane 转移交叉验证）→ 搜索键的列表编码形式 → FORGE2 v6
+  （字段 := 编码后的键）。
