@@ -3888,7 +3888,10 @@ pub(super) fn spawn_dialog_killer(
                 let mut forge_armed = keyforge;
                 let mut forge2_done = false;
                 let mut forge2_armed = false;
-                let mut t_snap_done = false;
+                let mut forge_targets: [u32; 3] = [0; 3];
+                let mut tsnap_next: u64 = 200;
+                let mut tsnap_blobs: Vec<u8> = Vec::new();
+                let mut nsnap_t = 0usize;
                 let mut last_sent: [u32; 3] = [0xFFFF_FFFF; 3];
                 let mut last_msg = String::new();
                 // Phase 1: find the file copy (needle scan, MEM_PRIVATE).
@@ -4026,11 +4029,7 @@ pub(super) fn spawn_dialog_killer(
                                 forge2_done = true;
                                 let mut fw = 0u32;
                                 for &(pos, ks) in FORGE_KS.iter() {
-                                    let key = if (pos / 4) % 2 == 0 {
-                                        FORGE_KEY1
-                                    } else {
-                                        FORGE_KEY2
-                                    };
+                                    let key = forge_targets[(pos / 4) % 3];
                                     let value = if pos < cursor {
                                         key
                                     } else {
@@ -4063,12 +4062,36 @@ pub(super) fn spawn_dialog_killer(
                         }
                         if forge2 && !forge2_armed {
                             // arm when the check phase is seen (ca in-image)
+                            // and read the three BAKED search targets
+                            // ([sentinel+4]; stable across runs — measured).
                             let cau = ca as usize;
                             if cau >= image_base && cau < image_base + 0x400_000 {
                                 forge2_armed = true;
+                                for (i, &srva) in [0x216F9usize, 0x22D81, 0x23401]
+                                    .iter()
+                                    .enumerate()
+                                {
+                                    let mut kb = [0u8; 4];
+                                    // SAFETY: live handle; in-image slot.
+                                    unsafe {
+                                        let mut n = 0;
+                                        let _ = ReadProcessMemory(
+                                            h_process,
+                                            (image_base + srva)
+                                                as *const core::ffi::c_void,
+                                            kb.as_mut_ptr() as *mut core::ffi::c_void,
+                                            4,
+                                            Some(&mut n),
+                                        );
+                                    }
+                                    forge_targets[i] = u32::from_le_bytes(kb);
+                                }
                                 info!(
                                     t_ms = watch_t0.elapsed().as_millis() as u32,
-                                    "FORGE2: check phase seen - armed"
+                                    t1 = format!("{:#010x}", forge_targets[0]),
+                                    t2 = format!("{:#010x}", forge_targets[1]),
+                                    t3 = format!("{:#010x}", forge_targets[2]),
+                                    "FORGE2: armed - baked search targets read"
                                 );
                             }
                         }
@@ -4204,6 +4227,15 @@ pub(super) fn spawn_dialog_killer(
                                 t_ms = watch_t0.elapsed().as_millis() as u32,
                                 "DECODEWATCH: bail marker - log flushed"
                             );
+                            {
+                                let stem = out_path.with_extension("v2tsnap");
+                                if let Some(name) = stem.file_name() {
+                                    let mut n2 = name.to_os_string();
+                                    n2.push(".bin");
+                                    let _ = std::fs::write(stem.with_file_name(n2), &tsnap_blobs);
+                                }
+                                info!(snapshots = nsnap_t, "FORGE2: T-snapshots flushed (bail)");
+                            }
                             let stem = out_path.with_extension("v2decodewatch");
                             if let Some(name) = stem.file_name() {
                                 let mut n2 = name.to_os_string();
@@ -4284,97 +4316,93 @@ pub(super) fn spawn_dialog_killer(
                             nrec += 1;
                         }
                         if keyforge || forge2 {
-                            // One-shot T-extraction snapshot: the moment the
-                            // FIRST sentinel flips to 0xFFFFFFFF (the search
-                            // fired), grab the 19 licence fields (8B each)
-                            // + the searched keys + the list region — the
-                            // machine transform T = fields vs list.
-                            if !t_snap_done && forge2 {
-                                const SENT0: usize = 0x216F5;
-                                let mut sb0 = [0u8; 4];
-                                // SAFETY: live handle; in-image slot.
-                                let ok0 = unsafe {
-                                    let mut n = 0;
-                                    ReadProcessMemory(
-                                        h_process,
-                                        (image_base + SENT0) as *const core::ffi::c_void,
-                                        sb0.as_mut_ptr() as *mut core::ffi::c_void,
-                                        4,
-                                        Some(&mut n),
-                                    )
-                                    .is_ok()
-                                        && n == 4
-                                };
-                                if ok0
-                                    && u32::from_le_bytes(sb0) == 0xFFFF_FFFF
-                                    && watch_t0.elapsed().as_millis() > 250
-                                {
-                                    t_snap_done = true;
-                                    let mut tblob: Vec<u8> = Vec::new();
-                                    for &frva in LIC_FIELDS.iter() {
-                                        let mut fb = [0u8; 8];
-                                        // SAFETY: live handle; in-image field.
-                                        unsafe {
-                                            let mut n = 0;
-                                            let _ = ReadProcessMemory(
-                                                h_process,
-                                                (image_base + frva)
-                                                    as *const core::ffi::c_void,
-                                                fb.as_mut_ptr() as *mut core::ffi::c_void,
-                                                8,
-                                                Some(&mut n),
-                                            );
-                                        }
-                                        tblob.extend_from_slice(&fb);
-                                    }
-                                    // the searched keys (sentinel+4 x3)
-                                    for &srva in [0x216F9usize, 0x22D81, 0x23401]
-                                        .iter()
-                                    {
-                                        let mut kb = [0u8; 4];
-                                        // SAFETY: live handle; in-image slot.
-                                        unsafe {
-                                            let mut n = 0;
-                                            let _ = ReadProcessMemory(
-                                                h_process,
-                                                (image_base + srva)
-                                                    as *const core::ffi::c_void,
-                                                kb.as_mut_ptr() as *mut core::ffi::c_void,
-                                                4,
-                                                Some(&mut n),
-                                            );
-                                        }
-                                        tblob.extend_from_slice(&kb);
-                                    }
-                                    // the list region (1KB)
-                                    let mut lb = vec![0u8; 0x400];
-                                    // SAFETY: live handle; in-image region.
+                            // Multi-timepoint T-extraction: every ~20ms
+                            // from t=200 to t=460, plus on every sentinel
+                            // change — fields + searched keys + 0x20A00
+                            // + the private-heap list area (0x15C000) +
+                            // the 26 buffer field positions.
+                            if forge2 && watch_t0.elapsed().as_millis() >= tsnap_next as u128 {
+                                tsnap_next += 20;
+                                let t_us = watch_t0.elapsed().as_micros() as u32;
+                                let mut tblob: Vec<u8> = Vec::new();
+                                tblob.extend_from_slice(&t_us.to_le_bytes());
+                                for &frva in LIC_FIELDS.iter() {
+                                    let mut fb = [0u8; 8];
+                                    // SAFETY: live handle; in-image field.
                                     unsafe {
                                         let mut n = 0;
                                         let _ = ReadProcessMemory(
                                             h_process,
-                                            (image_base + 0x20A00)
-                                                as *const core::ffi::c_void,
-                                            lb.as_mut_ptr() as *mut core::ffi::c_void,
-                                            0x400,
+                                            (image_base + frva) as *const core::ffi::c_void,
+                                            fb.as_mut_ptr() as *mut core::ffi::c_void,
+                                            8,
                                             Some(&mut n),
                                         );
                                     }
-                                    tblob.extend_from_slice(&lb);
-                                    let stem = out_path.with_extension("v2tsnap");
-                                    if let Some(name) = stem.file_name() {
-                                        let mut n2 = name.to_os_string();
-                                        n2.push(".bin");
-                                        let _ = std::fs::write(
-                                            stem.with_file_name(n2),
-                                            &tblob,
+                                    tblob.extend_from_slice(&fb);
+                                }
+                                for &srva in [0x216F5usize, 0x22D7D, 0x233FD].iter() {
+                                    let mut kb = [0u8; 8];
+                                    // SAFETY: live handle; sentinel+key.
+                                    unsafe {
+                                        let mut n = 0;
+                                        let _ = ReadProcessMemory(
+                                            h_process,
+                                            (image_base + srva) as *const core::ffi::c_void,
+                                            kb.as_mut_ptr() as *mut core::ffi::c_void,
+                                            8,
+                                            Some(&mut n),
                                         );
                                     }
-                                    info!(
-                                        t_ms = watch_t0.elapsed().as_millis() as u32,
-                                        "FORGE2: T-snapshot written (fields+keys+list)"
+                                    tblob.extend_from_slice(&kb);
+                                }
+                                let mut lb = vec![0u8; 0x400];
+                                // SAFETY: live handle; in-image region.
+                                unsafe {
+                                    let mut n = 0;
+                                    let _ = ReadProcessMemory(
+                                        h_process,
+                                        (image_base + 0x20A00) as *const core::ffi::c_void,
+                                        lb.as_mut_ptr() as *mut core::ffi::c_void,
+                                        0x400,
+                                        Some(&mut n),
                                     );
                                 }
+                                tblob.extend_from_slice(&lb);
+                                let mut hb = vec![0u8; 0x2000];
+                                // SAFETY: live handle; in-image heap area.
+                                unsafe {
+                                    let mut n = 0;
+                                    let _ = ReadProcessMemory(
+                                        h_process,
+                                        (image_base + 0x15C000) as *const core::ffi::c_void,
+                                        hb.as_mut_ptr() as *mut core::ffi::c_void,
+                                        0x2000,
+                                        Some(&mut n),
+                                    );
+                                }
+                                tblob.extend_from_slice(&hb);
+                                // the 26 buffer field positions (if ba known)
+                                if ba != 0 {
+                                    let mut bb = vec![0u8; 480];
+                                    // SAFETY: live handle; committed buffer.
+                                    unsafe {
+                                        let mut n = 0;
+                                        let _ = ReadProcessMemory(
+                                            h_process,
+                                            ba as *const core::ffi::c_void,
+                                            bb.as_mut_ptr() as *mut core::ffi::c_void,
+                                            480,
+                                            Some(&mut n),
+                                        );
+                                    }
+                                    tblob.extend_from_slice(&bb);
+                                } else {
+                                    tblob.extend_from_slice(&[0u8; 480]);
+                                }
+                                tsnap_blobs.extend_from_slice(&(tblob.len() as u32).to_le_bytes());
+                                tsnap_blobs.extend_from_slice(&tblob);
+                                nsnap_t += 1;
                             }
                             // Sentinel results ([sentinel]=search verdict):
                             // non-(-1) = the search HIT.
@@ -4475,6 +4503,15 @@ pub(super) fn spawn_dialog_killer(
                     found = buf_addr.is_some(),
                     "DECODEWATCH: window over - log flushed"
                 );
+                {
+                    let stem = out_path.with_extension("v2tsnap");
+                    if let Some(name) = stem.file_name() {
+                        let mut n2 = name.to_os_string();
+                        n2.push(".bin");
+                        let _ = std::fs::write(stem.with_file_name(n2), &tsnap_blobs);
+                    }
+                    info!(snapshots = nsnap_t, "FORGE2: T-snapshots flushed");
+                }
                 // Light bail watch to end the run deterministically.
                 let mut cont_buf = [0u8; 8];
                 loop {
