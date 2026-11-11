@@ -4128,6 +4128,12 @@ pub(super) fn spawn_dialog_killer(
                 let mut f2_blk = [0u8; 52];
                 let mut f2_blk_head = [0u8; 52];
                 let mut f2_sent = [0u8; 12];
+                // DISPATCH-SNATCH (stitching prerequisite): during the
+                // check era, scan the VM data area around dp for the
+                // 256-entry dispatch table (256 consecutive dwords inside
+                // the op band [0x1024000,0x1080000)) and dump it once.
+                let mut disp_dumped = false;
+                let mut disp_next_ms = 0u64;
                 let mut f2_last_patch = 0u32;
                 // FORGE2+SNATCH (v14): the in-loop context capture through
                 // the search/compare era while the continuous patch runs.
@@ -4305,6 +4311,117 @@ pub(super) fn spawn_dialog_killer(
                                         // SAFETY: suspended above.
                                         unsafe {
                                             let _ = ResumeThread(hm);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // DISPATCH-SNATCH: during the check era
+                        // (ca in-image) scan [dp, dp+0x20000) for the
+                        // 256-entry dispatch table — 256 consecutive
+                        // dwords inside the op band — and dump it once.
+                        let ca_now =
+                            u32::from_le_bytes(cont_buf[0..4].try_into().unwrap());
+                        if !disp_dumped
+                            && ca_now >= 0x1024000
+                            && ca_now < 0x1080000
+                        {
+                            let now_ms = watch_t0.elapsed().as_millis() as u64;
+                            if now_ms >= disp_next_ms {
+                                disp_next_ms = now_ms + 4;
+                                let dpv = u32::from_le_bytes(dp_buf) as usize;
+                                if dpv >= 0x10000 {
+                                    let span = 0x20000usize;
+                                    let mut region = vec![0u8; span];
+                                    // SAFETY: live handle; committed VM
+                                    // data area.
+                                    let got = unsafe {
+                                        let mut n = 0;
+                                        ReadProcessMemory(
+                                            h_process,
+                                            dpv as *const core::ffi::c_void,
+                                            region.as_mut_ptr()
+                                                as *mut core::ffi::c_void,
+                                            span,
+                                            Some(&mut n),
+                                        )
+                                        .is_ok()
+                                            && n == span
+                                    };
+                                    if got {
+                                        let mut table: Option<(usize, Vec<u32>)> =
+                                            None;
+                                        for off in
+                                            (0..span - 1024).step_by(4)
+                                        {
+                                            let mut okrun = true;
+                                            for j in 0..256 {
+                                                let v = u32::from_le_bytes(
+                                                    region[off + j * 4
+                                                        ..off + j * 4 + 4]
+                                                        .try_into()
+                                                        .unwrap(),
+                                                );
+                                                if !(0x1024000..0x1080000)
+                                                    .contains(&v)
+                                                {
+                                                    okrun = false;
+                                                    break;
+                                                }
+                                            }
+                                            if okrun {
+                                                table = Some((off, (0..256)
+                                                    .map(|j| {
+                                                        u32::from_le_bytes(
+                                                            region[off + j * 4
+                                                                ..off + j * 4
+                                                                    + 4]
+                                                                .try_into()
+                                                                .unwrap(),
+                                                        )
+                                                    })
+                                                    .collect()));
+                                                break;
+                                            }
+                                        }
+                                        if let Some((off, tbl)) = table {
+                                            disp_dumped = true;
+                                            let mut blob = Vec::with_capacity(
+                                                8 + 1024,
+                                            );
+                                            blob.extend_from_slice(
+                                                &(watch_t0.elapsed()
+                                                    .as_micros()
+                                                    as u32)
+                                                    .to_le_bytes(),
+                                            );
+                                            blob.extend_from_slice(
+                                                &((dpv + off) as u32)
+                                                    .to_le_bytes(),
+                                            );
+                                            for v in &tbl {
+                                                blob.extend_from_slice(
+                                                    &v.to_le_bytes(),
+                                                );
+                                            }
+                                            let stem = out_path
+                                                .with_extension("v2disp");
+                                            if let Some(name) = stem.file_name()
+                                            {
+                                                let mut n2 = name.to_os_string();
+                                                n2.push(".bin");
+                                                let _ = std::fs::write(
+                                                    stem.with_file_name(n2),
+                                                    &blob,
+                                                );
+                                            }
+                                            let uniq = tbl.iter().collect::<std::collections::HashSet<_>>().len();
+                                            info!(
+                                                t_ms = now_ms as u32,
+                                                table_va = format!("{:#x}", dpv + off),
+                                                uniq = uniq,
+                                                "DISPATCH-SNATCH: table dumped"
+                                            );
                                         }
                                     }
                                 }

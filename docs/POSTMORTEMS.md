@@ -3626,3 +3626,16 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   (b) REGSNATCH 记录格式修复后提取 check 期 EIP 轨迹 = handler VA 集。
 - 工件状态：CISC-1U.v2failfreeze.bin（IMAG 解密态）、
   check_op_body3.bin（POOLSNIFF 体）、ops/（空）。
+
+**续 21 补充 27（同日第十四轮）——DISPATCH-SNATCH 实现：表未在 [dp, dp+0x20000]**：
+
+- **实现落地**：DECODEWATCH 循环内 check 相位（ca_now ∈ op 带）扫描
+  [dp, dp+0x20000] 找「连续 256 dword ∈ op 带 [0x1024000,0x1080000]」，
+  命中即转储 <out>.v2disp.bin（4ms 节流）。零 Rust 告警。
+- **首轮结果 = 未命中**：pristine run 无 v2disp 落盘、无 log——**dp 在
+  check 期逐记录漂移**（0x38c30000 / 0xee0000 / 0xb206 …），固定
+  [dp@t, +128KB] 窗口错过表基（edi 为 check 全期恒定，dp 非恒定）。
+- **下一微增量**：扫描窗 = 本 run 的 dp 值集合并集（DECODEWATCH 记录
+  已含全部 dp），或 [dp-0x40000, dp+0x40000] 宽扫；另需打印 RPM 失败
+  计数区分「窗错」vs「读败」。
+- 工件：add_dispsnatch.py、disp_snatch_log.txt（pristine bail 正常）。
