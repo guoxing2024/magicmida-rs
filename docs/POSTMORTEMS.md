@@ -3683,3 +3683,18 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
 - **f 全模型边界确认**：表捕获 + 蹦板展开两项工具均未建成——f 静态
   恢复 = 长期工程；运行时路（连续补丁 + 哨兵裁决）= 已达当前仪器极限。
 - 工件：add_dispsnatch3.py、disp_snatch4_log.txt。
+
+**续 21 补充 31（同日第十八轮）——改名 oracle 复现 + 机制锐化：.dat 文件名内嵌于壳**：
+
+- **修正签名 DISPATCH-SNATCH（round 4）= 仍未捕获**（近递增 + 4MB 跨度
+  签名下无表——VM 区瞬态块假设下的表捕获仍需更深仪器）。
+- **改名 oracle（DECODEWATCH 仪测，决定性）**：O.exe/O.dat 改名副本 →
+  **.dat 工作缓冲从未出现**（needle found=false、records=0、哨兵零
+  活动）——续 20 oracle 复现 ✓ 且机制锐化：**O.exe 未读 O.dat** ⟹
+  .dat 文件名非 GetModuleFileName 派生，而是**内嵌于壳数据**（壳按
+  内嵌名 CISC-1 找 CISC-1.dat）。
+- **对 .dat 静态路径的含义**：重编码目标 = 原名 CISC-1.dat（文件名
+  不可变）；名字绑定在壳内嵌数据与 .dat 内容之间（名字字符串 = .dat
+  解码字段之一，改名 = 名字不匹配 = 不读）。**盘上重编码 oracle 的
+  对照组 = 原名 + 原目录**，唯一自由度 = .dat 内容。
+- 工件：O/ 目录（改名副本）、rename_oracle_log.txt。
