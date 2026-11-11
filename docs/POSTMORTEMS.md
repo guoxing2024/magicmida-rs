@@ -3593,3 +3593,21 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   下一增量。
 - 工件：forge2v16_log.txt、probe_wake2.py（argtypes + brute + 精确
   .text 扫描）、fix_wake3-5.py。
+
+**续 21 补充 25（同日第十二轮）——f 逆向 kickoff：4-lane 轮转确认 + 消费顺序数据相关 + S-box 否定**：
+
+- **数据资产**：check_states_v3.json 261 精细态（t/ctr/acc1/acc2）→ 141
+  个 acc-changing 转变（126 = 单字节变化，15 = 采样间隙多字节）。
+- **4-lane 轮转确认**：每转变恰一字节变化，lane 序列 = lo1→hi1→lo2→hi2
+  循环（acc1.lo/acc1.hi/acc2.lo/acc2.hi）。
+- **消费顺序 = 数据相关（重大）**：lane ≠ pos%4 = 89/126——线程解释器
+  按字节值派发（movzx+jmp [edi+eax*4]），字节消费**非顺序**（跳字节），
+  被消费字节的位置不可从转变序号推知。
+- **S-box 假设否定**：同一 lane_old 出现不同 K（lane_new^lane_old）——
+  K = f(byte, lane_old) 泛形，非 f(lane_old) 纯查表。
+- **覆盖不足**：126 个 (byte,old)->new 样本 vs 256×256/lane 空间——261 态
+  不足以重建 f。**f 完整逆向需要 handler 缝合**（168 唯一 handler 的
+  op 体 = 每字节值的更新函数——直接读出 F 而非拟合）。
+- **f 逆向增量结论**：结构已知（4-lane + 数据相关消费 + 逐字节 XOR
+  更新），全恢复 = handler 缝合工程（已知量：每 handler = 一个字节值
+  的完整更新语义）。工具：analyze_f.py / analyze_f2.py。
