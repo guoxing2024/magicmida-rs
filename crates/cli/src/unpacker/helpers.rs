@@ -5082,6 +5082,39 @@ pub(super) fn spawn_dialog_killer(
                                             hit = v != 0xFFFF_FFFF,
                                             "KEYFORGE: sentinel result"
                                         );
+                                        // v16 (2026-11-12): the verdict-read
+                                        // race refinement — the searches'
+                                        // OWN miss-write (v == 0xFFFFFFFF)
+                                        // is the anchor: single-shot write
+                                        // of our key microseconds later, so
+                                        // the downstream verdict reads in
+                                        // [340,382] ms see the hit without
+                                        // racing the 200 µs loop.
+                                        if forge2 && v == 0xFFFF_FFFF {
+                                            let kv = forge_targets[i];
+                                            // SAFETY: live handle; in-image
+                                            // verdict slot.
+                                            let ok_v16 = unsafe {
+                                                let mut n4 = 0;
+                                                WriteProcessMemory(
+                                                    h_process,
+                                                    (image_base + rva)
+                                                        as *mut core::ffi::c_void,
+                                                    &kv as *const u32
+                                                        as *const core::ffi::c_void,
+                                                    4,
+                                                    Some(&mut n4),
+                                                )
+                                                .is_ok()
+                                                    && n4 == 4
+                                            };
+                                            info!(
+                                                slot = i + 1,
+                                                wrote = format!("{kv:#010x}"),
+                                                ok = ok_v16,
+                                                "FORGE2 v16: verdict single-shot on flip"
+                                            );
+                                        }
                                     }
                                 }
                             }

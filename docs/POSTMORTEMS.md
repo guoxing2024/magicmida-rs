@@ -3574,3 +3574,22 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   基线（b017fdba…）。
 - 工件：CISC-1U.v2unpacked_v15.bin、CISC-1U.v2tsnap.v15.bin、
   add_forge2v15b.py、forge2v15*_log.txt。
+
+**续 21 补充 24（同日第十一轮）——v16 翻转锚定单发 + 「.text 解密」第二次假警报修正**：
+
+- **v16 实现**：哨兵翻转（搜索自己的 0xFFFFFFFF 写）为锚点的单发写入
+  ——微秒级跟写，下游 [340,382] 读点前就位（200µs 连续补丁保留兜底）。
+- **「.text 解密」第二次假警报**：v15/v16 两次 live-check = ".text ≠
+  盘上" —— **probe 的 disk = read(0x1000) 只读 4KB，disk[0x1000:0x1020]
+  = 空串 → 比较恒 False**（假解密）。时间序列（110s × 12 采样）证实：
+  **.text 稳定 = 盘上密文**，部署确认全零。两次假警报 = 同一 bug
+  （第一次的精查修正了它，第二次的 live-check 又犯——探针代码复用时
+  没修根因）。
+- **裁决读竞速精细化 = 结果不变**：v16 翻转锚定 + v15 连续补丁双保险
+  下，部署标记仍全零 → **verdict 读点不是唯一门**（或读点在别的槽/
+  别的进程副本）。
+- **按已激活备选转道 .dat 静态路径**：校验哈希 f 逆向（POOLSNIFF 状态
+  机 261 态 + handler 缝合 168 handler 在手）或 handler 缝合补完 =
+  下一增量。
+- 工件：forge2v16_log.txt、probe_wake2.py（argtypes + brute + 精确
+  .text 扫描）、fix_wake3-5.py。
