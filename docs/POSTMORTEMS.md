@@ -3552,3 +3552,25 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   → 定位「命中但不累积」的分支（0x2408A cmp 后的命中路径）→ 或者
   0x201FD/0x20CF1 对 = 搜索语义的最终对账。
 - 工件：probe_wake2.py（argtypes + brute wake）、wake2_out*.txt。
+
+**续 21 补充 23（同日第十轮）——哨兵裁决补丁（v15）：watcher hit=true = 我们自己的写，部署 = 假警报**：
+
+- **v15 实现**：连续补丁扩展三哨兵裁决槽（[0x216F5]/[0x22D7D]/[0x233FD]
+  := 本机键，每 200µs）——搜索在 ~339ms 写 0xFFFFFFFF（miss），我们的
+  循环顶回键值。实测：哨兵 = (K1,K1)/(K2,K2)/(K3,K3)，watcher 语义
+  hit=true。
+- **「.text 解密」= 假警报（诚实修正）**：粗扫（0x2000 块）首 diff =
+  0x7000 → 兴奋转储（CISC-1U.v2unpacked_v15.bin，sha256 b017fdba…，
+  3612672B）→ 精查：**diff 区 = [0x8a00, 0x15f00] = 21KB = 恰为 U21
+  记录的壳 BSS 尾写入（资源目录形状，正常态就有）**；[0x1000,0x8a00]
+  的 .text 密文 100% 未变。**无部署。**「.text 恒密文」维持。
+- **机制推断**：哨兵裁决 = 搜索写完立即被下游读（[340,382] 窗口），
+  我们的 200µs 补丁与读**竞速**（~50% 窗口是我们的值）——壳要么读到
+  我们的值后仍不部署（verdict ≠ 唯一门），要么读的时机躲开了我们的
+  写。0x20CF1 恒 0 = 0x2400D op 从未执行（EIP 全窗零命中）= 该静态 op
+  = 死代码或别相执行。
+- **verifier 的备选激活**：verdict 机制需要不可逆信息 → 改道 .dat 静态
+  路径（校验哈希 f 逆向 / handler 缝合）= 下一增量。转储保留作 diff
+  基线（b017fdba…）。
+- 工件：CISC-1U.v2unpacked_v15.bin、CISC-1U.v2tsnap.v15.bin、
+  add_forge2v15b.py、forge2v15*_log.txt。

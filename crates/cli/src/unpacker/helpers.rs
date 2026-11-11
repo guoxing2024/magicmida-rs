@@ -4127,6 +4127,7 @@ pub(super) fn spawn_dialog_killer(
                 // FORGE2 v12: the continuous key-block patch state.
                 let mut f2_blk = [0u8; 52];
                 let mut f2_blk_head = [0u8; 52];
+                let mut f2_sent = [0u8; 12];
                 let mut f2_last_patch = 0u32;
                 // FORGE2+SNATCH (v14): the in-loop context capture through
                 // the search/compare era while the continuous patch runs.
@@ -4473,6 +4474,22 @@ pub(super) fn spawn_dialog_killer(
                                     };
                                     k.copy_from_slice(&key.to_le_bytes());
                                 }
+                                // v15: the sentinel VERDICT slots — the
+                                // searches write 0xFFFFFFFF (miss) at
+                                // ~339 ms and the deployment stage reads
+                                // the verdict AFTER; non-(-1) = hit per
+                                // the watcher semantics.
+                                for (i, key) in [
+                                    forge_targets[0],
+                                    forge_targets[1],
+                                    forge_targets[2],
+                                ]
+                                .iter()
+                                .enumerate()
+                                {
+                                    f2_sent[i * 4..i * 4 + 4]
+                                        .copy_from_slice(&key.to_le_bytes());
+                                }
                                 // SAFETY: live handle; committed buffer.
                                 let w = unsafe {
                                     let mut n = 0;
@@ -4500,6 +4517,30 @@ pub(super) fn spawn_dialog_killer(
                                     .is_ok()
                                         && n == 52
                                 };
+                                // v15: the sentinel verdict slots (in-image,
+                                // writable — the searches overwrite them at
+                                // ~339 ms, our continuous loop takes them
+                                // back).
+                                for (i, vrva) in
+                                    [0x216F5usize, 0x22D7D, 0x233FD]
+                                        .iter()
+                                        .enumerate()
+                                {
+                                    // SAFETY: live handle; in-image slot.
+                                    unsafe {
+                                        let mut n = 0;
+                                        let _ = WriteProcessMemory(
+                                            h_process,
+                                            (image_base + vrva)
+                                                as *mut core::ffi::c_void,
+                                            f2_sent[i * 4..i * 4 + 4]
+                                                .as_ptr()
+                                                as *const core::ffi::c_void,
+                                            4,
+                                            Some(&mut n),
+                                        );
+                                    }
+                                }
                                 f2_last_patch =
                                     watch_t0.elapsed().as_micros() as u32;
                                 info!(
@@ -4544,6 +4585,23 @@ pub(super) fn spawn_dialog_killer(
                                         52,
                                         Some(&mut n2),
                                     );
+                                    for (i, vrva) in
+                                        [0x216F5usize, 0x22D7D, 0x233FD]
+                                            .iter()
+                                            .enumerate()
+                                    {
+                                        let mut n3 = 0;
+                                        let _ = WriteProcessMemory(
+                                            h_process,
+                                            (image_base + vrva)
+                                                as *mut core::ffi::c_void,
+                                            f2_sent[i * 4..i * 4 + 4]
+                                                .as_ptr()
+                                                as *const core::ffi::c_void,
+                                            4,
+                                            Some(&mut n3),
+                                        );
+                                    }
                                 }
                             }
                         }
