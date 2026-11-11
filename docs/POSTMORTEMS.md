@@ -3511,3 +3511,19 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   + join 超时）；NtQuerySystemInformation(64) 本场景**内核阻塞**（同法
   隔离）；heredoc 截断再犯两次（补丁一律落盘脚本）；python 输出必须 -u。
 - 工件：probe_wake.py + fix_*.py、wake_out*.txt。
+
+**续 21 补充 21（同日第八轮）——全局句柄表破解（428 句柄到手），类型查询待修**：
+
+- **census 攻坚成功**：NtQuerySystemInformation(16=legacy) 在 worker 线程
+  （超时隔离）下完成；**x64 的 legacy 条目 = 24 字节**（pid I + type B +
+  flags B + handle H + object Q + granted Q，'<IBBHQQ'）——16 字节布局
+  解析 = 全垃圾 pid（对齐漂移实锤：首条目 pid=4=System ✓）。**锻造
+  run = 428 个句柄到手**（probe_wake2.py）。
+- **SystemExtendedHandleInformation(64) 对该进程内核阻塞**（>6s worker
+  超时跳过），legacy(16) = 间歇性阻塞（需同法隔离）。
+- **types = 空 = 待修**：DuplicateHandle/NtQueryObject 循环返回空
+  （0.4s 超时 × 428 = 可能全超时，或 dup 失败——无 err 打印，待诊断）。
+  NtAlertThread 0/41（权限位待修：需含 THREAD_ALERT）。
+- **停泊态画像跨 5 个 run 稳定**：30-31 线程全阻塞内核等待、无部署
+  标记（运行时副本 / .text 解密 / 窗口全零）、CISC-1 存活。
+- 工件：probe_wake.py / probe_wake2.py / fix_*.py、wake*_out*.txt。
