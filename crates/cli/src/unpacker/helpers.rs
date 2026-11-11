@@ -4128,12 +4128,15 @@ pub(super) fn spawn_dialog_killer(
                 let mut f2_blk = [0u8; 52];
                 let mut f2_blk_head = [0u8; 52];
                 let mut f2_sent = [0u8; 12];
-                // DISPATCH-SNATCH (stitching prerequisite): during the
-                // check era, scan the VM data area around dp for the
-                // 256-entry dispatch table (256 consecutive dwords inside
-                // the op band [0x1024000,0x1080000)) and dump it once.
-                let mut disp_dumped = false;
+                // DISPATCH-SNATCH round 3: the table = transient inside
+                // the check [200,327] — high-frequency multi-point capture:
+                // 1 ms throttle, the wide window [dp-128KB, dp+256KB] per
+                // dp, all dp values round-robin, every distinct table
+                // collected, flushed at the window-over.
                 let mut disp_next_ms = 0u64;
+                let mut dp_seen: Vec<u32> = Vec::new();
+                let mut scan_round = 0u32;
+                let mut disp_tables: Vec<(u32, Vec<u32>)> = Vec::new();
                 let mut f2_last_patch = 0u32;
                 // FORGE2+SNATCH (v14): the in-loop context capture through
                 // the search/compare era while the continuous patch runs.
@@ -4322,33 +4325,42 @@ pub(super) fn spawn_dialog_killer(
                         // dwords inside the op band — and dump it once.
                         let ca_now =
                             u32::from_le_bytes(cont_buf[0..4].try_into().unwrap());
-                        if !disp_dumped
-                            && ca_now >= 0x1024000
-                            && ca_now < 0x1080000
+                        if ca_now >= 0x1024000 && ca_now < 0x1080000
                         {
                             let now_ms = watch_t0.elapsed().as_millis() as u64;
                             if now_ms >= disp_next_ms {
-                                disp_next_ms = now_ms + 4;
-                                let dpv = u32::from_le_bytes(dp_buf) as usize;
-                                if dpv >= 0x10000 {
-                                    let span = 0x20000usize;
-                                    let mut region = vec![0u8; span];
-                                    // SAFETY: live handle; committed VM
-                                    // data area.
-                                    let got = unsafe {
-                                        let mut n = 0;
-                                        ReadProcessMemory(
-                                            h_process,
-                                            dpv as *const core::ffi::c_void,
-                                            region.as_mut_ptr()
-                                                as *mut core::ffi::c_void,
-                                            span,
-                                            Some(&mut n),
-                                        )
-                                        .is_ok()
-                                            && n == span
-                                    };
-                                    if got {
+                                disp_next_ms = now_ms + 1;
+                                let dpv = u32::from_le_bytes(dp_buf);
+                                if dpv >= 0x10000 && !dp_seen.contains(&dpv) {
+                                    dp_seen.push(dpv);
+                                }
+                                if dp_seen.is_empty() {
+                                    std::thread::yield_now();
+                                    continue;
+                                }
+                                let base = dp_seen
+                                    [(scan_round as usize) % dp_seen.len()]
+                                    as usize;
+                                scan_round += 1;
+                                let lo = base.saturating_sub(0x20000);
+                                let span = 0x60000usize;
+                                let mut region = vec![0u8; span];
+                                // SAFETY: live handle; committed VM data
+                                // area.
+                                let got = unsafe {
+                                    let mut n = 0;
+                                    ReadProcessMemory(
+                                        h_process,
+                                        lo as *const core::ffi::c_void,
+                                        region.as_mut_ptr()
+                                            as *mut core::ffi::c_void,
+                                        span,
+                                        Some(&mut n),
+                                    )
+                                    .is_ok()
+                                        && n == span
+                                };
+                                if got {
                                         let mut table: Option<(usize, Vec<u32>)> =
                                             None;
                                         for off in
@@ -4385,46 +4397,39 @@ pub(super) fn spawn_dialog_killer(
                                             }
                                         }
                                         if let Some((off, tbl)) = table {
-                                            disp_dumped = true;
-                                            let mut blob = Vec::with_capacity(
-                                                8 + 1024,
-                                            );
-                                            blob.extend_from_slice(
-                                                &(watch_t0.elapsed()
-                                                    .as_micros()
-                                                    as u32)
-                                                    .to_le_bytes(),
-                                            );
-                                            blob.extend_from_slice(
-                                                &((dpv + off) as u32)
-                                                    .to_le_bytes(),
-                                            );
-                                            for v in &tbl {
-                                                blob.extend_from_slice(
-                                                    &v.to_le_bytes(),
-                                                );
-                                            }
-                                            let stem = out_path
-                                                .with_extension("v2disp");
-                                            if let Some(name) = stem.file_name()
-                                            {
-                                                let mut n2 = name.to_os_string();
-                                                n2.push(".bin");
-                                                let _ = std::fs::write(
-                                                    stem.with_file_name(n2),
-                                                    &blob,
-                                                );
-                                            }
+                                            // dedup by the first entry + the
+                                            // length of the unique set
                                             let uniq = tbl.iter().collect::<std::collections::HashSet<_>>().len();
-                                            info!(
-                                                t_ms = now_ms as u32,
-                                                table_va = format!("{:#x}", dpv + off),
-                                                uniq = uniq,
-                                                "DISPATCH-SNATCH: table dumped"
+                                            let sig = (
+                                                tbl[0],
+                                                tbl[255],
+                                                uniq,
                                             );
+                                            if !disp_tables.iter().any(
+                                                |(_, t)| {
+                                                    t[0] == sig.0
+                                                        && t[255] == sig.1
+                                                        && t.iter().collect::<std::collections::HashSet<_>>().len()
+                                                            == sig.2
+                                                },
+                                            ) {
+                                                disp_tables.push((
+                                                    (lo + off) as u32,
+                                                    tbl,
+                                                ));
+                                                info!(
+                                                    t_ms = now_ms as u32,
+                                                    table_va = format!(
+                                                        "{:#x}",
+                                                        lo + off
+                                                    ),
+                                                    uniq = uniq,
+                                                    tables = disp_tables.len(),
+                                                    "DISPATCH-SNATCH: table captured"
+                                                );
+                                            }
                                         }
                                     }
-                                }
                             }
                         }
                         // SAFETY: live handle; the 480 B buffer copy.
@@ -5297,6 +5302,30 @@ pub(super) fn spawn_dialog_killer(
                         let _ = std::fs::write(stem.with_file_name(n2), &tsnap_blobs);
                     }
                     info!(snapshots = nsnap_t, "FORGE2: T-snapshots flushed");
+                }
+                if !disp_tables.is_empty() {
+                    let mut blob = Vec::with_capacity(
+                        4 + disp_tables.len() * (8 + 1024),
+                    );
+                    blob.extend_from_slice(
+                        &(disp_tables.len() as u32).to_le_bytes(),
+                    );
+                    for (va, tbl) in &disp_tables {
+                        blob.extend_from_slice(&va.to_le_bytes());
+                        for v in tbl {
+                            blob.extend_from_slice(&v.to_le_bytes());
+                        }
+                    }
+                    let stem = out_path.with_extension("v2disp");
+                    if let Some(name) = stem.file_name() {
+                        let mut n2 = name.to_os_string();
+                        n2.push(".bin");
+                        let _ = std::fs::write(stem.with_file_name(n2), &blob);
+                    }
+                    info!(
+                        tables = disp_tables.len(),
+                        "DISPATCH-SNATCH: tables flushed"
+                    );
                 }
                 if forge2 && !sn_blobs.is_empty() {
                     let stem = out_path.with_extension("v2ctxsnatch");
