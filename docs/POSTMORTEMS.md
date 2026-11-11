@@ -3527,3 +3527,28 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
 - **停泊态画像跨 5 个 run 稳定**：30-31 线程全阻塞内核等待、无部署
   标记（运行时副本 / .text 解密 / 窗口全零）、CISC-1 存活。
 - 工件：probe_wake.py / probe_wake2.py / fix_*.py、wake*_out*.txt。
+
+**续 21 补充 22（同日第九轮）——唤醒实验第二轮：117 事件 + 32 告警全送达，壳有反应但部署仍被扣**：
+
+- **仪器三连修（根因全找到）**：① **ctypes 缺 argtypes = DuplicateHandle
+  全灭**——GetCurrentProcess() 伪句柄 -1 被 c_int 默认截成 0xFFFFFFFF
+  （x64 无效），typed 签名（argtypes/restype）后立即可用（独立测试：
+  dup value=0x160 ✓）；② **x64 UNICODE_STRING.Buffer = 8 字节**，`<I`
+  4 字节读 = 指针截断 = from_address 段错误（'<badptr>' 兜底的来源）；
+  ③ 解码 = utf-16-le（latin1 = "F i l e" 形）。worker 线程隔离弃用
+  （round-3 实测：worker 返回 None 而直接调用返回 'Event'——不可靠），
+  ot-map 用顶层 worker + 20s 整体超时。
+- **暴力唤醒执行**：SetEvent 对全部 433 句柄（**117 个成功触发** =
+  117 个真事件对象！）、NtAlertThread 32/32（THREAD_ALL_ACCESS ✓）。
+- **壳的反应**：线程 40→43（+3 新线程！）、出现 3 个新等待点
+  （0x76f4950c/0x76f4a08c/0x76f4a6b0）——事件风暴被壳感知。
+- **部署标记仍全零**（副本/解密/窗口）。
+- **判定 = 门在哨兵裁决位**：哨兵 [哨兵] = 0xFFFFFFFF = 搜索最终
+  verdict = miss → 部署被扣。搜索虽提前退出（miss 80）但 verdict 仍
+  miss——**verdict ≠ miss 计数**，verdict 机制 = 下一轮目标（0x2400D
+  op 静态全读已知：exit 块 0x2429D 写累积结果到 0x20CF1 = 今日仪表
+  已捕获 = 恒 0 = **0x20CF1 = 0 = 失败累积**！）。
+- **下一轮**：0x20CF1 累积结果的写时刻/写值监控（TSNAP 已捕获恒 0）
+  → 定位「命中但不累积」的分支（0x2408A cmp 后的命中路径）→ 或者
+  0x201FD/0x20CF1 对 = 搜索语义的最终对账。
+- 工件：probe_wake2.py（argtypes + brute wake）、wake2_out*.txt。
