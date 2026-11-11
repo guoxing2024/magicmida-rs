@@ -3639,3 +3639,19 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   已含全部 dp），或 [dp-0x40000, dp+0x40000] 宽扫；另需打印 RPM 失败
   计数区分「窗错」vs「读败」。
 - 工件：add_dispsnatch.py、disp_snatch_log.txt（pristine bail 正常）。
+
+**续 21 补充 28（同日第十五轮）——REGSNATCH 记录格式破解 + check 期 EIP 集**：
+
+- **记录格式（解析器验证 64/64）**：t u32, tid u32, eip u32, 9 regs u32
+  (Eax/Ebx/Ecx/Edx/Esi/Edi/Ebp/Esp/EFlags), slen u32, stack[slen],
+  plen u32, eippage[plen], blen u32 (0x2000 非 512！), block[blen],
+  got_s u32 (0x40), sc[got_s], got_b u32 (0x1e0=480), buf480[got_b],
+  **esiva u32 + got_e u32 + espage[got_e]（条件尾 = copy A 页，
+  首记录 esiva=0x10f0000 = 镜像数据区 .dat 副本！）**。
+- **check 期 EIP 集（64 张，t=[238,243]ms）**：46 个镜像内站点，全部
+  在 op 带 rva **0x60000-0x75000**（搜索/比较 op 区），**0x2400D 零
+  命中再次确认**（字段校验静态 op 从未执行）；0x5FC00 check op 亦零。
+- **缝合路线更新**：EIP 集 = 比较/搜索 op 站点（非 168 字节值 handler）
+  ——这些站点 = op 带静态，可从 failfreeze IMAG 直接折叠提取更新语义；
+  168 值 handler 的派发表仍需 DISPATCH-SNATCH 深化（dp 漂移未解）。
+- 解析器：内联于本轮（记录链 = 定长头 48B + 变长尾 + 条件 esiva 尾）。
