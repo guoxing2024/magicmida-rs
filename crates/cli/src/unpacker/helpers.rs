@@ -4128,6 +4128,11 @@ pub(super) fn spawn_dialog_killer(
                 let mut f2_blk = [0u8; 52];
                 let mut f2_blk_head = [0u8; 52];
                 let mut f2_last_patch = 0u32;
+                // FORGE2+SNATCH (v14): the in-loop context capture through
+                // the search/compare era while the continuous patch runs.
+                let mut sn_blobs: Vec<u8> = Vec::new();
+                let mut nsnatch = 0usize;
+                let mut sn_last = 0u32;
                 let mut last_msg = String::new();
                 // Phase 1: find the file copy (needle scan, MEM_PRIVATE).
                 while buf_addr.is_none() && watch_t0.elapsed().as_millis() < 260 {
@@ -4203,6 +4208,107 @@ pub(super) fn spawn_dialog_killer(
                     // ops too.
                     while watch_t0.elapsed().as_millis() < 500 {
                         polls += 1;
+                        // FORGE2+SNATCH (v14): capture the VM thread's
+                        // context through the search/compare era
+                        // ([315,470]ms) while the continuous patch runs.
+                        // Record = t_us, eip, 9 regs, clen, code[clen],
+                        // stack[1024] — the stack carries the compare's
+                        // expected values.
+                        if forge2 && nsnatch < 2400 {
+                            let now_us =
+                                watch_t0.elapsed().as_micros() as u32;
+                            if (315_000..470_000).contains(&now_us)
+                                && now_us.wrapping_sub(sn_last) >= 150
+                            {
+                                sn_last = now_us;
+                                if let Some(hm) = h_main {
+                                    use windows::Win32::System::Diagnostics::Debug::{
+                                        GetThreadContext, CONTEXT,
+                                    };
+                                    use windows::Win32::System::Threading::{
+                                        ResumeThread, SuspendThread,
+                                    };
+                                    // SAFETY: valid pre-opened handle.
+                                    let prev = unsafe { SuspendThread(hm) };
+                                    if prev != u32::MAX {
+                                        let mut ctx = CONTEXT::default();
+                                        ctx.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_FLAGS(0x0001_0003);
+                                        // SAFETY: suspended thread.
+                                        if unsafe {
+                                            GetThreadContext(hm, &mut ctx)
+                                        }
+                                        .is_ok()
+                                        {
+                                            let eip = ctx.Eip as usize;
+                                            let esp = ctx.Esp as usize;
+                                            let mut code = [0u8; 0x100];
+                                            // SAFETY: suspended; code page.
+                                            let clen = unsafe {
+                                                let mut n = 0;
+                                                let okr = ReadProcessMemory(
+                                                    h_process,
+                                                    eip as *mut core::ffi::c_void,
+                                                    code.as_mut_ptr()
+                                                        as *mut core::ffi::c_void,
+                                                    0x100,
+                                                    Some(&mut n),
+                                                )
+                                                .is_ok();
+                                                if okr {
+                                                    n.min(0x100) as u32
+                                                } else {
+                                                    0
+                                                }
+                                            };
+                                            let mut stk = [0u8; 1024];
+                                            // SAFETY: suspended; stack page.
+                                            unsafe {
+                                                let mut n = 0;
+                                                let _ = ReadProcessMemory(
+                                                    h_process,
+                                                    (esp.saturating_sub(512))
+                                                        as *mut core::ffi::c_void,
+                                                    stk.as_mut_ptr()
+                                                        as *mut core::ffi::c_void,
+                                                    1024,
+                                                    Some(&mut n),
+                                                );
+                                            }
+                                            sn_blobs.extend_from_slice(
+                                                &(watch_t0.elapsed()
+                                                    .as_micros()
+                                                    as u32)
+                                                    .to_le_bytes(),
+                                            );
+                                            sn_blobs.extend_from_slice(
+                                                &(eip as u32).to_le_bytes(),
+                                            );
+                                            for v in [
+                                                ctx.Eax, ctx.Ebx, ctx.Ecx,
+                                                ctx.Edx, ctx.Esi, ctx.Edi,
+                                                ctx.Ebp, ctx.Esp, ctx.EFlags,
+                                            ] {
+                                                sn_blobs.extend_from_slice(
+                                                    &v.to_le_bytes(),
+                                                );
+                                            }
+                                            sn_blobs.extend_from_slice(
+                                                &clen.to_le_bytes(),
+                                            );
+                                            sn_blobs.extend_from_slice(
+                                                &code[..clen as usize],
+                                            );
+                                            sn_blobs.extend_from_slice(&stk);
+                                            nsnatch += 1;
+                                        }
+                                        // SAFETY: suspended above.
+                                        unsafe {
+                                            let _ = ResumeThread(hm);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         // SAFETY: live handle; the 480 B buffer copy.
                         let ok_s = unsafe {
                             let mut n = 0;
@@ -4983,6 +5089,18 @@ pub(super) fn spawn_dialog_killer(
                         let _ = std::fs::write(stem.with_file_name(n2), &tsnap_blobs);
                     }
                     info!(snapshots = nsnap_t, "FORGE2: T-snapshots flushed");
+                }
+                if forge2 && !sn_blobs.is_empty() {
+                    let stem = out_path.with_extension("v2ctxsnatch");
+                    if let Some(name) = stem.file_name() {
+                        let mut n2 = name.to_os_string();
+                        n2.push(".bin");
+                        let _ = std::fs::write(stem.with_file_name(n2), &sn_blobs);
+                    }
+                    info!(
+                        snapshots = nsnatch,
+                        "FORGE2: context snatch flushed"
+                    );
                 }
                 // Light bail watch to end the run deterministically.
                 let mut cont_buf = [0u8; 8];

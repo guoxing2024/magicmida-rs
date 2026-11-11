@@ -3466,3 +3466,30 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   （key3 逐 run？名字绑定？后续阶段？）。下一轮：FORGE2+SEARCHSNATCH
   合流（搜捕命中瞬间的逐字节比较 + 命中后的流）。
 - 工件：CISC-1U.v2searchsnatch.verifier4.bin、ss_verifier*_log.txt。
+
+**续 21 补充 19（同日第六轮）——FORGE2+SNATCH 合流：停泊态 = 全进程等待死锁（41 线程全阻塞）**：
+
+- **合流落地（v14）**：上下文捕获并入 DECODEWATCH 循环（锻造连续补丁与
+  上下文快照同跑；记录 = t/eip/9regs/clen/code/栈 1KB；flush =
+  <out>.v2ctxsnatch.bin，957 张）。h_main 为 Copy，各分支互不影响。
+- **主线程时间线（v2ctxsnatch）**：[316,343]ms 在 op 带（0x2d600，比较
+  时代 ✓）→ [344,470]+ 全程 ntdll 等待（0x758a123c）。键值从未以整数
+  出现在寄存器/栈（逐字节变换一致 ✓）。
+- **等待现场（栈分析）**：栈里无壳镜像返回地址——调用方 = 低地址 VM 区
+  瞬态块代码（0x69xxxx）；帧里内核句柄 0x77f/0x7ff。
+- **全进程线程地图（probe_gate2.py，42 线程）**：**41 线程 100% 阻塞于
+  内核等待**——16× NtWaitForSingleObject 系、8× NtWaitForMultipleObjects、
+  7× NtWaitForAlertByThreadId（等告警无人告警）、7× kernelbase
+  WaitForSingleObject、主线程 1×。零线程在镜像、零线程执行应用代码。
+  **停泊态 = 整进程等待死锁**，不是「应用在 VM 里解释执行」。
+- **门的定位**：搜索命中（80-miss 提前退出）→ 流程进入下一阶段 →
+  该阶段 = 死等一个永不触发的内核事件 → 死锁。pristine（全 miss）=
+  fail 对话框不进入此等待 ✓。
+- **调试经验钉死**：64-bit python 枚举 toolhelp = THREADENTRY32 的
+  dwSize 必须 28（不是 24，err 24 = BAD_LENGTH）；读 32-bit 线程上下文
+  必须 Wow64GetThreadContext（普通 GetThreadContext 给 x64 布局 = 全零）。
+- **下一轮 = 唤醒实验**（观测即绕过的下一形态）：识别主线程等待句柄的
+  对象类型（栈更深 + NtQuerySystemInformation 全局句柄表）→
+  SetEvent/AlertThread 唤醒 → 看流程是否继续 → 部署标记。
+- 工件：CISC-1U.v2ctxsnatch.v14.bin（957 张）、probe_gate.py /
+  probe_gate2.py、add_forge2v14.py。
