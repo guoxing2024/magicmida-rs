@@ -3493,3 +3493,21 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   SetEvent/AlertThread 唤醒 → 看流程是否继续 → 部署标记。
 - 工件：CISC-1U.v2ctxsnatch.v14.bin（957 张）、probe_gate.py /
   probe_gate2.py、add_forge2v14.py。
+
+**续 21 补充 20（同日第七轮）——唤醒实验第一轮：未触达有效对象（仪器缺陷，非否定）**：
+
+- **实验执行**：锻造跑至停泊 → 主线程（kernelbase WFSO @0x758a123c）
+  深栈 16KB → 324 个小值候选 → SetEvent（dup 后从我们侧触发）→
+  NtAlertThread × 40 线程 → 10s 后复查。
+- **结果 = 全部落空**：324 个 DuplicateHandle **全部失败**（err 6 =
+  栈上小值 ≠ 本 run 的真实句柄——句柄值逐 run 变，而 WFSO 的参数槽
+  不在 esp 可见帧内，ntdll syscall stub 之下更深）；NtAlertThread 0 成功
+  （OpenThread 权限不足，需含 THREAD_ALERT 位）；4 线程离开 WFSO =
+  自然方差（非唤醒效果）。部署标记照旧全零。
+- **结论**：实验不成立 ≠ 路线否定——需要 (a) 全局句柄表拿到**本 run**
+  的真实句柄（NtQuerySystemInformation(64) 对该进程阻塞 100s+，原因
+  未明，需 worker 线程 + 超时隔离），或 (b) 解析 WFSO 深帧取参数槽。
+- **仪器坑钉死**：NtQueryObject 对管道类句柄**阻塞**（必须 worker 线程
+  + join 超时）；NtQuerySystemInformation(64) 本场景**内核阻塞**（同法
+  隔离）；heredoc 截断再犯两次（补丁一律落盘脚本）；python 输出必须 -u。
+- 工件：probe_wake.py + fix_*.py、wake_out*.txt。
