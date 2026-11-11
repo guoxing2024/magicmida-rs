@@ -3611,3 +3611,18 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
 - **f 逆向增量结论**：结构已知（4-lane + 数据相关消费 + 逐字节 XOR
   更新），全恢复 = handler 缝合工程（已知量：每 handler = 一个字节值
   的完整更新语义）。工具：analyze_f.py / analyze_f2.py。
+
+**续 21 补充 26（同日第十三轮）——handler 缝合资产盘点：三源清点**：
+
+- **ops/ = 空目录**（修正记忆：「20 个 op bodies」从未落盘为文件）。
+- **failfreeze = op 带解密态唯一在盘源**：check op（0x105FC00）与
+  POOLSNIFF 捕获体 1004/1024 字节吻合 ✓；IMAG 段 0x371000 全可读。
+- **256 项派发表不在 failfreeze**：CTXM（0x1020000, 32KB）/PRIV
+  （0x1150000, 256KB）扫「连续 256 dword ∈ op 带 [0x1024000,0x1080000]」
+  = 0 命中——表为运行时构建且 382ms 时已非连续形态（或条目指向瞬态
+  VM 区块）。
+- **缝合前置条件 = 二选一**：(a) DECODEWATCH 扩展在 check 期读 VM 数据
+  区派发表（dp 已知、表基 = edi = check op 代码内的 dp 相对寻址）；
+  (b) REGSNATCH 记录格式修复后提取 check 期 EIP 轨迹 = handler VA 集。
+- 工件状态：CISC-1U.v2failfreeze.bin（IMAG 解密态）、
+  check_op_body3.bin（POOLSNIFF 体）、ops/（空）。
