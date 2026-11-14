@@ -4773,3 +4773,36 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   ②多跑累积 0x1c8174d0 族（每块解密常数不同 → 写语义表）③fold 器
   补全（dec/inc RAW 残余 = esp 惯用法变体识别）。
 - 工件：dw88.py（fold 器）、DW82/ b6/b5 产物。
+**续 21 补充 89（同日第七十五轮）——战役最大结构突破：VM 核心完整可读——派发器 = 自定位→168 表重键→自旋锁→lodsb/xor bl 字节机主循环，f 机全貌现形**：
+
+- **派发器页捕获**（b6 顺手 RPM 0x1028000，55 态/跑；hub 跨 run 稳定
+  确认两次）。hub 态非零且逐态变化 = 派发器页逐块再解密活体。
+- **派发器全反汇编（0x102888a，capstone）**：
+  `pushal/pushfd/cld; call $+5; pop edi; sub edi,0x1226887e;
+  mov eax,edi; add edi,0x1226858a` → **edi = 0x102859e = 双基座第二
+  基座（补充 40 的 image+0x2859e！）= 状态窗基址**；
+  `cmp eax,[edi+2C]`（自检）≠ → `mov [edi+2C],eax` +
+  **`mov ecx,0xa8; add [edi+ecx*4+0x48],eax; dec; jne` = 168 项派发
+  表 [edi+0x48..] 一次性重键（0xa8 = 168 = 补充 25 的 168 handler！）**；
+  `mov esi,[esp+24]; ebx=esi; esi+=eax`（参数+自定位）；
+  **`lock cmpxchg [edi+30],ecx; jne` = 自旋锁**；
+  **`lodsb al,[esi]; xor al,bl; sub esp,2` = 字节机主循环**（= 补充
+  42 检查时代 lodsb/xor 同族！）→ `mov [esp],bx; jmp 0x102ff28` =
+  handler 派发。
+- **handler 链全 readable（同页直读）**：`mov bh,0x79` 链、
+  esi fixup 链、**bl = ~bl**（ah/dh 舞 + not al，junk 夹层）、
+  **三 XOR 交叉混合**（xor [esp],bl / xor bl,[esp] / xor [esp],bl =
+  补充 34-35 的交叉混合真身！）、**edx += 折叠常数**（esi =
+  0x27b74ed2-1+0xd848b133 折叠、ebp±0x42d44395 相消）——补充 33-35
+  家族全部在同一页家族（0x1028000-0x103C000）。
+- **f 机全貌**：.dat 解码 = 与检查同族的字节机（168 handler 表 +
+  lodsb/xor bl + 状态窗 [edi+8]），**程序 = 可折叠的明文代码**——
+  f 直读 = fold 链（jmp 跟踪 + junk 常数折叠）即可，无需再猜。
+- **仪器**：b7 = VM 核心区 [0x1028000,0x103C000) 80KB 变更快照
+  （60 态/跑 = 4.9MB）——链折叠全材料落盘。
+- **下一增量（f 直读收口）**：①fold 链走通：从 lodsb 点起跟踪
+  jmp 链（0x102ff28→…→回环），junk 折叠 → 语义序列 = f 程序；
+  ②跨 b7 态拼接（handler 页逐块解密，60 态并集 = 全链）；③f 验证：
+  用已知明文 112B 回放 f 程序 → 全吻合 = f 破译 → .dat 重编码
+  oracle 输入侧闭环。
+- 工件：patch 89/89b、b6 95 态（含 55 hub 态）、b7 60 态 4.9MB。
