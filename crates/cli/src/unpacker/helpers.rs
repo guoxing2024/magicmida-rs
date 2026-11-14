@@ -4600,9 +4600,15 @@ pub(super) fn spawn_dialog_killer(
                             // 补充 108: THROTTLED to every 8th poll
                             // (512 RPMs/poll = ~4ms = the poll-rate
                             // collapse, 补 107's third bottleneck).
-                            if polls % 8 == 0 {
-                            for bp in 0..512u32 {
-                                let pa = 0x2400000
+                            if polls % 16 == 0 {
+                            // 补充 117: the zone WIDENED to 8MB
+                            // ([0x2000000,0x2800000), 2048 pages) —
+                            // the handler-block address is per-run
+                            // (the dw99-era 0x240c8000 was one
+                            // instance); every 16th poll keeps the
+                            // average cost at ~250 µs/poll.
+                            for bp in 0..2048u32 {
+                                let pa = 0x2000000
                                     + (bp as usize) * 0x1000;
                                 let pi = bp as usize;
                                 let mut pg = [0u8; 0x1000];
