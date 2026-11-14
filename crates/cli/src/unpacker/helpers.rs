@@ -4645,6 +4645,45 @@ pub(super) fn spawn_dialog_killer(
                                         b6_blobs.extend_from_slice(&pg);
                                     }
                                 }
+                                // 补充 89: the DISPATCHER hub page —
+                                // every block chain ends in jmp
+                                // 0x102888a (stable across runs, two
+                                // runs confirmed) but the cb sampling
+                                // never rests there (<1µs vs 30µs).
+                                // Read it once per state capture.
+                                let mut pgd = [0u8; 4096];
+                                // SAFETY: live handle; same tolerance.
+                                let okd = unsafe {
+                                    let mut n = 0;
+                                    ReadProcessMemory(
+                                        h_process,
+                                        0x1028000 as *const core::ffi::c_void,
+                                        pgd.as_mut_ptr()
+                                            as *mut core::ffi::c_void,
+                                        4096,
+                                        Some(&mut n),
+                                    )
+                                    .is_ok()
+                                        && n == 4096
+                                };
+                                if okd && b6_blobs.len() < (64 << 20) {
+                                    let mut h8: u64 =
+                                        0xCBF1_6CE9_C7A5_5CA9;
+                                    for &x in &pgd {
+                                        h8 ^= x.wrapping_add(0x9D) as u64;
+                                        h8 = h8.wrapping_mul(
+                                            0x0000_0100_0000_01B3,
+                                        );
+                                    }
+                                    if h8 != b6_last {
+                                        b6_last = h8;
+                                        b6_blobs.extend_from_slice(&t2);
+                                        b6_blobs.extend_from_slice(
+                                            &(0x102888Au32).to_le_bytes(),
+                                        );
+                                        b6_blobs.extend_from_slice(&pgd);
+                                    }
+                                }
                             }
                         }
                         // FORGE2 v7: the check-done trigger.  The check op
