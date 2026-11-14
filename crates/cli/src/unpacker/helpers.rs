@@ -4369,9 +4369,33 @@ pub(super) fn spawn_dialog_killer(
                                     )
                                 };
                             }
-                            // the block pointer = the dword at
-                            // 0xeedc0014 (offset 0x14) if plausible
+                            // 补充 100b: the block pointer = the
+                            // FIRST dispatch-table entry at
+                            // [edi+0x48] = 0x10285E6 (the state
+                            // window base 0x102859e + 0x48; the table
+                            // = 168 entries pointing at the transient
+                            // blocks, 补 99) — fall back to the param
+                            // dword, then 0x240C8000.
                             let mut blkbase = 0x240C8000usize;
+                            let mut tb = [0u8; 4];
+                            if unsafe {
+                                let mut n = 0;
+                                ReadProcessMemory(
+                                    h_process,
+                                    0x10285E6 as *const core::ffi::c_void,
+                                    tb.as_mut_ptr()
+                                        as *mut core::ffi::c_void,
+                                    4,
+                                    Some(&mut n),
+                                )
+                                .is_ok()
+                                    && n == 4
+                            } {
+                                let tv = u32::from_le_bytes(tb) as usize;
+                                if (0x1000000..0x8000000).contains(&tv) {
+                                    blkbase = tv & !0xFFF;
+                                }
+                            }
                             let pv = u32::from_le_bytes(
                                 prm[0x14..0x18].try_into().unwrap(),
                             ) as usize;
