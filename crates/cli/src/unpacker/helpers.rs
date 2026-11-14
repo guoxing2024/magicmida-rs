@@ -3495,7 +3495,14 @@ pub(super) fn spawn_dialog_killer(
                             plen = rpm(eip & !0xFFF, &mut eippage);
                         }
                         let blen = rpm(image_base + 0x5F000, &mut block);
-                        let got_s = rpm(image_base + 0x5FFAE, &mut sc);
+                        let mut got_s = if ctx.Edi as usize >= 0x10000 {
+                            rpm(ctx.Edi as usize, &mut sc)
+                        } else {
+                            0
+                        };
+                        if got_s != 64 {
+                            got_s = rpm(image_base + 0x5FFAE, &mut sc);
+                        }
                         let got_b = if ba != 0 { rpm(ba, &mut buf480) } else { 0 };
                         // SAFETY: suspended above.
                         unsafe {
@@ -3538,9 +3545,15 @@ pub(super) fn spawn_dialog_killer(
                         // inside the image data area) — capture 4KB there
                         let esiva = ctx.Esi as usize;
                         if esiva >= 0x10000 {
-                            let mut esipage = [0u8; 0x1000];
-                            let got_e = rpm(esiva & !0xFFF, &mut esipage);
-                            blobs.extend_from_slice(&((esiva & !0xFFF) as u32).to_le_bytes());
+                            let mut esipage = [0u8; 0x4000];
+                            let ebase = esiva & !0xFFF;
+                            let mut got_e = 0usize;
+                            for epg in 0..4u32 {
+                                let pa = ebase + (epg as usize) * 0x1000;
+                                let _n = rpm(pa, &mut esipage[got_e..got_e + 0x1000]);
+                                got_e += 0x1000;
+                            }
+                            blobs.extend_from_slice(&(ebase as u32).to_le_bytes());
                             blobs.extend_from_slice(&(got_e as u32).to_le_bytes());
                             blobs.extend_from_slice(&esipage[..got_e]);
                         } else {
