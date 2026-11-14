@@ -4134,3 +4134,20 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   fetch 风暴——数据页应零填、取指页才 C3（待改）。
 - 工件：helpers.rs（esipage 16KB 分页捕）、emu_pass2.py（后台）、
   emu_bound.py（esi 并集版）、run-7/run-8 快照。
+
+**续 21 补充 51（同日第三十八轮）——pass-2 emu 锚定成功：指针 0x24→0x37 = 观测范围，但链再次入 API 门**：
+
+- **pass-2 锚点选择**：run-8 三条 pass-2 记录中 t=216810 的 eip=
+  0x106b78e = 恰在 API 调用点（间接跳 0xf8012910 = VM 导入 = 内核
+  态地址）→ **换 t=217826 eip=0x1066a38（xor al,dl = 补 39 全链解读
+  的站点，链中段）** → emu 干净起步 ✓。
+- **pass-2 跑通**：指针 0x00ff0024→0x00ff0037（20 个指针状态 =
+  与 run-8 观测范围一致！）→ 然后**再次进入同一 inter-pass API 链**
+  （0x115b7b6 = 同一调用点，helper + GetModuleHandleW）→ 栈下行
+  fault-storm（0xeeffc→0xebffc，esp -0x1000 步进）。
+- **判定**：pass-2 的链在 ptr≈0x37 处再次调 helper API——要么
+  pass-2 短（run-8 观测只到 0x37），要么 API 语义桩缺失导致提前
+  分流。**API 语义桩 = 收尾的关键单点**。
+- 下一增量：helper API 返回值语义（从 run-8/r4 的 pass-2 观测
+  推断或识别 helper）→ emu 完整两遍终值。
+- 工件：emu_pass2.py/.pkl/.log（锚定 pass-2 版）。
