@@ -5086,3 +5086,15 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   ~2000-4000 polls → 解码时代态密度 ↑ 30-60×）→ era 续跑器跑解码态
   全集字节轨迹 → 三处输出 → 112B 对位 → f 判定 → oracle。
 - 工件：patch 105、b8 50 拍（821KB）、b9 21 态。
+**续 21 补充 106（同日第九十二轮）——hoist 落地但真瓶颈 = GetThreadContext on running thread（~3ms/poll 内核线程同步）**：
+
+- **OpenThread hoist 落地**（一次 Open、循环内仅 GetThreadContext+
+  栈 RPM；check CHECK_EXIT=0；修两处锚点后干净入库）。
+- **结果**：polls 仍 92（~4.3ms/poll）——**瓶颈 ≠ OpenThread = 
+  GetThreadContext 对运行中线程**（内核强制同步 ~1-3ms）+ 16KB 栈
+  RPM（~1ms）。
+- **修正（下一 session，~5 行）**：b8 节流 = 每 8th poll 才
+  GetThreadContext+栈 RPM（页密度由 b9 每 poll 保持；寄存器 = 仅续
+  跑点需要）→ poll 回 ~100µs → 密度恢复 → 解码态全集 → 字节轨迹 →
+  112B 对位 → f 判定 → oracle。
+- 工件：patch 106、b8 52 拍、b9。
