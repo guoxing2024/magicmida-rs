@@ -5477,7 +5477,14 @@ pub(super) fn spawn_dialog_killer(
                             // serial page (0xfd1b00, 补充 81) build
                             // timeline.  Page-wise reads (the cross-region
                             // RPM = PARTIAL_COPY trap).
-                            if polls % 16 == 0 && lw2_blobs.len() < (48 << 20)
+                            // 补充 82f: the strings/serial burst lands
+                            // [313,316]ms (2 lw2 states at 1/16 cadence
+                            // missed the intermediates) — every poll from
+                            // t=280, every 16th before (dedup keeps the
+                            // distinct states only).
+                            if (polls % 16 == 0
+                                || watch_t0.elapsed().as_millis() >= 280)
+                                && lw2_blobs.len() < (48 << 20)
                             {
                                 // 补充 82e: the zone is BUFFER-RELATIVE —
                                 // run24: serial = ba-0xE500, strings =
