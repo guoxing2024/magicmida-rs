@@ -4266,3 +4266,15 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   工作区演变 = emu 轨迹的一部分；重编码 oracle 的输入 = copy A
   区（0x1142xxx）的构建（.dat→copy A）仍待定位。
 - 工件：helpers.rs（目标 wide）、run10/run11 快照、演变时间线。
+
+**续 21 补充 59（同日第四十六轮）——copy A 构建早于仪器首快照：needle 扫描阻塞定案**：
+
+- **wide 每记录**（200 wides）+ 双跑（run12/13，era = 176329 起）：
+  **copy A（esi 区）在首快照即已建满**（nz=16315/16384，头 =
+  ad969e63…）→ **构建 < 176ms**。
+- **根因 = REGSNATCH phase-1 needle 全内存扫描阻塞**（找到 .dat
+  缓冲才开始快照 = 176ms）——copy A 构建窗口 [~100,176] 被错过。
+- **下一增量**：needle 扫描异步化（快照先行、needle 后补）或
+  POOLSNIFF 式差分直接定位 copy A 写入时段——copy A 构建窗口
+  [100,176] 是变换的执行窗口。
+- 工件：run12/run13 快照（16.7MB each，200 wides）。
