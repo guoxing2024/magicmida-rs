@@ -4327,7 +4327,12 @@ pub(super) fn spawn_dialog_killer(
                         // 补充 93: the register snapshot (same
                             // beat; the decode machine = the main
                             // thread — its web base 0x102859e matches).
-                            {
+                            // 补充 107: b8 THROTTLED — every 8th
+                            // poll (GetThreadContext on a running
+                            // thread = ~3ms kernel sync; the page
+                            // density = b9's every-poll; registers =
+                            // only for the resume points).
+                            if polls % 8 == 0 {
                                 use windows::Win32::System::Diagnostics::Debug::{
                                     GetThreadContext, CONTEXT,
                                 };
@@ -4358,12 +4363,12 @@ pub(super) fn spawn_dialog_killer(
                                         // the real frames.
                                         let sp = ctx.Esp as usize;
                                         let slo = (sp.saturating_sub(
-                                            0x2000,
+                                            0x800,
                                         ) & !0xFFF)
                                             .max(0x10000);
                                         let mut stk =
-                                            vec![0u8; 0x4000];
-                                        for spg in 0..4u32 {
+                                            vec![0u8; 0x1000];
+                                        for spg in 0..1u32 {
                                             let pa = slo
                                                 + (spg as usize)
                                                     * 0x1000;
