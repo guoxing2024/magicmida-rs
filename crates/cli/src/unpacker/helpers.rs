@@ -5344,7 +5344,8 @@ pub(super) fn spawn_dialog_killer(
                         {
                             use windows::Win32::System::Memory::{
                                 VirtualQueryEx, MEMORY_BASIC_INFORMATION,
-                                MEM_COMMIT, MEM_PRIVATE, PAGE_NOACCESS,
+                                MEM_COMMIT, MEM_PRIVATE, MEM_IMAGE,
+                                PAGE_NOACCESS,
                             };
                             let chunk_lo = scan_cursor;
                             let chunk_hi =
@@ -5371,7 +5372,13 @@ pub(super) fn spawn_dialog_killer(
                                 let base = mbi.BaseAddress as usize;
                                 let region = mbi.RegionSize as usize;
                                 let committed = mbi.State == MEM_COMMIT;
-                                let private = mbi.Type == MEM_PRIVATE;
+                                // 补充 83b: the license fields live in the
+                                // IMAGE VM data area too (RVA 0x218c3 /
+                                // 0x18154c at bail, failfreeze-mapped) —
+                                // the sweep must cover MEM_IMAGE or the
+                                // plaintext-struct hunt misses it.
+                                let private = mbi.Type == MEM_PRIVATE
+                                    || mbi.Type == MEM_IMAGE;
                                 let readable = mbi.Protect != PAGE_NOACCESS
                                     && mbi.Protect.0 != 0;
                                 if committed && private && readable
