@@ -4038,3 +4038,20 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   run-6 的真实返回值回填。
 - 工件：emu_iter.py/.pkl（6824 迭代全输入轨迹）、emu_final 修复
   （fault 页 C3 桩 + API 参数捕获）。
+
+**续 21 补充 46（同日第三十三轮）——第二 API = GetModuleHandleW(NULL)；inter-pass 链 = VM 自定位代码**：
+
+- **调用者静态可读**：API 调用点 = `ff 95 71 08 26 12`
+  （call [ebp+0x12260871] = helper）→ 返回 → `6a 00 ff 95 9d 01 26
+  12`（**push 0; call [ebp+0x1226019d] = GetModuleHandleW(NULL)**）→
+  `8b c0`（mov eax,eax）→ `eb 3b`。
+- **语义桩落地**：0x7565d770 = mov eax,0x1000000; ret（模块基座）；
+  0x7565e960 = xor eax,eax; ret。死亡点不变：0x115b9e5 读
+  [0xffff9614]（eip = 0x115b9e5，访问 19）。
+- **inter-pass 链 = VM 自定位代码**：`call $+5; pop edx` +
+  `mov [esp+4],edx; add [esp+4],0x19; inc edx; push edx; ret` =
+  计算跳转连续体——线性反汇编无效，静态合成不可行；追踪只能靠 emu。
+- **残余**：死亡指针 0xffff9614 = 链内计算值（API 结果 + VM 状态）；
+  需要更深的语义桩（链中更多 API/状态读取）或 run-6 真实返回值
+  回填。emu 的 pass-1 轨迹 = 完整可复现（11/11）不变。
+- 工件：emu_final（语义桩版 + API 参数捕获）。
