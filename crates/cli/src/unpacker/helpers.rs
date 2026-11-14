@@ -4694,8 +4694,8 @@ pub(super) fn spawn_dialog_killer(
                             }
                             // 补充 89b: the VM core region on change.
                             if b7_blobs.len() < (64 << 20) {
-                                let mut reg = vec![0u8; 0x14000];
-                                for rp in 0..20u32 {
+                                let mut reg = vec![0u8; 0x16000];
+                                for rp in 0..22u32 {
                                     let pa = 0x1028000
                                         + (rp as usize) * 0x1000;
                                     let o7 = pa - 0x1028000;
