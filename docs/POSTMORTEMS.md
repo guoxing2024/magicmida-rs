@@ -4499,3 +4499,11 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   的离线分析（无需新 run）！
 - 下一增量：run-8 post-check ptrwin（ba 页）时间线分析 = .dat
   处理过程离线复原。
+
+**续 21 补充 77（同日第六十三轮）——run19 era 偏移：ba 未在 ptr 中出现**：
+
+- run19（t=152-366ms）：ptr 高位分布 = 0xe2xxxx×30（post-check 主区）、
+  0x6bxxxx×5、0x10dxxxx×17 等——**ba（0xfe/0xd5）未出现**（era
+  偏移：本 run 的 ptr 走了别的区）。
+- **ba 差分待续**：多跑取 era 对齐（ba = post-check ptr 的 run）。
+- 工件：run19 快照。
