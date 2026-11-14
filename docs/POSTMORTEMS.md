@@ -4619,3 +4619,33 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   转储 = 明文直读）。
 - 工件：OUT/ps1/patch_dw82.py、dw82.py、OUT/ps1/DW82/*.v2decodewatch*
   （三跑：b2 54/46 条、lw2 1/12/27 条）；提交 b980aac/a6e4c76/后续。
+**续 21 补充 83（同日第六十九轮）——双针 sweep + b3 逐 poll：明文不在任何可扫内存（三重否定），字段组装时刻/位置全捕获**：
+
+- **仪器**：sweep 第二 needle = serial ASCII 前 16B（"105A-0000-0000-0"，
+  跨 run 确定）→ 明文结构 hunt；b3 = 第二副本窗（ba-0x10000 512B）每
+  poll；sweep 扩 MEM_IMAGE（83b）。
+- **否定一（私有低内存）**：serial needle 两 run 零 <315ms 命中——明文
+  结构从不驻留私有低内存。首命中 = [315-319] 组装瞬间（0xff0080=
+  buffer+0x80 与 0xfd1b00/0xb71b00 显示区）。
+- **否定二（第二副本就地解密）**：b3 每 poll 下 cipher→SHA1 结构 =
+  **单 poll 转换（<30µs）**——[186,196] 无任何解密中间态；[195.8] 出现
+  41B 新结构（ee89eb7a…）= hash 结果暂存态。
+- **否定三（镜像）**：sweep 含 MEM_IMAGE 后仍零镜像命中——字段所在的
+  镜像 VM 数据块**执行后即再加密**（瞬态可读窗，sweep 扫不到；与补充
+  29-30 派发表同一机制）。
+- **显示区 = per-run 堆、不跟 buffer**：ba 同为 0xfe0000 的两 run，显
+  示区 = 0xfd1b00 vs 0xb71b00——固定偏移 lw2 对显示区失效（第二副本 +
+  SHA1 段仍有效）。
+- **failfreeze 段映射**（bail 383ms）："(CISC-1) Examples" 在 **IMAG
+  RVA 0x218c3 / 0x18154c + CTXM 0x10228c3 + PRIV 0x115254c** 四处；
+  **serial 不在 freeze 任何段**（其在 0xff0080/0xb71b00 = freeze 未覆
+  盖的低内存页）。
+- **组装时刻线**：[313.5-324.5]ms 三处并行（buffer+0x80 结构 336B 含
+  serial@0x80 / strings 页 36B / 显示区 serial+fd 字段 68B）——字段从
+  壳内部存储（寄存器/栈/瞬态 VM 块）直接拷出。
+- **oracle 推论**：变换 = API 级计算（SHA-1 参与验证，补充 82），明文
+  不落可扫内存。剩余捕获向量：① 栈观察器（[300,330] 每 poll 12KB
+  STCK 区——字段组装必经栈拷贝）② CTXM 区（0x10228c3 bail 有字段）
+  构建期监视 ③ 瞬态 VM 块 live 窗捕获（同派发表机制）。
+- 工件：patch_dw83.py、DW82/ 四跑产物（b2 30 条、b3 8 条、lw2 27 条）；
+  提交 b980aac 系 + 83/83b。
