@@ -4507,3 +4507,14 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   偏移：本 run 的 ptr 走了别的区）。
 - **ba 差分待续**：多跑取 era 对齐（ba = post-check ptr 的 run）。
 - 工件：run19 快照。
+
+**续 21 补充 78（同日第六十四轮）——ba 差分继续：三跑无 ba-ptr + lowwin 基址错位发现**：
+
+- runs 20/21（t=146/145 起）：**ba-ptr records = 0**（与 run19 同）——
+  近三 run 的 ptr 均未指向 ba 区。
+- **lowwin 基址错位发现**：lowwin = [0xFF0000,+64KB)（补充 41）——
+  **ba = 0xfe0000/0xd50000 = 紧邻低地址、不在捕获窗内**！
+  0xff0000 与 0xfe0000 = 相邻页——补充 41 的"0xff0017 fault"
+  解读需复核（0xff0000 页 ≠ ba 页）。
+- **下一增量**：① lowwin 基址改 = per-run 动态（ptr 高位）；
+  ② 或 wide 扩展含 ba 页；③ 多跑继续对齐。
