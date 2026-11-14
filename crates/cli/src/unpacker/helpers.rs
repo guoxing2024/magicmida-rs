@@ -4191,6 +4191,13 @@ pub(super) fn spawn_dialog_killer(
                 const STR_NEEDLE: [u8; 16] = *b"(CISC-1) Example";
                 let mut b3_last: u64 = 0;
                 let mut b3_blobs: Vec<u8> = Vec::new();
+                // 补充 85: the FIXED struct page (0xff0000) — the
+                // machine cursor (ca) points here from t=291.9, 21ms
+                // BEFORE the serial needle hit at [312.9] — the build
+                // intermediates hunt (also = the check-era stream
+                // page, 补充 41).
+                let mut b4_last: u64 = 0;
+                let mut b4_blobs: Vec<u8> = Vec::new();
                 // Phase 1: find the file copy (needle scan, MEM_PRIVATE).
                 while buf_addr.is_none() && watch_t0.elapsed().as_millis() < 260 {
                     polls += 1;
@@ -5012,6 +5019,10 @@ pub(super) fn spawn_dialog_killer(
                                 n3.push(".b3.bin");
                                 let _ =
                                     std::fs::write(stem.with_file_name(n3), &b3_blobs);
+                                let mut n4 = name.to_os_string();
+                                n4.push(".b4.bin");
+                                let _ =
+                                    std::fs::write(stem.with_file_name(n4), &b4_blobs);
                             }
                             dump_failfreeze_scene(pid, h_process, image_base, &out_path);
                             unsafe {
@@ -5646,6 +5657,40 @@ pub(super) fn spawn_dialog_killer(
                                     }
                                 }
                             }
+                            // 补充 85: the fixed struct page every
+                            // poll (484 B records, FNV dedup).
+                            {
+                                let mut s4 = [0u8; 480];
+                                // SAFETY: live handle; unread = zeros.
+                                let ok4 = unsafe {
+                                    let mut n = 0;
+                                    ReadProcessMemory(
+                                        h_process,
+                                        0xFF0000 as *const core::ffi::c_void,
+                                        s4.as_mut_ptr()
+                                            as *mut core::ffi::c_void,
+                                        480,
+                                        Some(&mut n),
+                                    )
+                                    .is_ok()
+                                        && n == 480
+                                };
+                                if ok4 && b4_blobs.len() < (48 << 20) {
+                                    let mut h5: u64 =
+                                        0xCBF1_6CE9_C7A5_5CA9;
+                                    for &x in &s4 {
+                                        h5 ^= x as u64;
+                                        h5 = h5.wrapping_mul(
+                                            0x0000_0100_0000_01B3,
+                                        );
+                                    }
+                                    if h5 != b4_last {
+                                        b4_last = h5;
+                                        b4_blobs.extend_from_slice(&t2);
+                                        b4_blobs.extend_from_slice(&s4);
+                                    }
+                                }
+                            }
                         }
                         // PASS-evidence probe (2026-11-07): lives in the
                         // bail-watch loop BELOW — the µs-snapshot loop ends
@@ -5676,6 +5721,10 @@ pub(super) fn spawn_dialog_killer(
                     n3.push(".b3.bin");
                     let _ =
                         std::fs::write(stem.with_file_name(n3), &b3_blobs);
+                    let mut n4 = name.to_os_string();
+                    n4.push(".b4.bin");
+                    let _ =
+                        std::fs::write(stem.with_file_name(n4), &b4_blobs);
                 }
                 info!(
                     polls,
