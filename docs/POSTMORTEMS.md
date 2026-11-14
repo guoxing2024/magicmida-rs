@@ -4825,3 +4825,26 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   dat 流喂入 + bl/acc/输出轨迹）②f 程序 = 回放轨迹的净语义 ③112B
   回放吻合验证 → .dat 重编码 oracle 输入侧闭环。
 - 工件：dw90.py、dw90.pkl、b7 62 态（5.6MB）。
+**续 21 补充 91（同日第七十七轮）——f-emu 回放机活着：3M 指令零故障、流消费实况（cursor=ba+0x51）、状态窗全字段对上**：
+
+- **回放机**（dw91.py）：b7 62 态并集（latest-wins 22/22 页）映射
+  [0x1028000,0x103E000)；.dat 拷贝（b2 首满态，ba=0xc30000）入
+  ba 页；栈 = 0xef000+12KB；**从派发器 0x102888a 起步（esi=流基址）**
+  → 3M 指令上限内 **clean、零 fault、1M writes** = **机器在捕获区内
+  完全自洽**（b7 材料足够，无需更多上下文）。
+- **状态窗实况（emu 终态 [0x102859e..+0x40]）**：cursor
+  [edi+0] = **0xc30051 = ba+0x51（流已消费 81 字节！）**、
+  [edi+4] = **0xc7485f48 = bank cb 写相位恒值（字段对上！）**、
+  [edi+8] = 0x5b5e2d9d（acc，32 位宽）、[edi+0x14] = **0xeedc0014 =
+  VM magic（补充 45 常数！）**。
+- **写轨迹**：1M writes 集中在 0xf1fd8-0xf1ff4（栈帧），含
+  0x1028892（派发器自地址）反复压栈 = 逐字节引导帧循环；esi 终值 =
+  0xeedc0014 = magic 位（跑入参数标记）。
+- **语义解读**：机器 = 逐字节消费 .dat 流（cursor 前进），每字节 =
+  引导帧 + handler 链 + acc 突变；1M writes/3M insns = 每字节
+  ~100 写 = handler 链长（~30 块/字节，与 168 表规模吻合）。
+- **下一增量（f 验证收口）**：①hook esi 读流页 = 每字节 (input,
+  bl, acc) 三元组轨迹 ②stosb/写流页 = 输出字节捕获 ③输出 @struct
+  [0x41,0xB1) vs 112B 已知明文逐位比对 = f 吻合判定 ④吻合 → f =
+  acc 突变程序 → 重编码 = 逆程序 → oracle 输入侧闭环。
+- 工件：dw91.py、dw91.pkl（faults/writes）。
