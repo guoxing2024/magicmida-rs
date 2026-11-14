@@ -4219,6 +4219,11 @@ pub(super) fn spawn_dialog_killer(
                 // region on change (page-wise reads), FNV dedup.
                 let mut b7_last: u64 = 0;
                 let mut b7_blobs: Vec<u8> = Vec::new();
+                // 补充 93: the machine-thread register snapshot per
+                // state (b8: t + eip/edi/esi/ebx/edx/ecx/eax/ebp/esp/
+                // eflags) — the era-consistent resume needs BOTH the
+                // pages AND the registers.
+                let mut b8_blobs: Vec<u8> = Vec::new();
                 // Phase 1: find the file copy (needle scan, MEM_PRIVATE).
                 while buf_addr.is_none() && watch_t0.elapsed().as_millis() < 260 {
                     polls += 1;
@@ -4725,6 +4730,48 @@ pub(super) fn spawn_dialog_killer(
                                     b7_last = h9;
                                     b7_blobs.extend_from_slice(&t2);
                                     b7_blobs.extend_from_slice(&reg);
+                                }
+                            }
+                            // 补充 93: the register snapshot (same
+                            // beat; the decode machine = the main
+                            // thread — its web base 0x102859e matches).
+                            {
+                                use windows::Win32::Foundation::CloseHandle;
+                                use windows::Win32::System::Diagnostics::Debug::{
+                                    GetThreadContext, CONTEXT,
+                                };
+                                use windows::Win32::System::Threading::{
+                                    OpenThread, THREAD_GET_CONTEXT,
+                                    THREAD_QUERY_INFORMATION,
+                                };
+                                if let Ok(hc) = unsafe {
+                                    OpenThread(
+                                        THREAD_GET_CONTEXT
+                                            | THREAD_QUERY_INFORMATION,
+                                        false,
+                                        main_tid,
+                                    )
+                                } {
+                                    let mut ctx = CONTEXT::default();
+                                    ctx.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_FLAGS(0x0001_0003);
+                                    if unsafe {
+                                        GetThreadContext(hc, &mut ctx)
+                                    }
+                                    .is_ok()
+                                    {
+                                        b8_blobs.extend_from_slice(&t2);
+                                        for v in [
+                                            ctx.Eip, ctx.Edi, ctx.Esi,
+                                            ctx.Ebx, ctx.Edx, ctx.Ecx,
+                                            ctx.Eax, ctx.Ebp, ctx.Esp,
+                                            ctx.EFlags,
+                                        ] {
+                                            b8_blobs.extend_from_slice(
+                                                &v.to_le_bytes(),
+                                            );
+                                        }
+                                    }
+                                    let _ = unsafe { CloseHandle(hc) };
                                 }
                             }
                         }
@@ -5235,6 +5282,10 @@ pub(super) fn spawn_dialog_killer(
                                 n7.push(".b7.bin");
                                 let _ =
                                     std::fs::write(stem.with_file_name(n7), &b7_blobs);
+                                let mut n8 = name.to_os_string();
+                                n8.push(".b8.bin");
+                                let _ =
+                                    std::fs::write(stem.with_file_name(n8), &b8_blobs);
                             }
                             dump_failfreeze_scene(pid, h_process, image_base, &out_path);
                             unsafe {
@@ -5953,6 +6004,10 @@ pub(super) fn spawn_dialog_killer(
                     n7.push(".b7.bin");
                     let _ =
                         std::fs::write(stem.with_file_name(n7), &b7_blobs);
+                    let mut n8 = name.to_os_string();
+                    n8.push(".b8.bin");
+                    let _ =
+                        std::fs::write(stem.with_file_name(n8), &b8_blobs);
                 }
                 info!(
                     polls,
