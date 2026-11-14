@@ -4534,6 +4534,60 @@ pub(super) fn spawn_dialog_killer(
                             continue;
                         }
                         let ca = u32::from_le_bytes(cont_buf[0..4].try_into().unwrap());
+                        // 补充 86b: the machine trajectory at EVERY
+                        // poll — moved BEFORE the forge/dispatch
+                        // sections (their `continue`s consumed 99% of
+                        // the polls: 83/27076 samples).  The decode-era
+                        // machine is cb-driven (ca=0, cb = image-area
+                        // pointers 0x1139d86/0xb20000) — so the block
+                        // reads cover BOTH ca+dp and the cb page.
+                        // Record = 1040 B, no dedup, cap 64 MB.
+                        if b5_blobs.len() < (64 << 20) {
+                            let cb5 = u32::from_le_bytes(
+                                cont_buf[4..8].try_into().unwrap(),
+                            );
+                            let dp5 = u32::from_le_bytes(dp_buf);
+                            let mut s5a = [0u8; 512];
+                            let bva5 = ca.wrapping_add(dp5);
+                            if bva5 >= 0x100 {
+                                // SAFETY: live handle; uncommitted
+                                // blocks just fail and stay zeros.
+                                let _ = unsafe {
+                                    let mut n = 0;
+                                    ReadProcessMemory(
+                                        h_process,
+                                        (bva5 - 0x100)
+                                            as *const core::ffi::c_void,
+                                        s5a.as_mut_ptr()
+                                            as *mut core::ffi::c_void,
+                                        512,
+                                        Some(&mut n),
+                                    )
+                                };
+                            }
+                            let mut s5b = [0u8; 512];
+                            let cbp = (cb5 & !0xFFF) as usize;
+                            if cbp >= 0x10000 {
+                                // SAFETY: live handle; same tolerance.
+                                let _ = unsafe {
+                                    let mut n = 0;
+                                    ReadProcessMemory(
+                                        h_process,
+                                        cbp as *const core::ffi::c_void,
+                                        s5b.as_mut_ptr()
+                                            as *mut core::ffi::c_void,
+                                        512,
+                                        Some(&mut n),
+                                    )
+                                };
+                            }
+                            b5_blobs.extend_from_slice(&t2);
+                            b5_blobs.extend_from_slice(&ca.to_le_bytes());
+                            b5_blobs.extend_from_slice(&cb5.to_le_bytes());
+                            b5_blobs.extend_from_slice(&dp5.to_le_bytes());
+                            b5_blobs.extend_from_slice(&s5a);
+                            b5_blobs.extend_from_slice(&s5b);
+                        }
                         // FORGE2 v7: the check-done trigger.  The check op
                         // = a 0.4ms burst at ~202.5ms writing its scratch
                         // u16 @image+0x5FFB2 every ~400ns; two consecutive
@@ -5704,37 +5758,6 @@ pub(super) fn spawn_dialog_killer(
                                         b4_blobs.extend_from_slice(&s4);
                                     }
                                 }
-                            }
-                            // 补充 86: the machine trajectory (bank +
-                            // executing block) at every poll, no dedup.
-                            if b5_blobs.len() < (64 << 20) {
-                                let cb5 = u32::from_le_bytes(
-                                    cont_buf[4..8].try_into().unwrap(),
-                                );
-                                let dp5 = u32::from_le_bytes(dp_buf);
-                                let mut s5 = [0u8; 512];
-                                let bva5 = ca.wrapping_add(dp5);
-                                if bva5 >= 0x100 {
-                                    // SAFETY: live handle; uncommitted
-                                    // blocks just fail and stay zeros.
-                                    let _ = unsafe {
-                                        let mut n = 0;
-                                        ReadProcessMemory(
-                                            h_process,
-                                            (bva5 - 0x100)
-                                                as *const core::ffi::c_void,
-                                            s5.as_mut_ptr()
-                                                as *mut core::ffi::c_void,
-                                            512,
-                                            Some(&mut n),
-                                        )
-                                    };
-                                }
-                                b5_blobs.extend_from_slice(&t2);
-                                b5_blobs.extend_from_slice(&ca.to_le_bytes());
-                                b5_blobs.extend_from_slice(&cb5.to_le_bytes());
-                                b5_blobs.extend_from_slice(&dp5.to_le_bytes());
-                                b5_blobs.extend_from_slice(&s5);
                             }
                         }
                         // PASS-evidence probe (2026-11-07): lives in the
