@@ -4237,6 +4237,12 @@ pub(super) fn spawn_dialog_killer(
                 let mut b10_last: u64 = 0;
                 let mut b10_blobs: Vec<u8> = Vec::new();
                 let mut b10_pages: Vec<u64> = Vec::new();
+                // 补充 112: b11 = the IMAGE STREAM page (0x1139000,
+                // 4KB) — the machine's byte stream = the image data
+                // area (esi = 0x1139275, 补 111); MEM_IMAGE = the
+                // earlier sweeps excluded it.
+                let mut b11_last: u64 = 0;
+                let mut b11_blobs: Vec<u8> = Vec::new();
                 // Phase 1: find the file copy (needle scan, MEM_PRIVATE).
                 while buf_addr.is_none() && watch_t0.elapsed().as_millis() < 260 {
                     polls += 1;
@@ -4501,6 +4507,35 @@ pub(super) fn spawn_dialog_killer(
                                         b10_blobs.extend_from_slice(&mg);
                                     }
                                 }
+                            }
+                        }
+                        // 补充 112: b11 — the image stream page.
+                        if b11_blobs.len() < (32 << 20) {
+                            let t11 = (watch_t0.elapsed().as_micros()
+                                as u32)
+                                .to_le_bytes();
+                            let mut sp = vec![0u8; 0x1000];
+                            let _ = unsafe {
+                                let mut n = 0;
+                                ReadProcessMemory(
+                                    h_process,
+                                    0x1139000 as *const core::ffi::c_void,
+                                    sp.as_mut_ptr()
+                                        as *mut core::ffi::c_void,
+                                    0x1000,
+                                    Some(&mut n),
+                                )
+                            };
+                            let mut h12: u64 = 0xCBF1_6CE9_C7A5_5CA9;
+                            for &x in &sp {
+                                h12 ^= x as u64;
+                                h12 = h12
+                                    .wrapping_mul(0x0000_0100_0000_01B3);
+                            }
+                            if h12 != b11_last {
+                                b11_last = h12;
+                                b11_blobs.extend_from_slice(&t11);
+                                b11_blobs.extend_from_slice(&sp);
                             }
                         }
                         // 补充 100: b10 — the param page + the
@@ -5569,6 +5604,10 @@ pub(super) fn spawn_dialog_killer(
                                 na.push(".b10.bin");
                                 let _ =
                                     std::fs::write(stem.with_file_name(na), &b10_blobs);
+                                let mut nb = name.to_os_string();
+                                nb.push(".b11.bin");
+                                let _ =
+                                    std::fs::write(stem.with_file_name(nb), &b11_blobs);
                             }
                             dump_failfreeze_scene(pid, h_process, image_base, &out_path);
                             unsafe {
@@ -6299,6 +6338,10 @@ pub(super) fn spawn_dialog_killer(
                     na.push(".b10.bin");
                     let _ =
                         std::fs::write(stem.with_file_name(na), &b10_blobs);
+                    let mut nb = name.to_os_string();
+                    nb.push(".b11.bin");
+                    let _ =
+                        std::fs::write(stem.with_file_name(nb), &b11_blobs);
                 }
                 info!(
                     polls,
