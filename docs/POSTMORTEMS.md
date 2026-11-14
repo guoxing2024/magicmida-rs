@@ -3900,3 +3900,42 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
 - 工件：`OUT/ps1/patch_regsnatch39.py`、`patch_reorder40.py`、
   `emu_check2.py/.pkl`、`fsolve40.py/fsolve40b.py/.pkl`、
   `parse_ctx.py`、`pagecmp.py`、run2-4 快照与 regsnatch_run3_log。
+
+**续 21 补充 41（同日第二十八轮）——检查环在 emu 里完整复现：K 表双源互证 38/42，f 代码静态现形**：
+
+- **REGSNATCH 低内存窗落地**：每记录 + [0xFF0000,+64KB)（got_l）+
+  [TB+4] dword 指针窗 4KB（ptrva+got_p+ptrwin）+ 每 16 记录
+  [0xD00000,+3MB) 宽转储（got_w；非宽记录写 got_w=0 哨兵——首版
+  条件写导致解析错位已修）。解析器 parse_ctx.py 双格式自适应。
+  **RPM 部分读陷阱**：64KB 跨区读 = ERROR_PARTIAL_COPY → 机器丢弃
+  → got_l=0；4KB 指针窗完整落区 → 成功。
+- **[TB+4] = VM 数据指针（dword）**：检查期 = 0x00ff0000+ctr
+  （run4/run6 同基 = 确定性）；u16@+4 = 其低 16 位 = 旧「ctr」。
+  **检查的真字节流 = [0x00ff0000+ctr]**，由 ptrwin 完整捕获；
+  **补充 40 的 esipage「流」= 错流**（esi = 另一指针，per-run 不同
+  基座）——fsolve40b 的 K 表以错流为键，其确定性 = 位置键合的伪象，
+  但结构结论（XOR 键 + 单 lane）仍成立。
+- **检查环 emu 完整复现（emu_check3/emu_kgen）**：从 run6 真快照
+  （t=199863，eip=0x1066a37，ctr=16，acc=(0x2ab0,0xc5cd)）+
+  freeze 网面 + ptrwin@0xff0000 + wide 低区 → **零故障跑通**：
+  cursor 16→27+（每 bump ~65K 指令）、acc 演化
+  **ctr=22/23 → (0x492b,0x539d) 与跨 run 观测逐位同**。
+  40M 指令 = 139 个 (lane,byte,old,new) 转变 + 128 (lane,byte) 槽。
+- **K 表双源互证**：emu 执行的 K（124 单键槽）vs 261 精细态解
+  （真流重解）——共享槽 **38 同 / 4 异**；emu 槽 **75/124 K==byte**
+  → 一阶 = `new = old ^ byte`，139 行中 83 行符合、56 行偏离
+  → **K = f(byte, old)**（old 相关）。校验残余：coarse 点单 lane
+  错位（acc1 ✓ acc2 ✗ 或反之）= lane 选择规则细节未闭合。
+- **f 代码静态现形**：acc 写点 0x10646e1 = **`mov byte ptr [ecx], bl`**
+  （lane 槽指针在 ECX、新值在 BL——lane = 桩动态计算的地址非固定
+  偏移！）；cursor bump 0x106c281 = `pop dword ptr [edx]`；字节入口
+  0x1067d28 = **`mov bl, al`**（al = 消费字节）；桩链
+  0x106f6e4→…→0x1072c92 出现**第一个真 jcc（jg 0x10626b0）**
+  ——f = 数据相关分支的实现，fold3 单路径不够 = 需要 BFS 全展开或
+  以 emu 轨迹为准。
+- **下一增量**：① f 桩（0x106f6e4 链）fold2 双路径全展开 +
+  `mov [ecx],bl` 的 ecx 计算链 = lane 规则；② emu 长跑到两遍终值
+  （~63M 指令）取 acc 终值 = 门常数验证；③ K = f(byte,old) 的
+  2D 表按 emu 多锚点补样。重编码 oracle 剩 copy A 变换逆 + f 全形。
+- 工件：patch_lowwin41.py、parse_ctx.py（双格式）、
+  emu_check3.py/.pkl、emu_kgen.py/.pkl、run5/run6 快照与日志。
