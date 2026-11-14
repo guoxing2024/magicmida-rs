@@ -3282,76 +3282,12 @@ pub(super) fn spawn_dialog_killer(
                     THREAD_SUSPEND_RESUME,
                 };
                 let h_process = HANDLE(handle_raw as *mut core::ffi::c_void);
-                // Phase 1: needle find the .dat buffer (for the offline
-                // replay's input bytes).
-                let mut buf_addr: Option<usize> = None;
-                let mut scan_buf = vec![0u8; 1 << 20];
-                while buf_addr.is_none() && watch_t0.elapsed().as_millis() < 260 {
-                    use windows::Win32::System::Memory::{
-                        VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_PRIVATE,
-                        PAGE_NOACCESS,
-                    };
-                    let mut addr = 0x1_0000usize;
-                    while addr < 0x0800_0000 && buf_addr.is_none() {
-                        let mut mbi = MEMORY_BASIC_INFORMATION::default();
-                        // SAFETY: live handle; sized MBI.
-                        let q = unsafe {
-                            VirtualQueryEx(
-                                h_process,
-                                Some(addr as *const core::ffi::c_void),
-                                &mut mbi,
-                                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
-                            )
-                        };
-                        if q == 0 {
-                            break;
-                        }
-                        let base = mbi.BaseAddress as usize;
-                        let region = mbi.RegionSize as usize;
-                        let committed = mbi.State == MEM_COMMIT;
-                        let private = mbi.Type == MEM_PRIVATE;
-                        let readable = mbi.Protect != PAGE_NOACCESS && mbi.Protect.0 != 0;
-                        if committed && private && readable && region >= 480 {
-                            let mut roff = 0usize;
-                            while roff < region && buf_addr.is_none() {
-                                let len = scan_buf.len().min(region - roff);
-                                // SAFETY: committed readable region.
-                                let got = unsafe {
-                                    let mut n = 0;
-                                    let okr = ReadProcessMemory(
-                                        h_process,
-                                        (base + roff) as *const core::ffi::c_void,
-                                        scan_buf.as_mut_ptr() as *mut core::ffi::c_void,
-                                        len,
-                                        Some(&mut n),
-                                    )
-                                    .is_ok();
-                                    if okr { n } else { 0 }
-                                };
-                                if got >= 16 {
-                                    if let Some(p) = scan_buf[..got]
-                                        .windows(16)
-                                        .position(|w| w == dat_needle)
-                                    {
-                                        buf_addr = Some(base + roff + p);
-                                        info!(
-                                            t_ms = watch_t0.elapsed().as_millis() as u32,
-                                            buf = format!("{:p}", (base + roff + p) as *const core::ffi::c_void),
-                                            "REGSNATCH: .dat buffer located"
-                                        );
-                                        break;
-                                    }
-                                }
-                                roff += len;
-                            }
-                        }
-                        addr = base.saturating_add(region.max(0x1000));
-                    }
-                    if buf_addr.is_none() {
-                        std::thread::yield_now();
-                    }
-                }
-                let ba = buf_addr.unwrap_or(0);
+                // 补充 62 小步①: the needle scan SKIPPED — it blocked
+                // the snapshots past the copy A build window
+                // [~100,176]ms.  ba = 0 (the buf480 = zeros; the
+                // .dat = the disk file offline).
+                let ba = 0usize;
+
                 let rpm = |va: usize, out: &mut [u8]| -> usize {
                     // SAFETY: live handle; caller guarantees committed range.
                     unsafe {
