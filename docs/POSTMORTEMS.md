@@ -3995,3 +3995,22 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   （1024 循环/ac 写的结构 = esi 步进语义）；③ pass-2 派发链
   （0x107154c 起）的缺失数据槽定位。
 - 工件：emu_ftrace.py/.pkl、emu_final.py/.pkl。
+
+**续 21 补充 44（同日第三十一轮）——循环结构定量：~1024 lodsb/acc 写、esi 四位置循环、G 非二元函数**：
+
+- **差分探针（emu_diff）**：扰动 esi 区前 4 字节（^1）→ 1.2M 指令内
+  acc **零变化**——早期迭代读的字节不是 acc 更新的直接输入。
+- **循环结构定量（emu_gtrace）**：1.2M 指令 = 10236 lodsb + **10 次
+  `mov bl,al`（= acc 写 1:1）**——bl 更新在 per-ctr 路径上，迭代循环
+  不经过 0x1067d28。**esi = 四位置循环**：0x114232e/0x1142444/
+  0x11425ae/0x1142720 每 4 次 acc 写一轮（步进 ~+0x116），walk 内
+  ~1024 次 lodsb/acc 写（esi delta 直方图：0×5709/1×3924/2×344/
+  4×237 = 慢游标带重复读）。
+- **G(bl_in, byte) 非二元**：同一 (esi=0x114232e, byte=0x8b,
+  bl_in=0xd4) 在 ctr=16 → bl_out=0x75、ctr=20 → 0x2b（同 lane 槽
+  +0x8！）——**f = 多输入函数**（byte + lane + 其余 lane/ctr 状态）。
+  闭式 = 需全输入轨迹（emu = 已验证 oracle；静态 fold2 = 形式化）。
+- **诚实记录**：本轮未闭合 K=f(byte,old) 2D 形式——其前提（单字节
+  输入）本身不成立；pass-2 缺失槽未定位。f 的实用形态 = emu 执行
+  本身（11/11 验证）。
+- 工件：emu_diff.py/.pkl、emu_gtrace.py/.pkl。
