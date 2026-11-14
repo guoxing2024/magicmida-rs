@@ -4308,3 +4308,16 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   churn ③ 200 快照+interleave ④ edi-dynamic sc ⑤ esipage 16KB
   ⑥ lowwin/ptrwin ⑦ 目标 wide。估计 = 7 次小步。
 - 工件：restore_all.py（合并版——仅作参照）、restore60.py。
+
+**续 21 补充 62（同日第四十九轮）——小步重放完成：机器改造 7 步全部恢复并提交（每步零告警）**：
+
+- 小步重放 ✓：①needle 删除/ba=0（7d84c3f）②双基座 churn 最小侵入
+  （d8a6b32）③200 快照+450us+interleave（cffec28——3 个 hh 误替换
+  到别函数即修 + hh 绑定补插）④⑤ edi-dynamic sc + esipage 16KB
+  ⑥⑦ lowwin 64KB + ptrwin + 目标 wide（1116355）。**全部零告警、
+  每步单独 commit**。
+- **run15 解析异常待查**：64 records (pre-41 fallback)、t=290268..
+  294590——格式回退到旧解析 = 新格式字段未被识别（待诊断：
+  lowwin/ptrwin/wide 顺序 vs parse_ctx 预期）。
+- **下一增量**：① parse_ctx 对齐新字段序 ② 重跑验证 esipage=16KB
+  ③ copy A 构建窗口复现。
