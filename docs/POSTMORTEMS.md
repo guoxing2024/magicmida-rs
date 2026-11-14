@@ -3939,3 +3939,32 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   2D 表按 emu 多锚点补样。重编码 oracle 剩 copy A 变换逆 + f 全形。
 - 工件：patch_lowwin41.py、parse_ctx.py（双格式）、
   emu_check3.py/.pkl、emu_kgen.py/.pkl、run5/run6 快照与日志。
+
+**续 21 补充 42（同日第二十九轮）——检查 = emu 完全复现并 11/11 逐点验证；f 桩 = 检查主循环本体**：
+
+- **f 桩全展开定案**：0x106f6e4 链 267 步 fold3 = **检查主循环本体**：
+  `0x10602e1 lodsb al,[esi]`（字节消费 = VM 自增 esi——真输入流 =
+  **esi 流**，run6 = 0x1142201 起 480B；补充 41 的「esipage = 错流」
+  再修正——esi 基座 per-run 不同但内容同 = 确定性，0xff0000 =
+  另一副本非消费源）→ `0x10602e2 xor al,bl`（字节 ⊕ lane BL）→
+  折叠常数链（3 个真 jcc：jg 0x10626b0 / jge 0x106832a / jl
+  0x10704bb = 数据相关分支）→ `0x1067d28 mov bl,al`（混合值回
+  bl）→ `0x10646e1 mov byte ptr [ecx],bl`（lane 槽写回，ecx = 桩内
+  从 ebx/edi+折叠常数计算）→ `0x106c281 pop [edx]`（指针 bump）→
+  `pushfd; jmp 0x10602e1` 循环。**f = 这个循环**——不是 256 桩派发。
+- **emu_final 验证方法修正 + 11/11 全绿**：coarse 快照 = 挂起瞬间
+  的 mid-cycle 态；此前「mismatch」= 比较 final-per-ctr 的 off-by
+  伪象。正确判据 = 观测点 (ctr, acc1, acc2) ∈ emu 在同 cursor 的
+  状态集 → **11/11 全部命中**（ctr=16/31/45/60/75/103/117/133/147/
+  161/175 全逐位同）——**emu = 检查的 ground truth 实锤**。
+- **emu_final 到达 pass 间过渡态**：acc=(0x2bc0,…) 与 run4 观测的
+  inter-pass 值 (0x2bc0,…) acc1 逐位同；**[TB+4] 指针在 pass 间切到
+  0x006fb000 区**（低 16 位 45488=0xb1b0 ✓ = 0x6fb1b0）——pass 2 =
+  消费 0x6fb000 流（run6 t=195829 记录的 ptrwin 已捕 ✓ 已映射）；
+  emu 在 pass-2 派发处死（dispatch 目标 = DLL 地址 = 表项 junk =
+  某输入仍缺）。union 映射 20 个 ptr 窗（0x6fb000/0xff0000/0xfd0000/
+  0xfe0000/0x1021xxx…）。
+- **残余缺口**：① pass-2 emu 死因（~7K 指令后派发出界——某区内容
+  仍缺/时变）；② lane 规则 = ecx 计算链的静态提取（ecx = ebx/edi+
+  折叠常数，在 jcc 路径里）；③ K = f(byte,old) 的 2D 形式。
+- 工件：emu_final.py/.pkl/.log、fold3_106f6e4.txt。
