@@ -5133,3 +5133,17 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   后的变换结果 = acc 突变非内存写——f = acc 程序，输出 = acc 快照
   时序对位）。
 - 工件：dw109c.py 逻辑（内联）、dw109c.pkl、dw109c_out.txt。
+**续 21 补充 110（同日第九十六轮）——栈写语义分层定案：1120/1280 = 指针 dword、零字节写——f = acc 突变程序 = 唯一存留假设**：
+
+- **离线分层**（dw109c.pkl，1280 栈写）：**ptr-like（高位
+  0x00/01/02）= 1120、size=1 字节写 = 0**——机器栈写 = 全 dword
+  帧/指针，无内存字节输出 = **f 非内存写程序**。
+- **f = acc 突变程序 = 唯一存留**（分支②触发）：变换结果 = acc
+  （[edi+8]，32 位）逐字节演化；许可字段 = 从 acc 终态/时序派生
+  （原生 [323] bulk copy 读 acc/派生结构写字段）。与检查时代同构
+  （补 40：acc_new = acc_old ^ K[lane][byte] 纯 XOR S 盒）。
+- **下一 session（f 判定最后一步）**：①emu 回放 + **lodsb 点 acc
+  快照 hook**（(input_byte, acc_before, acc_after) 三元组 ×384）②
+  112B 对位：acc 突变轨迹 vs 已知明文（直接/XOR/移位组合）③吻合 →
+  f = acc 程序 → 逆程序 → **oracle 输入侧闭环**。
+- 工件：dw110 分析（内联）、dw109c.pkl 复用。
