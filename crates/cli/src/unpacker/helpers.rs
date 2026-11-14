@@ -4224,6 +4224,10 @@ pub(super) fn spawn_dialog_killer(
                 // eflags) — the era-consistent resume needs BOTH the
                 // pages AND the registers.
                 let mut b8_blobs: Vec<u8> = Vec::new();
+                // 补充 97: b9 = the VM core region at EVERY loop
+                // iteration (bank-gate bypass); FNV dedup, cap 64 MB.
+                let mut b9_last: u64 = 0;
+                let mut b9_blobs: Vec<u8> = Vec::new();
                 // Phase 1: find the file copy (needle scan, MEM_PRIVATE).
                 while buf_addr.is_none() && watch_t0.elapsed().as_millis() < 260 {
                     polls += 1;
@@ -4298,6 +4302,44 @@ pub(super) fn spawn_dialog_killer(
                     // ops too.
                     while watch_t0.elapsed().as_millis() < 500 {
                         polls += 1;
+                        // 补充 97: b9 — the region capture at every
+                        // iteration, BEFORE the ok_s gate.
+                        if b9_blobs.len() < (64 << 20) {
+                            let t9 = (watch_t0.elapsed().as_micros()
+                                as u32)
+                                .to_le_bytes();
+                            let mut reg = vec![0u8; 0x16000];
+                            for rp in 0..22u32 {
+                                let pa = 0x1028000
+                                    + (rp as usize) * 0x1000;
+                                let o7 = pa - 0x1028000;
+                                // SAFETY: live handle; uncommitted
+                                // pages just fail and stay zeros.
+                                let _ = unsafe {
+                                    let mut n = 0;
+                                    ReadProcessMemory(
+                                        h_process,
+                                        pa as *const core::ffi::c_void,
+                                        reg[o7..o7 + 0x1000]
+                                            .as_mut_ptr()
+                                            as *mut core::ffi::c_void,
+                                        0x1000,
+                                        Some(&mut n),
+                                    )
+                                };
+                            }
+                            let mut h9: u64 = 0xCBF1_6CE9_C7A5_5CA9;
+                            for &x in &reg {
+                                h9 ^= x as u64;
+                                h9 = h9
+                                    .wrapping_mul(0x0000_0100_0000_01B3);
+                            }
+                            if h9 != b9_last {
+                                b9_last = h9;
+                                b9_blobs.extend_from_slice(&t9);
+                                b9_blobs.extend_from_slice(&reg);
+                            }
+                        }
                         // FORGE2+SNATCH (v14): capture the VM thread's
                         // context through the search/compare era
                         // ([315,470]ms) while the continuous patch runs.
@@ -5320,6 +5362,10 @@ pub(super) fn spawn_dialog_killer(
                                 n8.push(".b8.bin");
                                 let _ =
                                     std::fs::write(stem.with_file_name(n8), &b8_blobs);
+                                let mut n9 = name.to_os_string();
+                                n9.push(".b9.bin");
+                                let _ =
+                                    std::fs::write(stem.with_file_name(n9), &b9_blobs);
                             }
                             dump_failfreeze_scene(pid, h_process, image_base, &out_path);
                             unsafe {
@@ -6042,6 +6088,10 @@ pub(super) fn spawn_dialog_killer(
                     n8.push(".b8.bin");
                     let _ =
                         std::fs::write(stem.with_file_name(n8), &b8_blobs);
+                    let mut n9 = name.to_os_string();
+                    n9.push(".b9.bin");
+                    let _ =
+                        std::fs::write(stem.with_file_name(n9), &b9_blobs);
                 }
                 info!(
                     polls,
