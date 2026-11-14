@@ -4555,13 +4555,17 @@ pub(super) fn spawn_dialog_killer(
                                     );
                                 }
                             }
-                            // 补充 101: the handler blocks = 168
+                            // 补充 101/108: the handler blocks = 168
                             // SEPARATE heap allocations (one per byte
                             // value, 补 99's table) — capture the wide
                             // zone [0x2400000,0x2600000) (2MB, 512
                             // pages) with PER-PAGE dedup: a page is
                             // recorded when its content changes (the
                             // live window = its execution moment).
+                            // 补充 108: THROTTLED to every 8th poll
+                            // (512 RPMs/poll = ~4ms = the poll-rate
+                            // collapse, 补 107's third bottleneck).
+                            if polls % 8 == 0 {
                             for bp in 0..512u32 {
                                 let pa = 0x2400000
                                     + (bp as usize) * 0x1000;
@@ -4608,6 +4612,7 @@ pub(super) fn spawn_dialog_killer(
                                     );
                                     b10_blobs.extend_from_slice(&pg);
                                 }
+                            }
                             }
                         }
                         // FORGE2+SNATCH (v14): capture the VM thread's
