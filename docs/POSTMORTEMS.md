@@ -4978,3 +4978,21 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   → lodsb×384 全流 → 流页/结构页/栈三处输出 → 112B 对位 → f 判定
   → 逆程序 → **oracle 输入侧闭环**。
 - 工件：dw98.py/dw98.pkl、dw98b.pkl（锁释放版）。
+**续 21 补充 99（同日第八十五轮）——fault 迹 = 谜底：handler 链在瞬态 VM 块（0x240c8000 系），VM magic 地址 = 参数区实解引用**：
+
+- **dw99 fault 迹**（锁释放回放，201 faults 全打印）：
+  ①eip=0x10288d1（lodsb 后）读 **0xeedc0014 = VM magic 地址被实解引
+  用**（= 机器参数区指针——补充 45/91 的 magic = 指针非常数！）；
+  ②**eip = 0x240c8b66 = 机器跳进瞬态 VM 块**（0x240c8000 系高地址 =
+  补充 17-20 解码 op 块家族！）；③后续 faults = 0x240c9000+
+  顺序 +0x1000 = emu 映射零页线性执行（块内容缺失 = 零码行军）。
+- **定案**：**handler 链 = 瞬态 VM 块（0x240c8000 系，活窗解密/
+  用后重加密）非 0x1028 静态区**——0x1028 区 = 派发器 bootstrap +
+  状态窗；真 handler = 块地址从 magic 参数区（0xeedc0014）读出。
+- **下一 session（捕获目标修正，一步到位路径）**：①b9-style 区域捕
+  获改目标 = **0x240c8000 系瞬态块区**（该地址 = per-run，从 magic
+  区参数读出或 fault 定位；每 poll 直 RPM 不看 bank）②块活窗捕齐 →
+  union → dw96 回放（区 + 块 + magic 参数页 0xeedc0000 一并映射）
+  → lodsb×384 全流 → 三处输出对位 KP112 → f 判定 → 逆程序 →
+  **oracle 输入侧闭环**。
+- 工件：dw99.pkl（201 faults 全迹）。
