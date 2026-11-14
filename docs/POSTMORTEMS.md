@@ -5044,3 +5044,17 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   112B 对位 → f 判定 → oracle；②根因 = 不可读 → 回 dw99 fault 迹
   重追（0x240c8b66 块的 live 窗 = guard 路线）。
 - 工件：无新工件（设计入档）。
+**续 21 补充 103（同日第八十九轮）——根因定案：0xeedc0000 = MEM_RESERVE 未提交，magic 区 = VM 按需 commit 区**：
+
+- **探针结果**（VirtualQueryEx(0xEEDC0000)，全程稳定）：
+  `q=28 state=0x2000(MEM_RESERVE) protect=0 mtype=0x20000(MEM_PRIVATE)`
+  ——**magic 页 = 预留未提交**！b10 全零 = RPM 失败实锤（非真零）。
+- **机制解读**：0xeedc0014 = VM 预留区地址——机器 esi 重定向 = 指向
+  将按需 commit 的动态区（VM commit/用/释放 周期）。活窗 = commit
+  瞬间。
+- **捕获修正（下一 session 首动作，~10 行）**：b10 逐 poll 探
+  VirtualQueryEx State；**State == MEM_COMMIT(0x1000) 瞬间 → 立即
+  RPM 0xeedc0000 4KB 记录**（commit 窗捕获）→ union → emu esi=
+  magic 流 + 映射（commit 态内容）→ 全流回放 → 三处输出 → 112B
+  对位 → f 判定 → 逆程序 → **oracle 输入侧闭环**。
+- 工件：probe 日志（state=0x2000 稳定）。
