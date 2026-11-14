@@ -5177,3 +5177,17 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   移位）③吻合 → f = Δacc 程序 → 逆程序 → **oracle 输入侧闭环**。
 - 工件：patch 112（b11）、dw112.py、dw112.pkl（642 三元组）、
   dw112_out.txt。
+**续 21 补充 113（同日第九十九轮）——acc 槽 642 lodsb 零写：机器状态 = 寄存器（bl/ah 链），f = 寄存器链程序定案**：
+
+- **acc 写 hook 结果**（解码时代态重放，642 lodsb）：**[edi+8] 槽
+  写 = 0**——acc = 恒定，字节循环的状态 = **寄存器（bl/ah）**（与
+  dw90 walk 的 ah 变异 handler 序列互证：mov ah,0xc3/add/xor/inc
+  链 = bl/ah 演化）。
+- **f = 寄存器链程序定案**：每字节 = lodsb → xor al,bl → handler
+  链（bl/ah 变异 + 旗标分支）→ bl 演化 = 变换状态；输出 = …… 待
+  定位（bl 演化 → 块尾 acc/字段派生）。
+- **下一 session（f 提取）**：①lodsb 点 hook 扩记录
+  (input, bl_before, bl_after, ah) → 642 全轨迹 ②bl 轨迹 vs KP112
+  对位（直接/XOR）③吻合 → f = bl 链程序 → 逆程序 → **oracle 输入
+  侧闭环**。
+- 工件：dw113.py、dw113.pkl（0 对 = 负结果实锤）。
