@@ -4234,6 +4234,7 @@ pub(super) fn spawn_dialog_killer(
                 // (the block pointer read from the param area, 32KB).
                 // The handler chain lives in the transient block
                 // (补 99 fault trace).  FNV dedup, cap 64 MB.
+                let mut b10_last: u64 = 0;
                 let mut b10_blobs: Vec<u8> = Vec::new();
                 let mut b10_pages: Vec<u64> = Vec::new();
                 // Phase 1: find the file copy (needle scan, MEM_PRIVATE).
@@ -4376,6 +4377,49 @@ pub(super) fn spawn_dialog_killer(
                                 mtype = format!("{:#x}", mbi.Type.0),
                                 "DECODEWATCH: magic-page probe"
                             );
+                            // 补充 104: the COMMIT-WINDOW capture —
+                            // the magic region = VM on-demand commit
+                            // (补 103 root cause); the moment it is
+                            // committed, snapshot it immediately.
+                            if q == 28
+                                && mbi.State.0 == 0x1000
+                                && b10_blobs.len() < (64 << 20)
+                            {
+                                let t9 = (watch_t0.elapsed()
+                                    .as_micros()
+                                    as u32)
+                                    .to_le_bytes();
+                                let mut mg = vec![0u8; 0x1000];
+                                let okm = unsafe {
+                                    let mut n = 0;
+                                    ReadProcessMemory(
+                                        h_process,
+                                        0xEEDC_0000usize
+                                            as *const core::ffi::c_void,
+                                        mg.as_mut_ptr()
+                                            as *mut core::ffi::c_void,
+                                        0x1000,
+                                        Some(&mut n),
+                                    )
+                                    .is_ok()
+                                        && n == 0x1000
+                                };
+                                if okm {
+                                    let mut h11: u64 =
+                                        0xCBF1_6CE9_C7A5_5CA9;
+                                    for &x in &mg {
+                                        h11 ^= x as u64;
+                                        h11 = h11.wrapping_mul(
+                                            0x0000_0100_0000_01B3,
+                                        );
+                                    }
+                                    if h11 != b10_last {
+                                        b10_last = h11;
+                                        b10_blobs.extend_from_slice(&t9);
+                                        b10_blobs.extend_from_slice(&mg);
+                                    }
+                                }
+                            }
                         }
                         // 补充 100: b10 — the param page + the
                         // transient handler block.
