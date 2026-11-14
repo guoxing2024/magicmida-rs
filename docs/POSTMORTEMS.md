@@ -4117,3 +4117,20 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   尾标记？计数槽？）；0x1142xxx 区完整捕（REGSNATCH esipage 扩到
   16KB/块）。
 - 工件：emu_bound.py/.pkl/.log（80M 指令 487611 事件）。
+
+**续 21 补充 50（同日第三十七轮）——esipage 16KB + pass-2 锚点发现，emu 直锚 pass-2 跑终值**：
+
+- **REGSNATCH esipage 4KB→16KB**（分页 4×4KB 捕获避开 RPM 部分读
+  陷阱；1 个 unused-variable 告警即修）。run8 = 200×16384B。
+- **esi walk = 多区域**（0x1141/0x1142/0x114f/0xef000…跨 ~49 个
+  4KB 页）——emu 改为 esipage 并集映射 + 栈区容错（walk 部分读栈！）。
+- **pass-2 在 run-8 记录里直接捕获**：t=216810 ptr=0x00ff000c、
+  t=217826 ptr=0x00ff0024、t=218824 ptr=0x00ff0037 = **pass-2 运行中**
+  （pass-1 终止 → inter-pass(t=215797 ptr=0x006ed234) → pass-2！）。
+  **emu 直锚 pass-2 记录**（t=216810, eip=0x106b78e）→ 跑到流尾 =
+  两遍终值 = 门常数（后台 400M 指令，minimal hooks 提速）。
+- **run-8 锚点探针副产物**：某锚点首指令写 0x4a660105 = 缺失堆区
+  （wide 只捕 [0xD00000,0x1000000)）+ C3 填充页被当代码执行的
+  fetch 风暴——数据页应零填、取指页才 C3（待改）。
+- 工件：helpers.rs（esipage 16KB 分页捕）、emu_pass2.py（后台）、
+  emu_bound.py（esi 并集版）、run-7/run-8 快照。
