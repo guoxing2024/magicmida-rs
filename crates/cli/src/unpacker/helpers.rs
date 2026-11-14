@@ -4204,6 +4204,14 @@ pub(super) fn spawn_dialog_killer(
                 // trajectory + the op-band code for the f-structure
                 // read.  528 B records, cap 64 MB.
                 let mut b5_blobs: Vec<u8> = Vec::new();
+                // 补充 87: the cb-page FULL 4KB snapshot on change —
+                // the decode machine's code pointer (cb) stops inside
+                // pages (0x1132268 = offset 0x268, beyond the 512 B
+                // window); the executing VM-block code = the f-
+                // structure read.  Record = t(4) cb(4) page(4096).
+                let mut b6_last: u64 = 0;
+                let mut b6_last_cb: u32 = 0;
+                let mut b6_blobs: Vec<u8> = Vec::new();
                 // Phase 1: find the file copy (needle scan, MEM_PRIVATE).
                 while buf_addr.is_none() && watch_t0.elapsed().as_millis() < 260 {
                     polls += 1;
@@ -4590,6 +4598,51 @@ pub(super) fn spawn_dialog_killer(
                             b5_blobs.extend_from_slice(&dp5.to_le_bytes());
                             b5_blobs.extend_from_slice(&s5a);
                             b5_blobs.extend_from_slice(&s5b);
+                        }
+                        // 补充 87: the cb-page 4 KB on change.
+                        if b6_blobs.len() < (64 << 20) {
+                            let cb6 = u32::from_le_bytes(
+                                cont_buf[4..8].try_into().unwrap(),
+                            );
+                            let cpage = (cb6 & !0xFFF) as usize;
+                            if cpage >= 0x10000 {
+                                let mut pg = [0u8; 4096];
+                                // SAFETY: live handle; unread = zeros.
+                                let ok6 = unsafe {
+                                    let mut n = 0;
+                                    ReadProcessMemory(
+                                        h_process,
+                                        cpage as *const core::ffi::c_void,
+                                        pg.as_mut_ptr()
+                                            as *mut core::ffi::c_void,
+                                        4096,
+                                        Some(&mut n),
+                                    )
+                                    .is_ok()
+                                        && n == 4096
+                                };
+                                if ok6 {
+                                    let mut h7: u64 =
+                                        0xCBF1_6CE9_C7A5_5CA9;
+                                    for &x in &pg {
+                                        h7 ^= x as u64;
+                                        h7 = h7.wrapping_mul(
+                                            0x0000_0100_0000_01B3,
+                                        );
+                                    }
+                                    if h7 != b6_last
+                                        || cb6 != b6_last_cb
+                                    {
+                                        b6_last = h7;
+                                        b6_last_cb = cb6;
+                                        b6_blobs.extend_from_slice(&t2);
+                                        b6_blobs.extend_from_slice(
+                                            &cb6.to_le_bytes(),
+                                        );
+                                        b6_blobs.extend_from_slice(&pg);
+                                    }
+                                }
+                            }
                         }
                         // FORGE2 v7: the check-done trigger.  The check op
                         // = a 0.4ms burst at ~202.5ms writing its scratch
@@ -5090,6 +5143,10 @@ pub(super) fn spawn_dialog_killer(
                                 n5.push(".b5.bin");
                                 let _ =
                                     std::fs::write(stem.with_file_name(n5), &b5_blobs);
+                                let mut n6 = name.to_os_string();
+                                n6.push(".b6.bin");
+                                let _ =
+                                    std::fs::write(stem.with_file_name(n6), &b6_blobs);
                             }
                             dump_failfreeze_scene(pid, h_process, image_base, &out_path);
                             unsafe {
@@ -5800,6 +5857,10 @@ pub(super) fn spawn_dialog_killer(
                     n5.push(".b5.bin");
                     let _ =
                         std::fs::write(stem.with_file_name(n5), &b5_blobs);
+                    let mut n6 = name.to_os_string();
+                    n6.push(".b6.bin");
+                    let _ =
+                        std::fs::write(stem.with_file_name(n6), &b6_blobs);
                 }
                 info!(
                     polls,
