@@ -3328,8 +3328,11 @@ pub(super) fn spawn_dialog_killer(
                             prev_sc2 = sc;
                         }
                     }
-                    if got == 64 && sc != prev_sc {
-                        if last_scan.elapsed().as_micros() < 150 {
+                    // 补充 65 de-trigger: the scan = immediate (not
+                    // churn-gated) so the snapshots cover the copy A
+                    // build window [~100,145]ms.
+                    if true {
+                        if last_scan.elapsed().as_micros() < 5000 {
                             std::thread::yield_now();
                             continue;
                         }
