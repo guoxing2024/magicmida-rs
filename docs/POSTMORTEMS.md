@@ -4962,3 +4962,19 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   写捕获）与栈写捕获 ②跑 30M → 输出字节序列 ③对位 KP112（直接
   /XOR-1B）→ f 吻合判定 ④吻合 → 逆程序 → oracle 输入侧闭环。
 - 工件：patch 97（commit）、b9 50 态、dw96.py、dw96.pkl。
+**续 21 补充 98（同日第八十四轮）——自旋锁释放后链出捕获区：lodsb=1 → FETCH_UNMAPPED，缺页 = 下一 session 区界**：
+
+- **三页同捕回放**（dw98.py，结构页+栈+流页三 hook）：锁释放前 =
+  struct/栈写全 0（仅 bootstrap 帧 10 写）——**自旋锁 [edi+0x30]=1
+  继承持锁态 = 死转实锤**。
+- **锁释放后**（dw98b，[edi+30]=0 写入）：**lodsb=1（消费 1 字节）**
+  → 41 faults → **FETCH_UNMAPPED**——handler 链第一字节后跳出捕获区
+  [0x1028000,0x103E000)。struct 页写 = 0（f 判定未中）。
+- **突破度**：机器字节循环 = 已进入（lodsb 触发 ✓），卡点收敛 =
+  **链的下一页地址**（fault 页 = dw98b 未存 faults——下一 run 打印
+  fault 页 = 区界）。
+- **下一 session（两步收口）**：①dw98b 重跑打印 fault 页 → b9 区界
+  扩到含链全页（上限 = 区域太大则只补 fault 页）②union 补全后回放
+  → lodsb×384 全流 → 流页/结构页/栈三处输出 → 112B 对位 → f 判定
+  → 逆程序 → **oracle 输入侧闭环**。
+- 工件：dw98.py/dw98.pkl、dw98b.pkl（锁释放版）。
