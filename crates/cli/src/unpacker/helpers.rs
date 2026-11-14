@@ -5657,16 +5657,20 @@ pub(super) fn spawn_dialog_killer(
                                     }
                                 }
                             }
-                            // 补充 85: the fixed struct page every
-                            // poll (484 B records, FNV dedup).
+                            // 补充 85: the struct page = BUFFER-
+                            // RELATIVE (ba+0x10000: 0x34c0000 when
+                            // ba=0x34b0000; the 0xff0000 hits = the
+                            // same rule) — every poll (484 B records,
+                            // FNV dedup).
                             {
+                                let s4va = (ba + 0x10000) & !0xFFF;
                                 let mut s4 = [0u8; 480];
                                 // SAFETY: live handle; unread = zeros.
                                 let ok4 = unsafe {
                                     let mut n = 0;
                                     ReadProcessMemory(
                                         h_process,
-                                        0xFF0000 as *const core::ffi::c_void,
+                                        s4va as *const core::ffi::c_void,
                                         s4.as_mut_ptr()
                                             as *mut core::ffi::c_void,
                                         480,
