@@ -4933,3 +4933,18 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   已是；需 bank 门控旁路 = 直接 RPM 区不看 bank）②union 补全后
   dw91 全流回放 → 流页写 = 解码输出 ③112B 对位 → f 判定 → oracle。
 - 工件：dw95.py、dw95.pkl（526 对）。
+**续 21 补充 96（同日第八十二轮）——坏手术入库事故与回滚：管道吞 check 退出码 = 新工程纪律**：
+
+- **事故**：b7 循环顶搬移的 cut/paste 手术括号失衡（916 行闭包失
+  配）——`cargo check 2>&1 | tail -1` **管道吞掉退出码** → && 链继续
+  → **坏文件被 git add+commit 为 b60dcd7**。
+- **回滚**：`git checkout d7ba1c8 -- helpers.rs` + commit f16125a，
+  cargo check 1.10s clean ✓。
+- **新纪律**：cargo check 后的链 = **绝不经管道**（`cargo check &&
+  git add` 或 `cargo check; echo ${PIPESTATUS[0]}`）；坏文件入库后
+  的排查 = `git status --short`（空 = 坏版本已入库）+ `git log` 对
+  文件 commit。
+- **b7 循环顶搬移未完成**（b9 独立块方案 = 正确做法，不动 b7）。
+  96 的仪器改造顺延：①b9 = 循环顶区域捕获（bank 门控旁路）②union
+  补全 → dw91 全流回放 → 112B 对位 → f 判定 → oracle。
+- 工件：f16125a（回滚）。
