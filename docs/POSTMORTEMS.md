@@ -4167,3 +4167,24 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
 - 下一增量：helper 返回值枚举×递归判据（递归消失 = 正确）；
   或识别 helper（参数 ptr/416/hash/ptr2/magic = 壳内部校验函数）。
 - 工件：emu_pass2.py（映射顺序修复版）。
+
+**续 21 补充 53（同日第四十轮）——helper 返回枚举彻底否决；死亡 = 无限栈下降递归**：
+
+- **emu_enum2（7 候选×递归判据）**：zero/one/hash_echo/ptr/len/ptr2/
+  modbase 全部**逐位相同**（esp_min=0xefeec 窗内、faults=81、
+  ptr=0x00ff0037、acc=(0xb45d,0x0000)）——**helper 返回值与流程
+  无关，枚举路线正式关闭**。acc2 = 0x0000 现形（pass-2 acc2 被清）。
+- **死亡 fault 页直方图**：0x7565e000/0x7565d000（API ✓）+
+  **0xea000→0xde000 逐页下降** = esp 穿过栈窗底无限下降——
+  inter-pass 链（VM 自定位代码）在 API 桩处**无限递归**（每页
+  C3 桩 → 链继续 → esp 再降）。
+- **机制**：链 = 自定位栈传输（call $+5/pop/push/ret 连续体），
+  桩返回值错误 → 条件分支走递归侧 → esp 永降。正确返回值 =
+  使分支走推进侧；枚举不可达 → **需识别 helper 本体**（参数
+  ptr/416/hash/ptr2/magic = 壳内部校验函数；DLL 0x7565xxxx per-run）。
+- **下一增量**：① helper 识别（run-8 的模块列表/API 名——需新
+  仪器捕获模块表+导出）；② 或 pass-2 尾部回填（run-8 观测 pass-2
+  只到 ptr=0x37，helper 调用 = pass-2 真实终止的一部分——直接从
+  run-8 记录取 pass-2 后的状态继续）；③ 或 acc 门常数从 run-4/6/8
+  的 post-check 观测直接读（0x115b9e5 链 = 非检查本体）。
+- 工件：emu_enum2.py/.pkl/.log。
