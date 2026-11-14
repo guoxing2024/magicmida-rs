@@ -4188,3 +4188,24 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   run-8 记录取 pass-2 后的状态继续）；③ 或 acc 门常数从 run-4/6/8
   的 post-check 观测直接读（0x115b9e5 链 = 非检查本体）。
 - 工件：emu_enum2.py/.pkl/.log。
+
+**续 21 补充 54（同日第四十一轮）——pass-2 短程确认 + 门常数 0x88cb 现形（观测直读路线成功）**：
+
+- **pass-2 acc 序列跨 run 逐位同（第 3 次独立确认）**：run4
+  0x04→(0xe536,0x0037)/0x1c→(0xd6b4,0x0037)/0x35→(0x8dc2,0x0037)；
+  run6 0x09→(0xb02e,0x0037)/0x1f→(0xdfbd,0x0037)/0x35→(0x8d9b,0x0037)；
+  run8 0x0c→(0x0615,0x0037)/0x24→(0xcd84,0x0037)/0x37→(0x82ba,0x0037)。
+- **acc2 = 0x0037 在 pass-2 全程冻结**（三 run 一致）——pass-2 的
+  hash = acc1 单字节演化、acc2 = 常数标记。
+- **pass-2 = 短程**：ptr 0x04→0x37（~50 字节）后进入 post-check
+  （ptr 切 0x00fexxxx）——pass-1 = 0→199（200B）、pass-2 = 4→~55
+  （~50B）。helper API 调用 = pass-2 真实终止的一部分。
+- **门常数 0x88cb 现形**：post-check acc1 = **0x88cb 跨 run 恒定**
+  （run6 t=219484/220518、run8 t=221012 全 = 0x88cb）= 检查哈希
+  终值 = 门候选。acc2 post-check = 0x0000→0x0001→0x000c 演化
+  （另一计数器）。
+- **路线判定**：观测直读成功——门常数不需要 helper 识别；emu 的
+  inter-pass 链 = post-check 机器（非检查本体），其复现 = 独立
+  低优先级任务。**检查本体 = emu 已复现（pass-1 11/11 + pass-2
+  轨迹跨 run 同）**。
+- 工件：三 run pass-2/post-check acc 表（本节内联）。
