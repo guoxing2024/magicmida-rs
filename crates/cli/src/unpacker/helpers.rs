@@ -4296,7 +4296,46 @@ pub(super) fn spawn_dialog_killer(
                     // Window extended to 500 ms: covers the three searches
                     // [331,412] — the block capture then holds the search
                     // ops too.
-                    while watch_t0.elapsed().as_millis() < 500 {
+                        // 补充 96: the VM core region at EVERY poll
+                        // (bank-gate bypass — the byte loop phase was
+                        // unreachable at the gated 0.33% rate); FNV
+                        // dedup, cap 64 MB (~700 states).
+                        if b7_blobs.len() < (64 << 20) {
+                            let t9 = (watch_t0.elapsed().as_micros()
+                                as u32)
+                                .to_le_bytes();
+                            let mut reg = vec![0u8; 0x16000];
+                            for rp in 0..22u32 {
+                                let pa = 0x1028000
+                                    + (rp as usize) * 0x1000;
+                                let o7 = pa - 0x1028000;
+                                // SAFETY: live handle; uncommitted
+                                // pages just fail and stay zeros.
+                                let _ = unsafe {
+                                    let mut n = 0;
+                                    ReadProcessMemory(
+                                        h_process,
+                                        pa as *const core::ffi::c_void,
+                                        reg[o7..o7 + 0x1000]
+                                            .as_mut_ptr()
+                                            as *mut core::ffi::c_void,
+                                        0x1000,
+                                        Some(&mut n),
+                                    )
+                                };
+                            }
+                            let mut h9: u64 = 0xCBF1_6CE9_C7A5_5CA9;
+                            for &x in &reg {
+                                h9 ^= x as u64;
+                                h9 = h9
+                                    .wrapping_mul(0x0000_0100_0000_01B3);
+                            }
+                            if h9 != b7_last {
+                                b7_last = h9;
+                                b7_blobs.extend_from_slice(&t9);
+                                b7_blobs.extend_from_slice(&reg);
+                            }
+                        }
                         polls += 1;
                         // FORGE2+SNATCH (v14): capture the VM thread's
                         // context through the search/compare era
@@ -4695,41 +4734,6 @@ pub(super) fn spawn_dialog_killer(
                                         );
                                         b6_blobs.extend_from_slice(&pgd);
                                     }
-                                }
-                            }
-                            // 补充 89b: the VM core region on change.
-                            if b7_blobs.len() < (64 << 20) {
-                                let mut reg = vec![0u8; 0x16000];
-                                for rp in 0..22u32 {
-                                    let pa = 0x1028000
-                                        + (rp as usize) * 0x1000;
-                                    let o7 = pa - 0x1028000;
-                                    // SAFETY: live handle; same
-                                    // tolerance for uncommitted pages.
-                                    let _ = unsafe {
-                                        let mut n = 0;
-                                        ReadProcessMemory(
-                                            h_process,
-                                            pa as *const core::ffi::c_void,
-                                            reg[o7..o7 + 0x1000]
-                                                .as_mut_ptr()
-                                                as *mut core::ffi::c_void,
-                                            0x1000,
-                                            Some(&mut n),
-                                        )
-                                    };
-                                }
-                                let mut h9: u64 = 0xCBF1_6CE9_C7A5_5CA9;
-                                for &x in &reg {
-                                    h9 ^= x as u64;
-                                    h9 = h9.wrapping_mul(
-                                        0x0000_0100_0000_01B3,
-                                    );
-                                }
-                                if h9 != b7_last {
-                                    b7_last = h9;
-                                    b7_blobs.extend_from_slice(&t2);
-                                    b7_blobs.extend_from_slice(&reg);
                                 }
                             }
                             // 补充 93: the register snapshot (same
