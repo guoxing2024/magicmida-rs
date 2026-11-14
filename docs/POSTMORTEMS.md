@@ -4014,3 +4014,27 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   输入）本身不成立；pass-2 缺失槽未定位。f 的实用形态 = emu 执行
   本身（11/11 验证）。
 - 工件：emu_diff.py/.pkl、emu_gtrace.py/.pkl。
+
+**续 21 补充 45（同日第三十二轮）——写门=第二 jcc；f 闭式前提再证伪；pass-2 = helper DLL API 门**：
+
+- **emu_iter 逐迭代全输入轨迹（6824 迭代/10 acc 写）**：写路径 =
+  **到达第二 jcc（0x1072c92 `jg`）的迭代**——5/6824 ≈ 0.07%；
+  路径族 = 3412 无 jcc + 3407 过第一 jcc（0x1070fce `jge` 恒 taken）
+  + 5 双 jcc+写。**jcc 条件闭合**：第一 jcc 恒 taken（其 eflags 模式
+  固定）；写门 = 第二 jcc 的 jg 条件。
+- **f 闭式再证伪**：写迭代 (byte, bl, al_in) = (0x38, 0x23, 0xc5)
+  在 ctr=18 → 0x20、ctr=19 → 0x53 **同输入异输出**——隐藏输入 =
+  其余 lane/寄存器/内存（链内读取未入轨迹）。K=f(byte,old) 的 2D
+  前提正式作废；f 的实用形态 = emu（11/11 验证）。
+- **pass-2 门 = helper DLL API 调用**：inter-pass 链经导入指针
+  跳 0x7565e960 / 0x7565d770（真实 DLL 地址——emu 缺 DLL → fetch
+  错误）。**C3/xor-eax-ret 桩页修复 fault-storm**（零页 =
+  add [eax],al 风暴的根因）。API 参数捕获：
+  **(ptr=0x115b7ae, 0x1a0=416, 0x1c4e8ece, ptr2=0x10e35a3,
+  0xeedc0014=VM magic, …)** + 第二调 (ptr2, 0, 416, …) ——
+  **壳自带的校验/解密 helper**（参数形 = 缓冲+长度+校验+键+magic）。
+  eax=0 桩 → 调用者用返回值算指针 → 读 0xffff9614 死。
+  **下一增量 = 该 helper 的语义桩**（识别 DLL/返回值约定）或从
+  run-6 的真实返回值回填。
+- 工件：emu_iter.py/.pkl（6824 迭代全输入轨迹）、emu_final 修复
+  （fault 页 C3 桩 + API 参数捕获）。
