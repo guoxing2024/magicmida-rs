@@ -4348,6 +4348,35 @@ pub(super) fn spawn_dialog_killer(
                                 b9_blobs.extend_from_slice(&reg);
                             }
                         }
+                        // 补充 103: the magic-page root-cause probe
+                        // (the b10 param reads = zeros — RPM failure
+                        // or true zero was indistinguishable).
+                        {
+                            use windows::Win32::System::Memory::{
+                                VirtualQueryEx, MEMORY_BASIC_INFORMATION,
+                            };
+                            let mut mbi =
+                                MEMORY_BASIC_INFORMATION::default();
+                            let q = unsafe {
+                                VirtualQueryEx(
+                                    h_process,
+                                    Some(0xEEDC_0000usize
+                                        as *const core::ffi::c_void),
+                                    &mut mbi,
+                                    std::mem::size_of::<
+                                        MEMORY_BASIC_INFORMATION,
+                                    >(),
+                                )
+                            };
+                            info!(
+                                t_ms = watch_t0.elapsed().as_millis() as u32,
+                                q = q,
+                                state = format!("{:#x}", mbi.State.0),
+                                protect = format!("{:#x}", mbi.Protect.0),
+                                mtype = format!("{:#x}", mbi.Type.0),
+                                "DECODEWATCH: magic-page probe"
+                            );
+                        }
                         // 补充 100: b10 — the param page + the
                         // transient handler block.
                         if b10_blobs.len() < (64 << 20) {
