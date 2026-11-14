@@ -4367,3 +4367,16 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
 - 下一增量：copy A 时间线切片与 .dat 的对应关系（每个快照的字节
   与 .dat 的映射）→ 变换的输入输出对提取。
 - 工件：run18 快照（29.8MB，200×16KB esipage 时间线）。
+
+**续 21 补充 66（同日第五十三轮）——copy A 时间线分析：esi = API 字符串游走，.dat 不在 esipage**：
+
+- run18 的 200×4KB esipage 时间线逐快照分析：早期 era（146-151ms）
+  的 esi = 读系统字符串（"NtQuerySystemInfo"/"VerifyLanguageName"）
+  = **壳的 API/许可检查游走**，非数据流；.dat needle 在 esipage =
+  **0/20 未出现**。
+- **判读**：copy A ≠ .dat 的直接拷贝；esi = 通用读游标（API 字符串
+  → 数据区 → …多用途）。.dat 的副本在 ba（needle 定位）独立存在。
+- **下一增量**：copy A 的真身定位——从检查循环（emu 已复现）的
+  lodsb [esi] 反推 esi 在检查期的取值序列（emu 轨迹 = esi 时间线），
+  对齐 .dat 映射。
+- 工件：run18 esipage 时间线分析（本节内联）。
