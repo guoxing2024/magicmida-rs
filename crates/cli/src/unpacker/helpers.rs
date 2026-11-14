@@ -4543,6 +4543,9 @@ pub(super) fn spawn_dialog_killer(
                         // reads cover BOTH ca+dp and the cb page.
                         // Record = 1040 B, no dedup, cap 64 MB.
                         if b5_blobs.len() < (64 << 20) {
+                            let t2 = (watch_t0.elapsed().as_micros()
+                                as u32)
+                                .to_le_bytes();
                             let cb5 = u32::from_le_bytes(
                                 cont_buf[4..8].try_into().unwrap(),
                             );
