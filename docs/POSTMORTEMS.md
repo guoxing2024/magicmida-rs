@@ -4209,3 +4209,16 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   低优先级任务。**检查本体 = emu 已复现（pass-1 11/11 + pass-2
   轨迹跨 run 同）**。
 - 工件：三 run pass-2/post-check acc 表（本节内联）。
+
+**续 21 补充 55（同日第四十二轮）——copy A 变换：无简单代数式，decode-era emu 首锚未命中**：
+
+- **diff 分析**：stream vs raw .dat——diff = 209 distinct（随机形），
+  非常量键/非滚动键/非位置 XOR/非置换（sorted 不等）——变换 =
+  复杂算法（rolling/加密形）。
+- **decode-era emu（emu_transform，锚 run-8 t=184012）**：20M 指令
+  干净跑完（4 次 DLL 调用 = 桩处理 ✓），**0xff0000 写 = 0**——该锚
+  的流 ≠ 变换写入（变换更早或别的线程/路径）。
+- **下一增量**：锚提前（run-8 t=176312）+ 监视面扩大（0xff0000 写 +
+  0x1142xxx 写 = copy A 主区）；或先定位 0xff0000 区的写入者
+  （POOLSNIFF 式全镜像差分 [180,196]ms 窗）。
+- 工件：emu_transform.py/.pkl/.log。
