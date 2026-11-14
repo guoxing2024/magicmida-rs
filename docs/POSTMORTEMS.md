@@ -3858,3 +3858,45 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   即重编码 oracle 的骨架（改 buf 内容重放即可量零自由度）。
 - 工件：`OUT/ps1/fold3_106b5eb.txt`、`emu39.py`/`emu39.pkl`、
   `emu_check.py`/`emu_check.pkl`、`fmodel39.py`、`parse_ctx.py`。
+
+**续 21 补充 40（2026-11-14 第二十七轮）——检查活捉：f = lane ^ K[lane][byte] S 盒结构（数据级破解）**：
+
+- **REGSNATCH 宽窗改造落地**（三步补丁，零告警）：① 快照 64→200、
+  ~450µs 节奏（~135ms 覆盖）；② **churn 识别先于 needle 扫描**
+  （needle 会把触发拖到检查之后——run2 实测 224ms 才起步）；③ 双基
+  churn 监视（TB + image+0x2859e）+ **sc 改为按快照线程的 edi 动态读**
+  （主线程的网有第二个状态基座 edi=0x102859e！）。run4：base2 在
+  142ms 先 churn、识别 tid=18528（= 主线程）、needle 172ms 命中
+  0xd50000、快照 [172,384]ms 200 张。
+- **检查活捉**：run4 [196,222]ms = 检查期，线程在**上带 web**
+  （edi=TB；补充 39「检查 = 下层网」修正——0x105FC00 hub 是别的
+  环）。**跨 run 确定性实锤**：ctr=22→(0x492b,0x539d)、ctr=45→
+  (0xfa11,0xbeb9) 与 POOLSNIFF 时代 check_states_v3 逐位同（不同
+  run、同值）。cursor 在 ~210ms 重置 = 两遍确认。
+- **检查的字节流 = copy A**（esi 驱动，run4 = esipage[0x5d5:+480]，
+  ≠ 盘上 raw .dat 的任何窗口）且跨 run 同值 → copy A 变换确定性。
+  消费站点 = 0x10747a4/0x10602e1/0x1061014（sz1 顺序读 [esi]）。
+- **f 数据级破解（fsolve40b）**：261 精细态中 **91 个 Δctr=0 单 lane
+  acc 转变 100% 确定**；**77/83 (lane,byte) 对 = 单 XOR 键**，即
+  **acc_new = acc_old ^ K[lane][byte]**——纯 XOR S 盒结构（补充 25
+  的「S 盒否定」用了 raw .dat 当流 = 错流，故否定作废）。K 非线性
+  （GF(2) 三元组 0/63）、跨 lane 不同（0/5 同键）→ K = 逐 lane 表，
+  最可能 = **派发桩的折叠常数**（补充 36 模型的常数表，语义对上：
+  桩选 lane + K）。lane 序列数据相关（ctr 29-47 = 0/1 交替、68+ =
+  0,1,2,3 循环）。6 个多键对 = 扫描漏拍的多重更新合成。
+- **emu 复现受阻点定案**：freeze 代码跨 run 全同（run4 的 99 张
+  上带 eippage vs freeze = 99/99 逐字节同；block 窗 8173/8192）——
+  分歧不是代码。emu_check2 从真快照起步：cursor 22→33（字节写真实
+  发生）但 acc 重写为原值（K=0 路径）+ **[TB+4] 被写成指针
+  0xff0017..0xff001c** → **[TB+4] = dword 流指针**，存在第二个流
+  （0xff0000，image 下方的固定 VM 数据区，任何捕获都没盖到）——
+  emu 缺低内存区 → 走零页 → 分歧。下一补丁 = REGSNATCH 增配
+  [0xff0000,+64KB)（或按快照动态捕指针窗）。
+- **下一增量**：① REGSNATCH 低内存窗补捕 → emu 复现检查环 → K 表
+  全提取（emu = K 生成器）；② 多跑 POOLSNIFF 精扫_union（每 run
+  ~90 转变，~11 run 覆满 4×256）；③ 静态路线 = 168 桩 fold3 →
+  (lane, K) 表 + 派发链 = byte→桩映射。重编码 oracle 还差 copy A
+  变换（.dat → 流）的逆。
+- 工件：`OUT/ps1/patch_regsnatch39.py`、`patch_reorder40.py`、
+  `emu_check2.py/.pkl`、`fsolve40.py/fsolve40b.py/.pkl`、
+  `parse_ctx.py`、`pagecmp.py`、run2-4 快照与 regsnatch_run3_log。
