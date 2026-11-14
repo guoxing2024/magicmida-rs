@@ -413,9 +413,13 @@ pub fn create_debug_process(
         .collect();
 
     // Use the directory containing the executable as the working directory.
+    // A bare relative filename ("CISC-1.exe") has parent() == Some("") —
+    // an empty lpCurrentDirectory fails CreateProcessW with 0x8007007B
+    // (measured 2026-11-14) — so fall through to "." in that case.
     let current_dir_str = executable_path
         .parent()
         .and_then(|p| p.to_str())
+        .filter(|s| !s.is_empty())
         .unwrap_or(".");
     let current_dir_wide: Vec<u16> = current_dir_str
         .encode_utf16()
