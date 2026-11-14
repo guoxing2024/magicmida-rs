@@ -5075,3 +5075,14 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   State 记录）→ 解码时代态密度 ↑②era 续跑器跑解码态全集 → 字节
   循环轨迹 ③流页/结构页/栈三处输出 → 112B 对位 → f 判定 → oracle。
 - 工件：patch 104（commit）、b10 = 0 字节（负结果实锤）。
+**续 21 补充 105（同日第九十一轮）——b8 门控旁路化落地但 OpenThread 每 poll = 新瓶颈（poll 26000→87）**：
+
+- **b8 搬循环顶落地**（门控旁路，自带 t8，check CHECK_EXIT=0）。
+- **性能实锤**：OpenThread+GetThreadContext+16KB 栈 RPM 每 poll =
+  ~2-4ms → **polls 26000→87**，态密度 50 拍/400ms（0.125/ms）反低于
+  门控版 72（0.18/ms）。
+- **下一 session 首动作（一行级）**：**OpenThread 句柄 hoist 到循环
+  外**（一次 Open，循环内仅 GetThreadContext+栈 RPM ≈ 100µs/poll →
+  ~2000-4000 polls → 解码时代态密度 ↑ 30-60×）→ era 续跑器跑解码态
+  全集字节轨迹 → 三处输出 → 112B 对位 → f 判定 → oracle。
+- 工件：patch 105、b8 50 拍（821KB）、b9 21 态。
