@@ -4184,6 +4184,11 @@ pub(super) fn spawn_dialog_killer(
                 // run agree) + the second-copy side log (b3 = every-poll
                 // 512 B at ba-0x10000, the [186,196] decrypt hunt).
                 const SER_NEEDLE: [u8; 16] = *b"105A-0000-0000-0";
+                // 补充 84: the license-strings needle — the strings'
+                // entry ERA (vs the serial's [315]) locates the
+                // decode-output staging (CTXM/PRIV/IMAG hold them at
+                // bail; the sweep never searched for them before).
+                const STR_NEEDLE: [u8; 16] = *b"(CISC-1) Exampl";
                 let mut b3_last: u64 = 0;
                 let mut b3_blobs: Vec<u8> = Vec::new();
                 // Phase 1: find the file copy (needle scan, MEM_PRIVATE).
@@ -5464,6 +5469,36 @@ pub(super) fn spawn_dialog_killer(
                                                     None
                                                 };
                                             }
+                                            // 补充 84: the strings
+                                            // needle — staging-location
+                                            // + entry-era hunt.
+                                            let mut p3 = scan_buf[..got]
+                                                .windows(16)
+                                                .position(|w| w == STR_NEEDLE);
+                                            while let Some(pp) = p3 {
+                                                let va = base + roff + pp;
+                                                if buf_addrs.len() < 16
+                                                    && !buf_addrs
+                                                        .contains(&va)
+                                                {
+                                                    buf_addrs.push(va);
+                                                    info!(
+                                                        t_ms = watch_t0.elapsed().as_millis() as u32,
+                                                        nth = buf_addrs.len(),
+                                                        buf = format!("{:p}", va as *const core::ffi::c_void),
+                                                        "DECODEWATCH: strings candidate (sweep)"
+                                                    );
+                                                }
+                                                let nxt = pp + 1;
+                                                p3 = if nxt + 16 <= got {
+                                                    scan_buf[nxt..got]
+                                                        .windows(16)
+                                                        .position(|w| w == STR_NEEDLE)
+                                                        .map(|q4| nxt + q4)
+                                                } else {
+                                                    None
+                                                };
+                                            }
                                         }
                                         roff += len;
                                     }
@@ -5507,7 +5542,9 @@ pub(super) fn spawn_dialog_killer(
                                         .wrapping_mul(0x0000_0100_0000_01B3);
                                 }
                                 let prev = bufs_last.get(bi).copied();
-                                if prev != Some(h2) {
+                                if prev != Some(h2)
+                                    && bufs_blobs.len() < (48 << 20)
+                                {
                                     if bi < bufs_last.len() {
                                         bufs_last[bi] = h2;
                                     } else {
