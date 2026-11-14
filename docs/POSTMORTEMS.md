@@ -4055,3 +4055,24 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   需要更深的语义桩（链中更多 API/状态读取）或 run-6 真实返回值
   回填。emu 的 pass-1 轨迹 = 完整可复现（11/11）不变。
 - 工件：emu_final（语义桩版 + API 参数捕获）。
+
+**续 21 补充 47（同日第三十四轮）——枚举否决 + 分歧点定位：pass 边界过渡 = 缺失环节**：
+
+- **helper 返回值枚举否决**：C3 桩（eax=残余 0xf639）与 xor-eax 桩
+  （eax=0）死亡点**完全相同**（0x115b9e5 读 0xffff9614）→
+  **EDI = 0xffff9614 与 helper 返回值无关**——枚举无意义。
+- **死亡寄存器**：EDI = 0xffff9614（死亡指针在 EDI）、EBX = 0x2bc0
+  = inter-pass acc1（链用 acc 作参数）、ESI = 0xb3f32194（已乱）。
+- **emu_final 死亡前派发环（关键）**：死亡前 esi = 0x115b5e4 起每
+  派发 +1 = **emu 在 inter-pass 后消费了 ~103K 字节**（esi 从快照
+  0x1142201 走到 0x115b5e4 = +0x193E3）——区域 = freeze 图像字节 =
+  错误内容。**emu 的 pass-1 完全正确（11/11 至 ctr=200），分歧点 =
+  pass 边界过渡**：真 inter-pass = 指针切 0x006f90DC（run4），
+  emu = 指针走 0x00ffb47f（乱）→ 错流 ~103K → 死。
+- **边界过渡 = 缺失环节**：真 transition 的驱动（指针 0x6fb000+
+  0x90dc 的来源 = pass-1 终态的函数？某状态槽？）未定位——emu 需要
+  该过渡的语义（更多状态/API/内存内容）。
+- **下一增量**：定位边界过渡的驱动（对比 run4/run6 的 inter-pass
+  指针值 0x6f90dc/0x6fb1b0 与 pass-1 终态）→ emu 复现过渡 →
+  pass-2 → 两遍终值。
+- 工件：emu_enum.py/.pkl（枚举否决）、emu_final（寄存器+派发环）。
