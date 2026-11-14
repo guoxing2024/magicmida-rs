@@ -5014,3 +5014,20 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   0x240c8000 页 = PAGE_GUARD → 块首次执行 = guard 异常 = 我们在
   异常里转储（post-attach 无调试循环 = 异常给谁？需 DBG 展开）。
 - 工件：patch 100/100b（commit×2）、b10 1 态（块址正确、内容零）。
+**续 21 补充 101（同日第八十七轮）——esi 重定向谜底：机器字节流 = magic 区（0xeedc0014），非 .dat 拷贝页**：
+
+- **b10 扩 2MB 页级捕获落地**（168 handler = 独立块址）+ 表条目探测
+  转 info 日志。**probe 结果 = tbl0@0x10285E6 = 0x0 且 magic_deref =
+  0x0 全程**——live 表条目在该址为零（union 里的 0x240c8b66 条目来
+  自别处 = 状态窗 edi 在执行期 ≠ 0x102859e）。
+- **dw99 fault 迹重读 = 关键修正**：fault#1 = eip=0x10288d1（lodsb）
+  读 **[esi=0xeedc0014]**——**机器的流指针 = magic 区**！链在
+  bootstrap 后把 esi 重定向到 0xeedc0014 = VM 自有数据段 = **真字节
+  流位置**（非 .dat 拷贝页 ba）——我的 emu 喂错流（esi=ba）。
+- **因果链修正**：0x240c8b66 的跳 = 从 magic 区读出的块指针（链读
+  magic → 参数 → 块）——全部机制 = magic 参数区驱动的两级跳转。
+- **下一 session（捕获+回放双修正）**：①live 捕 0xeedc0000 页为何
+  全零（RPM 失败？NOACCESS？页守护？）= 读通 magic 区 ②emu 修正：
+  esi = magic 区流指针（从 union/b10 参数页取值）+ 映射 magic 页
+  （内容 = live 捕获）③回放 → 输出 → 112B 对位 → f 判定 → oracle。
+- 工件：patch 101（b10 2MB 页级 + probe）、b10 0 字节（页全零）。
