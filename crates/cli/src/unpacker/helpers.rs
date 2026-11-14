@@ -3313,6 +3313,7 @@ pub(super) fn spawn_dialog_killer(
                 let mut prev_sc = [0u8; 64];
                 let mut vm_tid: Option<u32> = None;
                 let mut last_scan = std::time::Instant::now();
+                let mut lane_matched = false;
                 let mut prev_sc2 = [0u8; 64];
                 let base2 = image_base + 0x2859e;
                 let _ = rpm(base2, &mut prev_sc2);
@@ -3394,6 +3395,7 @@ pub(super) fn spawn_dialog_killer(
                         }
                         if let Some((tid, eip)) = lane_hit {
                             vm_tid = Some(tid);
+                            lane_matched = true;
                             info!(
                                 t_ms = watch_t0.elapsed().as_millis() as u32,
                                 tid,
@@ -3437,13 +3439,30 @@ pub(super) fn spawn_dialog_killer(
                         }
                         return;
                     };
+                    let h_main = if !lane_matched && tid != main_tid {
+                        unsafe { OpenThread(
+                            THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME,
+                            false, main_tid,
+                        ) }.ok()
+                    } else {
+                        None
+                    };
                     let mut stack = vec![0u8; 0x8000];
                     let mut eippage = [0u8; 0x1000];
                     let mut block = [0u8; 0x2000];
                     let mut buf480 = [0u8; 480];
-                    while nsnap < 64 {
+                    while nsnap < 200 {
+                        if nsnap > 0 {
+                            std::thread::sleep(
+                                std::time::Duration::from_micros(450));
+                        }
+                        let hh = if nsnap % 2 == 1 {
+                            h_main.unwrap_or(h)
+                        } else {
+                            h
+                        };
                         // SAFETY: valid handle.
-                        let prev = unsafe { SuspendThread(h) };
+                        let prev = unsafe { SuspendThread(hh) };
                         if prev == u32::MAX {
                             break;
                         }
@@ -3452,11 +3471,11 @@ pub(super) fn spawn_dialog_killer(
                         ctx.ContextFlags =
                             windows::Win32::System::Diagnostics::Debug::CONTEXT_FLAGS(0x0001_001F);
                         // SAFETY: valid handle; suspended thread.
-                        let got = unsafe { GetThreadContext(h, &mut ctx) }.is_ok();
+                        let got = unsafe { GetThreadContext(hh, &mut ctx) }.is_ok();
                         if !got {
                             // SAFETY: suspended above.
                             unsafe {
-                                let _ = ResumeThread(h);
+                                let _ = ResumeThread(hh);
                             }
                             break;
                         }
@@ -3480,7 +3499,7 @@ pub(super) fn spawn_dialog_killer(
                         let got_b = if ba != 0 { rpm(ba, &mut buf480) } else { 0 };
                         // SAFETY: suspended above.
                         unsafe {
-                            let _ = ResumeThread(h);
+                            let _ = ResumeThread(hh);
                         }
                         if got_s == 64 {
                             let ctr = u16::from_le_bytes([sc[4], sc[5]]) as u32;
