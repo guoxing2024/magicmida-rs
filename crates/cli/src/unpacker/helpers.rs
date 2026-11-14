@@ -4168,6 +4168,17 @@ pub(super) fn spawn_dialog_killer(
                 let mut nsnatch = 0usize;
                 let mut sn_last = 0u32;
                 let mut last_msg = String::new();
+                // 补充 82: ALL .dat-buffer candidates (the six-phase
+                // decode lives in a SECOND buffer — the first hit = the
+                // raw file copy, 补充 81) + the side logs (b2 = per-
+                // buffer snaps, lw2 = the license-page window) + the
+                // chunked-sweep cursor.
+                let mut buf_addrs: Vec<usize> = Vec::new();
+                let mut bufs_last: Vec<u64> = Vec::new();
+                let mut bufs_blobs: Vec<u8> = Vec::new();
+                let mut lw2_last: u64 = 0;
+                let mut lw2_blobs: Vec<u8> = Vec::new();
+                let mut scan_cursor: usize = 0x1_0000;
                 // Phase 1: find the file copy (needle scan, MEM_PRIVATE).
                 while buf_addr.is_none() && watch_t0.elapsed().as_millis() < 260 {
                     polls += 1;
@@ -4975,6 +4986,17 @@ pub(super) fn spawn_dialog_killer(
                                 n2.push(".bin");
                                 let _ = std::fs::write(stem.with_file_name(n2), &blobs);
                             }
+                            // 补充 82: the side logs (b2 + lw2).
+                            if let Some(name) = stem.file_name() {
+                                let mut nb = name.to_os_string();
+                                nb.push(".b2.bin");
+                                let _ =
+                                    std::fs::write(stem.with_file_name(nb), &bufs_blobs);
+                                let mut nl = name.to_os_string();
+                                nl.push(".lw2.bin");
+                                let _ =
+                                    std::fs::write(stem.with_file_name(nl), &lw2_blobs);
+                            }
                             dump_failfreeze_scene(pid, h_process, image_base, &out_path);
                             unsafe {
                                 let _ = TerminateProcess(h_process, 0x2C);
@@ -5297,6 +5319,198 @@ pub(super) fn spawn_dialog_killer(
                                 }
                             }
                         }
+                        // 补充 82a: seed the candidate list with the
+                        // phase-1 hit so the b2 log covers it at once.
+                        if !buf_addrs.contains(&ba) {
+                            buf_addrs.insert(0, ba);
+                        }
+                        // 补充 82b: the chunked round-robin discovery
+                        // sweep — 8 MB per poll across [0x10000,
+                        // 0x8000000): DAT_HEAD content appearing LATER
+                        // (the decode workspace) in an existing heap
+                        // region or a new one; the space re-covers every
+                        // ~8-10 polls while the snapshots continue.
+                        {
+                            use windows::Win32::System::Memory::{
+                                VirtualQueryEx, MEMORY_BASIC_INFORMATION,
+                                MEM_COMMIT, MEM_PRIVATE, PAGE_NOACCESS,
+                            };
+                            let chunk_lo = scan_cursor;
+                            let chunk_hi =
+                                (chunk_lo + (8 << 20)).min(0x0800_0000);
+                            let mut addr = chunk_lo;
+                            let mut cbytes = 0usize;
+                            while addr < chunk_hi {
+                                let mut mbi =
+                                    MEMORY_BASIC_INFORMATION::default();
+                                // SAFETY: live handle; sized MBI.
+                                let q = unsafe {
+                                    VirtualQueryEx(
+                                        h_process,
+                                        Some(addr as *const core::ffi::c_void),
+                                        &mut mbi,
+                                        std::mem::size_of::<
+                                            MEMORY_BASIC_INFORMATION,
+                                        >(),
+                                    )
+                                };
+                                if q == 0 {
+                                    break;
+                                }
+                                let base = mbi.BaseAddress as usize;
+                                let region = mbi.RegionSize as usize;
+                                let committed = mbi.State == MEM_COMMIT;
+                                let private = mbi.Type == MEM_PRIVATE;
+                                let readable = mbi.Protect != PAGE_NOACCESS
+                                    && mbi.Protect.0 != 0;
+                                if committed && private && readable
+                                    && region >= 480
+                                {
+                                    let mut roff = 0usize;
+                                    while roff < region && cbytes < (8 << 20)
+                                    {
+                                        let len = scan_buf
+                                            .len()
+                                            .min(region - roff);
+                                        cbytes += len;
+                                        // SAFETY: committed region.
+                                        let got = unsafe {
+                                            let mut n = 0;
+                                            let okr = ReadProcessMemory(
+                                                h_process,
+                                                (base + roff)
+                                                    as *const core::ffi::c_void,
+                                                scan_buf.as_mut_ptr()
+                                                    as *mut core::ffi::c_void,
+                                                len,
+                                                Some(&mut n),
+                                            )
+                                            .is_ok();
+                                            if okr { n } else { 0 }
+                                        };
+                                        if got >= 16 {
+                                            let mut p = scan_buf[..got]
+                                                .windows(16)
+                                                .position(|w| w == dat_needle);
+                                            while let Some(pp) = p {
+                                                let va = base + roff + pp;
+                                                if buf_addrs.len() < 8
+                                                    && !buf_addrs
+                                                        .contains(&va)
+                                                {
+                                                    buf_addrs.push(va);
+                                                    info!(
+                                                        t_ms = watch_t0.elapsed().as_millis() as u32,
+                                                        nth = buf_addrs.len(),
+                                                        buf = format!("{:p}", va as *const core::ffi::c_void),
+                                                        "DECODEWATCH: .dat buffer candidate (sweep)"
+                                                    );
+                                                }
+                                                let nxt = pp + 1;
+                                                p = if nxt + 16 <= got {
+                                                    scan_buf[nxt..got]
+                                                        .windows(16)
+                                                        .position(|w| w == dat_needle)
+                                                        .map(|q2| nxt + q2)
+                                                } else {
+                                                    None
+                                                };
+                                            }
+                                        }
+                                        roff += len;
+                                    }
+                                }
+                                addr = base
+                                    .saturating_add(region.max(0x1000));
+                            }
+                            scan_cursor = if chunk_hi >= 0x0800_0000 {
+                                0x1_0000
+                            } else {
+                                chunk_hi
+                            };
+                        }
+                        // 补充 82c: per-buffer snapshots into the b2 side
+                        // log (488 B records, per-buffer FNV dedup).
+                        if decodewatch {
+                            let t2 = (watch_t0.elapsed().as_micros() as u32)
+                                .to_le_bytes();
+                            for (bi, &bva) in buf_addrs.iter().enumerate() {
+                                let mut s2 = [0u8; 480];
+                                // SAFETY: live handle; tracked candidate.
+                                let ok2 = unsafe {
+                                    let mut n = 0;
+                                    ReadProcessMemory(
+                                        h_process,
+                                        bva as *const core::ffi::c_void,
+                                        s2.as_mut_ptr() as *mut core::ffi::c_void,
+                                        480,
+                                        Some(&mut n),
+                                    )
+                                    .is_ok()
+                                        && n == 480
+                                };
+                                if !ok2 {
+                                    continue;
+                                }
+                                let mut h2: u64 = 0xCBF1_6CE9_C7A5_5CA9;
+                                for &x in &s2 {
+                                    h2 ^= x as u64;
+                                    h2 = h2
+                                        .wrapping_mul(0x0000_0100_0000_01B3);
+                                }
+                                let prev = bufs_last.get(bi).copied();
+                                if prev != Some(h2) {
+                                    if bi < bufs_last.len() {
+                                        bufs_last[bi] = h2;
+                                    } else {
+                                        bufs_last.push(h2);
+                                    }
+                                    bufs_blobs.extend_from_slice(&t2);
+                                    bufs_blobs.extend_from_slice(
+                                        &(bva as u32).to_le_bytes(),
+                                    );
+                                    bufs_blobs.extend_from_slice(&s2);
+                                }
+                            }
+                            // 补充 82d: the license-page window
+                            // [0xFD0000,+128KB) every 16th poll — the
+                            // serial page (0xfd1b00, 补充 81) build
+                            // timeline.  Page-wise reads (the cross-region
+                            // RPM = PARTIAL_COPY trap).
+                            if polls % 16 == 0 && lw2_blobs.len() < (48 << 20)
+                            {
+                                let mut lw = vec![0u8; 0x20000];
+                                for lpg in 0..32u32 {
+                                    let pa = 0xFD0000
+                                        + (lpg as usize) * 0x1000;
+                                    let o = pa - 0xFD0000;
+                                    // SAFETY: live handle; unread pages
+                                    // just fail and keep the zeros.
+                                    let _ = unsafe {
+                                        let mut n = 0;
+                                        ReadProcessMemory(
+                                            h_process,
+                                            pa as *const core::ffi::c_void,
+                                            lw[o..o + 0x1000].as_mut_ptr()
+                                                as *mut core::ffi::c_void,
+                                            0x1000,
+                                            Some(&mut n),
+                                        )
+                                    };
+                                }
+                                let mut h3: u64 = 0xCBF1_6CE9_C7A5_5CA9;
+                                for &x in &lw {
+                                    h3 ^= x as u64;
+                                    h3 = h3
+                                        .wrapping_mul(0x0000_0100_0000_01B3);
+                                }
+                                if h3 != lw2_last {
+                                    lw2_last = h3;
+                                    lw2_blobs.extend_from_slice(&t2);
+                                    lw2_blobs.extend_from_slice(&lw);
+                                }
+                            }
+                        }
                         // PASS-evidence probe (2026-11-07): lives in the
                         // bail-watch loop BELOW — the µs-snapshot loop ends
                         // at the 500 ms window while the licensed shell
@@ -5311,6 +5525,17 @@ pub(super) fn spawn_dialog_killer(
                     let mut n2 = name.to_os_string();
                     n2.push(".bin");
                     let _ = std::fs::write(stem.with_file_name(n2), &blobs);
+                }
+                // 补充 82: the side logs (b2 + lw2).
+                if let Some(name) = stem.file_name() {
+                    let mut nb = name.to_os_string();
+                    nb.push(".b2.bin");
+                    let _ =
+                        std::fs::write(stem.with_file_name(nb), &bufs_blobs);
+                    let mut nl = name.to_os_string();
+                    nl.push(".lw2.bin");
+                    let _ =
+                        std::fs::write(stem.with_file_name(nl), &lw2_blobs);
                 }
                 info!(
                     polls,
