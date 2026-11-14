@@ -4188,7 +4188,7 @@ pub(super) fn spawn_dialog_killer(
                 // entry ERA (vs the serial's [315]) locates the
                 // decode-output staging (CTXM/PRIV/IMAG hold them at
                 // bail; the sweep never searched for them before).
-                const STR_NEEDLE: [u8; 16] = *b"(CISC-1) Exampl";
+                const STR_NEEDLE: [u8; 16] = *b"(CISC-1) Example";
                 let mut b3_last: u64 = 0;
                 let mut b3_blobs: Vec<u8> = Vec::new();
                 // Phase 1: find the file copy (needle scan, MEM_PRIVATE).
