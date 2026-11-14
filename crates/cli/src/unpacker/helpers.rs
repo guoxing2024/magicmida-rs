@@ -4770,6 +4770,40 @@ pub(super) fn spawn_dialog_killer(
                                                 &v.to_le_bytes(),
                                             );
                                         }
+                                        // 补充 94: the REAL stack
+                                        // (esp-8KB, 16KB) — the VM's
+                                        // output channel = the stack
+                                        // (补 93); the resume needs
+                                        // the real frames.
+                                        let sp = ctx.Esp as usize;
+                                        let slo = (sp.saturating_sub(
+                                            0x2000,
+                                        ) & !0xFFF)
+                                            .max(0x10000);
+                                        let mut stk =
+                                            vec![0u8; 0x4000];
+                                        for spg in 0..4u32 {
+                                            let pa = slo
+                                                + (spg as usize)
+                                                    * 0x1000;
+                                            let o = pa - slo;
+                                            let _ = unsafe {
+                                                let mut n = 0;
+                                                ReadProcessMemory(
+                                                    h_process,
+                                                    pa as *const core::ffi::c_void,
+                                                    stk[o..o + 0x1000]
+                                                        .as_mut_ptr()
+                                                        as *mut core::ffi::c_void,
+                                                    0x1000,
+                                                    Some(&mut n),
+                                                )
+                                            };
+                                        }
+                                        b8_blobs.extend_from_slice(
+                                            &(slo as u32).to_le_bytes(),
+                                        );
+                                        b8_blobs.extend_from_slice(&stk);
                                     }
                                     let _ = unsafe { CloseHandle(hc) };
                                 }
