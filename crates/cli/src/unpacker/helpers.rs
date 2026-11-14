@@ -3313,11 +3313,21 @@ pub(super) fn spawn_dialog_killer(
                 let mut prev_sc = [0u8; 64];
                 let mut vm_tid: Option<u32> = None;
                 let mut last_scan = std::time::Instant::now();
+                let mut prev_sc2 = [0u8; 64];
+                let base2 = image_base + 0x2859e;
+                let _ = rpm(base2, &mut prev_sc2);
                 let _ = rpm(image_base + 0x5FFAE, &mut prev_sc);
                 while vm_tid.is_none() && watch_t0.elapsed().as_millis() < 400 {
                     let got = rpm(image_base + 0x5FFAE, &mut sc);
                     if got == 64 && sc != prev_sc {
                         prev_sc = sc;
+                    } else {
+                        let got2 = rpm(base2, &mut sc);
+                        if got2 == 64 && sc != prev_sc2 {
+                            prev_sc2 = sc;
+                        }
+                    }
+                    if got == 64 && sc != prev_sc {
                         if last_scan.elapsed().as_micros() < 150 {
                             std::thread::yield_now();
                             continue;
