@@ -3560,6 +3560,49 @@ pub(super) fn spawn_dialog_killer(
                             blobs.extend_from_slice(&(0u32).to_le_bytes());
                             blobs.extend_from_slice(&(0u32).to_le_bytes());
                         }
+                        // 补充 41: the low-memory windows.
+                        let mut lowwin = vec![0u8; 0x10000];
+                        let mut got_l = 0usize;
+                        for lpg in 0..16u32 {
+                            let pa = 0xFF0000 + (lpg as usize) * 0x1000;
+                            let _n = rpm(pa, &mut lowwin[got_l..got_l + 0x1000]);
+                            got_l += 0x1000;
+                        }
+                        blobs.extend_from_slice(&(got_l as u32).to_le_bytes());
+                        blobs.extend_from_slice(&lowwin[..got_l]);
+                        let mut ptrwin = [0u8; 0x1000];
+                        let mut got_p = 0usize;
+                        if got_s == 64 {
+                            let ptrv = u32::from_le_bytes(
+                                [sc[4], sc[5], sc[6], sc[7]],
+                            ) as usize;
+                            if ptrv >= 0x10000 && ptrv < 0x8000_0000 {
+                                got_p = rpm(ptrv & !0xFFF, &mut ptrwin);
+                                blobs.extend_from_slice(
+                                    &((ptrv & !0xFFF) as u32).to_le_bytes(),
+                                );
+                            } else {
+                                blobs.extend_from_slice(&(0u32).to_le_bytes());
+                            }
+                        } else {
+                            blobs.extend_from_slice(&(0u32).to_le_bytes());
+                        }
+                        blobs.extend_from_slice(&(got_p as u32).to_le_bytes());
+                        blobs.extend_from_slice(&ptrwin[..got_p]);
+                        // 补充 58: the targeted wide = the stream
+                        // page [0xff0000,+4KB) + the copy A
+                        // [0x1142000,+16KB), every record.
+                        let mut wide = vec![0u8; 0x5000];
+                        let mut got_w = 0usize;
+                        for wpg in 0..5u32 {
+                            let pa = if wpg == 0 { 0xFF0000 } else {
+                                0x1142000 + ((wpg - 1) as usize) * 0x1000
+                            };
+                            let _n = rpm(pa, &mut wide[got_w..got_w + 0x1000]);
+                            got_w += 0x1000;
+                        }
+                        blobs.extend_from_slice(&(got_w as u32).to_le_bytes());
+                        blobs.extend_from_slice(&wide[..got_w]);
                         nsnap += 1;
                     }
                     // SAFETY: handle from OpenThread.
