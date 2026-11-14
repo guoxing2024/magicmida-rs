@@ -4198,6 +4198,12 @@ pub(super) fn spawn_dialog_killer(
                 // page, 补充 41).
                 let mut b4_last: u64 = 0;
                 let mut b4_blobs: Vec<u8> = Vec::new();
+                // 补充 86: the FULL machine trajectory — bank (t/ca/cb/
+                // dp) + the executing block (512 B at ca+dp-0x100) at
+                // EVERY poll, no dedup: the decode era [189,203] state
+                // trajectory + the op-band code for the f-structure
+                // read.  528 B records, cap 64 MB.
+                let mut b5_blobs: Vec<u8> = Vec::new();
                 // Phase 1: find the file copy (needle scan, MEM_PRIVATE).
                 while buf_addr.is_none() && watch_t0.elapsed().as_millis() < 260 {
                     polls += 1;
@@ -5023,6 +5029,10 @@ pub(super) fn spawn_dialog_killer(
                                 n4.push(".b4.bin");
                                 let _ =
                                     std::fs::write(stem.with_file_name(n4), &b4_blobs);
+                                let mut n5 = name.to_os_string();
+                                n5.push(".b5.bin");
+                                let _ =
+                                    std::fs::write(stem.with_file_name(n5), &b5_blobs);
                             }
                             dump_failfreeze_scene(pid, h_process, image_base, &out_path);
                             unsafe {
@@ -5695,6 +5705,37 @@ pub(super) fn spawn_dialog_killer(
                                     }
                                 }
                             }
+                            // 补充 86: the machine trajectory (bank +
+                            // executing block) at every poll, no dedup.
+                            if b5_blobs.len() < (64 << 20) {
+                                let cb5 = u32::from_le_bytes(
+                                    cont_buf[4..8].try_into().unwrap(),
+                                );
+                                let dp5 = u32::from_le_bytes(dp_buf);
+                                let mut s5 = [0u8; 512];
+                                let bva5 = ca.wrapping_add(dp5);
+                                if bva5 >= 0x100 {
+                                    // SAFETY: live handle; uncommitted
+                                    // blocks just fail and stay zeros.
+                                    let _ = unsafe {
+                                        let mut n = 0;
+                                        ReadProcessMemory(
+                                            h_process,
+                                            (bva5 - 0x100)
+                                                as *const core::ffi::c_void,
+                                            s5.as_mut_ptr()
+                                                as *mut core::ffi::c_void,
+                                            512,
+                                            Some(&mut n),
+                                        )
+                                    };
+                                }
+                                b5_blobs.extend_from_slice(&t2);
+                                b5_blobs.extend_from_slice(&ca.to_le_bytes());
+                                b5_blobs.extend_from_slice(&cb5.to_le_bytes());
+                                b5_blobs.extend_from_slice(&dp5.to_le_bytes());
+                                b5_blobs.extend_from_slice(&s5);
+                            }
                         }
                         // PASS-evidence probe (2026-11-07): lives in the
                         // bail-watch loop BELOW — the µs-snapshot loop ends
@@ -5729,6 +5770,10 @@ pub(super) fn spawn_dialog_killer(
                     n4.push(".b4.bin");
                     let _ =
                         std::fs::write(stem.with_file_name(n4), &b4_blobs);
+                    let mut n5 = name.to_os_string();
+                    n5.push(".b5.bin");
+                    let _ =
+                        std::fs::write(stem.with_file_name(n5), &b5_blobs);
                 }
                 info!(
                     polls,
