@@ -4485,3 +4485,17 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
 - **实施修正**：① ba = 从 post-check 记录的 ptr 高位提取（无需
   needle）；② 或 needle 恢复为异步（后台线程）。
 - 下一增量：ba = ptr 提取 → POOLSNIFF 式差分（emu 钩或机器）。
+
+**续 21 补充 75（同日第六十二轮）——ba 差分监视实施方案具体化**：
+
+- **方案 A（机器侧）**：REGSNATCH 的 ptrwin = ptr 高位（0xfe0000/
+  0xd50000）页——post-check 记录已捕获 ba 页内容（ptrwin = ba 的
+  4KB 时间线 ✓ 已在手！）——ba 内容演变 = ptrwin 时间线分析
+  （与 wide 同法）。
+- **方案 B（emu 侧）**：emu 锚 = post-check 记录（ptr = ba 页）→
+  emu 跑 post-check 链 + ba 区读写钩——但链 = 递归死（语义桩缺）。
+- **首选 = 方案 A**（纯数据、无 emu）：run-8 的 post-check 记录
+  ptrwin（ptr=0x00fe025c）= ba 页快照——ba 内容演变 = 已有数据
+  的离线分析（无需新 run）！
+- 下一增量：run-8 post-check ptrwin（ba 页）时间线分析 = .dat
+  处理过程离线复原。
