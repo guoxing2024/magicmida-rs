@@ -5031,3 +5031,16 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   esi = magic 区流指针（从 union/b10 参数页取值）+ 映射 magic 页
   （内容 = live 捕获）③回放 → 输出 → 112B 对位 → f 判定 → oracle。
 - 工件：patch 101（b10 2MB 页级 + probe）、b10 0 字节（页全零）。
+**续 21 补充 102（同日第八十八轮）——magic 页根因探针设计（本轮未执行，下一 session 首动作）**：
+
+- **b10 缺陷定位**：参数页读 = `let _ = RPM(...)` 无结果检查——全零
+  = RPM 失败（未提交/NOACCESS）或真零，无法分辨。
+- **下一 session 首动作（b10 补丁，~15 行）**：VirtualQueryEx
+  (0xEEDC0000) → 记录 State/Protect/Type 进 b10 记录头 → 定根因：
+  MEM_COMMIT+NOACCESS = 页守护路线（guard/调试器）；MEM_FREE/未提交
+  = **0xeedc0014 = 非活体地址**（= emu 上下文值/常数产物，esi 重定向
+  解读需再修正——真流 = 他处）。
+- **随后分叉**：①根因 = 可读 → emu esi=magic 流+映射 → 全流回放 →
+  112B 对位 → f 判定 → oracle；②根因 = 不可读 → 回 dw99 fault 迹
+  重追（0x240c8b66 块的 live 窗 = guard 路线）。
+- 工件：无新工件（设计入档）。
