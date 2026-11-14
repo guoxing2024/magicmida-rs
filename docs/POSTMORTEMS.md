@@ -4278,3 +4278,19 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   POOLSNIFF 式差分直接定位 copy A 写入时段——copy A 构建窗口
   [100,176] 是变换的执行窗口。
 - 工件：run12/run13 快照（16.7MB each，200 wides）。
+
+**续 21 补充 60（同日第四十七轮）——事故：git checkout 丢失未提交机器改造；恢复计划**：
+
+- **事故**：phase 重排文本手术破坏结构（phaseC 截到文件尾）→
+  git checkout helpers.rs 回滚 → **补充 40-58 的全部 helpers.rs
+  改造（未提交）丢失**：wide 窗改造、双基座 churn、edi 动态 sc、
+  esipage 16KB、lowwin/ptrwin/wide 目标转储、needle 重排——
+  全部回到 389239c 旧版。
+- **教训**：机器改造应**即时提交**（本轮多轮 .rs 补丁只提交了
+  docs）；文本手术前先 git add。
+- **恢复路径**（补丁脚本部分在 OUT/ps1）：① patch_regsnatch39.py
+  （宽窗+主线程交错）② patch_reorder40.py ③ patch_lowwin41.py
+  ④ esipage 16KB/分页 wide/目标 wide（inline——需重写）⑤ needle
+  异步化（本轮目标）。恢复后重跑 run 验证 esipage=16KB。
+- **本轮目标（needle 异步化）顺延**；copy A 构建窗口 [~100,176]
+  复现 = 恢复后首个增量。
