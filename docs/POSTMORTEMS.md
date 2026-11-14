@@ -3968,3 +3968,30 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   仍缺/时变）；② lane 规则 = ecx 计算链的静态提取（ecx = ebx/edi+
   折叠常数，在 jcc 路径里）；③ K = f(byte,old) 的 2D 形式。
 - 工件：emu_final.py/.pkl/.log、fold3_106f6e4.txt。
+
+**续 21 补充 43（同日第三十轮）——lane 规则破解：完美 ctr%4 四循环；f 闭式=链非单 XOR**：
+
+- **pass-2 死因定位**：fatal dispatch = eax=0x80 → 合法目标
+  0x107154c，链首 = **`push dword ptr [edi+0x38]`**（状态窗 +0x38 槽，
+  64B sc 之内）——死亡在其后更深处的间接跳（经某数据槽 = emu 侧
+  陈旧/零值）。edi 全程 = TB（162333 派发无一例外）。
+- **lane 规则 = 完美 ctr%4 四循环（emu 193 次 acc 写实测）**：
+  ctr%4=0→[TB+8](acc1.lo)、1→[TB+9](acc1.hi)、2→[TB+0x18](acc2.lo)、
+  3→[TB+0x19](acc2.hi)，49/48/48/48 次 = **零例外**。补充 25 的
+  pos%4 直觉对 lane 本身成立（错在字节流与 K 形式）。
+- **[TB+4] = 0x00ff0000+ctr 的流指针确认**（193 行 ptr 高 16 位全部
+  = 0xff）——但消费字节 ≠ ptrwin[ctr]：emu_ftrace 范围钩（lodsb 点
+  0x10602e1 + acc 写点 0x10646e1）实测：**lodsb 每次 acc 写触发
+  ~1024 次**、esi 步进 ~+0x116（走一个更大的数据结构非字节游标）；
+  同一 (esi, al_in, bl_in, mem) 四元组重复出现 = 循环确定性。
+  f 闭式 ≠ old^ptrwin[ctr]（ctr=16/18/19 巧合符合、17/20/21 不符）
+  ——**f = lodsb 字节 + bl lane + 折叠常数 + jcc 路径的链**，
+  闭式提取 = f 桩的 fold2 双路径语义合成（emu = 已验证的 oracle，
+  静态 = 形式化路线）。
+- **emu = 检查的 ground truth 实锤不变**：lane 写序列
+  0x75/0x4d/0x20/0x53/0x2b… 与 emu_check3 及跨 run 观测一致。
+- **下一增量**：① f 桩 0x106f6e4→0x10602e1 循环的 fold2 双路径
+  语义合成（3 个 jcc 的条件与两侧效果）；② emu 迭代计数器挂钩
+  （1024 循环/ac 写的结构 = esi 步进语义）；③ pass-2 派发链
+  （0x107154c 起）的缺失数据槽定位。
+- 工件：emu_ftrace.py/.pkl、emu_final.py/.pkl。
