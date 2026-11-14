@@ -4601,6 +4601,9 @@ pub(super) fn spawn_dialog_killer(
                         }
                         // 补充 87: the cb-page 4 KB on change.
                         if b6_blobs.len() < (64 << 20) {
+                            let t2 = (watch_t0.elapsed().as_micros()
+                                as u32)
+                                .to_le_bytes();
                             let cb6 = u32::from_le_bytes(
                                 cont_buf[4..8].try_into().unwrap(),
                             );
