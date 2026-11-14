@@ -4228,6 +4228,14 @@ pub(super) fn spawn_dialog_killer(
                 // iteration (bank-gate bypass); FNV dedup, cap 64 MB.
                 let mut b9_last: u64 = 0;
                 let mut b9_blobs: Vec<u8> = Vec::new();
+                // 补充 100: b10 = the VM magic PARAM page
+                // (0xeedc0000, 4KB — the machine dereferences
+                // 0xeedc0014) + the TRANSIENT handler block zone
+                // (the block pointer read from the param area, 32KB).
+                // The handler chain lives in the transient block
+                // (补 99 fault trace).  FNV dedup, cap 64 MB.
+                let mut b10_last: u64 = 0;
+                let mut b10_blobs: Vec<u8> = Vec::new();
                 // Phase 1: find the file copy (needle scan, MEM_PRIVATE).
                 while buf_addr.is_none() && watch_t0.elapsed().as_millis() < 260 {
                     polls += 1;
@@ -4338,6 +4346,70 @@ pub(super) fn spawn_dialog_killer(
                                 b9_last = h9;
                                 b9_blobs.extend_from_slice(&t9);
                                 b9_blobs.extend_from_slice(&reg);
+                            }
+                        }
+                        // 补充 100: b10 — the param page + the
+                        // transient handler block.
+                        if b10_blobs.len() < (64 << 20) {
+                            let t9 = (watch_t0.elapsed().as_micros()
+                                as u32)
+                                .to_le_bytes();
+                            let mut prm = vec![0u8; 0x1000];
+                            {
+                                let pa = 0xEEDC_0000usize;
+                                let _ = unsafe {
+                                    let mut n = 0;
+                                    ReadProcessMemory(
+                                        h_process,
+                                        pa as *const core::ffi::c_void,
+                                        prm.as_mut_ptr()
+                                            as *mut core::ffi::c_void,
+                                        0x1000,
+                                        Some(&mut n),
+                                    )
+                                };
+                            }
+                            // the block pointer = the dword at
+                            // 0xeedc0014 (offset 0x14) if plausible
+                            let mut blkbase = 0x240C8000usize;
+                            let pv = u32::from_le_bytes(
+                                prm[0x14..0x18].try_into().unwrap(),
+                            ) as usize;
+                            if (0x2000000..0x8000000).contains(&pv) {
+                                blkbase = pv & !0xFFF;
+                            }
+                            let mut blk = vec![0u8; 0x8000];
+                            for bp in 0..8u32 {
+                                let pa = blkbase
+                                    + (bp as usize) * 0x1000;
+                                let o = pa - blkbase;
+                                let _ = unsafe {
+                                    let mut n = 0;
+                                    ReadProcessMemory(
+                                        h_process,
+                                        pa as *const core::ffi::c_void,
+                                        blk[o..o + 0x1000]
+                                            .as_mut_ptr()
+                                            as *mut core::ffi::c_void,
+                                        0x1000,
+                                        Some(&mut n),
+                                    )
+                                };
+                            }
+                            let mut h10: u64 = 0xCBF1_6CE9_C7A5_5CA9;
+                            for &x in prm.iter().chain(blk.iter()) {
+                                h10 ^= x as u64;
+                                h10 = h10
+                                    .wrapping_mul(0x0000_0100_0000_01B3);
+                            }
+                            if h10 != b10_last {
+                                b10_last = h10;
+                                b10_blobs.extend_from_slice(&t9);
+                                b10_blobs.extend_from_slice(&prm);
+                                b10_blobs.extend_from_slice(
+                                    &(blkbase as u32).to_le_bytes(),
+                                );
+                                b10_blobs.extend_from_slice(&blk);
                             }
                         }
                         // FORGE2+SNATCH (v14): capture the VM thread's
@@ -5366,6 +5438,10 @@ pub(super) fn spawn_dialog_killer(
                                 n9.push(".b9.bin");
                                 let _ =
                                     std::fs::write(stem.with_file_name(n9), &b9_blobs);
+                                let mut na = name.to_os_string();
+                                na.push(".b10.bin");
+                                let _ =
+                                    std::fs::write(stem.with_file_name(na), &b10_blobs);
                             }
                             dump_failfreeze_scene(pid, h_process, image_base, &out_path);
                             unsafe {
@@ -6092,6 +6168,10 @@ pub(super) fn spawn_dialog_killer(
                     n9.push(".b9.bin");
                     let _ =
                         std::fs::write(stem.with_file_name(n9), &b9_blobs);
+                    let mut na = name.to_os_string();
+                    na.push(".b10.bin");
+                    let _ =
+                        std::fs::write(stem.with_file_name(na), &b10_blobs);
                 }
                 info!(
                     polls,
