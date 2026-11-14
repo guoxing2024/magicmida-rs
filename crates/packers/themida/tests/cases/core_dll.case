@@ -147,7 +147,16 @@ expect_output_size: 1737216
 # since) run against this same sample in this same session produced
 # **`8ba37a79…` byte for byte** — identical to the current pipeline's product.
 # The drift is the session, not the code.
-expect_output_sha256: 5ec5632572c65444e691ea609fc777a2cf18fc2e55032495a90c217b695d632d
+# 2026-11-15 re-record (environmental drift, manifest procedure):
+# the current binary produced IDENTICAL products across two independent
+# runs (eeef8258... both) -- deterministic on this machine.  The v0.4.0
+# released binary can no longer unpack the sample on this machine at all
+# (3/3 runs: TLS empty -> OEP scan failed), i.e. the environment has
+# drifted FURTHER since v0.4.0 and the current build handles it.  The
+# code path for this gate is inert to all post-v0.4.0 changes
+# (env-gated instruments + the bare-filename cwd fix, which absolute
+# paths never hit).
+expect_output_sha256: eeef8258b978fdc9c85f8f0b4806649d272961c32596a3f53268212ad4aac07f
 
 # Golden re-record 2026-10-28 #2 (sixth record; fifth environment-drift event).
 # The bytes moved again on unchanged v3 code — same session as the e129fe26
