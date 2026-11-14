@@ -4311,6 +4311,83 @@ pub(super) fn spawn_dialog_killer(
                     // ops too.
                     while watch_t0.elapsed().as_millis() < 500 {
                         polls += 1;
+                        // 补充 93: the register snapshot (same
+                            // beat; the decode machine = the main
+                            // thread — its web base 0x102859e matches).
+                            {
+                                use windows::Win32::Foundation::CloseHandle;
+                                use windows::Win32::System::Diagnostics::Debug::{
+                                    GetThreadContext, CONTEXT,
+                                };
+                                use windows::Win32::System::Threading::{
+                                    OpenThread, THREAD_GET_CONTEXT,
+                                    THREAD_QUERY_INFORMATION,
+                                };
+                                if let Ok(hc) = unsafe {
+                                    OpenThread(
+                                        THREAD_GET_CONTEXT
+                                            | THREAD_QUERY_INFORMATION,
+                                        false,
+                                        main_tid,
+                                    )
+                                } {
+                                    let mut ctx = CONTEXT::default();
+                                    ctx.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_FLAGS(0x0001_0003);
+                                    if unsafe {
+                                        GetThreadContext(hc, &mut ctx)
+                                    }
+                                    .is_ok()
+                                    {
+                                        let t8 = (watch_t0.elapsed().as_micros() as u32).to_le_bytes();
+                                        b8_blobs.extend_from_slice(&t8);
+                                        for v in [
+                                            ctx.Eip, ctx.Edi, ctx.Esi,
+                                            ctx.Ebx, ctx.Edx, ctx.Ecx,
+                                            ctx.Eax, ctx.Ebp, ctx.Esp,
+                                            ctx.EFlags,
+                                        ] {
+                                            b8_blobs.extend_from_slice(
+                                                &v.to_le_bytes(),
+                                            );
+                                        }
+                                        // 补充 94: the REAL stack
+                                        // (esp-8KB, 16KB) — the VM's
+                                        // output channel = the stack
+                                        // (补 93); the resume needs
+                                        // the real frames.
+                                        let sp = ctx.Esp as usize;
+                                        let slo = (sp.saturating_sub(
+                                            0x2000,
+                                        ) & !0xFFF)
+                                            .max(0x10000);
+                                        let mut stk =
+                                            vec![0u8; 0x4000];
+                                        for spg in 0..4u32 {
+                                            let pa = slo
+                                                + (spg as usize)
+                                                    * 0x1000;
+                                            let o = pa - slo;
+                                            let _ = unsafe {
+                                                let mut n = 0;
+                                                ReadProcessMemory(
+                                                    h_process,
+                                                    pa as *const core::ffi::c_void,
+                                                    stk[o..o + 0x1000]
+                                                        .as_mut_ptr()
+                                                        as *mut core::ffi::c_void,
+                                                    0x1000,
+                                                    Some(&mut n),
+                                                )
+                                            };
+                                        }
+                                        b8_blobs.extend_from_slice(
+                                            &(slo as u32).to_le_bytes(),
+                                        );
+                                        b8_blobs.extend_from_slice(&stk);
+                                    }
+                                    let _ = unsafe { CloseHandle(hc) };
+                                }
+                            }
                         // 补充 97: b9 — the region capture at every
                         // iteration, BEFORE the ok_s gate.
                         if b9_blobs.len() < (64 << 20) {
@@ -4962,83 +5039,7 @@ pub(super) fn spawn_dialog_killer(
                                     b7_blobs.extend_from_slice(&reg);
                                 }
                             }
-                            // 补充 93: the register snapshot (same
-                            // beat; the decode machine = the main
-                            // thread — its web base 0x102859e matches).
-                            {
-                                use windows::Win32::Foundation::CloseHandle;
-                                use windows::Win32::System::Diagnostics::Debug::{
-                                    GetThreadContext, CONTEXT,
-                                };
-                                use windows::Win32::System::Threading::{
-                                    OpenThread, THREAD_GET_CONTEXT,
-                                    THREAD_QUERY_INFORMATION,
-                                };
-                                if let Ok(hc) = unsafe {
-                                    OpenThread(
-                                        THREAD_GET_CONTEXT
-                                            | THREAD_QUERY_INFORMATION,
-                                        false,
-                                        main_tid,
-                                    )
-                                } {
-                                    let mut ctx = CONTEXT::default();
-                                    ctx.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_FLAGS(0x0001_0003);
-                                    if unsafe {
-                                        GetThreadContext(hc, &mut ctx)
-                                    }
-                                    .is_ok()
-                                    {
-                                        b8_blobs.extend_from_slice(&t2);
-                                        for v in [
-                                            ctx.Eip, ctx.Edi, ctx.Esi,
-                                            ctx.Ebx, ctx.Edx, ctx.Ecx,
-                                            ctx.Eax, ctx.Ebp, ctx.Esp,
-                                            ctx.EFlags,
-                                        ] {
-                                            b8_blobs.extend_from_slice(
-                                                &v.to_le_bytes(),
-                                            );
-                                        }
-                                        // 补充 94: the REAL stack
-                                        // (esp-8KB, 16KB) — the VM's
-                                        // output channel = the stack
-                                        // (补 93); the resume needs
-                                        // the real frames.
-                                        let sp = ctx.Esp as usize;
-                                        let slo = (sp.saturating_sub(
-                                            0x2000,
-                                        ) & !0xFFF)
-                                            .max(0x10000);
-                                        let mut stk =
-                                            vec![0u8; 0x4000];
-                                        for spg in 0..4u32 {
-                                            let pa = slo
-                                                + (spg as usize)
-                                                    * 0x1000;
-                                            let o = pa - slo;
-                                            let _ = unsafe {
-                                                let mut n = 0;
-                                                ReadProcessMemory(
-                                                    h_process,
-                                                    pa as *const core::ffi::c_void,
-                                                    stk[o..o + 0x1000]
-                                                        .as_mut_ptr()
-                                                        as *mut core::ffi::c_void,
-                                                    0x1000,
-                                                    Some(&mut n),
-                                                )
-                                            };
-                                        }
-                                        b8_blobs.extend_from_slice(
-                                            &(slo as u32).to_le_bytes(),
-                                        );
-                                        b8_blobs.extend_from_slice(&stk);
-                                    }
-                                    let _ = unsafe { CloseHandle(hc) };
-                                }
                             }
-                        }
                         // FORGE2 v7: the check-done trigger.  The check op
                         // = a 0.4ms burst at ~202.5ms writing its scratch
                         // u16 @image+0x5FFB2 every ~400ns; two consecutive
