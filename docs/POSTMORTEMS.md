@@ -4294,3 +4294,17 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   异步化（本轮目标）。恢复后重跑 run 验证 esipage=16KB。
 - **本轮目标（needle 异步化）顺延**；copy A 构建窗口 [~100,176]
   复现 = 恢复后首个增量。
+
+**续 21 补充 61（同日第四十八轮）——恢复手术二次失败：结构性中间态定案，路线改为小步重放**：
+
+- **恢复手术**（restore_all.py 合并补丁）后括号失衡两次修正仍余
+  2 个结构错误（while 3322 未闭合 + 5759 多余 )）——文本手术
+  叠加多块替换 = 括号追踪超限。
+- **已回滚**到干净基线（cargo build 零告警 ✓）。helpers.rs =
+  389239c 旧版（补充 40-58 改造仍缺）。
+- **恢复路线改判**：一次性合并补丁 = 不可行（锚点漂移 + 括号
+  跨块）。改 = **小步重放**：每步一个独立小补丁 + cargo check
+  逐块验证 + 每步 git commit。步骤 = ① needle 删除/ba=0 ② 双基座
+  churn ③ 200 快照+interleave ④ edi-dynamic sc ⑤ esipage 16KB
+  ⑥ lowwin/ptrwin ⑦ 目标 wide。估计 = 7 次小步。
+- 工件：restore_all.py（合并版——仅作参照）、restore60.py。
