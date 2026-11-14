@@ -4473,3 +4473,15 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   ② helper 调用点参数里的 ptr/ptr2 指向内容的转储；③ rolchk
   静态逻辑与 ba 区的对接。
 - 本轮 = 计划记录；实施 = 下轮（预算）。
+
+**续 21 补充 74（同日第六十一轮）——de-trigger 的代价与 ba 的替代来源**：
+
+- run-18（de-triggered）= **无 ba**（needle 已删 = buf480 空）——
+  ba 区监视需 ba 地址 = 缺。
+- **ba 的替代来源**：post-check 的 ptr = 0x00fe025c（run-8
+  t=221012）/ 0x00d50260 = **ptr 本身指向 ba 区**（0xfe0000/
+  0xd50000 = needle 历史值 ✓）——ptr = 通用数据游标，post-check
+  阶段游走 ba 区。
+- **实施修正**：① ba = 从 post-check 记录的 ptr 高位提取（无需
+  needle）；② 或 needle 恢复为异步（后台线程）。
+- 下一增量：ba = ptr 提取 → POOLSNIFF 式差分（emu 钩或机器）。
