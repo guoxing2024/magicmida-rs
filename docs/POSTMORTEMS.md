@@ -4996,3 +4996,21 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   → lodsb×384 全流 → 三处输出对位 KP112 → f 判定 → 逆程序 →
   **oracle 输入侧闭环**。
 - 工件：dw99.pkl（201 faults 全迹）。
+**续 21 补充 100（同日第八十六轮）——b10 表条目块址正确（0x240c8000）但块内容全零：瞬态块活窗仍未捕到**：
+
+- **b10 落地**：参数页 0xeedc0000（4KB）+ 块区 32KB，块址 = 派发表
+  首条目 [edi+0x48]=0x10285E6 读出 = **0x240c8000 ✓（表条目 = 块指
+  针实锤，补充 99 互证）**。1 态/跑（FNV 恒定）。
+- **块内容 = 全零（335 poll 全程）**——瞬态块在所有 poll 时刻不可读：
+  ①活窗 = 块自身执行 µs 窗（~30µs/块 vs poll 1.1ms）②或块页在非执
+  行期为 NOACCESS/未提交（RPM 静默失败 = 零）。参数页 0xeedc0000 =
+  也全零（committed-but-zero 或同因）。
+- **f 判定仍未中**；emu 回放的块内容 = 零页 = 零码行军（补充 99）。
+- **下一 session 候选路径**：①**EMU 内自举**：dw98b 回放至 fault 页
+  （0x240c8000）时，从 **live 进程 RPM 抢捕**该页（回放与活体并跑 =
+  时序对齐难）②**DRBP/GPU 方式**：调试器 hardware breakpoint @
+  0x240c8b66 执行瞬间转储块（V2 post-attach 无调试端口 = 需
+  DBG_PORT 路线或页守护）③**页守护 guard page**：VirtualProtectEx
+  0x240c8000 页 = PAGE_GUARD → 块首次执行 = guard 异常 = 我们在
+  异常里转储（post-attach 无调试循环 = 异常给谁？需 DBG 展开）。
+- 工件：patch 100/100b（commit×2）、b10 1 态（块址正确、内容零）。
