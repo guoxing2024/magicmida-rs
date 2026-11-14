@@ -4518,3 +4518,12 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   解读需复核（0xff0000 页 ≠ ba 页）。
 - **下一增量**：① lowwin 基址改 = per-run 动态（ptr 高位）；
   ② 或 wide 扩展含 ba 页；③ 多跑继续对齐。
+
+**续 21 补充 79（同日第六十五轮）——ptrwin 已是动态：无需 lowwin 改造，ba 缺席 = era 问题**：
+
+- **ptrwin = ptr & ~0xFFF 页 = 本来就动态跟随**——ba = post-check
+  ptr 时 ptrwin = ba 页 ✓（机器无需改）。lowwin 改造 = 多余。
+- runs 19-21 的 ba 缺席 = **era 问题**（ptr 走了别的区）——多跑
+  继续（每 run = 一次抽样，era = 随机 ±20ms，ba 出现概率 = 高）。
+- 下一增量：批量跑（5-10 次）+ 自动筛 ba-ptr records → ba 页
+  时间线 → .dat 处理离线复原。
