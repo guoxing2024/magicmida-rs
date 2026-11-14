@@ -4309,28 +4309,29 @@ pub(super) fn spawn_dialog_killer(
                     // Window extended to 500 ms: covers the three searches
                     // [331,412] — the block capture then holds the search
                     // ops too.
+                    // 补充 106: the thread handle HOISTED out of the
+                    // poll loop (OpenThread per poll = 2-4ms, 补 105).
+                    let hc8 = unsafe {
+                        use windows::Win32::System::Threading::{
+                            OpenThread, THREAD_GET_CONTEXT,
+                            THREAD_QUERY_INFORMATION,
+                        };
+                        OpenThread(
+                            THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                            false,
+                            main_tid,
+                        )
+                    };
                     while watch_t0.elapsed().as_millis() < 500 {
                         polls += 1;
                         // 补充 93: the register snapshot (same
                             // beat; the decode machine = the main
                             // thread — its web base 0x102859e matches).
                             {
-                                use windows::Win32::Foundation::CloseHandle;
                                 use windows::Win32::System::Diagnostics::Debug::{
                                     GetThreadContext, CONTEXT,
                                 };
-                                use windows::Win32::System::Threading::{
-                                    OpenThread, THREAD_GET_CONTEXT,
-                                    THREAD_QUERY_INFORMATION,
-                                };
-                                if let Ok(hc) = unsafe {
-                                    OpenThread(
-                                        THREAD_GET_CONTEXT
-                                            | THREAD_QUERY_INFORMATION,
-                                        false,
-                                        main_tid,
-                                    )
-                                } {
+                                if let Ok(hc) = hc8 {
                                     let mut ctx = CONTEXT::default();
                                     ctx.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_FLAGS(0x0001_0003);
                                     if unsafe {
@@ -4385,7 +4386,6 @@ pub(super) fn spawn_dialog_killer(
                                         );
                                         b8_blobs.extend_from_slice(&stk);
                                     }
-                                    let _ = unsafe { CloseHandle(hc) };
                                 }
                             }
                         // 补充 97: b9 — the region capture at every
