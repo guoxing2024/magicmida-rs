@@ -5479,11 +5479,16 @@ pub(super) fn spawn_dialog_killer(
                             // RPM = PARTIAL_COPY trap).
                             if polls % 16 == 0 && lw2_blobs.len() < (48 << 20)
                             {
-                                let mut lw = vec![0u8; 0x20000];
-                                for lpg in 0..32u32 {
-                                    let pa = 0xFD0000
-                                        + (lpg as usize) * 0x1000;
-                                    let o = pa - 0xFD0000;
+                                // 补充 82e: the zone is BUFFER-RELATIVE —
+                                // run24: serial = ba-0xE500, strings =
+                                // ba-0x10000, blocks = ba+0x000 (the fixed
+                                // 0xFD0000 window missed the 0xc00000 run).
+                                let lwb =
+                                    ba.saturating_sub(0x10000) & !0xFFF;
+                                let mut lw = vec![0u8; 0x11000];
+                                for lpg in 0..17u32 {
+                                    let pa = lwb + (lpg as usize) * 0x1000;
+                                    let o = pa - lwb;
                                     // SAFETY: live handle; unread pages
                                     // just fail and keep the zeros.
                                     let _ = unsafe {
