@@ -4234,8 +4234,8 @@ pub(super) fn spawn_dialog_killer(
                 // (the block pointer read from the param area, 32KB).
                 // The handler chain lives in the transient block
                 // (补 99 fault trace).  FNV dedup, cap 64 MB.
-                let mut b10_last: u64 = 0;
                 let mut b10_blobs: Vec<u8> = Vec::new();
+                let mut b10_pages: Vec<u64> = Vec::new();
                 // Phase 1: find the file copy (needle scan, MEM_PRIVATE).
                 while buf_addr.is_none() && watch_t0.elapsed().as_millis() < 260 {
                     polls += 1;
@@ -4369,71 +4369,90 @@ pub(super) fn spawn_dialog_killer(
                                     )
                                 };
                             }
-                            // 补充 100b: the block pointer = the
-                            // FIRST dispatch-table entry at
-                            // [edi+0x48] = 0x10285E6 (the state
-                            // window base 0x102859e + 0x48; the table
-                            // = 168 entries pointing at the transient
-                            // blocks, 补 99) — fall back to the param
-                            // dword, then 0x240C8000.
-                            let mut blkbase = 0x240C8000usize;
-                            let mut tb = [0u8; 4];
-                            if unsafe {
-                                let mut n = 0;
-                                ReadProcessMemory(
-                                    h_process,
-                                    0x10285E6 as *const core::ffi::c_void,
-                                    tb.as_mut_ptr()
-                                        as *mut core::ffi::c_void,
-                                    4,
-                                    Some(&mut n),
-                                )
-                                .is_ok()
-                                    && n == 4
-                            } {
-                                let tv = u32::from_le_bytes(tb) as usize;
-                                if (0x1000000..0x8000000).contains(&tv) {
-                                    blkbase = tv & !0xFFF;
+                            // 补充 100b: the table-entry probe — the
+                            // first dispatch-table entry at
+                            // [edi+0x48] = 0x10285E6 = the transient
+                            // block pointer (补 99).  Logged, the wide
+                            // zone sweep below covers all 168 blocks.
+                            {
+                                let mut tb = [0u8; 8];
+                                if unsafe {
+                                    let mut n = 0;
+                                    ReadProcessMemory(
+                                        h_process,
+                                        0x10285E6 as *const core::ffi::c_void,
+                                        tb.as_mut_ptr()
+                                            as *mut core::ffi::c_void,
+                                        8,
+                                        Some(&mut n),
+                                    )
+                                    .is_ok()
+                                        && n == 8
+                                } {
+                                    let tv = u32::from_le_bytes(
+                                        tb[0..4].try_into().unwrap(),
+                                    );
+                                    info!(
+                                        t_ms = watch_t0.elapsed().as_millis() as u32,
+                                        tbl0 = format!("{:#x}", tv),
+                                        magic_deref = format!("{:#x}", u32::from_le_bytes(prm[0x14..0x18].try_into().unwrap())),
+                                        "DECODEWATCH: handler-block table probe"
+                                    );
                                 }
                             }
-                            let pv = u32::from_le_bytes(
-                                prm[0x14..0x18].try_into().unwrap(),
-                            ) as usize;
-                            if (0x2000000..0x8000000).contains(&pv) {
-                                blkbase = pv & !0xFFF;
-                            }
-                            let mut blk = vec![0u8; 0x8000];
-                            for bp in 0..8u32 {
-                                let pa = blkbase
+                            // 补充 101: the handler blocks = 168
+                            // SEPARATE heap allocations (one per byte
+                            // value, 补 99's table) — capture the wide
+                            // zone [0x2400000,0x2600000) (2MB, 512
+                            // pages) with PER-PAGE dedup: a page is
+                            // recorded when its content changes (the
+                            // live window = its execution moment).
+                            for bp in 0..512u32 {
+                                let pa = 0x2400000
                                     + (bp as usize) * 0x1000;
-                                let o = pa - blkbase;
-                                let _ = unsafe {
+                                let pi = bp as usize;
+                                let mut pg = [0u8; 0x1000];
+                                // SAFETY: live handle; uncommitted
+                                // pages just fail and stay zeros.
+                                let okg = unsafe {
                                     let mut n = 0;
                                     ReadProcessMemory(
                                         h_process,
                                         pa as *const core::ffi::c_void,
-                                        blk[o..o + 0x1000]
-                                            .as_mut_ptr()
+                                        pg.as_mut_ptr()
                                             as *mut core::ffi::c_void,
                                         0x1000,
                                         Some(&mut n),
                                     )
+                                    .is_ok()
+                                        && n == 0x1000
                                 };
-                            }
-                            let mut h10: u64 = 0xCBF1_6CE9_C7A5_5CA9;
-                            for &x in prm.iter().chain(blk.iter()) {
-                                h10 ^= x as u64;
-                                h10 = h10
-                                    .wrapping_mul(0x0000_0100_0000_01B3);
-                            }
-                            if h10 != b10_last {
-                                b10_last = h10;
-                                b10_blobs.extend_from_slice(&t9);
-                                b10_blobs.extend_from_slice(&prm);
-                                b10_blobs.extend_from_slice(
-                                    &(blkbase as u32).to_le_bytes(),
-                                );
-                                b10_blobs.extend_from_slice(&blk);
+                                if !okg {
+                                    continue;
+                                }
+                                let mut hp: u64 =
+                                    0xCBF1_6CE9_C7A5_5CA9;
+                                for &x in &pg {
+                                    hp ^= x as u64;
+                                    hp = hp.wrapping_mul(
+                                        0x0000_0100_0000_01B3,
+                                    );
+                                }
+                                if pi >= b10_pages.len() {
+                                    b10_pages.push(hp);
+                                    b10_blobs.extend_from_slice(&t9);
+                                    b10_blobs.extend_from_slice(
+                                        &(pa as u32).to_le_bytes(),
+                                    );
+                                    b10_blobs.extend_from_slice(&pg);
+                                } else if b10_pages[pi] != hp {
+                                    b10_pages[pi] = hp;
+                                    b10_blobs.extend_from_slice(&t9);
+                                    b10_blobs.extend_from_slice(
+                                        &(pa as u32).to_le_bytes(),
+                                    );
+                                    b10_blobs.extend_from_slice(&pg);
+                                }
                             }
                         }
                         // FORGE2+SNATCH (v14): capture the VM thread's
