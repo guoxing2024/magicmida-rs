@@ -4151,3 +4151,19 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
 - 下一增量：helper API 返回值语义（从 run-8/r4 的 pass-2 观测
   推断或识别 helper）→ emu 完整两遍终值。
 - 工件：emu_pass2.py/.pkl/.log（锚定 pass-2 版）。
+
+**续 21 补充 52（同日第三十九轮）——栈映射顺序 bug 修复 + 栈下行递归现形**：
+
+- **映射顺序 bug**：esi 并集先映射 0xef000（16KB = [0xef000,0xf3000)）
+  **挡掉栈映射** [0xeb000,0xfb000) —— 栈只有一页在映射里 →
+  0xeeffc/0xedffc… fault-storm 的真根因。修复 = 栈先映射、esi 页
+  逐页（4KB 粒度）容错后映射。
+- **修复后**：faults 变为栈**下行递归**（0xeaffc→0xe9ffc→0xe8ffc→
+  0xe7ffc，esp 穿过 64KB 栈窗继续降）= inter-pass 链在 API 桩
+  （xor eax,eax; ret）处**递归调用**——桩返回值错误 → 链条件
+  分支走递归侧。helper 语义返回值 = 仍缺。
+- **判据**：栈下行 = 桩语义错误的直接信号；正确返回值应使链
+  不递归而推进 pass-2。
+- 下一增量：helper 返回值枚举×递归判据（递归消失 = 正确）；
+  或识别 helper（参数 ptr/416/hash/ptr2/magic = 壳内部校验函数）。
+- 工件：emu_pass2.py（映射顺序修复版）。
