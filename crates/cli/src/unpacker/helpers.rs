@@ -4179,6 +4179,13 @@ pub(super) fn spawn_dialog_killer(
                 let mut lw2_last: u64 = 0;
                 let mut lw2_blobs: Vec<u8> = Vec::new();
                 let mut scan_cursor: usize = 0x1_0000;
+                // 补充 83: the serial-field needle (the decoded license
+                // serial, deterministic per machine — run24 + the 0xfe0000
+                // run agree) + the second-copy side log (b3 = every-poll
+                // 512 B at ba-0x10000, the [186,196] decrypt hunt).
+                const SER_NEEDLE: [u8; 16] = *b"105A-0000-0000-0";
+                let mut b3_last: u64 = 0;
+                let mut b3_blobs: Vec<u8> = Vec::new();
                 // Phase 1: find the file copy (needle scan, MEM_PRIVATE).
                 while buf_addr.is_none() && watch_t0.elapsed().as_millis() < 260 {
                     polls += 1;
@@ -4996,6 +5003,10 @@ pub(super) fn spawn_dialog_killer(
                                 nl.push(".lw2.bin");
                                 let _ =
                                     std::fs::write(stem.with_file_name(nl), &lw2_blobs);
+                                let mut n3 = name.to_os_string();
+                                n3.push(".b3.bin");
+                                let _ =
+                                    std::fs::write(stem.with_file_name(n3), &b3_blobs);
                             }
                             dump_failfreeze_scene(pid, h_process, image_base, &out_path);
                             unsafe {
@@ -5416,6 +5427,36 @@ pub(super) fn spawn_dialog_killer(
                                                     None
                                                 };
                                             }
+                                            // 补充 83: the serial-field
+                                            // needle — the decoded
+                                            // plaintext struct hunt.
+                                            let mut p2 = scan_buf[..got]
+                                                .windows(16)
+                                                .position(|w| w == SER_NEEDLE);
+                                            while let Some(pp) = p2 {
+                                                let va = base + roff + pp;
+                                                if buf_addrs.len() < 12
+                                                    && !buf_addrs
+                                                        .contains(&va)
+                                                {
+                                                    buf_addrs.push(va);
+                                                    info!(
+                                                        t_ms = watch_t0.elapsed().as_millis() as u32,
+                                                        nth = buf_addrs.len(),
+                                                        buf = format!("{:p}", va as *const core::ffi::c_void),
+                                                        "DECODEWATCH: serial-field candidate (sweep)"
+                                                    );
+                                                }
+                                                let nxt = pp + 1;
+                                                p2 = if nxt + 16 <= got {
+                                                    scan_buf[nxt..got]
+                                                        .windows(16)
+                                                        .position(|w| w == SER_NEEDLE)
+                                                        .map(|q3| nxt + q3)
+                                                } else {
+                                                    None
+                                                };
+                                            }
                                         }
                                         roff += len;
                                     }
@@ -5522,6 +5563,45 @@ pub(super) fn spawn_dialog_killer(
                                     lw2_blobs.extend_from_slice(&lw);
                                 }
                             }
+                            // 补充 83: the second-copy window
+                            // (ba-0x10000) at EVERY poll — the [186,196]
+                            // decrypt intermediates hunt (lw2's 1/16
+                            // cadence saw only full-cipher -> zero).
+                            // 516 B records, FNV dedup.
+                            {
+                                let w1 =
+                                    ba.saturating_sub(0x10000) & !0xFFF;
+                                let mut s3 = [0u8; 512];
+                                // SAFETY: live handle; unread = zeros.
+                                let ok3 = unsafe {
+                                    let mut n = 0;
+                                    ReadProcessMemory(
+                                        h_process,
+                                        w1 as *const core::ffi::c_void,
+                                        s3.as_mut_ptr()
+                                            as *mut core::ffi::c_void,
+                                        512,
+                                        Some(&mut n),
+                                    )
+                                    .is_ok()
+                                        && n == 512
+                                };
+                                if ok3 && b3_blobs.len() < (48 << 20) {
+                                    let mut h4: u64 =
+                                        0xCBF1_6CE9_C7A5_5CA9;
+                                    for &x in &s3 {
+                                        h4 ^= x as u64;
+                                        h4 = h4.wrapping_mul(
+                                            0x0000_0100_0000_01B3,
+                                        );
+                                    }
+                                    if h4 != b3_last {
+                                        b3_last = h4;
+                                        b3_blobs.extend_from_slice(&t2);
+                                        b3_blobs.extend_from_slice(&s3);
+                                    }
+                                }
+                            }
                         }
                         // PASS-evidence probe (2026-11-07): lives in the
                         // bail-watch loop BELOW — the µs-snapshot loop ends
@@ -5548,6 +5628,10 @@ pub(super) fn spawn_dialog_killer(
                     nl.push(".lw2.bin");
                     let _ =
                         std::fs::write(stem.with_file_name(nl), &lw2_blobs);
+                    let mut n3 = name.to_os_string();
+                    n3.push(".b3.bin");
+                    let _ =
+                        std::fs::write(stem.with_file_name(n3), &b3_blobs);
                 }
                 info!(
                     polls,
