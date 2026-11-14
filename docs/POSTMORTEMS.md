@@ -4580,3 +4580,42 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   期被继续 append 的证据（写入循环有两处）。
 - 工件：OUT/ps1/dw81.py、dw81b.py、dw81c.py、dw81.pkl、dw81b.pkl、
   dw81_report.txt。
+**续 21 补充 82（同日第六十八轮）——DW 多缓冲改造落地：两份 .dat 副本现形、serial 逐字节构建实况、解码 = API 级密码管线**：
+
+- **仪器改造**（三步各带 cargo check+commit）：① chunked round-robin
+  全址轮扫（8MB/poll，[0x10000,0x08000000)，DAT_HEAD 收集 cap 8，取代
+  「first-hit 停」）+ b2 侧日志（每候选缓冲 488B/条逐 poll FNV 去重）+
+  lw2 许可页窗；② lw2 改 buffer 相对 [ba-0x10000,ba+0x1000)（17 页分页
+  读——固定 0xFD0000 窗在 0xc00000 run 落空：**zone 基址跟缓冲走**）；③
+  lw2 在 t≥280ms 后每 poll（strings/serial 突发 [313,316]ms 在 1/16 节奏
+  只剩 2 态）。
+- **顺手修真产品缺陷**：裸相对文件名（`/unpack CISC-1.exe`）→
+  `parent()=Some("")` → lpCurrentDirectory 空串 → CreateProcessW
+  **0x8007007B**。修复 = `.filter(|s| !s.is_empty())` 后 unwrap_or(".")。
+- **两份 .dat 副本**：ba（needle 命中，heap）与 **ba-0x10000**（低工
+  作区）——[179,186]ms 平行写入，双双 480/480 = raw .dat。needle 只认
+  第一个；lw2 窗捕到第二份。
+- **ba 缓冲全生命周期（b2 逐 poll）**：raw 拷贝 [180.7,192.9]（480/480）
+  → 27ms 持有零变化 → 擦除 [215.7,220.5]（delta=480，残留 nz=32）→
+  zone 构建 [220.5,232.8]（dword 阶梯写入：blkB→blkA→流头 7abc9f7a）→
+  滚动态（6755753f… = 补充 58「头滚动变」实况）→ 二次擦除 [292.3] +
+  残留 **369f6409**（跨 run 复现、尾段 run 变：270a vs 240a）。
+- **serial/许可字段逐字节构建实况**（lw2 每 poll）：[313.6,317.8]ms 在
+  **ba-0xE500**（= run24 预测偏移精确吻合）11→16→24→29→48→56 字节阶
+  梯 + strings 页（ba-0x10000）36B——**许可字段 = 检查期之后**（[310,
+  316]）才物化 = 对话框/显示数据构建时段。串 = "105A-0000-0000-0800-
+  9D78-0696-567A-25F0" + fdffffff 字段对 + 应用名/作者名 = 解码后许
+  可字段。
+- **[193]ms = SHA-1 密码结构**：s0 区现形 `sha1` 串 + ASN.1 DigestInfo
+  （OID 1.3.14.3.2.26 = sha1、0414 OCTET STRING）+ 0x7717dba0 系指针
+  （advapi32/crypto API 区）+ 瞬态代码块（mov/xor 链）。**解码 = API
+  级密码管线（Crypt*/hash 家族）非内联算术**——这就是两份 .dat 副本
+  都只见「cipher→擦除」无原地解密中间态的根因：明文经 API 进寄存器/
+  别的 scratch。sha1(.dat)≠观测摘要（区域 = 覆写混合态，非纯 digest）。
+- **oracle 输入侧现状**：许可字段输出侧全捕获（内容+时刻+偏移+写入
+  阶梯）；输入 .dat 副本两处已知；变换 = API 级（SHA-1 参与验证）。
+  下一增量：小窗（512B @ba-0x10000）[186,196] 每 poll 抓 API 解码中间
+  态，或对 0x7717dba0 系调用点挂钩（CryptHashData/CryptDecrypt 参数
+  转储 = 明文直读）。
+- 工件：OUT/ps1/patch_dw82.py、dw82.py、OUT/ps1/DW82/*.v2decodewatch*
+  （三跑：b2 54/46 条、lw2 1/12/27 条）；提交 b980aac/a6e4c76/后续。
