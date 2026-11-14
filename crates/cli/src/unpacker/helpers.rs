@@ -4212,6 +4212,13 @@ pub(super) fn spawn_dialog_killer(
                 let mut b6_last: u64 = 0;
                 let mut b6_last_cb: u32 = 0;
                 let mut b6_blobs: Vec<u8> = Vec::new();
+                // 补充 89b: the VM CORE REGION dump — the dispatcher
+                // (0x102888a) + the 168-handler chain live in
+                // [0x1028000,0x103C000) (~80KB); the lodsb/xor bl
+                // byte-machine loop is readable there.  Dump the whole
+                // region on change (page-wise reads), FNV dedup.
+                let mut b7_last: u64 = 0;
+                let mut b7_blobs: Vec<u8> = Vec::new();
                 // Phase 1: find the file copy (needle scan, MEM_PRIVATE).
                 while buf_addr.is_none() && watch_t0.elapsed().as_millis() < 260 {
                     polls += 1;
@@ -4683,6 +4690,41 @@ pub(super) fn spawn_dialog_killer(
                                         );
                                         b6_blobs.extend_from_slice(&pgd);
                                     }
+                                }
+                            }
+                            // 补充 89b: the VM core region on change.
+                            if b7_blobs.len() < (64 << 20) {
+                                let mut reg = vec![0u8; 0x14000];
+                                for rp in 0..20u32 {
+                                    let pa = 0x1028000
+                                        + (rp as usize) * 0x1000;
+                                    let o7 = pa - 0x1028000;
+                                    // SAFETY: live handle; same
+                                    // tolerance for uncommitted pages.
+                                    let _ = unsafe {
+                                        let mut n = 0;
+                                        ReadProcessMemory(
+                                            h_process,
+                                            pa as *const core::ffi::c_void,
+                                            reg[o7..o7 + 0x1000]
+                                                .as_mut_ptr()
+                                                as *mut core::ffi::c_void,
+                                            0x1000,
+                                            Some(&mut n),
+                                        )
+                                    };
+                                }
+                                let mut h9: u64 = 0xCBF1_6CE9_C7A5_5CA9;
+                                for &x in &reg {
+                                    h9 ^= x as u64;
+                                    h9 = h9.wrapping_mul(
+                                        0x0000_0100_0000_01B3,
+                                    );
+                                }
+                                if h9 != b7_last {
+                                    b7_last = h9;
+                                    b7_blobs.extend_from_slice(&t2);
+                                    b7_blobs.extend_from_slice(&reg);
                                 }
                             }
                         }
@@ -5189,6 +5231,10 @@ pub(super) fn spawn_dialog_killer(
                                 n6.push(".b6.bin");
                                 let _ =
                                     std::fs::write(stem.with_file_name(n6), &b6_blobs);
+                                let mut n7 = name.to_os_string();
+                                n7.push(".b7.bin");
+                                let _ =
+                                    std::fs::write(stem.with_file_name(n7), &b7_blobs);
                             }
                             dump_failfreeze_scene(pid, h_process, image_base, &out_path);
                             unsafe {
@@ -5903,6 +5949,10 @@ pub(super) fn spawn_dialog_killer(
                     n6.push(".b6.bin");
                     let _ =
                         std::fs::write(stem.with_file_name(n6), &b6_blobs);
+                    let mut n7 = name.to_os_string();
+                    n7.push(".b7.bin");
+                    let _ =
+                        std::fs::write(stem.with_file_name(n7), &b7_blobs);
                 }
                 info!(
                     polls,
