@@ -4544,3 +4544,39 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
 - 下一增量：ba 流与 .dat 的解码对应（DECODEWATCH 六相对接）→
   校验消费语义 → 重编码 oracle。
 - 工件：run22/24/25/26/27_bahits.pkl + ba 内容分析（本节内联）。
+**续 21 补充 81（同日第六十七轮）——DW↔ba 对应建立：buf=ba 基址、两周期定案、六相解码不在其中**：
+
+- **旧 2677 条读数作废**：那是对 CISC1test.v2decodewatch.bin 的错
+  stride 解析（324B 假记录）。真实格式 = **1012 B/条**（t/ca/cb/dp/
+  ba + snap480 + bank512）× **857 条**（签名扫描 ba=0xd50000 恒定、
+  spacing 1012 全部命中、t 单调）。「buf vs 流 0/32」结论作废。
+- **对应建立**：DW 的 buf_addr = **0xd50000 = ba 区基址本身**（跨
+  run 同址）。cycle-2 写入门当实时与 bahits image **同 offset 逐字
+  节全同**（rec#825→852 写 blkB [0x12c,0x160)，win@buf+0x128 →
+  img+0x128 对齐命中 1→45 递增；run22/24/25/26/27 五 run image 逐
+  字节相同 = 跨 run 确定性）。
+- **两周期结构定案**：cycle-1（t≈177.8→193.3ms）= raw .dat 文件
+  副本逐字节写（3 B/快照，dat_same 恒=nz，终态 480/480 与盘上
+  CISC-1.dat 全同），持有 **31 ms 零变化**，t=224.9ms 擦除；
+  **cycle-2（t=225.2ms 起）= ba 流构建**（先 blkB、后 blkA、流头
+  7abc9f7a…）。**六相解码不在此缓冲**——持有期 dat_same 恒 480，
+  补充 17-20 的六相（逐 dword 解密→enc1→enc2）= 另一缓冲的观测，
+  待定位（needle 只认第一个 DAT_HEAD 命中）。
+- **ba 区布局（5 run 恒定）**：+0x000 52B + +0x12c 52B 两块（与
+  .dat 无常数/重复 XOR 关系、非 .dat 切片）；+0x258 48B = 检查期
+  流头兄弟副本；run24 @0xfd1000+0xb00 = ASCII **"105A-0000-0000-
+  0800-9D78-0696-567A-25F0"**（完整 serial，补充 80 只记了尾部）+
+  0xFFFFFFFD 字段对；@0xfd0000 = "(CISC-1) Examples" / "LCF-AT" /
+  "KuNeGHiM/[CCG]" 可读字符串页。
+- **serial 数值字段在 raw .dat 零命中**（105A/0800/9D78/0696/567A/
+  25F0 的 u16 LE/BE 与 0xFFFFFFFD 全无）——.dat→许可 = 真密码变换，
+  无明文字段存储。
+- **oracle 输入侧现状**：语义图补齐（.dat 副本→31ms 持有→擦除→
+  ba 流构建；ba 区全布局；serial 页定位）；**变换输入输出对仍未到
+  手**（解码工作区 ≠ 0xd50000）。下一增量：DECODEWATCH 盯**全部**
+  DAT_HEAD 缓冲（不止第一个命中）/ 盯 0xfd1000 serial 页构建，抓
+  .dat→serial 变换对；REGSNATCH ptr 游标对 ba 逐偏移 = 消费语义。
+- 待查细节：rec#856 t=628139 超出 340ms 循环窗 = blobs 在 bail-watch
+  期被继续 append 的证据（写入循环有两处）。
+- 工件：OUT/ps1/dw81.py、dw81b.py、dw81c.py、dw81.pkl、dw81b.pkl、
+  dw81_report.txt。
