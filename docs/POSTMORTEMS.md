@@ -5341,3 +5341,28 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   时代已量）②copy A 逆 = 后向逐字节（oracle 查询）③.dat 逆 = 变换 op 逆（同法）
   ④校验和 = check-op snap 续跑算出 ⑤forge .dat → 真跑 = 许可验证通过？！
 - 工件：dw132.pkl（45 全扫）、dw134/135 pkl、DW82e/f 存档。
+
+**续 22 补充 123（同日第一百零七轮）——差分扫描：输入 = 8 字节块读取、全级联滚动键**：
+
+- 36 位差分扫描（patch copyA [0x111e4db+j] → 输出 diff）×unicorn 崩溃噪声
+  （19/36 CRASH×3——hk_u mem_map 竞态 = 不稳定源；缓解 = 预映射 fault 页省
+  hk_u）：
+  - **有效输入 = 8 字节块**：va 0x111e4fb/0x111e50b/0x111e51b/0x111e553/
+    0x111e57b/0x111e59b → **输出 diff [0..64] 全 65 字节**；0x111e5b3/0x111e5c3
+    → [1..64]（out[0] 独立）——**每输入块影响其后全部输出 = 全级联** ✓
+  - 间隔 8 的地址有效（0x4fb→0x503 无→0x50b 有）= **qword 粒度读取**，
+    506 reads ≈ 63 qwords ↔ 65 输出字节 ≈ 1 qword/字节
+  - 无变化位（0x4eb/0x513/0x55b/0x583/0x5cb/0x5d3）= 跳过的 qword（2-mod-4
+    对齐模式待定）
+- **forge 求逆确认可行**：全级联 → 后向归纳（末字节先解：out[k]=f(in[k],
+  key_k)，key_k = 已解前缀决定 → 逐字节回溯，f = XOR 族字节可逆）。emu 单次
+  查询 ~40-90s（25549 lodsb）→ 后向 65 字节 × 256 候选不可行 → **f 直接提取**
+  = trace 单次运行 (in, key)→(out, key') 元组表（65 对 = 密码结构显影）。
+- **模型终稿（本 session）**：copy A = 镜像内嵌加密字段（[0-100]ms init era
+  写入，仪器不可及）；.dat = ReadFile [185.7-186.7] → 缓冲 → check keystone
+  （hash 单字节敏感）→ 擦除；字段 = copy A decode [186.7-190]（emu 已复现 ✓）；
+  裁决 = [375+] 写 KP112。oracle = emu（patch → 预测 ✓）。
+- **下一 session**：①f 表提取（单次 trace，hook 减负 = 预映射）②后向求解器
+  （字段 → copyA）③变换逆与校验和（check-op snap 续跑）④forge .dat → 真跑
+  → **oracle 输入侧闭环**。
+- 工件：差分扫描输出（后台 exec_4f1b）、dw132-135 pkl、DW82e/f/g 存档。
