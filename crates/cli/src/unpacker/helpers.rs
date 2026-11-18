@@ -4256,6 +4256,10 @@ pub(super) fn spawn_dialog_killer(
                 // the machine's data-channel output timeline.
                 let mut b14_pages: Vec<u64> = Vec::new();
                 let mut b14_blobs: Vec<u8> = Vec::new();
+                // 补充 118: b15 = the live image data pool
+                // [0x1080000,0x1148000) + the struct page 0x1022000.
+                let mut b15_pages: Vec<u64> = Vec::new();
+                let mut b15_blobs: Vec<u8> = Vec::new();
                 // Phase 1: find the file copy (needle scan, MEM_PRIVATE).
                 while buf_addr.is_none() && watch_t0.elapsed().as_millis() < 260 {
                     polls += 1;
@@ -4384,14 +4388,22 @@ pub(super) fn spawn_dialog_killer(
                                         // output channel = the stack
                                         // (补 93); the resume needs
                                         // the real frames.
+                                        // 补充 118: the window WIDENED
+                                        // upward to 5 pages
+                                        // [esp-0x800, esp+0x3800) —
+                                        // the V (=[E-12]) and the
+                                        // caller frames live ABOVE
+                                        // esp; the 4KB window missed
+                                        // them (the decode machine's
+                                        // V never captured).
                                         let sp = ctx.Esp as usize;
                                         let slo = (sp.saturating_sub(
                                             0x800,
                                         ) & !0xFFF)
                                             .max(0x10000);
                                         let mut stk =
-                                            vec![0u8; 0x1000];
-                                        for spg in 0..1u32 {
+                                            vec![0u8; 0x5000];
+                                        for spg in 0..5u32 {
                                             let pa = slo
                                                 + (spg as usize)
                                                     * 0x1000;
@@ -4743,7 +4755,13 @@ pub(super) fn spawn_dialog_killer(
                             }
                         }
                         // 补充 118: b14 — the V-relative data space.
-                        if b14_blobs.len() < (64 << 20) {
+                        // /4 cadence AFTER the first full capture
+                        // (the space is static; the first capture =
+                        // the pre-era state).
+                        if b14_pages.len() < 640
+                            || (b14_blobs.len() < (64 << 20)
+                                && polls % 4 == 0)
+                        {
                             let t14 = (watch_t0.elapsed().as_micros()
                                 as u32)
                                 .to_le_bytes();
@@ -4785,6 +4803,64 @@ pub(super) fn spawn_dialog_killer(
                                         &(vpa as u32).to_le_bytes(),
                                     );
                                     b14_blobs.extend_from_slice(&vpg);
+                                }
+                            }
+                        }
+                        // 补充 118: b15 — the LIVE image data pool
+                        // [0x1080000,0x1148000) (200 pages) + the
+                        // struct page [0x1022000,0x1023000) (1 page)
+                        // — the emu's stale-data source: the
+                        // failfreeze holds the POST-era state, the
+                        // replay needs the era-live values (the
+                        // needle pages 0x10DCxxx, the streams,
+                        // 0x10BDExx/0x10CFxxx).  Per-page dedup,
+                        // every poll.
+                        if b15_blobs.len() < (64 << 20) {
+                            let t15 = (watch_t0.elapsed().as_micros()
+                                as u32)
+                                .to_le_bytes();
+                            for sbp2 in 0..201u32 {
+                                let spa2 = if sbp2 == 0 {
+                                    0x1022000usize
+                                } else {
+                                    0x1080000usize
+                                        + ((sbp2 - 1) as usize) * 0x1000
+                                };
+                                let mut spg2 = vec![0u8; 0x1000];
+                                let _ = unsafe {
+                                    let mut n = 0;
+                                    ReadProcessMemory(
+                                        h_process,
+                                        spa2 as *const core::ffi::c_void,
+                                        spg2.as_mut_ptr()
+                                            as *mut core::ffi::c_void,
+                                        0x1000,
+                                        Some(&mut n),
+                                    )
+                                };
+                                let mut h15: u64 =
+                                    0xCBF1_6CE9_C7A5_5CA9;
+                                for &x in &spg2 {
+                                    h15 ^= x as u64;
+                                    h15 = h15.wrapping_mul(
+                                        0x0000_0100_0000_01B3,
+                                    );
+                                }
+                                if sbp2 as usize >= b15_pages.len() {
+                                    b15_pages.push(h15);
+                                    b15_blobs.extend_from_slice(&t15);
+                                    b15_blobs.extend_from_slice(
+                                        &(spa2 as u32).to_le_bytes(),
+                                    );
+                                    b15_blobs.extend_from_slice(&spg2);
+                                } else if b15_pages[sbp2 as usize] != h15
+                                {
+                                    b15_pages[sbp2 as usize] = h15;
+                                    b15_blobs.extend_from_slice(&t15);
+                                    b15_blobs.extend_from_slice(
+                                        &(spa2 as u32).to_le_bytes(),
+                                    );
+                                    b15_blobs.extend_from_slice(&spg2);
                                 }
                             }
                         }
@@ -5754,6 +5830,10 @@ pub(super) fn spawn_dialog_killer(
                                 nd.push(".b14.bin");
                                 let _ =
                                     std::fs::write(stem.with_file_name(nd), &b14_blobs);
+                                let mut ne = name.to_os_string();
+                                ne.push(".b15.bin");
+                                let _ =
+                                    std::fs::write(stem.with_file_name(ne), &b15_blobs);
                             }
                             dump_failfreeze_scene(pid, h_process, image_base, &out_path);
                             unsafe {
@@ -6496,6 +6576,10 @@ pub(super) fn spawn_dialog_killer(
                     nd.push(".b14.bin");
                     let _ =
                         std::fs::write(stem.with_file_name(nd), &b14_blobs);
+                    let mut ne = name.to_os_string();
+                    ne.push(".b15.bin");
+                    let _ =
+                        std::fs::write(stem.with_file_name(ne), &b15_blobs);
                 }
                 info!(
                     polls,
