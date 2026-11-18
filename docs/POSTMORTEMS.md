@@ -5300,3 +5300,24 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   （b8 节奏加密 /1）→ 全链续跑；②改 .dat 单字节 → emu 预测 struct/裁决 → 对照真跑
   → **oracle 闭环**；③裁决 era op（[374696, fail]，写 KP112）单独续跑。
 - 工件：dw130/131/132.py、dw133_232461.pkl、dw133_241958.pkl、DW82d 存档。
+
+**续 22 补充 120（同日第一百零五轮）——.dat 字段解码完全仿真：emu = 解密器本体**：
+
+- **b8 全节奏 /1**（41 snap 全 era 覆盖）+ 全量续跑扫描（OSError 护栏）。
+- **era① 解码 op 完整终结**：t=186813 snap（region 机器 0x102b9d1、esi=0x111e781）
+  续跑 = **done、25549 lodsb、ba 页 65 次写**——**写值 = 明文 ASCII**：
+  `[0x1d2,0x213) = "5This application has been registered to
+(CISC-1) Examples - LCF"`
+  = 许可注释字段**解码后就地写回缓冲**（与 KP 已知许可结构逐字吻合）。
+  **.dat 加密字段 → 明文的变换 = emu 已完整执行 ✓**（本 run ba=0xd50000）。
+- **终局 era 落点**（b2@368865）：KP 头 "(CISC-1) Example" @0xd40000/0xd60041、
+  serial "105A-0000…" @0xd41b00/0x60080 = 裁决字段拷贝到新堆块（验证 era 实锤）。
+- **oracle 形状定案**：解码 = 就地缓冲变换 → **改密文 → 续跑 snap（缓冲补丁 =
+  改后密文）→ 解码输出 = 预测**。resume 点后已解码区不受改prefix影响（改 X ≥
+  0x213 区段）。逆程序（加密器）= 按 field 查询 oracle（密文候选 → 明文比对）
+  逐 field 求逆——forge .dat = 已知字段（19 机器键）→ 逐 field 逆 → 密文 →
+  **校验和**（POOLSNIFF 16 位双累加器，check-era snap 同法续跑可算）→ 完整 forge。
+- **下一轮**：①oracle 原型 = 改 ba 单字节 → 续跑 → 输出 diff（保真终验）②check-op
+  snap 定位（[196,220] era）→ 校验和 emu 计算 ③逐 field 逆 → forge .dat → 真跑对照
+  → **oracle 输入侧闭环**。
+- 工件：dw132.pkl（41 全扫）、dw134.pkl（era① 65 写 + 终缓冲）。

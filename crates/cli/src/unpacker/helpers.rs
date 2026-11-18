@@ -4359,7 +4359,13 @@ pub(super) fn spawn_dialog_killer(
                             // ([esp+0x24] = stream base - CHECK) are
                             // the entry-protocol ground truth; more
                             // contexts = more protocol validation.
-                            if polls % 2 == 0 {
+                            // 补充 119: /1 — the resume runner needs
+                            // snaps across ALL eras (esp. the copy
+                            // [188-200], the transform [200-215] and
+                            // the verdict tail [375+]); each snap = a
+                            // complete machine state (regs + 20KB
+                            // stack) = a replay point.
+                            if polls % 1 == 0 {
                                 use windows::Win32::System::Diagnostics::Debug::{
                                     GetThreadContext, CONTEXT,
                                 };
