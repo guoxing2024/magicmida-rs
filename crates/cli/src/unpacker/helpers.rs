@@ -4260,6 +4260,9 @@ pub(super) fn spawn_dialog_killer(
                 // [0x1080000,0x1148000) + the struct page 0x1022000.
                 let mut b15_pages: Vec<u64> = Vec::new();
                 let mut b15_blobs: Vec<u8> = Vec::new();
+                // 补充 120: the buffer-hash state for the
+                // change-triggered snaps.
+                let mut b8_buf_last: u64 = 0;
                 // Phase 1: find the file copy (needle scan, MEM_PRIVATE).
                 while buf_addr.is_none() && watch_t0.elapsed().as_millis() < 260 {
                     polls += 1;
@@ -4434,6 +4437,100 @@ pub(super) fn spawn_dialog_killer(
                                     }
                                 }
                             }
+                        // 补充 120: the buffer-hash-triggered snap —
+                        // the decode phase boundaries = exact replay
+                        // points (the poll cadence misses the ~µs
+                        // decode bursts; the buffer content change =
+                        // the event).  Same record shape as b8.
+                        if let Some(baa) = buf_addr {
+                            use windows::Win32::System::Diagnostics::Debug::{
+                                GetThreadContext, CONTEXT,
+                            };
+                            if let Ok(hcb) = hc8 {
+                                let mut bpg = [0u8; 0x1000];
+                                let okb = unsafe {
+                                    let mut n = 0;
+                                    ReadProcessMemory(
+                                        h_process,
+                                        (baa & !0xFFF)
+                                            as *const core::ffi::c_void,
+                                        bpg.as_mut_ptr()
+                                            as *mut core::ffi::c_void,
+                                        0x1000,
+                                        Some(&mut n),
+                                    )
+                                    .is_ok()
+                                        && n == 0x1000
+                                };
+                                if okb {
+                                    let mut hb: u64 =
+                                        0xCBF1_6CE9_C7A5_5CA9;
+                                    for &x in &bpg {
+                                        hb ^= x as u64;
+                                        hb = hb.wrapping_mul(
+                                            0x0000_0100_0000_01B3,
+                                        );
+                                    }
+                                    if hb != b8_buf_last {
+                                        b8_buf_last = hb;
+                                        let mut ctx = CONTEXT::default();
+                                        ctx.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_FLAGS(0x0001_0003);
+                                        if unsafe {
+                                            GetThreadContext(hcb, &mut ctx)
+                                        }
+                                        .is_ok()
+                                        {
+                                            let t8 = (watch_t0.elapsed()
+                                                .as_micros()
+                                                as u32)
+                                                .to_le_bytes();
+                                            b8_blobs.extend_from_slice(
+                                                &t8,
+                                            );
+                                            for v in [
+                                                ctx.Eip, ctx.Edi, ctx.Esi,
+                                                ctx.Ebx, ctx.Edx, ctx.Ecx,
+                                                ctx.Eax, ctx.Ebp, ctx.Esp,
+                                                ctx.EFlags,
+                                            ] {
+                                                b8_blobs.extend_from_slice(
+                                                    &v.to_le_bytes(),
+                                                );
+                                            }
+                                            let sp = ctx.Esp as usize;
+                                            let slo = (sp
+                                                .saturating_sub(0x800)
+                                                & !0xFFF)
+                                                .max(0x10000);
+                                            let mut stk =
+                                                vec![0u8; 0x5000];
+                                            for spg in 0..5u32 {
+                                                let pa = slo
+                                                    + (spg as usize)
+                                                        * 0x1000;
+                                                let o = pa - slo;
+                                                let _ = unsafe {
+                                                    let mut n = 0;
+                                                    ReadProcessMemory(
+                                                        h_process,
+                                                        pa as *const core::ffi::c_void,
+                                                        stk[o..o + 0x1000]
+                                                            .as_mut_ptr()
+                                                            as *mut core::ffi::c_void,
+                                                        0x1000,
+                                                        Some(&mut n),
+                                                    )
+                                                };
+                                            }
+                                            b8_blobs.extend_from_slice(
+                                                &(slo as u32).to_le_bytes(),
+                                            );
+                                            b8_blobs.extend_from_slice(&stk);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         // 补充 97: b9 — the region capture at every
                         // iteration, BEFORE the ok_s gate.
                         // 补充 118: the zone EXTENDED to 44 pages:

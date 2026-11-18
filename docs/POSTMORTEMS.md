@@ -5321,3 +5321,23 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   snap 定位（[196,220] era）→ 校验和 emu 计算 ③逐 field 逆 → forge .dat → 真跑对照
   → **oracle 输入侧闭环**。
 - 工件：dw132.pkl（41 全扫）、dw134.pkl（era① 65 写 + 终缓冲）。
+
+**续 22 补充 121（同日第一百零六轮）——ORACLE 激活：改输入 → emu 预测解码输出 ✓**：
+
+- **输入源定案**：解码 op 读址追踪 = **copy A = 镜像 0x111E000**（506 读，
+  0x111e4db..；snap esi = 0x111e781 就在其中）——链 = .dat →（变换）→ copy A →
+  （decode）→ 缓冲字段。0x293ef000 高址区 26 读 = 次级数据源。
+- **buffer 触发 snap 仪器**（b8 格式追加，缓冲页哈希变化 → GetThreadContext 即时
+  snap）——但解码爆发 < poll 间隙，此 run 未赶上（解码 µs 级，poll ~5-10ms）。
+  b8 口算修正：记录 = 20528B（4+40+4+0x5000），45 条。
+- **ORACLE 活证**：resume@186813（DW82f 存档，ba=0xd50000）+ patch copy A
+  0x111e750 = 0xAA → **输出 13 字节变化（[0x1d3,0x1df) 'This applicat' → 级联
+  破坏）**——改输入 → emu 预测解码输出 ✓✓。patch 0x111e700 = diff 0（未消费区）；
+  patch ba 页 [0x1d4-0x1dc] 全 diff 0（输入 = copy A 非 ba，交叉验证）。
+- **解码形状**：滚动键级联（patch 点后全破坏 = 位置相关流式）→ 逆程序 = **后向
+  逐字节求解**（末字节 = g(input_last, key_final)，key 状态末端已知 → 逐字节回溯，
+  g = XOR 族可逆）。
+- **forge 完整路线（机械步骤，emu = 工具）**：①目标字段（19 机器键，补 16-23
+  时代已量）②copy A 逆 = 后向逐字节（oracle 查询）③.dat 逆 = 变换 op 逆（同法）
+  ④校验和 = check-op snap 续跑算出 ⑤forge .dat → 真跑 = 许可验证通过？！
+- 工件：dw132.pkl（45 全扫）、dw134/135 pkl、DW82e/f 存档。
