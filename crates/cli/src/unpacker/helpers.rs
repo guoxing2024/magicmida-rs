@@ -4243,6 +4243,19 @@ pub(super) fn spawn_dialog_killer(
                 // earlier sweeps excluded it.
                 let mut b11_last: u64 = 0;
                 let mut b11_blobs: Vec<u8> = Vec::new();
+                // 补充 118: b12 = the stream zone [0x1136000,0x113B000).
+                let mut b12_pages: Vec<u64> = Vec::new();
+                let mut b12_blobs: Vec<u8> = Vec::new();
+                // 补充 118: b14 = the V-relative data space
+                // [0x12200000,0x12480000) — the replay's faults land
+                // there FIRST (0x12261689/0x12260b45/0x12376260): the
+                // chains read their constant/data pool through the
+                // fake V pointer (V = stream + 0x1123FFEC, always
+                // 0x1237xxxx).  Per-page dedup, every poll — the
+                // first capture = the pre-era state, later changes =
+                // the machine's data-channel output timeline.
+                let mut b14_pages: Vec<u64> = Vec::new();
+                let mut b14_blobs: Vec<u8> = Vec::new();
                 // Phase 1: find the file copy (needle scan, MEM_PRIVATE).
                 while buf_addr.is_none() && watch_t0.elapsed().as_millis() < 260 {
                     polls += 1;
@@ -4338,7 +4351,11 @@ pub(super) fn spawn_dialog_killer(
                             // thread = ~3ms kernel sync; the page
                             // density = b9's every-poll; registers =
                             // only for the resume points).
-                            if polls % 8 == 0 {
+                            // 补充 118: /2 — the stack V anchors
+                            // ([esp+0x24] = stream base - CHECK) are
+                            // the entry-protocol ground truth; more
+                            // contexts = more protocol validation.
+                            if polls % 2 == 0 {
                                 use windows::Win32::System::Diagnostics::Debug::{
                                     GetThreadContext, CONTEXT,
                                 };
@@ -4401,15 +4418,29 @@ pub(super) fn spawn_dialog_killer(
                             }
                         // 补充 97: b9 — the region capture at every
                         // iteration, BEFORE the ok_s gate.
+                        // 补充 118: the zone EXTENDED to 44 pages:
+                        // the interpreter region [0x1028000,0x103E000)
+                        // (family 1) + the op-band interpreter copy
+                        // [0x105E000,0x1076000) (family 2, state
+                        // window edi=0x105FFAE, bootstrap 0x106029A)
+                        // — the buffer-transform machine lives there.
                         if b9_blobs.len() < (64 << 20) {
                             let t9 = (watch_t0.elapsed().as_micros()
                                 as u32)
                                 .to_le_bytes();
-                            let mut reg = vec![0u8; 0x16000];
-                            for rp in 0..22u32 {
-                                let pa = 0x1028000
-                                    + (rp as usize) * 0x1000;
-                                let o7 = pa - 0x1028000;
+                            let mut reg = vec![0u8; 0x2C000];
+                            for rp in 0..44u32 {
+                                let pa = if rp < 22 {
+                                    0x1028000 + (rp as usize) * 0x1000
+                                } else {
+                                    0x105E000
+                                        + ((rp - 22) as usize) * 0x1000
+                                };
+                                let o7 = if rp < 22 {
+                                    pa - 0x1028000
+                                } else {
+                                    0x16000 + (pa - 0x105E000)
+                                };
                                 // SAFETY: live handle; uncommitted
                                 // pages just fail and stay zeros.
                                 let _ = unsafe {
@@ -4597,18 +4628,15 @@ pub(super) fn spawn_dialog_killer(
                             // pages) with PER-PAGE dedup: a page is
                             // recorded when its content changes (the
                             // live window = its execution moment).
-                            // 补充 108: THROTTLED to every 8th poll
-                            // (512 RPMs/poll = ~4ms = the poll-rate
-                            // collapse, 补 107's third bottleneck).
-                            if polls % 16 == 0 {
-                            // 补充 117: the zone WIDENED to 8MB
-                            // ([0x2000000,0x2800000), 2048 pages) —
-                            // the handler-block address is per-run
-                            // (the dw99-era 0x240c8000 was one
-                            // instance); every 16th poll keeps the
-                            // average cost at ~250 µs/poll.
-                            for bp in 0..2048u32 {
-                                let pa = 0x2000000
+                            // 补充 118: the emu replay (dw119) FETCHED
+                            // 0x240c8b66 — the handler block is at a
+                            // FIXED per-build address (0x240c8000, same
+                            // as the dw99 era), NOT per-run; the 8MB
+                            // /16 sweep missed it (transient window).
+                            // Narrow to [0x2408000,0x2410000) (8 pages)
+                            // at EVERY poll (~130 µs/poll).
+                            for bp in 0..8u32 {
+                                let pa = 0x2408000
                                     + (bp as usize) * 0x1000;
                                 let pi = bp as usize;
                                 let mut pg = [0u8; 0x1000];
@@ -4654,6 +4682,110 @@ pub(super) fn spawn_dialog_killer(
                                     b10_blobs.extend_from_slice(&pg);
                                 }
                             }
+                        }
+                        // 补充 118: b12 — the STREAM zone.  dw119's
+                        // stack scan: the decode machine's V decodes
+                        // to stream 0x11390C3 (inner op) inside the
+                        // outer program page 0x113Axxx — b11's single
+                        // 0x1139000 page is the inner program's FIRST
+                        // page; widen to [0x1136000,0x113B000) (5
+                        // pages), per-page dedup, same record shape.
+                        // 补充 118b: + [0x1142000,0x1148000) (6 pages)
+                        // — the FAMILY-2 op streams (the buffer
+                        // transform machine's V decodes there: b8
+                        // stack hit 0x1237FD1A -> 0x1146DCE era).
+                        if b12_blobs.len() < (32 << 20) {
+                            let t12 = (watch_t0.elapsed().as_micros()
+                                as u32)
+                                .to_le_bytes();
+                            for sbp in 0..11u32 {
+                                let spa = if sbp < 5 {
+                                    0x1136000 + (sbp as usize) * 0x1000
+                                } else {
+                                    0x1142000
+                                        + ((sbp - 5) as usize) * 0x1000
+                                };
+                                let mut spg = vec![0u8; 0x1000];
+                                let _ = unsafe {
+                                    let mut n = 0;
+                                    ReadProcessMemory(
+                                        h_process,
+                                        spa as *const core::ffi::c_void,
+                                        spg.as_mut_ptr()
+                                            as *mut core::ffi::c_void,
+                                        0x1000,
+                                        Some(&mut n),
+                                    )
+                                };
+                                let mut h13: u64 =
+                                    0xCBF1_6CE9_C7A5_5CA9;
+                                for &x in &spg {
+                                    h13 ^= x as u64;
+                                    h13 = h13.wrapping_mul(
+                                        0x0000_0100_0000_01B3,
+                                    );
+                                }
+                                if sbp as usize >= b12_pages.len() {
+                                    b12_pages.push(h13);
+                                    b12_blobs.extend_from_slice(&t12);
+                                    b12_blobs.extend_from_slice(
+                                        &(spa as u32).to_le_bytes(),
+                                    );
+                                    b12_blobs.extend_from_slice(&spg);
+                                } else if b12_pages[sbp as usize] != h13 {
+                                    b12_pages[sbp as usize] = h13;
+                                    b12_blobs.extend_from_slice(&t12);
+                                    b12_blobs.extend_from_slice(
+                                        &(spa as u32).to_le_bytes(),
+                                    );
+                                    b12_blobs.extend_from_slice(&spg);
+                                }
+                            }
+                        }
+                        // 补充 118: b14 — the V-relative data space.
+                        if b14_blobs.len() < (64 << 20) {
+                            let t14 = (watch_t0.elapsed().as_micros()
+                                as u32)
+                                .to_le_bytes();
+                            for vbp in 0..640u32 {
+                                let vpa = 0x1220_0000usize
+                                    + (vbp as usize) * 0x1000;
+                                let mut vpg = vec![0u8; 0x1000];
+                                let _ = unsafe {
+                                    let mut n = 0;
+                                    ReadProcessMemory(
+                                        h_process,
+                                        vpa as *const core::ffi::c_void,
+                                        vpg.as_mut_ptr()
+                                            as *mut core::ffi::c_void,
+                                        0x1000,
+                                        Some(&mut n),
+                                    )
+                                };
+                                let mut h14: u64 =
+                                    0xCBF1_6CE9_C7A5_5CA9;
+                                for &x in &vpg {
+                                    h14 ^= x as u64;
+                                    h14 = h14.wrapping_mul(
+                                        0x0000_0100_0000_01B3,
+                                    );
+                                }
+                                if vbp as usize >= b14_pages.len() {
+                                    b14_pages.push(h14);
+                                    b14_blobs.extend_from_slice(&t14);
+                                    b14_blobs.extend_from_slice(
+                                        &(vpa as u32).to_le_bytes(),
+                                    );
+                                    b14_blobs.extend_from_slice(&vpg);
+                                } else if b14_pages[vbp as usize] != h14
+                                {
+                                    b14_pages[vbp as usize] = h14;
+                                    b14_blobs.extend_from_slice(&t14);
+                                    b14_blobs.extend_from_slice(
+                                        &(vpa as u32).to_le_bytes(),
+                                    );
+                                    b14_blobs.extend_from_slice(&vpg);
+                                }
                             }
                         }
                         // FORGE2+SNATCH (v14): capture the VM thread's
@@ -5614,6 +5746,14 @@ pub(super) fn spawn_dialog_killer(
                                 nb.push(".b11.bin");
                                 let _ =
                                     std::fs::write(stem.with_file_name(nb), &b11_blobs);
+                                let mut nc = name.to_os_string();
+                                nc.push(".b12.bin");
+                                let _ =
+                                    std::fs::write(stem.with_file_name(nc), &b12_blobs);
+                                let mut nd = name.to_os_string();
+                                nd.push(".b14.bin");
+                                let _ =
+                                    std::fs::write(stem.with_file_name(nd), &b14_blobs);
                             }
                             dump_failfreeze_scene(pid, h_process, image_base, &out_path);
                             unsafe {
@@ -6348,6 +6488,14 @@ pub(super) fn spawn_dialog_killer(
                     nb.push(".b11.bin");
                     let _ =
                         std::fs::write(stem.with_file_name(nb), &b11_blobs);
+                    let mut nc = name.to_os_string();
+                    nc.push(".b12.bin");
+                    let _ =
+                        std::fs::write(stem.with_file_name(nc), &b12_blobs);
+                    let mut nd = name.to_os_string();
+                    nd.push(".b14.bin");
+                    let _ =
+                        std::fs::write(stem.with_file_name(nd), &b14_blobs);
                 }
                 info!(
                     polls,

@@ -5233,3 +5233,41 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   对）→ dw96 回放（区+块+流页三映射）→ lodsb×384 全流 → 三处输出
   → 112B 对位 → f 判定 → 逆程序 → **oracle 输入侧闭环**。
 - 工件：patch 117、b10 64 页写（2 活页 16 态）。
+
+**续 22 补充 118（2026-11-18，同日第一百零三轮）——协议/家族/V 空间三重突破 + 两处撤回：emu 内首次完整 VM op 执行**：
+
+- **撤回一（补充 117 的块解读）**：0x27ce000/0x27cf000 两页 = **堆页（segment heap 元数据）**
+  （8 字节槽 64 位值、`feffffffffffffff` = -2 编码头、0x280fd24 堆指针）——非 handler 块。
+- **撤回二（补充 99/101 的 fault 解读）**：dw99 时代 eip=0x240c8b66 与"流指针 = magic 区"=
+  **同一 emu 入栈伪迹**（esi = [esp+0x24]+CHECK，emu 栈零 → esi = 0xEEDC0014 = CHECK 本尊；
+  0x240c8b66 = 零流 opcode-0 派发链的确定性落点）。
+- **数字位错定案**：0x240c8b66 = 604 MB（8 位）非 37 MB——补充 100-117 历代 b10 扫区
+  [0x2000000,0x2800000) 全部扫错区；块页 poll 时刻不可读（b10 窄区 [0x2408000,0x2410000) 每
+  poll = 0 字节实锤，未提交页 RPM 静默失败）。捕获通道 = 停机窗（SuspendThread/调试事件）。
+- **CHECK 修正**：0x1028892 − 0x1226887E = **0xEEDC0014 = VM magic 本尊**（此前口算
+  0xFEDC0014 错）；edi 第一基座 = 0xEEDC0014（VM 对象指针 = magic = [edi+0x14] 存的值）。
+- **入口协议实锤**（dw118 全反汇编 + dw119 fault + dw127 尾迹）：bootstrap = pushal/pushfd/cld/
+  call $+5/pop edi/sub 0x1226887E/mov eax,edi/add 0x1226858A（edi = 0x102859E 窗口）→
+  cmp eax,[edi+2C] 自检 → 重键 add [edi+ecx*4+0x48],eax ×168（**派发索引 [19,186]**）→
+  lock cmpxchg [edi+30] → **esi = [esp+0x24]（= [E-12]）+ eax；ebx = esi（bl = 初始密钥）**
+  → lodsb/xor al,bl/sub esp,2/mov [esp],bx/jmp 0x102ff28 → 链尾 **jmp [edi+eax*4]**
+  （0x102f9b4，256 项表 @edi）。emu 入栈 = esp0 = V_addr+12（[E-12] = V = 流基址 − CHECK）。
+- **四副本**（failfreeze 签名 60 9C FC E8 扫出，全解密）：入口 0x102888A / 0x103E1E2 /
+  0x10534AB / 0x106029A；窗口 = 0x102859E / 0x103DEF6 / 0x10531BF / 0x105FFAE；
+  sub-add delta 全 = 0x2F4；CHECK 全 = 0xEEDC0014。家族 4（op 带）= 缓冲变换 era
+  [200424,214671] 的机器（b8：eip 0x106xxxx、edi = 0x105FFAE、esi = 0x1142-0x1147xxx）。
+- **V 空间**：[0x12200000,0x12480000) = **外层机器代码/数据区**——V = 伪返回地址 = 外层
+  call 位址（ret 回 V 空间继续）；全程静态（b14 一次快照零变化）。
+- **赢家回放（emu 内首次完整 VM op）**：family-1、V = 0x12379679、流 = 0x113968d、esp0 =
+  0xefee0（+真栈 b8@202344 + b14 V 空间 + failfreeze 镜像 + ba 页）→ **457 lodsb 后正常
+  终结**：解锁（mov [edx+0x30],eax=0）→ popal → popfd → ret（补 retaddr 槽后 eip =
+  0xDEAD0000 干净停机）。f 链实测：xor al,bh 变换（0x0e→0x6d→…）、bl/ah/cl 全链变异、
+  [esp] 槽存 bx（当前密钥）。~6500 insn/字节；每轮 lodsb 间 = 60-90 指令混淆链。
+- **残留缺口**：emu 数据态陈旧（failfreeze 镜像数据 ≠ 活体 era）→ 分支分歧风险；b8 栈窗
+  4KB 太窄（V 常在 esp+0x800 外）；解码机器（家族 4）V 未到手。**下一轮**：①b8 栈窗
+  上扩 [esp,esp+0x3800)；②b15 活体数据池 [0x1080000,0x1148000) 逐 poll；③家族 4 回放
+  → KP112 → f 判定 → 逆程序 → oracle 闭环。
+- 仪器：b10 窄区 8 页每 poll（替换 8MB/16）、b12 扩 11 页（+0x1142000-0x1148000）、
+  **b14 = V 空间 640 页每 poll 逐页去重**（首捕 = pre-era 态）、b8 /2。
+- 工件：dw118/118b/119/120/121/122/124/125/126/127/128/129.py、dw121_blk.pkl、
+  dw122_blkblob_0.bin、DW82a/b/c 三代 bin 存档。
