@@ -4263,9 +4263,131 @@ pub(super) fn spawn_dialog_killer(
                 // 补充 120: the buffer-hash state for the
                 // change-triggered snaps.
                 let mut b8_buf_last: u64 = 0;
+                // 补充 122: the phase-1 early-era thread handle.
+                let mut hc_early: Option<
+                    windows::Win32::Foundation::HANDLE,
+                > = None;
                 // Phase 1: find the file copy (needle scan, MEM_PRIVATE).
                 while buf_addr.is_none() && watch_t0.elapsed().as_millis() < 260 {
                     polls += 1;
+                    // 补充 122: the EARLY-era capture — the copy A write
+                    // era [0,182]ms happens BEFORE the first main-loop
+                    // poll (phase 1 = 182ms); the transform op
+                    // (.dat→copyA) lives here.  Same record shapes as
+                    // the main-loop b15/b8.
+                    {
+                        use windows::Win32::System::Diagnostics::Debug::{
+                            GetThreadContext, CONTEXT,
+                        };
+                        use windows::Win32::System::Threading::{
+                            OpenThread, THREAD_GET_CONTEXT,
+                            THREAD_QUERY_INFORMATION,
+                        };
+                        let t14 = (watch_t0.elapsed().as_micros() as u32)
+                            .to_le_bytes();
+                        // the data pool (b15 shape)
+                        for sbp2 in 0..201u32 {
+                            let spa2 = if sbp2 == 0 {
+                                0x1022000usize
+                            } else {
+                                0x1080000usize
+                                    + ((sbp2 - 1) as usize) * 0x1000
+                            };
+                            let mut spg2 = vec![0u8; 0x1000];
+                            let _ = unsafe {
+                                let mut n = 0;
+                                ReadProcessMemory(
+                                    h_process,
+                                    spa2 as *const core::ffi::c_void,
+                                    spg2.as_mut_ptr()
+                                        as *mut core::ffi::c_void,
+                                    0x1000,
+                                    Some(&mut n),
+                                )
+                            };
+                            let mut h15: u64 = 0xCBF1_6CE9_C7A5_5CA9;
+                            for &x in &spg2 {
+                                h15 ^= x as u64;
+                                h15 = h15
+                                    .wrapping_mul(0x0000_0100_0000_01B3);
+                            }
+                            if sbp2 as usize >= b15_pages.len() {
+                                b15_pages.push(h15);
+                                b15_blobs.extend_from_slice(&t14);
+                                b15_blobs.extend_from_slice(
+                                    &(spa2 as u32).to_le_bytes(),
+                                );
+                                b15_blobs.extend_from_slice(&spg2);
+                            } else if b15_pages[sbp2 as usize] != h15 {
+                                b15_pages[sbp2 as usize] = h15;
+                                b15_blobs.extend_from_slice(&t14);
+                                b15_blobs.extend_from_slice(
+                                    &(spa2 as u32).to_le_bytes(),
+                                );
+                                b15_blobs.extend_from_slice(&spg2);
+                            }
+                        }
+                        // the context + stack (b8 shape)
+                        if hc_early.is_none() {
+                            if let Ok(h) = unsafe {
+                                OpenThread(
+                                    THREAD_GET_CONTEXT
+                                        | THREAD_QUERY_INFORMATION,
+                                    false,
+                                    main_tid,
+                                )
+                            } {
+                                hc_early = Some(h);
+                            }
+                        }
+                        if let Some(he) = hc_early {
+                            let mut ctx = CONTEXT::default();
+                            ctx.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_FLAGS(0x0001_0003);
+                            if unsafe { GetThreadContext(he, &mut ctx) }
+                                .is_ok()
+                            {
+                                let t8 = (watch_t0.elapsed().as_micros()
+                                    as u32)
+                                    .to_le_bytes();
+                                b8_blobs.extend_from_slice(&t8);
+                                for v in [
+                                    ctx.Eip, ctx.Edi, ctx.Esi, ctx.Ebx,
+                                    ctx.Edx, ctx.Ecx, ctx.Eax, ctx.Ebp,
+                                    ctx.Esp, ctx.EFlags,
+                                ] {
+                                    b8_blobs.extend_from_slice(
+                                        &v.to_le_bytes(),
+                                    );
+                                }
+                                let sp = ctx.Esp as usize;
+                                let slo = (sp.saturating_sub(0x800)
+                                    & !0xFFF)
+                                    .max(0x10000);
+                                let mut stk = vec![0u8; 0x5000];
+                                for spg in 0..5u32 {
+                                    let pa = slo
+                                        + (spg as usize) * 0x1000;
+                                    let o = pa - slo;
+                                    let _ = unsafe {
+                                        let mut n = 0;
+                                        ReadProcessMemory(
+                                            h_process,
+                                            pa as *const core::ffi::c_void,
+                                            stk[o..o + 0x1000]
+                                                .as_mut_ptr()
+                                                as *mut core::ffi::c_void,
+                                            0x1000,
+                                            Some(&mut n),
+                                        )
+                                    };
+                                }
+                                b8_blobs.extend_from_slice(
+                                    &(slo as u32).to_le_bytes(),
+                                );
+                                b8_blobs.extend_from_slice(&stk);
+                            }
+                        }
+                    }
                     use windows::Win32::System::Memory::{
                         VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_PRIVATE,
                         PAGE_NOACCESS,
