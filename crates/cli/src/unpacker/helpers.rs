@@ -4954,6 +4954,94 @@ pub(super) fn spawn_dialog_killer(
                                 }
                             }
                         }
+                        // 补充 132i: KEYCOPY — continuous dynamic
+                        // copy from the decode buffer to a
+                        // buffer-relative destination.  The machine's
+                        // binding state = the buffer's live key block
+                        // (computed at runtime, OUR machine's values);
+                        // the binding check compares the struct's
+                        // [0,0xC0) (LCF-AT's values) against it.
+                        // MAGICMIDA_V2_KEYCOPY=<src>-<dst>-<len>
+                        #[cfg(target_arch = "x86")]
+                        {
+                            static KC_LIST: std::sync::OnceLock<
+                                Vec<(usize, usize, usize)>,
+                            > = std::sync::OnceLock::new();
+                            let kc_list = KC_LIST.get_or_init(|| {
+                                let mut v = Vec::new();
+                                if let Ok(kv) =
+                                    std::env::var("MAGICMIDA_V2_KEYCOPY")
+                                {
+                                    for spec in kv.split(',') {
+                                        let parts: Vec<&str> =
+                                            spec.split('-').collect();
+                                        if parts.len() != 3 {
+                                            continue;
+                                        }
+                                        let src = usize::from_str_radix(
+                                            parts[0].trim_start_matches("0x"),
+                                            16,
+                                        )
+                                        .unwrap_or(0);
+                                        let dst = usize::from_str_radix(
+                                            parts[1].trim_start_matches("0x"),
+                                            16,
+                                        )
+                                        .unwrap_or(0);
+                                        let len = usize::from_str_radix(
+                                            parts[2].trim_start_matches("0x"),
+                                            16,
+                                        )
+                                        .unwrap_or(0);
+                                        if src != 0 && dst != 0 && len > 0 && len <= 0x100 {
+                                            v.push((src, dst, len));
+                                        }
+                                    }
+                                }
+                                v
+                            });
+                            if let Some(ba) = buf_addr {
+                                for (src, dst, len) in kc_list.iter() {
+                                    let mut cur = vec![0u8; *len];
+                                    let mut newv = vec![0u8; *len];
+                                    let ok_s = unsafe {
+                                        let mut n = 0;
+                                        ReadProcessMemory(
+                                            h_process,
+                                            (ba + src) as *const core::ffi::c_void,
+                                            newv.as_mut_ptr() as *mut core::ffi::c_void,
+                                            *len,
+                                            Some(&mut n),
+                                        )
+                                        .is_ok()
+                                            && n == *len
+                                    };
+                                    let ok_d = unsafe {
+                                        let mut n = 0;
+                                        ReadProcessMemory(
+                                            h_process,
+                                            (ba + dst) as *const core::ffi::c_void,
+                                            cur.as_mut_ptr() as *mut core::ffi::c_void,
+                                            *len,
+                                            Some(&mut n),
+                                        )
+                                        .is_ok()
+                                            && n == *len
+                                    };
+                                    if ok_s && ok_d && cur[..] != newv[..] {
+                                        let _ = unsafe {
+                                            WriteProcessMemory(
+                                                h_process,
+                                                (ba + dst) as *const core::ffi::c_void,
+                                                newv.as_ptr() as *const core::ffi::c_void,
+                                                *len,
+                                                None,
+                                            )
+                                        };
+                                    }
+                                }
+                            }
+                        }
                         // 补充 132e: NOPPATH — skip the search-era
                         // fault loop.  The thread sits at 0x102786F
                         // (add [eax],al x4, eax=54831A79 garbage) from

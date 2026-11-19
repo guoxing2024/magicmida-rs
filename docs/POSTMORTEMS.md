@@ -5800,3 +5800,23 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   KEYBUF（ba+0x10000 相对 = struct 直打）、EIPHIST（窗口可调）、fpfind
   （全内存扫描）。
 - 工件：dw132_runU15/U16/U16b/U16c.log、kp_u15.txt（48 spec）。
+
+**续 22 补充 132i（2026-11-20）——KEYCOPY 仪器 + 绑定检查再排除两项**：
+
+- **KEYCOPY**（MAGICMIDA_V2_KEYCOPY=src-dst-len，均 ba 相对）：µs 循环内
+  **动态值连续复制**（RPM src → 比较 dst → WPM）——机器绑定态 = buffer 键块
+  （壳运行时算好 = 本机值），静态 payload（KEYPATCH）无法表达动态复制。
+  机制落地（U17 实测执行）。
+- **U17**：KEYCOPY 0-10000-34（buffer [0,52) 13-dword 本机键 → struct
+  [0x10000,+0x34)）+ U11 buffer patch → 对话框文案零变化 → **校验 ≠ struct
+  前 13 dword vs buffer 键块比较**。
+- **fp 原版已灭**：全内存扫描（corrupted dialog 活体）——原版
+  5E66-5E6D 零副本；3 副本（0x582740 堆/0x102135e/0x10228ba image）全部 =
+  重组后本机 fp；buffer/struct 区零 ASCII → **fp 重组 = 原地覆盖，fp =
+  确定性不是门**。
+- **下一步（精确）**：corruption 检查 op 定位 = 消息写入点（0x102133e/
+  0x102289a）的写入者追踪——①EIPHIST 全线程轮询（校验可能非主线程或
+  采样间隙错过）；②DR3 写监视（0x102133e，post-attach 无调试端口 = 异常
+  落壳 SEH 链——需验证壳是否透明转发）；③消息模板静态引用交叉
+  （closehandle 图扫模板地址 → push imm32 引用 = 校验调用点静态定位）。
+- 工件：dw132_runU17.log、patch_keycopy.py。
