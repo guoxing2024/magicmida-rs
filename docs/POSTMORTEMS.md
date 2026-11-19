@@ -5471,3 +5471,13 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   比对侧完成）。
 - 工件：dw157-189 脚本+pkl、dw170.pkl（19 字段写表）、dw183（verifier 反汇编）、
   dw187（时代快照盘点）。
+
+**续 22 补充 127 补遗（同轮，vmhash 可逆性 + 前向计算器定案）**：
+
+- **vmhash 逐步长双射实证**（dw190）：core_step 对固定字节在 4096 随机态上
+  单射 ✓（(cl,ch,dl,dh) → 全活 4 字节态；dh 末值 = bx 高字节 XOR，非恒 0）。
+  **前向计算器与 vmhash_full 3/3 一致**（CISC-1/LCF-AT/serial）——forge 的
+  比对侧完成：`expected = vmhash_forward(new_field)`，后向求解器 = 从终态
+  逐字节反推（双射保证可行）。
+- 阻断不变：expected 常数的来源（blob 编码 / caller 派生）= verifier caller
+  框架态 = 需活体 era snap（Device Guard 限制）。
