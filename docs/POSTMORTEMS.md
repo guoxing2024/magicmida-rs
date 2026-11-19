@@ -5436,3 +5436,38 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   （GF(2) 线性，可解字段）③字段 patch + KP 一致性 ④真跑验证 = forge 闭环。
 - 工件：dw139-156 脚本+pkl（dw147 读值修复版、dw153 边界对账、dw154 组隔离、
   dw155/156 计数器曲线）、dw139_window.pkl（441 值窗）、check_states.json。
+
+**续 22 补充 127（2026-11-19，第一百一十一轮）——verifier op 全反汇编 + 19 字段槽定案 + 阻断确认**：
+
+- **verifier op = 镜像常驻 0x102400D，全反汇编（dw183）**：esi 走 4 字节步表
+  （lodsd）→ eax = entry + [esp+0x28]（caller 帧常数）= 字段串指针；首字节
+  预检（[ebp+0x12262d31] 开关）→ scasb 取长 → **vmhash 核心 = OUT/vmhash.py
+  逐指令同**（0x5041/0x5449 常数确认）→ `cmp edx, eax`（edx = caller 传入的
+  expected）。miss 路径 `pop esi; add esi,4`。**blob ≠ 直接指针表**（entry+K
+  无重复 K）、**≠ 单 XOR/ADD 掩码**（dw167/补127 掩码测试 max 3/5 命中）。
+- **19 字段槽定案（dw170）**：t=257544 op（1.87M 步，干净终结）写 **恰好 19
+  个槽**（0x1020139…0x113f32e）× 7 次 = 补16 的 19 LICPATCH 字段实锤；14 槽
+  恒定值 + 5 槽演化（0x102118d/0x1021d35 = 0xd41b27 递减计数器、0x102082d/
+  0x1021601/0x113f32a-e = per-run 键）。**field-op oracle = 0.8-1.0s/查询**
+  （dw171，vs era1 90s）；输入 = **0x1147xxx 流**（15303 读，非 copyA！
+  dw172-173：流 patch → 字段变 ✓，copyA patch → 零变化）。
+- **check-era（[196,220]ms）7 snap 全 derail**（dw178-181）：检 op =
+  interpreter-4 族（edi=0x105FFAE 全同）；derail = **缺 0x293e-f 时代态**
+  （VM 栈 = 机器状态载体，b15 时代才有捕获）。t=214162 跑 6470 lodsb 后
+  fetch-fault，ba 读 = 0（检 op 的 .dat 输入路径未达）。
+- **phase-1（[0,182]ms）snap 状态缺口实锤（dw187-189）**：DW82 时代 b8 最早
+  t=103372（转换 op era 内）但 **0x293e-f 完全未捕获**（该仪器 b15 时代才
+  有）→ phase-1 resume 全在 VM 栈 deref 处 derail（t=112014：region 机器
+  入口 0x102b9d1、首 op 写 0x1 = 空栈）。**.dat→copyA/PT 转换 op = 永未
+  捕获 = .dat 逆的硬阻断**。解除条件 = Device Guard 放行 + b8 加 0x293e-f
+  dump 重跑（仪器改动 ~20 行现成）。
+- **离线替代路径否定**：盘上 exe @copyA RVA = 未解密态（18/4096 同）；
+  .dat→win 直接/位置/单键 XOR 全噪（dw185）；vmhash 链对 check 事件 0 命中
+  （dw174-177，init 全排列）。
+- **下一增量（二选一）**：①Device Guard 解除 → 20 行仪器扩展（b8 加
+  0x293e-f dump）→ 重跑 → phase-1 转换 op 续跑 → .dat 逆 → forge 闭环；
+  ②blob 编码逆向（需 verifier caller 框架态 = era snap，同样等活体）。
+  离线可做：vmhash 仿射性证明 + 字段→expected 的前向计算器（forge 的
+  比对侧完成）。
+- 工件：dw157-189 脚本+pkl、dw170.pkl（19 字段写表）、dw183（verifier 反汇编）、
+  dw187（时代快照盘点）。
