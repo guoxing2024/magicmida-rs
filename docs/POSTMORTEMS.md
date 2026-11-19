@@ -5890,3 +5890,14 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
 - 下一增量：①JIT 区全量 dump + 反汇编（校验式重建）②JIT 函数的输入
   = [ecx] 结构 = 字段表定位 ③差分：改 buffer 输入 → JIT 行为对比。
 - 工件：dw132_runU20.log（活体指针读）。
+
+**续 22 补充 132n（2026-11-20）——JIT = 惰性填充定案（trap 时指针已置、代码未写）**：
+
+- **MSGTRAP 扩展 JIT 捕获**（struct+0x78 → dump ±0x1200 → msgtrap_jit.bin）
+  实测：trap @251ms 时 **ptr = 0x75f4206（与 U20 同址 = per-boot 确定性堆分配）
+  但代码区全零** = **JIT = 惰性填充**（指针预置、代码首次调用时写）。
+- U20 的 13s 活体读 = 代码完整 ✓（132m 的反汇编 = 有效）。**JIT dump 的
+  正确姿势 = dialog 后活体读**（fpfind.py 模式），非 trap 瞬间。
+- msgtrap_jit.bin（9216B 零态）= 惰性填充的证据工件。
+- 下一增量 = 不变：dialog 态活体读 JIT 区（0x75f4206±0x1200）→ 全量
+  反汇编重建校验式 → [ecx] 字段表 → buffer 差分 → 本机绑定值。

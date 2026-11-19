@@ -5430,6 +5430,51 @@ pub(super) fn spawn_dialog_killer(
                                             );
                                         }
                                     }
+                                    // 补充 132n: the JIT field-check fn
+                                    // (struct+0x78 pointer, called 19x
+                                    // right before the message) — dump
+                                    // it NOW (per-run heap, gone later).
+                                    let mut jraw = vec![0u8; 4];
+                                    let mut n5 = 0;
+                                    unsafe {
+                                        let _ = ReadProcessMemory(
+                                            hp,
+                                            (ba + 0x10078) as *const core::ffi::c_void,
+                                            jraw.as_mut_ptr() as *mut core::ffi::c_void,
+                                            4,
+                                            Some(&mut n5),
+                                        );
+                                    }
+                                    let jptr = u32::from_le_bytes(
+                                        jraw[..4].try_into().unwrap_or([0; 4]),
+                                    ) as usize;
+                                    if 0x1000000 < jptr && jptr < 0x7FFD0000 {
+                                        let mut jreg = vec![0u8; 0x2400];
+                                        let mut n6 = 0;
+                                        unsafe {
+                                            let _ = ReadProcessMemory(
+                                                hp,
+                                                (jptr - 0x1200) as *const core::ffi::c_void,
+                                                jreg.as_mut_ptr() as *mut core::ffi::c_void,
+                                                0x2400,
+                                                Some(&mut n6),
+                                            );
+                                        }
+                                        let stemj =
+                                            out2.with_extension("msgtrap_jit");
+                                        if let Some(name) = stemj.file_name() {
+                                            let mut nm = name.to_os_string();
+                                            nm.push(".bin");
+                                            let _ = std::fs::write(
+                                                stemj.with_file_name(nm),
+                                                &jreg,
+                                            );
+                                        }
+                                        info!(
+                                            jit = format!("{jptr:#x}"),
+                                            "MSGTRAP: JIT region captured"
+                                        );
+                                    }
                                     let stem2 = out2.with_extension("msgtrap_ops");
                                     if let Some(name) = stem2.file_name() {
                                         let mut nm = name.to_os_string();
