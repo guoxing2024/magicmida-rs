@@ -5920,3 +5920,14 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   （buffer patch = U11 已做 → 流程推进 ✓）→ 对话框 = 下一道门（绑定
   校验 = fp/绑定字段）。
 - 工件：jit_full.bin（8KB 活体 dump）、dw132_runU23.log。
+
+**续 22 补充 132p（2026-11-20）——JIT = 每 run 不同函数定案 + MSGTRAP 冻结窗口验证**：
+
+- **JIT-only trap（U26）**：MSGTRAP 改为只轮询 JIT 区非零（惰性填充 = 首次调用
+  瞬间）→ trap @311ms，38 线程冻结，进程保持挂起态（活体分析窗口！）。
+- **同 VA 不同码定案**：0x75f4206 = 堆复用 VA——U23 run = 链表扫描 fn、
+  U26 run = min-max fn（编译器风格）→ **struct+0x78 指针 = 每 call 重写 =
+  19 次 call = 19 个不同 JIT 函数**（非同一函数 ×19）。
+- **MSGTRAP 冻结窗口验证**：挂起态进程 = 活体分析窗口（JIT 已填充可 dump、
+  全内存可 RPM）——解析/差分实验可在冻结进程上无限期进行。
+- 工件：CISC-1U.msgtrap.bin（38 线程）、jit_live.bin。
