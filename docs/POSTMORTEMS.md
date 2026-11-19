@@ -6131,3 +6131,15 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
 - **下一增量**：payload 二分（半区 keys/半区 markers）× log2(83)≈7 runs →
   源偏移 → 外科 patch → CALC 通过 → 部署启动。
 - 工件：dw132_runU42a/b.log。
+
+**续 22 补充 132ac（2026-11-20）——0x1020095 差分反转：+8 = per-run 随机值**：
+
+- **二分驱动实测（8 runs 同 payload split=266）**：0x1020095+8 =
+  0xf1167700/0x6b9b4700/0xc4f98c00/0xef9d7800/0x87de4700/0xe273d100/
+  0x49fbd000/0x44720200 = **每次都不同**（低字节恒 00）→ **+8 = per-run
+  随机值**（堆态/ASLR 类）→ **132ab 的「差分阳性」反转**（U42a/b 两 run
+  差异 = run 方差非 payload 效应）。
+- **fp-middle 源 = 仍未定位**；0x1020095+8 = 无差分价值。**校验逻辑 =
+  全可读但比较输入源 = 需运行时 trace**（check-op 阶段的寄存器级观测 =
+  MSGTRAP 冻结态寄存器 + ops 反汇编深读）。
+- 工件：dw132_bisect_0-7.log。
