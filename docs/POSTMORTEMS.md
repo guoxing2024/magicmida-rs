@@ -5681,24 +5681,24 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
 **续 22 补充 132c（2026-11-20）——部署键派生输入源判定：license struct 全排除（8 组 patch 实验）**：
 
 - **新仪器**（helpers.rs，全部 x86 门控、双架构零告警）：
-  - **KEYPATCH**（）：µs 循环
+  - **KEYPATCH**（`MAGICMIDA_V2_KEYPATCH=<hexaddr>-<hexbytes>,...`）：µs 循环
     内连续重写——slot 内容 ≠ payload 即 WPM。形状 = KEYFORGE 时代实证的
     「连续补丁 = 唯一有效形状」。实测：一次 FIELDPATCH @184ms 被 field-op
     （257ms 起 7 写/槽）覆盖（run T1 槽值回退），KEYPATCH 全存活（T2/T6
     crash 时刻槽值 = payload ✓）。
-  - **KEYBUF**（）：同机制但地址 =
+  - **KEYBUF**（`MAGICMIDA_V2_KEYBUF=<off>-<bytes>,...`）：同机制但地址 =
     DECODEWATCH buf_addr 相对偏移（µs 循环内 ba 在作用域）；marker 位
     0x80000000 区分绝对/相对。
-  - **PASSPATH**（）：[320,420]ms pattern-scan
-    verifier 页（VERIFIERBYPASS 同款）patch （mov eax,
+  - **PASSPATH**（`MAGICMIDA_V2_PASSPATH=1`）：[320,420]ms pattern-scan
+    verifier 页（VERIFIERBYPASS 同款）patch `8b 85 e9 01 26 12`（mov eax,
     [miss 0x10201FD]，折叠 disp = magic EEDC0014 相对 = per-build 常数）
-    →  + （jne）→ 6×nop。实测 hits=2（读+jne
+    → `b8 00 00 00 00 90` + `0f 85 06 00 00 00`（jne）→ 6×nop。实测 hits=2（读+jne
     都命中 = 崩溃页解码正确）。
 - **crash 页精读（WER dump Memory64 活体字节 + VA 标注）**：Eip=0x102786F
-  =  = **add [eax],al**（Eax=54831A79 = 写目标 ✓）。je 目标 =
+  = `00 00` = **add [eax],al**（Eax=54831A79 = 写目标 ✓）。je 目标 =
   0x102409C（= UE filter 消息里的地址 = **verifier 匹配路径**）；循环尾
-   折叠 = **0x10201FD miss 计数器**（补 16 的
-  0x201FD ✓）；pass path 读 miss 计数器后  分支。
+  `inc [ebp+0x122601E9]` 折叠 = **0x10201FD miss 计数器**（补 16 的
+  0x201FD ✓）；pass path 读 miss 计数器后 `jne` 分支。
 - **app 永未解密实锤**：crash 时刻 image 的 281 条新增 ASCII 串全部 =
   壳引擎自体（Software\WinLicense、WLProjectName、驱动路径
   oreans32.sys、/getwlstatus 等、WLProtectionDateTime=2009-3-14 = per-build）；
