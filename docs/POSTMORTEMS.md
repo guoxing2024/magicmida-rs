@@ -5562,3 +5562,26 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   重加密 = forge 的最后两块。
 - 工件：dw193/194/195、dw130_run1.log（15 CHECKWATCH snaps）、
   CISC-1U.v2decodewatch.b8.bin（fresh 49 snaps）。
+
+**续 22 补充 131（2026-11-19，第一百一十五轮）——VERIFIERBYPASS 落地 + 裁决通过（shell 进 app 阶段）**：
+
+- **VERIFIERBYPASS 仪器落地**（`MAGICMIDA_V2_VERIFIERBYPASS=1`）：[320,420]ms
+  窗口 pattern-scan 活体 verifier 页（image+0x24000 起，0x800B）找
+  **`cmp edx,eax; je rel8`（3B D0 74 xx）** → WPM `je→jmp`（2 字节）。
+  活体布局 = 冻结布局相同（je @0x102408d = 74 0f ✓；首次窗口错写
+  0x4000/0x40000 已修 = RVA 0x24000）。
+- **实测（dw131_run7）**：patch 命中 @0x102408b；**shell 行为剧变**：
+  - pristine = **0.5s exit 44**（fail bail 立即触发）
+  - bypass = **4.4s 运行 + 新模块加载**（0x73110000 等 DLL 在 ~4s 现身 =
+    **app 阶段启动**）→ 最终 0xC0000005（app 阶段下游崩溃，非许可门）
+  - FAILFREEZE/SFREZE = 全程未触发（fail 路径未走）
+- **结论：许可字段检查 = 通过**（vmhash(field)==expected 全部短路）——
+  **V2 锻造的许可门 = 攻破**。crash = app 阶段下游（.dat 擦除竞速 / 反
+  篡改 / demo app 自身），下一增量定位。
+- **forge 语义重定义（补 131 定案）**：per-run 加密的 verifier op 使静态
+  补丁不可行 → 运行时窗口 pattern-scan + 2 字节 patch = 可靠（布局 =
+  per-build 确定性，多次运行实测稳定）。字段 patch（补 129 双命中）+
+  verifier bypass（本轮）= 组合拳已齐。
+- 过程缺陷：扫描窗口 RVA 错写 0x4000（正确 = 0x24000）一轮；b0=0x7c 误判
+  = 活体页与冻结页同布局但初读时机错（300ms 太早，op 未解密）。
+- 工件：dw131_run1-7.log。

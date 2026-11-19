@@ -4675,6 +4675,76 @@ pub(super) fn spawn_dialog_killer(
                                 }
                             }
                         }
+                        // 补充 131: the VERIFIER bypass —
+                        // MAGICMIDA_V2_VERIFIERBYPASS=1: in [320,420]ms,
+                        // pattern-scan the live verifier page for
+                        // 'cmp edx,eax; je rel8' (3B D0 74 xx) — the op
+                        // bytes = per-run decoded — and patch je→jmp =
+                        // every vmhash(field) check passes.
+                        #[cfg(target_arch = "x86")]
+                        {
+                            static VB_ARMED: std::sync::atomic::AtomicUsize =
+                                std::sync::atomic::AtomicUsize::new(0);
+                            if std::env::var("MAGICMIDA_V2_VERIFIERBYPASS")
+                                .is_ok()
+                                && VB_ARMED.load(
+                                    std::sync::atomic::Ordering::Relaxed,
+                                ) == 0
+                                && watch_t0.elapsed().as_millis() >= 320
+                                && watch_t0.elapsed().as_millis() <= 420
+                            {
+                                let mut page = vec![0u8; 0x800];
+                                let ok_r = unsafe {
+                                    let mut n = 0;
+                                    ReadProcessMemory(
+                                        h_process,
+                                        (image_base + 0x24000)
+                                            as *const core::ffi::c_void,
+                                        page.as_mut_ptr()
+                                            as *mut core::ffi::c_void,
+                                        0x800,
+                                        Some(&mut n),
+                                    )
+                                    .is_ok()
+                                        && n == 0x800
+                                };
+                                let mut hit: Option<usize> = None;
+                                if ok_r {
+                                    for j in 0..0x7FD {
+                                        if page[j] == 0x3B
+                                            && page[j + 1] == 0xD0
+                                            && page[j + 2] == 0x74
+                                        {
+                                            hit = Some(j);
+                                            break;
+                                        }
+                                    }
+                                }
+                                if let Some(j) = hit {
+                                    let va = image_base + 0x24000 + j;
+                                    let patch = [0xEBu8, page[j + 3]];
+                                    let _ = unsafe {
+                                        WriteProcessMemory(
+                                            h_process,
+                                            va as *const core::ffi::c_void,
+                                            patch.as_ptr()
+                                                as *const core::ffi::c_void,
+                                            2,
+                                            None,
+                                        )
+                                    };
+                                    VB_ARMED.store(
+                                        1,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                    info!(
+                                        va = format!("{va:#x}"),
+                                        old = %format!("{:02x} {:02x}", page[j+2], page[j+3]),
+                                        "VERIFIERBYPASS applied — je→jmp"
+                                    );
+                                }
+                            }
+                        }
                         // 补充 129: the FIELDPATCH injector —
                         // MAGICMIDA_V2_FIELDPATCH=<hexaddr>-<hexbytes>:
                         // poll the page; at first nonzero content (the
