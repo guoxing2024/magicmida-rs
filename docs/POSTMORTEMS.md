@@ -6007,3 +6007,21 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   对话框 = 阵列命中后的下一道门 = fp/绑定校验 = 定位其检查点（消息
   写入点 0x102133e 的写入者 = msgtrap_ops 阶段反汇编）。
 - 工件：dw132_runU33.log、fpfind.py（相邻对扫描扩展）。
+
+**续 22 补充 132u（2026-11-20）——check-op 折叠引用全图（76 目标）+ 节点构建时代定位**：
+
+- **check-op 折叠引用全图**（12 阶段 × 0x400B 全量反汇编，magic+disp 收集）：
+  **128 distinct targets，76 落 image 许可区**——struct 头区（+0x44/+0x78
+  call/+0xa4/+0xe8...）到 +0x1850 全覆盖 = **校验 op 的 struct 访问完整
+  引用地图**（每次 1 ref = 单字段单访问；0x102044d = add/sub 对 = 校正；
+  0x1020561 = inc ×3 = 计数器）。
+- **阵列（0xb80052 堆）= 折叠图无引用**（堆 = 动态基址寄存器访问，非
+  magic 折叠）→ **节点构建 op = 更早时代**（解码 era [189,220]ms，节点
+  随解码成形）= MSGTRAP（250ms）之前 → **DISPATCH-SNATCH @ 解码 era**
+  （补 85 现成工具）= 节点构建捕获路径。
+- **校验逻辑状态**：搜索 = 已解码（132o 链表扫描）；check-op 引用图 =
+  已建（132u）；剩余 = ①节点构建时代捕获（DISPATCH-SNATCH）②CALC
+  对话框检查点 = 0x102133e 写入者 = check-op 阶段中（76 引用图的
+  0x102132d struct+0x11f4 mov = 消息区写入候选！struct+0x11f4 =
+  0x102132d = **corruption 消息写入点 = check-op 内实锤**）。
+- 工件：msgtrap_ops.bin + 折叠图脚本。
