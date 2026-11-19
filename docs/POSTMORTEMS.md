@@ -6106,3 +6106,17 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
 - 下一增量：0x10a1ffd/0x10a3882 两 stage 反汇编 = fp-middle 读取源 =
   外科 patch 偏移 → CALC 通过。
 - 工件：msgtrap_ops.bin + 本解码。
+
+**续 22 补充 132aa（2026-11-20）——check stage 全解码：0x1020095 读 = fp-middle 候选**：
+
+- **stage @0x10a1efd 全解码**（magic 折叠全标注）：
+  - **mov esi, [ebp+0x12260081] → 0x1020095（struct+0xF4C）= 许可字段
+    读取 = fp-middle 源候选**
+  - lea ebx, [→0x1099faf]（ops 区）；add [0x1021305], edi（消息写 ✓）；
+    call [0x1020449]（thunk ✓）；mov [0x10234fd], ecx（数据区写）
+  - stage @0x109EAB4（前轮）= miss 写 + 常数 0x1FF94595 + cmp vs 2000
+- **校验逻辑 = 全可读**：比较（vs 2000）+ 字段读（0x1020095）+ 常数 +
+  消息组装 = 完整链条。
+- **下一会话**：0x1020095 差分（改 buffer 输入 → 0x1020095 值变化？）=
+  fp-middle 源确认 → 外科 patch → CALC 通过 → 部署启动 = forge 全闭环。
+- 工件：msgtrap_ops.bin + 本解码。
