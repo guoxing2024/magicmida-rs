@@ -972,6 +972,50 @@ pub(super) fn spawn_dialog_killer(
                             && n == 8
                     };
                     if ok {
+                        // 补充 132y2: the execution counter (@magic+0x12262D29
+                        // = 0x1022d3d) is loaded by the decode and checked
+                        // vs 2000 at ~250ms — reset it to 0 the moment it
+                        // first appears (BEFORE the check) = the license
+                        // fresh.  Keep resetting (the decode may reload).
+                        {
+                            let caddr = (0xEEDC0014usize
+                                .wrapping_add(0x12262D29))
+                                & 0xFFFFFFFF;
+                            let mut cb2 = [0u8; 4];
+                            let mut n2 = 0;
+                            let okc = unsafe {
+                                ReadProcessMemory(
+                                    hp,
+                                    caddr as *const core::ffi::c_void,
+                                    cb2.as_mut_ptr() as *mut core::ffi::c_void,
+                                    4,
+                                    Some(&mut n2),
+                                )
+                                .is_ok()
+                                    && n2 == 4
+                            };
+                            if okc {
+                                let cv = u32::from_le_bytes(cb2);
+                                if cv != 0 && cv <= 0x7D1 {
+                                    let zero = [0u8; 4];
+                                    let mut w5 = 0;
+                                    unsafe {
+                                        let _ = WriteProcessMemory(
+                                            hp,
+                                            caddr as *const core::ffi::c_void,
+                                            zero.as_ptr() as *const core::ffi::c_void,
+                                            4,
+                                            Some(&mut w5),
+                                        );
+                                    }
+                                    info!(
+                                        t_ms = (t0b.elapsed().as_millis() as u32),
+                                        old = format!("{cv:#x}"),
+                                        "BLKSTREAM-EARLY: exec counter zeroed pre-check"
+                                    );
+                                }
+                            }
+                        }
                         let ca = u32::from_le_bytes(cb8[0..4].try_into().unwrap());
                         let cb = u32::from_le_bytes(cb8[4..8].try_into().unwrap());
                         if (ca, cb) != last {
@@ -5658,6 +5702,49 @@ pub(super) fn spawn_dialog_killer(
                                         info!(
                                             jit = format!("{jptr:#x}"),
                                             "MSGTRAP: JIT region captured"
+                                        );
+                                    }
+                                    // 补充 132y2: the check = the counter
+                                    // comparison (cmp [X], 0x7d0 — the
+                                    // measured operand = 0x7D1 = just past
+                                    // 2000 = the execution-count limit!).
+                                    // Reset the counter to 0 = the license
+                                    // fresh = the check passes.
+                                    {
+                                        let caddr = (0xEEDC0014usize
+                                            .wrapping_add(0x12262D29))
+                                            & 0xFFFFFFFF;
+                                        let zero = [0u8; 4];
+                                        let mut w3 = 0;
+                                        unsafe {
+                                            let _ = WriteProcessMemory(
+                                                hp,
+                                                caddr as *const core::ffi::c_void,
+                                                zero.as_ptr() as *const core::ffi::c_void,
+                                                4,
+                                                Some(&mut w3),
+                                            );
+                                        }
+                                        // also the constant slot = re-stamp
+                                        // (the check re-validates)
+                                        let caddr2 = (0xEEDC0014usize
+                                            .wrapping_add(0x12262561))
+                                            & 0xFFFFFFFF;
+                                        let stamp =
+                                            0x1FF94595u32.to_le_bytes();
+                                        let mut w4 = 0;
+                                        unsafe {
+                                            let _ = WriteProcessMemory(
+                                                hp,
+                                                caddr2 as *const core::ffi::c_void,
+                                                stamp.as_ptr() as *const core::ffi::c_void,
+                                                4,
+                                                Some(&mut w4),
+                                            );
+                                        }
+                                        info!(
+                                            caddr = format!("{caddr:#x}"),
+                                            "MSGTRAP: execution counter reset to 0"
                                         );
                                     }
                                     let stem2 = out2.with_extension("msgtrap_ops");
