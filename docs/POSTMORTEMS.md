@@ -5774,3 +5774,29 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
 - 工件：dw132_runU1-U14.log、CISC-1U.eiphist.bin（12k 样本站点图）、
   fpfind.py、patch_noppath.py/patch_valloc.py/patch_eiphist*.py、
   kp_blob_u1/u10/kp_buf_u11/u14/kp_fp_u12.txt。
+
+**续 22 补充 132h（2026-11-20）——搜索已被 buffer patch 解决 + 绑定数据 = struct [0,0xC0) 定位**：
+
+- **搜索命中实锤（U13/U15/U16c b8）**：buffer 许可区 patch（KEYBUF [52,480) 本机键）
+  后 **fault 站点零采样**——搜索完整走完（blob = 从 buffer 重建 → 本机键被编码进
+  语料 → 扫描命中）→ 流程推进到 CALC 绑定校验。**搜索命中问题 = buffer patch
+  解决**（KEYFORGE 时代 pos300 单点 = 不够；[52,480) 全区 = 够）。
+- **struct 页活体读（U16c dialog 态，ba=0xc70000）**：**[0x00,0xC0) = 192B 许可
+  二进制字段**（高熵 = 绑定数据）；**[0xC0,0x1E0+) = U15 markers 全存活**
+  （0xE2000001.. 逐 dword，KEYPATCH 穿透 dialog 态 ✓）。struct = ba+0x10000
+  （补 84 布局 ✓）。
+- **绑定校验定位**：corruption 消息两副本 @0x102133e/0x102289a（均 image，
+  prot=0x40）——0x102133e = struct 头相邻区 = 校验在 struct-adjacent ops；
+  0x10228ba 区域后期被消息覆写（U12 的 fp patch 254D-9F3C 在 crash dump
+  的消息区可见 = patch 存活但无效 = 校验读 buffer 副本）。
+- **U15/U16 实验组**：struct 二进制区 47 dword markers + buffer keys 同打 →
+  对话框文案零变化 = 绑定校验不读 [0xBF,0x17D) 或全字段 all-or-nothing；
+  EIPHIST [190,700]ms 38k 样本 = dialog 流零 fault 站点 ✓（搜索命中复证），
+  但校验站点未捕获（校验 = 主线程解释器站，与 blob 走读站同族混叠；或
+  别的线程）。
+- **剩余边界（精确化）**：绑定校验 = struct [0,0xC0) 48 dword（LCF-AT 机器
+  绑定值）vs 本机计算态。已知本机值 4 dword（键 2 + fp 中段 2），其余
+  ~44 dword = 需逆壳的本机绑定计算（= blob 构建算法的镜像）。仪器就绪：
+  KEYBUF（ba+0x10000 相对 = struct 直打）、EIPHIST（窗口可调）、fpfind
+  （全内存扫描）。
+- 工件：dw132_runU15/U16/U16b/U16c.log、kp_u15.txt（48 spec）。

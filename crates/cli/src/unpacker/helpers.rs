@@ -5105,13 +5105,13 @@ pub(super) fn spawn_dialog_killer(
                                         let hc = windows::Win32::Foundation::HANDLE(
                                             hraw as *mut core::ffi::c_void,
                                         );
-                                        while t0e.elapsed().as_millis() < 320 {
+                                        while t0e.elapsed().as_millis() < 190 {
                                             std::thread::sleep(
                                                 std::time::Duration::from_millis(2),
                                             );
                                         }
                                         let mut recs: Vec<[u32; 11]> = Vec::new();
-                                        while t0e.elapsed().as_millis() <= 500
+                                        while t0e.elapsed().as_millis() <= 700
                                             && recs.len() < 50000
                                         {
                                             let mut ctx = CONTEXT::default();
