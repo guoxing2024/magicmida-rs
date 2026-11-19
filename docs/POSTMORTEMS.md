@@ -5730,3 +5730,47 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   23912/29788/27080.dmp）、patch_keypatch.py/patch_keybuf.py/
   patch_passpath.py、dw170.pkl（19 槽全表：13 恒定 + 6 演化含
   0x102118d/0x1021d35 计数器）。
+
+**续 22 补充 132d-g（2026-11-20）——搜索 = blob 字节走读 + U11 解锁：buffer 许可区 patch = 崩溃变 CALC 对话框**：
+
+- **搜索时代重构（b8 CHECKWATCH + EIPHIST 采样线程实锤）**：线程自
+  t=332ms 起反复停在 **0x102786F 同一 fault 指令**（同寄存器，eax=54831A79）
+  直至 489ms+ —— **4-9s 的「app 阶段」 = 389 次 fault 重试的墙钟成本**
+  （miss 计数 = 重试计数！）。NOPPATH（NOP 掉 4x add [eax],al）→ 推进到
+  0x1027880（call [0x1020A41]）再次冻结 = 逐站重试链。
+- **EIPHIST 采样线程**（MAGICMIDA_V2_EIPHIST=1，0.5ms 级独立线程
+  [320,500]ms，12k 样本 514 站点）：**搜索 = 解释器逐字节走读 blob**
+  （esi = 0x10DC756 → 0x10DCC59 = image+0xDC000 blob 区 ✓，[322,331]ms），
+  走完后进 fault 循环（79.6% 样本）。「3x207 元素扫描」模型废弃 =
+  搜索卡死在首 fault 重试。
+- **blob 结构性（U9/U10）**：blob 全 0x41 → **零走读**（立即 abort）=
+  blob 有结构头（[0x10DC000,0x10DC756) 区段校验）；blob = **运行时填充**
+  （closehandle 图该区全零）= f(license, machine) 混合体的编码语料。
+- **U1 blob dword marker（1024/1024 存活）**：eax 不变 → fault 不依赖
+  blob 内容 = 键态依赖。
+- **VALLOC（U3/U3b）**：0x54831A79 = 合法 user 区地址 = **页面未映射**
+  （非野指针）；VirtualAllocEx 0x54830000+0x20000 覆盖 → 流程不变 =
+  搜索不是等映射。
+- **U11 解锁（本轮头条）**：KEYBUF buffer [52,480) = 本机键字节 →
+  **流程越过 fault 循环直达 CALC 对话框**（win32u syscall 挂起 =
+  对话框等待；不再 0xC0000005！）。对话框（隐藏桌面 MagicmidaV2Desktop
+  枚举可读）：**Your license key is corrupted. 1051-BCEC-14F2-0C18-
+  3745-254D-9F3C-2536** + 确定。OK → exit 2（结构化 fail）。
+- **fp 三副本全 = 本机指纹**（fpfind.py 全内存扫描：0x582740 堆 +
+  0x102135e/0x10228ba image，全部 254D-9F3C = **fp 运行时重组**
+  （license 基段 + 机器中段替换）→ fp 不是门）。0x10228ba 区域后期被
+  崩溃消息覆写（An internal exception...）。
+- **U14 绑定校验定案**：KEYBUF [52,384)（明文尾 [384,480) 不动）→
+  同一 corrupted 对话框 → **corrupted = 机器绑定校验**（license 的
+  机器绑定字段 = LCF-AT 值 vs 本机计算值 mismatch），非 checksum。
+  绑定字段 = struct 二进制区 [0xBF,0x17D)（190B，补 84 布局）候选。
+- **forge 形状更新**：①buffer 许可区 patch = 解锁对话流程的钥匙
+  （KEYBUF 仪器已备）；②绑定字段 = 需本机硬件衍生值（已知 4 dword：
+  键 0x7DC80DE6/0x022869C8 + fp 中段 254D/9F3C，其余 ~46 dword 未解）；
+  ③绑定字段定位 = field-op oracle 流（0x1147xxx）逐偏移差分。
+- 新增坑：64-bit python 读 WOW64 目标的 MBI 结构 = x64 布局
+  （AllocationBase+align 补位）；&Path 逃逸 static 闭包 = to_path_buf；
+  HANDLE !Send = hraw isize 转发；fpfind.py = 全内存 fp 扫描器。
+- 工件：dw132_runU1-U14.log、CISC-1U.eiphist.bin（12k 样本站点图）、
+  fpfind.py、patch_noppath.py/patch_valloc.py/patch_eiphist*.py、
+  kp_blob_u1/u10/kp_buf_u11/u14/kp_fp_u12.txt。

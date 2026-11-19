@@ -913,6 +913,7 @@ pub(super) fn spawn_dialog_killer(
         0
     };
     let oepwatch = std::env::var("MAGICMIDA_V2_OEPWATCH").is_ok();
+
     let join = std::thread::spawn(move || {
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
@@ -4950,6 +4951,208 @@ pub(super) fn spawn_dialog_killer(
                                         hits,
                                         "PASSPATH applied — miss-gate forced open"
                                     );
+                                }
+                            }
+                        }
+                        // 补充 132e: NOPPATH — skip the search-era
+                        // fault loop.  The thread sits at 0x102786F
+                        // (add [eax],al x4, eax=54831A79 garbage) from
+                        // ~332ms, retrying ~389 times (miss counter =
+                        // retry count); the blob markers did nothing (U1:
+                        // 1024/1024 survived, eax unchanged) so the
+                        // search never reaches any element scan.  Scan
+                        // the live decrypted layout for '0b c0 74 58'
+                        // right after the faulting 4 zero bytes and NOP
+                        // them, once, as soon as they appear.
+                        #[cfg(target_arch = "x86")]
+                        {
+                            static NP_ARMED: std::sync::atomic::AtomicUsize =
+                                std::sync::atomic::AtomicUsize::new(0);
+                            if std::env::var("MAGICMIDA_V2_NOPPATH").is_ok()
+                                && NP_ARMED.load(
+                                    std::sync::atomic::Ordering::Relaxed,
+                                ) == 0
+                                && watch_t0.elapsed().as_millis() >= 300
+                                && watch_t0.elapsed().as_millis() <= 500
+                            {
+                                let scan_lo = image_base + 0x27600;
+                                let mut pg = vec![0u8; 0x400];
+                                let ok_n = unsafe {
+                                    let mut n = 0;
+                                    ReadProcessMemory(
+                                        h_process,
+                                        scan_lo as *const core::ffi::c_void,
+                                        pg.as_mut_ptr()
+                                            as *mut core::ffi::c_void,
+                                        0x400,
+                                        Some(&mut n),
+                                    )
+                                    .is_ok()
+                                        && n == 0x400
+                                };
+                                if ok_n {
+                                    for j in 0..0x400 - 12 {
+                                        if pg[j + 4..j + 8]
+                                            == [0x0B, 0xC0, 0x74, 0x58]
+                                            && pg[j..j + 4]
+                                                == [0x00, 0x00, 0x00, 0x00]
+                                        {
+                                            let va = scan_lo + j;
+                                            let nops = [0x90u8; 4];
+                                            let _ = unsafe {
+                                                WriteProcessMemory(
+                                                    h_process,
+                                                    va as *const core::ffi::c_void,
+                                                    nops.as_ptr()
+                                                        as *const core::ffi::c_void,
+                                                    4,
+                                                    None,
+                                                )
+                                            };
+                                            NP_ARMED.store(
+                                                1,
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            );
+                                            info!(
+                                                va = format!("{va:#x}"),
+                                                t_ms = (watch_t0.elapsed().as_millis() as u32),
+                                                "NOPPATH applied — fault loop skipped"
+                                            );
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // 补充 132f: VALLOC — the search-era fault
+                        // polls eax=0x54831A79, a valid user-mode address
+                        // whose page was never allocated (the allocation
+                        // is gated by the license state, which is
+                        // machine-mismatched).  Commit the page ourselves
+                        // before the fault loop starts (~332ms) and see
+                        // whether the search unblocks (b8 readout).
+                        #[cfg(target_arch = "x86")]
+                        {
+                            use windows::Win32::System::Memory::{
+                                VirtualAllocEx, MEM_COMMIT, MEM_RESERVE,
+                                PAGE_READWRITE,
+                            };
+                            use windows::Win32::Foundation::GetLastError;
+                            static VA_DONE: std::sync::atomic::AtomicUsize =
+                                std::sync::atomic::AtomicUsize::new(0);
+                            if std::env::var("MAGICMIDA_V2_VALLOC").is_ok()
+                                && VA_DONE.load(
+                                    std::sync::atomic::Ordering::Relaxed,
+                                ) == 0
+                                && watch_t0.elapsed().as_millis() >= 320
+                            {
+                                VA_DONE.store(
+                                    1,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                // the faulting pointer's page (this
+                                // machine's constant; derived from the
+                                // key state, measured across 6 runs).
+                                // 64KB allocation granularity: reserve
+                                // from the granularity floor with a
+                                // 128KB span so 0x54831A79 is covered.
+                                let fault_page = 0x54830000usize;
+                                let base = unsafe {
+                                    VirtualAllocEx(
+                                        h_process,
+                                        Some(fault_page as *const core::ffi::c_void),
+                                        0x20000,
+                                        MEM_RESERVE | MEM_COMMIT,
+                                        PAGE_READWRITE,
+                                    )
+                                };
+                                let errv = unsafe { GetLastError() };
+                                info!(
+                                    base = %format!("{:?}", base),
+                                    err = %errv.0.to_string(),
+                                    t_ms = (watch_t0.elapsed().as_millis() as u32),
+                                    "VALLOC: search-poll page committed"
+                                );
+                            }
+                        }
+                        // 补充 132g: EIPHIST — sample the main
+                        // thread's registers every µs-loop iteration in
+                        // [330,500]ms; the frozen retry cycle's stations
+                        // (fault 0x102786F, call 0x1027880, the inner
+                        // faults) map the broken chain.
+                        #[cfg(target_arch = "x86")]
+                        {
+                            use windows::Win32::System::Diagnostics::Debug::{
+                                GetThreadContext, CONTEXT,
+                            };
+                            static EH_ON: std::sync::atomic::AtomicUsize =
+                                std::sync::atomic::AtomicUsize::new(0);
+                            if std::env::var("MAGICMIDA_V2_EIPHIST").is_ok()
+                                && EH_ON.swap(
+                                    1,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                ) == 0
+                            {
+                                // dedicated sampler thread: the µs loop is
+                                // too heavy (8ms/iter) to catch the inner
+                                // stations of the retry cycle.
+                                if let Ok(hc) = hc8 {
+                                    let hraw = hc.0 as isize;
+                                    let out: std::path::PathBuf =
+                                        out_path.clone();
+                                    let t0e = watch_t0;
+                                    std::thread::spawn(move || {
+                                        let hc = windows::Win32::Foundation::HANDLE(
+                                            hraw as *mut core::ffi::c_void,
+                                        );
+                                        while t0e.elapsed().as_millis() < 320 {
+                                            std::thread::sleep(
+                                                std::time::Duration::from_millis(2),
+                                            );
+                                        }
+                                        let mut recs: Vec<[u32; 11]> = Vec::new();
+                                        while t0e.elapsed().as_millis() <= 500
+                                            && recs.len() < 50000
+                                        {
+                                            let mut ctx = CONTEXT::default();
+                                            ctx.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_FLAGS(0x0001_0003);
+                                            if unsafe {
+                                                GetThreadContext(hc, &mut ctx)
+                                            }
+                                            .is_ok()
+                                            {
+                                                recs.push([
+                                                    t0e.elapsed().as_micros() as u32,
+                                                    ctx.Eip, ctx.Edi, ctx.Esi,
+                                                    ctx.Ebx, ctx.Edx, ctx.Ecx,
+                                                    ctx.Eax, ctx.Ebp, ctx.Esp,
+                                                    ctx.EFlags,
+                                                ]);
+                                            }
+                                        }
+                                        let mut blob =
+                                            Vec::with_capacity(recs.len() * 44);
+                                        for r in &recs {
+                                            for v in r {
+                                                blob.extend_from_slice(
+                                                    &v.to_le_bytes(),
+                                                );
+                                            }
+                                        }
+                                        let stem = out.with_extension("eiphist");
+                                        if let Some(name) = stem.file_name() {
+                                            let mut nm = name.to_os_string();
+                                            nm.push(".bin");
+                                            let _ = std::fs::write(
+                                                stem.with_file_name(nm),
+                                                &blob,
+                                            );
+                                        }
+                                        info!(
+                                            records = recs.len(),
+                                            "EIPHIST: sampler thread flushed"
+                                        );
+                                    });
                                 }
                             }
                         }
