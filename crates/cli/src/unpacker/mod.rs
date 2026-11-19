@@ -85,6 +85,10 @@ struct LoopState {
     /// Watchdog for identical-access-violation storms.  See
     /// [`AvStorm`](av_handler::AvStorm).
     av_storm: av_handler::AvStorm,
+    /// 补充 132b: CYPWATCH — resolved advapi32 Crypt* VAs
+    /// (CryptHashData, CryptDeriveKey, CryptDecrypt) once advapi32
+    /// loads; the SingleStep handler captures the args at each hit.
+    cypwatch: Option<(usize, usize, usize)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -628,6 +632,7 @@ pub fn unpack(
         last_possible_oep: None,
         iat_monitoring_done: false,
         av_storm: av_handler::AvStorm::default(),
+        cypwatch: None,
     };
     let guard_protection = PAGE_NOACCESS.0;
     // Image boundary from PE header (pre-ASLR value). Will be rebased after
@@ -1502,6 +1507,51 @@ pub fn unpack(
                     == mida_packers_themida::ThemidaVersion::V2
                 {
                     state.v2_dll_bases.insert(base_address as u64);
+                }
+                // 补充 132b: CYPWATCH — when advapi32 loads, resolve the
+                // Crypt* exports and arm execute BPs in slots 1-3 (the
+                // .dat cipher recipe per the 补 128 model; the offline
+                // recipe sweep found nothing, so the calls are observed
+                // live).  Debugged runs only: the post-attach pipeline has
+                // no debug events to catch the hits.
+                if state.pe_info.themida_version
+                    == mida_packers_themida::ThemidaVersion::V2
+                    && std::env::var("MAGICMIDA_V2_CYPWATCH").is_ok()
+                    && ls.cypwatch.is_none()
+                {
+                    let mname = helpers::module_name_from_handle(h_file);
+                    if let Some(mname) = mname {
+                        if mname.eq_ignore_ascii_case("advapi32.dll") {
+                            if let Some((vh, vd, ve)) = helpers::cypwatch_resolve(
+                                &mut dbg,
+                                base_address as usize,
+                            ) {
+                                for (slot, addr, label) in [
+                                    (1usize, vh, "CryptHashData"),
+                                    (2usize, vd, "CryptDeriveKey"),
+                                    (3usize, ve, "CryptDecrypt"),
+                                ] {
+                                    match dbg.set_hw_breakpoint(
+                                        slot,
+                                        addr,
+                                        HwbpType::Execute,
+                                    ) {
+                                        Ok(()) => info!(
+                                            api = label,
+                                            addr = format!("{addr:#x}"),
+                                            "CYPWATCH: BP armed"
+                                        ),
+                                        Err(e) => warn!(
+                                            api = label,
+                                            error = %e,
+                                            "CYPWATCH: arm failed"
+                                        ),
+                                    }
+                                }
+                                ls.cypwatch = Some((vh, vd, ve));
+                            }
+                        }
+                    }
                 }
                 // SAFETY: h_file is valid per contract.
                 unsafe {
@@ -2552,6 +2602,35 @@ pub fn unpack(
                     addr = %format!("{address:#x}"),
                     "SingleStep at known HW-BP address — treating as CloseHandle hit"
                 );
+
+                // 补充 132b: CYPWATCH hits — capture the Crypt* args and
+                // buffers, disable the one-shot slot, and resume.  The
+                // shared handler is not interested in these addresses.
+                if let Some((vh, vd, ve)) = ls.cypwatch {
+                    let kind = if address as usize == vh {
+                        Some(0usize)
+                    } else if address as usize == vd {
+                        Some(1)
+                    } else if address as usize == ve {
+                        Some(2)
+                    } else {
+                        None
+                    };
+                    if let Some(kind) = kind {
+                        helpers::cypwatch_capture(
+                            &mut dbg,
+                            kind,
+                            thread_id,
+                            &output_path,
+                        );
+                        let slot = kind + 1;
+                        if let Err(e) = dbg.disable_hw_breakpoint(slot) {
+                            warn!(slot, error = %e, "CYPWATCH: disable failed");
+                        }
+                        dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+                        continue;
+                    }
+                }
 
                 log::log(LogType::Info, &format!("SINGLE STEP at {address:#x} — handle_hw_breakpoint about to be called"));
 

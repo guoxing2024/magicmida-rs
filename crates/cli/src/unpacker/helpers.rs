@@ -9403,6 +9403,216 @@ fn read_remote_sections(dbg: &ProcessSession, base: usize) -> Option<Vec<RemoteS
 // ---------------------------------------------------------------------------
 
 /// Handle a hardware breakpoint event (CloseHandle / VirtualAlloc / .text+0x1000).
+// ---------------------------------------------------------------------------
+// 补充 132b: CYPWATCH — advapi32 Crypt* capture
+// ---------------------------------------------------------------------------
+
+/// Module file name for a LoadDll event's h_file.  Toolhelp snapshots
+/// fail/hang here: the target is suspended mid-load with the loader lock
+/// held (measured: every module probe returned None at the LoadDll
+/// debug event).  The handle's own name needs no loader lock.
+pub(super) fn module_name_from_handle(h_file: HANDLE) -> Option<String> {
+    use windows::Win32::Storage::FileSystem::{
+        GetFileInformationByHandleEx, FileNameInfo,
+    };
+    let mut buf = [0u8; 1024];
+    // SAFETY: h_file is the debug event's live file handle; buf sized.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            h_file,
+            FileNameInfo,
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+            buf.len() as u32,
+        )
+    };
+    if ok.is_err() {
+        return None;
+    }
+    // FILE_NAME_INFO.FileNameLength = the NAME length in bytes (the
+    // 4-byte length field precedes it) — first pass sliced [4..len] and
+    // truncated every name by 2 chars (measured: "advapi32.d").
+    let len = u32::from_le_bytes(buf[0..4].try_into().ok()?) as usize;
+    if len == 0 || 4 + len > buf.len() {
+        return None;
+    }
+    let units: Vec<u16> = buf[4..4 + len]
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let name = String::from_utf16_lossy(&units);
+    Some(
+        name.rsplit(['\\', '/'])
+            .next()
+            .unwrap_or(&name)
+            .to_string(),
+    )
+}
+
+/// Parse the export table of the module at `base` (in-target PE32) and
+/// resolve the three Crypt* functions the .dat cipher uses (补 128 model:
+/// CryptHashData → CryptDeriveKey → CryptDecrypt).  The offline recipe
+/// sweep (datcrack.py) found nothing in the naive space, so the calls are
+/// observed live: this runs at the advapi32 LoadDll event, target
+/// suspended.
+pub(super) fn cypwatch_resolve(
+    dbg: &mut ProcessSession,
+    base: usize,
+) -> Option<(usize, usize, usize)> {
+    let mut hdr = vec![0u8; 0x200];
+    dbg.read_memory(base, &mut hdr).ok()?;
+    if hdr.get(..2)? != b"MZ" {
+        return None;
+    }
+    let e_lfanew =
+        u32::from_le_bytes(hdr.get(0x3C..0x40)?.try_into().ok()?) as usize;
+    let mut pe = vec![0u8; 0x100];
+    dbg.read_memory(base + e_lfanew, &mut pe).ok()?;
+    if pe.get(..2)? != b"PE" {
+        return None;
+    }
+    let magic = u16::from_le_bytes(pe.get(24..26)?.try_into().ok()?) as usize;
+    let dd_off = 24 + if magic == 0x10B { 96 } else { 112 };
+    let exp_rva =
+        u32::from_le_bytes(pe.get(dd_off..dd_off + 4)?.try_into().ok()?) as usize;
+    if exp_rva == 0 {
+        return None;
+    }
+    let mut exp = vec![0u8; 0x28];
+    dbg.read_memory(base + exp_rva, &mut exp).ok()?;
+    let nnames =
+        u32::from_le_bytes(exp.get(0x18..0x1C)?.try_into().ok()?) as usize;
+    let afns =
+        u32::from_le_bytes(exp.get(0x1C..0x20)?.try_into().ok()?) as usize;
+    let anames =
+        u32::from_le_bytes(exp.get(0x20..0x24)?.try_into().ok()?) as usize;
+    let anords =
+        u32::from_le_bytes(exp.get(0x24..0x28)?.try_into().ok()?) as usize;
+    if nnames == 0 || nnames > 10_000 {
+        return None;
+    }
+    let mut want = ["CryptHashData", "CryptDeriveKey", "CryptDecrypt"];
+    let mut out = [0usize; 3];
+    for i in 0..nnames {
+        if want.iter().all(|w| w.is_empty()) {
+            break;
+        }
+        let mut nb = [0u8; 4];
+        dbg.read_memory(base + anames + i * 4, &mut nb).ok()?;
+        let nrva = u32::from_le_bytes(nb) as usize;
+        let mut sb = [0u8; 40];
+        if dbg.read_memory(base + nrva, &mut sb).is_err() {
+            continue;
+        }
+        let end = sb.iter().position(|&b| b == 0).unwrap_or(sb.len());
+        let nm = std::str::from_utf8(&sb[..end]).unwrap_or("");
+        for (k, w) in want.iter_mut().enumerate() {
+            if !w.is_empty() && *w == nm {
+                let mut ob = [0u8; 2];
+                dbg.read_memory(base + anords + i * 2, &mut ob).ok()?;
+                let o = u16::from_le_bytes(ob) as usize;
+                let mut fb = [0u8; 4];
+                dbg.read_memory(base + afns + o * 4, &mut fb).ok()?;
+                out[k] = base + u32::from_le_bytes(fb) as usize;
+                *w = "";
+            }
+        }
+    }
+    if out.iter().any(|&v| v == 0) {
+        return None;
+    }
+    Some((out[0], out[1], out[2]))
+}
+
+/// CYPWATCH hit capture.  `kind`: 0 = CryptHashData, 1 = CryptDeriveKey,
+/// 2 = CryptDecrypt.  Dumps the hashed/decrypt buffer to disk (the
+/// post-decrypt state lands in the check op's own work buffer, which the
+/// debugged runs do not watch — the dumps are the record).
+pub(super) fn cypwatch_capture(
+    dbg: &mut ProcessSession,
+    kind: usize,
+    thread_id: u32,
+    output_path: &std::path::Path,
+) {
+    use mida_core::debugger::ctx_sp;
+    static N: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let ctx = match dbg.get_thread_context_control(thread_id) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(kind, error = %e, "CYPWATCH: ctx read failed");
+            return;
+        }
+    };
+    let sp = ctx_sp(&ctx) as usize;
+    let mut args = [0u32; 6];
+    for (i, a) in args.iter_mut().enumerate() {
+        let mut b = [0u8; 4];
+        if dbg.read_memory(sp + 4 + i * 4, &mut b).is_ok() {
+            *a = u32::from_le_bytes(b);
+        }
+    }
+    let rd = |addr: usize, len: usize| -> Vec<u8> {
+        let len = len.min(0x2000);
+        let mut buf = vec![0u8; len];
+        if dbg.read_memory(addr, &mut buf).is_ok() {
+            buf
+        } else {
+            Vec::new()
+        }
+    };
+    let hex = |b: &[u8]| -> String {
+        b.iter().take(24).map(|x| format!("{x:02x}")).collect()
+    };
+    match kind {
+        0 => {
+            // CryptHashData(hHash, pbData, dwDataLen, dwFlags)
+            let (pb, len, flags) = (args[1] as usize, args[2] as usize, args[3]);
+            let data = rd(pb, len);
+            let stem = output_path.with_extension(format!("cypwatch_hash_{n}"));
+            let mut name =
+                stem.file_name().expect("output path has a name").to_os_string();
+            name.push(".bin");
+            let _ = std::fs::write(stem.with_file_name(name), &data);
+            info!(
+                n, len,
+                flags = format!("{flags:#x}"),
+                head = %hex(&data),
+                "CYPWATCH: CryptHashData"
+            );
+        }
+        1 => {
+            // CryptDeriveKey(hProv, Algid, hBaseData, dwFlags, phKey)
+            info!(
+                n,
+                algid = format!("{:#x}", args[1]),
+                flags = format!("{:#x}", args[3]),
+                "CYPWATCH: CryptDeriveKey"
+            );
+        }
+        2 => {
+            // CryptDecrypt(hKey, hFinal, fFinal, pdwDataLen, pbData, dwBufLen)
+            let mut pdl = [0u8; 4];
+            dbg.read_memory(args[3] as usize, &mut pdl).ok();
+            let dlen = u32::from_le_bytes(pdl);
+            let pb = args[4] as usize;
+            let buf_len = args[5] as usize;
+            let data = rd(pb, buf_len.max(dlen as usize));
+            let stem = output_path.with_extension(format!("cypwatch_dec_{n}"));
+            let mut name =
+                stem.file_name().expect("output path has a name").to_os_string();
+            name.push(".bin");
+            let _ = std::fs::write(stem.with_file_name(name), &data);
+            info!(
+                n, dlen, buf_len,
+                head = %hex(&data),
+                "CYPWATCH: CryptDecrypt"
+            );
+        }
+        _ => {}
+    }
+}
+
 pub(super) fn handle_hw_breakpoint(
     dbg: &mut ProcessSession,
     state: &mut ThemidaState,

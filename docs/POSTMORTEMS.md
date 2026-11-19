@@ -5649,8 +5649,31 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   ——不是反篡改响应、不是 FP 字段、不是壳字节码 bug。forge 全闭环 =
   .dat 重加密（本机硬件字段）——已知的剩余缺口（补 129 定案的 check-op
   emu 阻断 / Crypt* API dump 替代路线）。
+- **CYPWATCH 仪器（补充 132b）——Crypt\* 活体捕获路线 = 负结果关闭**：
+  - 形状： + DEBUGGED=1。advapi32 的 LoadDll 事件
+    时（句柄名解析 = GetFileInformationByHandleEx(FileNameInfo)，注意
+    FileNameLength = 纯名字字节数、名字在 +4 起——首版切片 [4..len] 截掉
+    2 字符 = "advapi32.d" 静默失配）解析三导出（PE32 导出表手工走：
+    NumberOfNames@0x18/AFNS@0x1C/ANAMES@0x20/ANORDS@0x24）→ DR slots
+    1-3 execute BP（dbg.set_hw_breakpoint，全线程应用）→ 命中于
+    SingleStep 分支拦截捕获（args @esp+4..、buffer dump
+    cypwatch_hash_N.bin / cypwatch_dec_N.bin）→ disable one-shot slot +
+    continue。工具链坑两轮：LoadDll 时 toolhelp 快照 = loader lock 持有
+    → 全 None（换句柄名）；LoopState 增 cypwatch 字段。
+  - 实测（dw132_runM/R）：**advapi32 = 静态导入 @0.03s 即加载，3 BP 全部
+    arm 成功**（CryptHashData@0x75fe3a10 / CryptDeriveKey@0x75fff060 /
+    CryptDecrypt@0x75fe9660），**但 3 分钟零命中**——debugged run 的壳 =
+    反调试扣留 .text 解密（补 128 定案）→ 壳到不了 license 阶段 → .dat
+    解密调用（若有）不发生。结合离线 sweep（datcrack.py：hash 算法 ×
+    输入候选 × key 算法全组合 0 强命中）＝**壳不用 CryptoAPI 做 .dat
+    密码——.dat 密码 = 壳自己的实现（真值表 dword 变换，续 17-20 实测）**。
+  - **forge 的 .dat 重加密 = 需逆壳自有密码（SEH 阻断的 check-op emu 路
+    线，补 129-130 已定案）或纯内存 forge（license struct + 派生键材料
+    post-decrypt patch——但「本机应是什么值」= 部署键派生知识，未解）**。
+    剩余边界如实记录。
 - 过程坑（工具层）：grep 对含 NUL 的日志静默返回空（26 个 NUL 字节 =
   binary 判定）→ 全部日志分析走 python；64-bit 宿主解析 32-bit 目标的
   DEBUG_EVENT 偏移错位一轮；后台 python 的相对 cwd 漂移 → 一律绝对路径。
-- 工件：dw132_run1-11/runB/runC/runD/runE-H.log、dw132_attach1-9.log、
-  werdumps/CISC-1.exe.29112.dmp（34MB）、lateattach2.py、dumpcrash.py。
+- 工件：dw132_run1-11/runB/runC/runD/runE-H/runM-R.log、dw132_attach1-9.log、
+  werdumps/CISC-1.exe.29112.dmp+4796.dmp（34MB × 2）、lateattach2.py、
+  dumpcrash.py、datcrack.py。
