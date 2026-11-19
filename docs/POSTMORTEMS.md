@@ -6077,3 +6077,17 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   映射）②外科 patch（仅节点键源 X 区 = 本机键，保留校验和/尾区）→
   CALC 通过 → 部署启动。
 - 工件：CISC-1U.blkstream_early.bin（56 记录时间线）、dw132_runU39.log。
+
+**续 22 补充 132y（2026-11-20）——节点键源确认 + fp 二进制源不在常规区**：
+
+- **节点键源确认**：U40 markers [0x25,0x1C2) → STRICT 扫描 = 0 命中 =
+  节点键 ≠ 该区；U33 keys = 节点 = 本机键 ✓ → **节点键源 = buffer
+  [52,384)（U11 patch = 已正确覆盖节点键源 = 搜索命中 ✓）**。
+- **fp 二进制源未定位**：fp-words（1051/BCEC/14F2/0C18/3745 LE word 序列）
+  在 buffer/struct = 零命中 → **fp 组装编码 ≠ LE-words**（字节序/变换/
+  分散字段待差分）。
+- **收敛判断**：节点键 = 已解（buffer patch ✓ 搜索命中 ✓）；CALC 门 =
+  fp 绑定校验 = license fp-middle vs 机器 fp-middle → 机器 middle =
+  254D-9F3C（已知）→ license middle = 待定位（fp 组装编码逆向 = 最后
+  差分目标）。
+- 工件：dw132_runU40/U41.log。
