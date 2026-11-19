@@ -5540,3 +5540,25 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   字段解密的逆（Crypt* 导出函数 = 罕见但可从壳会话 dump）。
 - 工件：fp_payload.txt、dw129_run1-4.log、dw192.py、b15 PWNED 13 版本、
   fp_block.txt。
+
+**续 22 补充 130（2026-11-19，第一百一十四轮）——CHECKWATCH 仪器 + check-op = interpreter-4 VM op + SEH 阻断**：
+
+- **CHECKWATCH 落地**（DECODEWATCH 内联：poll image+0x5FFB2 u16，变化即
+  GetThreadContext + 20KB 栈 snap）：实测 **15 个 burst 边界 snap**
+  （t=195..235ms，ctr 0xff001c/0xff0078/0x10bde3e/...）——**µs 级 check
+  burst 的后状态首次可捕获**（burst 间 ms 级间隔 > 轮询间隙）。
+- **check op 身份定案**：mid-burst snap EIP 不在 0x5FC00 带（= POOLSNIFF
+  diff = 可写 scratch/变量），edi=0x105FFAE = **interpreter-4 窗口基** →
+  check op = **interpreter-4 族 VM op**（esi=0x114271d = 字节码流）。
+- **era 链推进**：t=316116 snap（eip=0x102b9d1 = region 机器入口，[316,343]
+  字段构建带）= 继 t=186813 后第二个入口态 snap。emu 续跑 = **div ecx 除零
+  异常阻断**（0x1038089 = 壳的异常驱动混淆；int3-skip 循环不适用 = 需要
+  SEH 仿真，异常副作用未知）。
+- **结论**：check-op 函数拟合的 emulator 路线 = 卡在 VM op 的 SEH/入口态
+  （mid-op snap 载入不完整，entry 态 snap 只有 era1 与 [316] 两个，且后者
+  异常密集）。**替代路线 = API 级解密器 dump**（补 115：[193] SHA-1 +
+  Crypt*——从壳会话记录 CryptImportKey/CryptDecrypt 参数 = .dat 字段解密
+  的直接观察 = 加密器逆的钥匙）。FIELDPATCH 端到端传播（补 129）+ .dat
+  重加密 = forge 的最后两块。
+- 工件：dw193/194/195、dw130_run1.log（15 CHECKWATCH snaps）、
+  CISC-1U.v2decodewatch.b8.bin（fresh 49 snaps）。

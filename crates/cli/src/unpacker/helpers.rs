@@ -4580,6 +4580,101 @@ pub(super) fn spawn_dialog_killer(
                     };
                     while watch_t0.elapsed().as_millis() < 500 {
                         polls += 1;
+                        // 补充 130: the CHECKWATCH — poll the check-op
+                        // scratch ctr (image+0x5FFB2 u16); on change take a
+                        // b8-format snap (regs + 20KB stack) + the scratch
+                        // page = the post-burst machine states (the check
+                        // op = a µs burst; the states bracket it).
+                        #[cfg(target_arch = "x86")]
+                        {
+                            static CW_LAST: std::sync::atomic::AtomicU32 =
+                                std::sync::atomic::AtomicU32::new(0xFFFF_FFFF);
+                            static CW_SNAPS: std::sync::atomic::AtomicU32 =
+                                std::sync::atomic::AtomicU32::new(0);
+                            let mut sb = [0u8; 4];
+                            let ok_s = unsafe {
+                                let mut n = 0;
+                                ReadProcessMemory(
+                                    h_process,
+                                    (image_base + 0x5FFB2)
+                                        as *const core::ffi::c_void,
+                                    sb.as_mut_ptr()
+                                        as *mut core::ffi::c_void,
+                                    4,
+                                    Some(&mut n),
+                                )
+                                .is_ok()
+                                    && n == 4
+                            };
+                            if ok_s {
+                                let sc = u32::from_le_bytes(sb);
+                                let last = CW_LAST.load(
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                if sc != 0 && sc != last {
+                                    CW_LAST.store(
+                                        sc,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                    let n_snap = CW_SNAPS.fetch_add(
+                                        1,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                    if n_snap < 64 {
+                                        use windows::Win32::System::Diagnostics::Debug::{
+                                            GetThreadContext, CONTEXT,
+                                        };
+                                        if let Ok(hc) = hc8 {
+                                            let mut ctx = CONTEXT::default();
+                                            ctx.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_FLAGS(0x0001_0003);
+                                            if unsafe {
+                                                GetThreadContext(hc, &mut ctx)
+                                            }
+                                            .is_ok()
+                                            {
+                                                let t8 = (watch_t0.elapsed().as_micros() as u32).to_le_bytes();
+                                                b8_blobs.extend_from_slice(&t8);
+                                                for v in [
+                                                    ctx.Eip, ctx.Edi, ctx.Esi,
+                                                    ctx.Ebx, ctx.Edx, ctx.Ecx,
+                                                    ctx.Eax, ctx.Ebp, ctx.Esp,
+                                                    ctx.EFlags,
+                                                ] {
+                                                    b8_blobs.extend_from_slice(
+                                                        &v.to_le_bytes(),
+                                                    );
+                                                }
+                                                let sp = ctx.Esp as usize;
+                                                let slo = (sp.saturating_sub(0x800) & !0xFFF).max(0x10000);
+                                                let mut stk = vec![0u8; 0x5000];
+                                                for spg in 0..5u32 {
+                                                    let pa = slo + (spg as usize) * 0x1000;
+                                                    let o = pa - slo;
+                                                    let _ = unsafe {
+                                                        let mut nn = 0;
+                                                        ReadProcessMemory(
+                                                            h_process,
+                                                            pa as *const core::ffi::c_void,
+                                                            stk[o..o + 0x1000].as_mut_ptr() as *mut core::ffi::c_void,
+                                                            0x1000,
+                                                            Some(&mut nn),
+                                                        )
+                                                    };
+                                                }
+                                                b8_blobs.extend_from_slice(&(slo as u32).to_le_bytes());
+                                                b8_blobs.extend_from_slice(&stk);
+                                                info!(
+                                                    t_ms = (watch_t0.elapsed().as_millis() as u32),
+                                                    ctr = format!("{sc:#x}"),
+                                                    eip = format!("{:#x}", ctx.Eip),
+                                                    "CHECKWATCH: post-burst snap taken"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         // 补充 129: the FIELDPATCH injector —
                         // MAGICMIDA_V2_FIELDPATCH=<hexaddr>-<hexbytes>:
                         // poll the page; at first nonzero content (the
