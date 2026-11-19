@@ -6025,3 +6025,20 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   0x102132d struct+0x11f4 mov = 消息区写入候选！struct+0x11f4 =
   0x102132d = **corruption 消息写入点 = check-op 内实锤**）。
 - 工件：msgtrap_ops.bin + 折叠图脚本。
+
+**续 22 补充 132v（2026-11-20）——BLKSTREAM 解码 era 捕获尝试 + 会话收口状态**：
+
+- **BLKSTREAM 运行（U34）**：KEYBUF keys + BLKSTREAM=1 → 流程 = dialog 挂起
+  形状（CISC-1 37MB 存活）→ **blkstream.bin = 循环结束才写 = dialog 挂起
+  阻塞捕获**。解法 = dialog 程序化 OK（U13 已验证 = exit 2 → 流程结束 →
+  文件落地）或 BLKSTREAM 窗口截断改进。
+- **会话收口状态（全链路可读 + 仪器就绪）**：
+  - 校验 = JIT 链表扫描（132o 全解码）；搜索命中 = buffer patch 解决（U11）
+  - CALC 对话框 = .dat 完整性被粗暴 patch 破坏的后果（132s）→
+    **外科 patch = 仅节点键源字段**
+  - 节点构建 = 解码 era（132u）→ BLKSTREAM 捕获 = 下一会话首步
+  - 仪器链：KEYBUF/KEYCOPY/PASSPATH/MSGTRAP（冻结+ops/JIT/seq）/EIPHIST/
+    FPLOCATE/fpfind 全就绪
+- **下一会话路径**：①BLKSTREAM + dialog OK 程序化关闭 → 解码 era op 带 →
+  节点构建 op 定位 ②外科 patch（仅键源字段）→ CALC 通过 → 部署启动 =
+  forge 全闭环。
