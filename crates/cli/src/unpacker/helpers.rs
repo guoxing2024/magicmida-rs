@@ -4857,6 +4857,102 @@ pub(super) fn spawn_dialog_killer(
                             }
                             vb_restore(h_process);
                         }
+                        // 补充 132d: PASSPATH — force the verifier's
+                        // pass path past the miss-counter gate.  The
+                        // crash-time page decodes the loop tail as:
+                        //   ... 74 0f (je, our bypass target @0x102408b)
+                        //   ... e9 6f ff ff ff (loop back)
+                        //   8b 85 e9 01 26 12  mov eax,[miss 0x10201FD]
+                        //   0f 85 06 00 00 00  jne (skip success code)
+                        // The searches still miss (389) with the bypass,
+                        // so the counter is nonzero mid-search-era and
+                        // T5's µs rewrite lost the race — the pass path
+                        // branches to the failure continuation, the next
+                        // stage never initializes (the app is never
+                        // decrypted at the crash), and the orphaned
+                        // dispatch dies as the 0xC0000005 at RVA 0x2786F
+                        // (the shell's UE filter prints the cached
+                        // \"internal exception (0x102409c)\" — the je
+                        // target).  Patch the read to 0 and the jne to
+                        // nops = the success-only mutation always runs.
+                        #[cfg(target_arch = "x86")]
+                        {
+                            static PP_ARMED: std::sync::atomic::AtomicUsize =
+                                std::sync::atomic::AtomicUsize::new(0);
+                            if std::env::var("MAGICMIDA_V2_PASSPATH")
+                                .is_ok()
+                                && PP_ARMED.load(
+                                    std::sync::atomic::Ordering::Relaxed,
+                                ) == 0
+                                && watch_t0.elapsed().as_millis() >= 320
+                                && watch_t0.elapsed().as_millis() <= 420
+                            {
+                                let mut pg = vec![0u8; 0x800];
+                                let ok_p = unsafe {
+                                    let mut n = 0;
+                                    ReadProcessMemory(
+                                        h_process,
+                                        (image_base + 0x24000)
+                                            as *const core::ffi::c_void,
+                                        pg.as_mut_ptr()
+                                            as *mut core::ffi::c_void,
+                                        0x800,
+                                        Some(&mut n),
+                                    )
+                                    .is_ok()
+                                        && n == 0x800
+                                };
+                                if ok_p {
+                                    let pat_read: [u8; 6] =
+                                        [0x8B, 0x85, 0xE9, 0x01, 0x26, 0x12];
+                                    let pat_jne: [u8; 6] =
+                                        [0x0F, 0x85, 0x06, 0x00, 0x00, 0x00];
+                                    let rep_read: [u8; 6] =
+                                        [0xB8, 0x00, 0x00, 0x00, 0x00, 0x90];
+                                    let rep_jne: [u8; 6] =
+                                        [0x90, 0x90, 0x90, 0x90, 0x90, 0x90];
+                                    let mut hits = 0usize;
+                                    for j in 0..0x800 - 6 {
+                                        let seg = &pg[j..j + 6];
+                                        if seg == pat_read {
+                                            let _ = unsafe {
+                                                WriteProcessMemory(
+                                                    h_process,
+                                                    (image_base + 0x24000 + j)
+                                                        as *const core::ffi::c_void,
+                                                    rep_read.as_ptr()
+                                                        as *const core::ffi::c_void,
+                                                    6,
+                                                    None,
+                                                )
+                                            };
+                                            hits += 1;
+                                        } else if seg == pat_jne {
+                                            let _ = unsafe {
+                                                WriteProcessMemory(
+                                                    h_process,
+                                                    (image_base + 0x24000 + j)
+                                                        as *const core::ffi::c_void,
+                                                    rep_jne.as_ptr()
+                                                        as *const core::ffi::c_void,
+                                                    6,
+                                                    None,
+                                                )
+                                            };
+                                            hits += 1;
+                                        }
+                                    }
+                                    PP_ARMED.store(
+                                        1,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                    info!(
+                                        hits,
+                                        "PASSPATH applied — miss-gate forced open"
+                                    );
+                                }
+                            }
+                        }
                         // 补充 129: the FIELDPATCH injector —
                         // MAGICMIDA_V2_FIELDPATCH=<hexaddr>-<hexbytes>:
                         // poll the page; at first nonzero content (the
@@ -5055,7 +5151,123 @@ pub(super) fn spawn_dialog_killer(
                                 }
                             }
                         }
-                        // 补充 93: the register snapshot (same
+                        // 补充 132c: KEYPATCH — continuous re-apply of
+                        // value patches across the field-op era.  The
+                        // field-op rewrites its 19 slots 7x at
+                        // [257,365]ms, so a one-shot FIELDPATCH at ~184ms
+                        // is overwritten before the deploy stage reads
+                        // them (measured run T1: patched KEY1/KEY2 at
+                        // 0x102082d/0x1021601 reverted by crash time).
+                        // This block re-writes whenever the slot content
+                        // differs, every µs-loop iteration until the
+                        // window closes; after 500ms nothing touches the
+                        // slots again, so the values hold to the crash.
+                        // MAGICMIDA_V2_KEYPATCH=<hexaddr>-<hexbytes>[,...]
+                        #[cfg(target_arch = "x86")]
+                        {
+                            static KP_LIST: std::sync::OnceLock<
+                                Vec<(usize, Vec<u8>)>,
+                            > = std::sync::OnceLock::new();
+                            let kp_list = KP_LIST.get_or_init(|| {
+                                let mut v = Vec::new();
+                                for env_name in [
+                                    "MAGICMIDA_V2_KEYPATCH",
+                                    "MAGICMIDA_V2_KEYBUF",
+                                ] {
+                                    if let Ok(kv) = std::env::var(env_name) {
+                                        for spec in kv.split(',') {
+                                            let mut it = spec.splitn(2, '-');
+                                            let ka = usize::from_str_radix(
+                                                it.next().unwrap_or("")
+                                                    .trim_start_matches("0x"),
+                                                16,
+                                            )
+                                            .unwrap_or(0);
+                                            let kb: Vec<u8> = it
+                                                .next()
+                                                .unwrap_or("")
+                                                .as_bytes()
+                                                .chunks(2)
+                                                .filter_map(|h| {
+                                                    u8::from_str_radix(
+                                                        std::str::from_utf8(h)
+                                                            .unwrap_or("zz"),
+                                                        16,
+                                                    )
+                                                    .ok()
+                                                })
+                                                .collect();
+                                            if ka != 0 && !kb.is_empty() {
+                                                // KEYBUF specs = offsets
+                                                // into the .dat decode
+                                                // buffer (ba-relative,
+                                                // resolved per iteration
+                                                // below); flag them by
+                                                // storing the raw offset
+                                                // and a marker bit.
+                                                let is_buf =
+                                                    env_name.ends_with("KEYBUF");
+                                                v.push((
+                                                    if is_buf {
+                                                        ka | 0x8000_0000
+                                                    } else {
+                                                        ka
+                                                    },
+                                                    kb,
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                                v
+                            });
+                            for (ka, kb) in kp_list.iter() {
+                                let is_buf = *ka & 0x8000_0000 != 0;
+                                let target = if is_buf {
+                                    // buffer-relative: ba + (addr without
+                                    // the marker bit)
+                                    match buf_addr {
+                                        Some(ba) => {
+                                            ba + (*ka & 0x7FFF_FFFF)
+                                        }
+                                        None => continue,
+                                    }
+                                } else {
+                                    *ka
+                                };
+                                let pg_lo = target & !0xFFF;
+                                let off = target - pg_lo;
+                                if off + kb.len() > 0x1000 {
+                                    continue;
+                                }
+                                let mut cur = vec![0u8; kb.len()];
+                                let ok_c = unsafe {
+                                    let mut n = 0;
+                                    ReadProcessMemory(
+                                        h_process,
+                                        target as *const core::ffi::c_void,
+                                        cur.as_mut_ptr()
+                                            as *mut core::ffi::c_void,
+                                        kb.len(),
+                                        Some(&mut n),
+                                    )
+                                    .is_ok()
+                                        && n == kb.len()
+                                };
+                                if ok_c && cur[..] != kb[..] {
+                                    let _ = unsafe {
+                                        WriteProcessMemory(
+                                            h_process,
+                                            target as *const core::ffi::c_void,
+                                            kb.as_ptr()
+                                                as *const core::ffi::c_void,
+                                            kb.len(),
+                                            None,
+                                        )
+                                    };
+                                }
+                            }
+                        }// 补充 93: the register snapshot (same
                             // beat; the decode machine = the main
                             // thread — its web base 0x102859e matches).
                             // 补充 107: b8 THROTTLED — every 8th

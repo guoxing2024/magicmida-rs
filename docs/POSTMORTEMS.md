@@ -5677,3 +5677,56 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
 - 工件：dw132_run1-11/runB/runC/runD/runE-H/runM-R.log、dw132_attach1-9.log、
   werdumps/CISC-1.exe.29112.dmp+4796.dmp（34MB × 2）、lateattach2.py、
   dumpcrash.py、datcrack.py。
+
+**续 22 补充 132c（2026-11-20）——部署键派生输入源判定：license struct 全排除（8 组 patch 实验）**：
+
+- **新仪器**（helpers.rs，全部 x86 门控、双架构零告警）：
+  - **KEYPATCH**（）：µs 循环
+    内连续重写——slot 内容 ≠ payload 即 WPM。形状 = KEYFORGE 时代实证的
+    「连续补丁 = 唯一有效形状」。实测：一次 FIELDPATCH @184ms 被 field-op
+    （257ms 起 7 写/槽）覆盖（run T1 槽值回退），KEYPATCH 全存活（T2/T6
+    crash 时刻槽值 = payload ✓）。
+  - **KEYBUF**（）：同机制但地址 =
+    DECODEWATCH buf_addr 相对偏移（µs 循环内 ba 在作用域）；marker 位
+    0x80000000 区分绝对/相对。
+  - **PASSPATH**（）：[320,420]ms pattern-scan
+    verifier 页（VERIFIERBYPASS 同款）patch （mov eax,
+    [miss 0x10201FD]，折叠 disp = magic EEDC0014 相对 = per-build 常数）
+    →  + （jne）→ 6×nop。实测 hits=2（读+jne
+    都命中 = 崩溃页解码正确）。
+- **crash 页精读（WER dump Memory64 活体字节 + VA 标注）**：Eip=0x102786F
+  =  = **add [eax],al**（Eax=54831A79 = 写目标 ✓）。je 目标 =
+  0x102409C（= UE filter 消息里的地址 = **verifier 匹配路径**）；循环尾
+   折叠 = **0x10201FD miss 计数器**（补 16 的
+  0x201FD ✓）；pass path 读 miss 计数器后  分支。
+- **app 永未解密实锤**：crash 时刻 image 的 281 条新增 ASCII 串全部 =
+  壳引擎自体（Software\WinLicense、WLProjectName、驱动路径
+  oreans32.sys、/getwlstatus 等、WLProtectionDateTime=2009-3-14 = per-build）；
+  许可字符串（GUID/registered/LCF-AT）= 零残留（已擦除）→ **app 区从未
+  解密 = 部署从未开始**。crash 消息 = 运行时构建（closehandle 图零字节）
+  = 壳 UE filter 打印 **缓存的 verifier-era 内部异常（0x102409c）**。
+- **8 组 patch 实验（全部跑崩溃→WER dump→Eax 对比，baseline
+  Eax=54831A79 七项逐字节稳定）**：
+  | # | 目标 | 存活 | Eax |
+  |---|---|---|---|
+  | T1 | FP@184ms 两个 per-run 键槽 | ✗（field-op 覆盖）| — 无效实验 |
+  | T2 | KEYPATCH 同两槽（0x102082d/0x1021601）| ✓ | **不变** |
+  | T3 | KEYBUF buffer [0,52) 13-dword + pos300 | pos300 ✓，[0,52) 窗口内被重加密吞 | **不变** |
+  | T4 | 文本/数据区 [0x1021dc0,0x1022900) 2880B | ✓ | **不变** |
+  | T5 | KEYPATCH miss=0 + sentinel=3 | 竞速输（搜索 era 内持续递增）| **不变** |
+  | T6 | 13 个恒定 license 槽独立 marker（0xE0000001..0D）| **全 13 存活** | **不变** |
+  | T7 | PASSPATH 读→0 + jne→nop（hits=2）| ✓ | **不变** |
+  | T8b | 0x113f32a/e 本机键 | ✓ | **不变** |
+- **判定**：部署键派生（Eax=54831A79 的计算）**不读任何可及的 license
+  struct 槽 / buffer 键块 / 搜索状态槽 / pass-path miss 门**——输入 =
+  VM/堆态（VM 栈 @0xB8C933A4 = dump 未捕获 = UE filter 先 teardown）+
+  per-run 解密 op 链自有数据。**license 数据对部署的影响 = 经由搜索
+  （miss 389 → 下一 stage 不初始化 → pass-path 的派发异常成孤儿）**——
+  搜索的 corpus = image+0xDC000 编码 blob（1024 dword，per-build），
+  forge 搜索命中 = 需 blob 元素编码逆（补 127 选项 ②，需 era 态）。
+- **附**：VB 窗口 [320,420]ms 可被 370ms 步距的循环整体错过（T8 首跑
+  pristine fail 44）= 方差 ~1/3，重试即过。
+- 工件：dw132_runS0/S1/T1-T8b.log、werdumps/（28948/28248/7028/23308/
+  23912/29788/27080.dmp）、patch_keypatch.py/patch_keybuf.py/
+  patch_passpath.py、dw170.pkl（19 槽全表：13 恒定 + 6 演化含
+  0x102118d/0x1021d35 计数器）。
