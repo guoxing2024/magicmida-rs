@@ -5244,6 +5244,181 @@ pub(super) fn spawn_dialog_killer(
                                 }
                             }
                         }
+                        // 补充 132j: MSGTRAP — poll the corruption-
+                        // message write sites; on the first nonzero,
+                        // suspend the process and dump every thread's
+                        // context + stack (the check's return chain).
+                        #[cfg(target_arch = "x86")]
+                        {
+                            static MT_ON: std::sync::atomic::AtomicUsize =
+                                std::sync::atomic::AtomicUsize::new(0);
+                            if std::env::var("MAGICMIDA_V2_MSGTRAP").is_ok()
+                                && MT_ON.swap(
+                                    1,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                ) == 0
+                            {
+                                let hraw = h_process.0 as isize;
+                                let mraw = pid;
+                                let out2: std::path::PathBuf =
+                                    out_path.clone();
+                                let t0m = watch_t0;
+                                std::thread::spawn(move || {
+                                    use windows::Win32::Foundation::{HANDLE, CloseHandle};
+                                    use windows::Win32::System::Diagnostics::Debug::{
+                                        GetThreadContext, CONTEXT,
+                                    };
+                                    use windows::Win32::System::Threading::{
+                                        OpenThread, SuspendThread,
+                                        THREAD_GET_CONTEXT, THREAD_SUSPEND_RESUME,
+                                    };
+                                    let hp = HANDLE(hraw as *mut core::ffi::c_void);
+                                    // wait for the check era
+                                    while t0m.elapsed().as_millis() < 250 {
+                                        std::thread::sleep(
+                                            std::time::Duration::from_millis(2),
+                                        );
+                                    }
+                                    let sites = [0x102133eusize, 0x102289ausize];
+                                    let mut trapped = false;
+                                    while t0m.elapsed().as_millis() <= 4000 {
+                                        for site in sites {
+                                            let mut b = [0u8; 8];
+                                            let mut n = 0;
+                                            let ok = unsafe {
+                                                ReadProcessMemory(
+                                                    hp,
+                                                    site as *const core::ffi::c_void,
+                                                    b.as_mut_ptr() as *mut core::ffi::c_void,
+                                                    8,
+                                                    Some(&mut n),
+                                                )
+                                                .is_ok()
+                                                    && n == 8
+                                            };
+                                            if ok && b.iter().any(|&x| x != 0) {
+                                                trapped = true;
+                                                break;
+                                            }
+                                        }
+                                        if trapped {
+                                            break;
+                                        }
+                                        std::thread::sleep(
+                                            std::time::Duration::from_micros(200),
+                                        );
+                                    }
+                                    if !trapped {
+                                        warn!("MSGTRAP: no message seen in window");
+                                        return;
+                                    }
+                                    info!(
+                                        t_ms = (t0m.elapsed().as_millis() as u32),
+                                        "MSGTRAP: message written — suspending process"
+                                    );
+                                    // suspend every thread of the process
+                                    let mut tids: Vec<u32> = Vec::new();
+                                    {
+                                        use windows::Win32::System::Diagnostics::ToolHelp::{
+                                            CreateToolhelp32Snapshot, Thread32First,
+                                            Thread32Next, THREADENTRY32, TH32CS_SNAPTHREAD,
+                                        };
+                                        let snap = match unsafe {
+                                            CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+                                        } {
+                                            Ok(h) => h,
+                                            Err(_) => {
+                                                warn!("MSGTRAP: snapshot failed");
+                                                return;
+                                            }
+                                        };
+                                        let mut te = THREADENTRY32::default();
+                                        te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+                                        if unsafe { Thread32First(snap, &mut te) }.is_ok() {
+                                            loop {
+                                                if te.th32OwnerProcessID == mraw {
+                                                    tids.push(te.th32ThreadID);
+                                                }
+                                                if unsafe { Thread32Next(snap, &mut te) }
+                                                    .is_err()
+                                                {
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        unsafe {
+                                            let _ = CloseHandle(snap);
+                                        }
+                                    }
+                                    let mut blob: Vec<u8> = Vec::new();
+                                    blob.extend_from_slice(&(tids.len() as u32).to_le_bytes());
+                                    for tid in &tids {
+                                        let h = (unsafe {
+                                            OpenThread(
+                                                THREAD_GET_CONTEXT
+                                                    | THREAD_SUSPEND_RESUME,
+                                                false,
+                                                *tid,
+                                            )
+                                        })
+                                        .ok();
+                                        let Some(h) = h else {
+                                            continue;
+                                        };
+                                        unsafe {
+                                            let _ = SuspendThread(h);
+                                        }
+                                        let mut ctx = CONTEXT::default();
+                                        ctx.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_FLAGS(0x0001_0003);
+                                        if unsafe { GetThreadContext(h, &mut ctx) }.is_ok()
+                                        {
+                                            blob.extend_from_slice(&(*tid).to_le_bytes());
+                                            for v in [
+                                                ctx.Eip, ctx.Edi, ctx.Esi, ctx.Ebx,
+                                                ctx.Edx, ctx.Ecx, ctx.Eax, ctx.Ebp,
+                                                ctx.Esp, ctx.EFlags,
+                                            ] {
+                                                blob.extend_from_slice(&v.to_le_bytes());
+                                            }
+                                            let sp = ctx.Esp as usize;
+                                            let slo = sp.saturating_sub(0x1000) & !0xFFF;
+                                            let mut stk = vec![0u8; 0x4000];
+                                            for pg in 0..4u32 {
+                                                let pa = slo + (pg as usize) * 0x1000;
+                                                let o = pa - slo;
+                                                let mut n2 = 0;
+                                                unsafe {
+                                                    let _ = ReadProcessMemory(
+                                                        hp,
+                                                        pa as *const core::ffi::c_void,
+                                                        stk[o..o + 0x1000].as_mut_ptr()
+                                                            as *mut core::ffi::c_void,
+                                                        0x1000,
+                                                        Some(&mut n2),
+                                                    );
+                                                }
+                                            }
+                                            blob.extend_from_slice(&(slo as u32).to_le_bytes());
+                                            blob.extend_from_slice(&stk);
+                                        }
+                                        unsafe {
+                                            let _ = CloseHandle(h);
+                                        }
+                                    }
+                                    let stem = out2.with_extension("msgtrap");
+                                    if let Some(name) = stem.file_name() {
+                                        let mut nm = name.to_os_string();
+                                        nm.push(".bin");
+                                        let _ = std::fs::write(stem.with_file_name(nm), &blob);
+                                    }
+                                    info!(
+                                        threads = tids.len(),
+                                        bytes = blob.len(),
+                                        "MSGTRAP: all-thread dump written"
+                                    );
+                                });
+                            }
+                        }
                         // 补充 129: the FIELDPATCH injector —
                         // MAGICMIDA_V2_FIELDPATCH=<hexaddr>-<hexbytes>:
                         // poll the page; at first nonzero content (the

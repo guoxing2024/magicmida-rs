@@ -5820,3 +5820,24 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   落壳 SEH 链——需验证壳是否透明转发）；③消息模板静态引用交叉
   （closehandle 图扫模板地址 → push imm32 引用 = 校验调用点静态定位）。
 - 工件：dw132_runU17.log、patch_keycopy.py。
+
+**续 22 补充 132j（2026-11-20）——MSGTRAP：校验定位 @250ms + worker 池流水线结构实锤**：
+
+- **MSGTRAP 仪器**（MAGICMIDA_V2_MSGTRAP=1）：0.2ms 轮询 corruption 消息写入点
+  （0x102133e/0x102289a），首个非零 → **SuspendThread 全进程 + 全 27 线程
+  context/stack dump**（443KB）。**校验 = t=250ms**（非 4-9s！）。
+- **worker 池流水线实锤（27 线程返回链）**：多数线程 = ntdll 等待
+  （77bf837c/77bf869c）+ 返回链 = **[自身 op 地址， 0x102002b 公共调度器，
+  op2, op3, op3]**；op 地址跨线程顺序展开（0x109E388/0x109F568/0x10A0700/
+  0x10A1260/0x10A1CCD/0x10A2754/0x10A3385/0x10A1FEF...）= **ops 区
+  0x109E000-0x10A4000 = 流水线阶段表**，0x102002b = 派发循环（per-build）。
+- **U17（KEYCOPY）**：buffer [0,52) 13-dword 本机键 → struct [0x10000,+0x34)
+  连续复制 = 对话框零变化 = 校验 ≠ 该比较。fp 原版 5E66-5E6D 全内存零副本
+  （重组 = 原地覆盖）= fp 确定性不是门。
+- **下一增量（精确）**：MSGTRAP 瞬间同步 RPM ops 区 [0x109E000,0x10A8000)
+  （解密态！dump 后即重加密）+ 0x102002b 调度器 disasm → 流水线各阶段
+  反汇编 = 绑定校验 op = 比较逻辑 + 输入源直读。
+- 工具坑：windows 0.58 = CreateToolhelp32Snapshot/OpenThread 返回
+  Result（match/.ok()）；let-else 块内多语句需括号包裹。
+- 工件：dw132_runU18.log、CISC-1U.msgtrap.bin（27 线程 dump）、
+  patch_msgtrap.py、patch_keycopy.py。
