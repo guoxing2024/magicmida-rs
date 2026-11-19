@@ -5404,3 +5404,35 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   性判定 ③后向求解器 ④check-op 校验和 ⑤forge .dat → 真跑闭环。
 - 工件：dw136.pkl（32727 读+65 写）、dw137.pkl（65 周期寄存器快照全同）、
   dw138.pkl（栈读 = 1）。
+
+**续 22 补充 126（2026-11-19，第一百一十轮）——era1 op 全解剖：模型重写（静态 PT 拷贝，非 .dat 解密）**：
+
+- **真周期定案**：dw136 "周期"切分修正——真周期 = **圆形扫**（wrap 边界
+  0x111e892→0x111e4db，65 圈 × 506 读，dw147 固定 read-value 捕获后确认每圈
+  读址+值全同；此前以 0x111e4db 出现次数切分把每圈腰斩）。
+- **k 通道隔离（dw148-155）**：边界态 diff（dw153，1/2 周期全快照对账）=
+  EDX、5 scratch dword、**3 个 VM 帧 dword @0x102859c/5ac/5b4**、ba 1 字节。
+  逐组移植实验：仅 **帧 dword [0x10285B4] 高 u16**（0x2522+k）翻转 out 值
+  （0x54→0x68→0x69 随 +1）；[0x102859C] 只搬写地址；EDX/scratch/ba 全无效。
+- **PT 表发现**：counter 曲线（dw156，0x2522+k 连续 70 值）= **整条明文
+  'This application has been registered to\n\r(CISC-1) Examples - LCF'**——
+  计数器 = **读指针低 16 位**，明文表 = **0x1182522 静态驻留**（failfreeze
+  镜像内 '5This application…'，PT[0]=0x35 在 0x1182522；out[k]=PT[k+1]，
+  dw141 的 0x1182523 读 = 该表的本尊读）。
+- **模型重写**：era1 op（t=186813，"字段解码"）= **静态明文表 → ba 缓冲的
+  拷贝走表**，与 .dat 内容零耦合（dw121 已证 ba patch 无 diff，本轮反证
+  完整闭环）。"65 周期密码 F" = 走表循环；F 可逆性 = 平凡（拷贝）。
+  **.dat 的真角色 = hash keystone**（check-op 校验通过后擦除，内容不参与
+  字段）——补 122 的"镜像内嵌加密字段"模型修正为"静态表 + keystone"。
+- **方法论教训**：dw140 读 hook 的 unicorn value 参数不可靠（全 0）——
+  hook 内必须 uc.mem_read 取值；dw147 修复后值全对。2549 周期寄存器全同 +
+  计数器单调 = 走表机器的指纹（此前误读为"重运算密码"）。
+- **forge 路线 v2**：许可字段 = 静态镜像数据（PT 表 + KP 结构页）→ 改字段 =
+  patch 静态区 + verifier 期望值对齐；.dat = 保持 pristine（hash 已过）。
+  verifier（0x2402C）逐字段 vmhash（OUT/vmhash.py 全实现）期望常数 =
+  搜索列表 @RVA 0xDC000 编码 blob 内（1024 dword 全非零，需解编码）或
+  check-op 转移表（check_states.json 16 态已存）。
+- 下一 session：①搜索列表 blob 解码（expected 常数提取）②vmhash 仿射求逆
+  （GF(2) 线性，可解字段）③字段 patch + KP 一致性 ④真跑验证 = forge 闭环。
+- 工件：dw139-156 脚本+pkl（dw147 读值修复版、dw153 边界对账、dw154 组隔离、
+  dw155/156 计数器曲线）、dw139_window.pkl（441 值窗）、check_states.json。
