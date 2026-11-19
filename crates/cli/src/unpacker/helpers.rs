@@ -937,6 +937,78 @@ pub(super) fn spawn_dialog_killer(
         const FAIL_MARK: u32 = 0xFFFF_A595;
         const BANK_RVA: usize = 0x28580;
         let bank_addr = image_base + BANK_RVA;
+        // 补充 132x: dedicated early BLKSTREAM thread — the main watch
+        // loop's first BLKSTREAM entry lands at ~370ms (its cadence),
+        // structurally AFTER the decode era [189,220]ms.  This thread
+        // polls the bank state (ca/cb/dp) at 1ms cadence through the
+        // decode era = the node-build timeline.
+        if std::env::var("MAGICMIDA_V2_BLKSTREAM").is_ok() {
+            let hraw_b = handle_raw;
+            let baddr = bank_addr;
+            let outb: std::path::PathBuf = out_path.to_path_buf();
+            let t0b = watch_t0;
+            std::thread::spawn(move || {
+                use windows::Win32::Foundation::HANDLE;
+                let hp = HANDLE(hraw_b as *mut core::ffi::c_void);
+                while t0b.elapsed().as_millis() < 140 {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                let mut recs: Vec<[u32; 4]> = Vec::new();
+                let mut last = (0u32, 0u32);
+                let fail_seen = false;
+                let _ = fail_seen;
+                while t0b.elapsed().as_millis() <= 320 {
+                    let mut cb8 = [0u8; 8];
+                    let mut n = 0;
+                    let ok = unsafe {
+                        ReadProcessMemory(
+                            hp,
+                            (baddr + 0x1E) as *const core::ffi::c_void,
+                            cb8.as_mut_ptr() as *mut core::ffi::c_void,
+                            8,
+                            Some(&mut n),
+                        )
+                        .is_ok()
+                            && n == 8
+                    };
+                    if ok {
+                        let ca = u32::from_le_bytes(cb8[0..4].try_into().unwrap());
+                        let cb = u32::from_le_bytes(cb8[4..8].try_into().unwrap());
+                        if (ca, cb) != last {
+                            recs.push([
+                                t0b.elapsed().as_millis() as u32, ca, cb, 0,
+                            ]);
+                            last = (ca, cb);
+                        }
+                        if ca == 0xFFFF_A595 {
+                            info!(
+                                t_ms = (t0b.elapsed().as_millis() as u32),
+                                "BLKSTREAM-EARLY: FAIL_MARK seen"
+                            );
+                            break;
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                let mut blob: Vec<u8> = Vec::new();
+                blob.extend_from_slice(&(recs.len() as u32).to_le_bytes());
+                for r in &recs {
+                    for v in r {
+                        blob.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+                let stem = outb.with_extension("blkstream_early");
+                if let Some(name) = stem.file_name() {
+                    let mut nm = name.to_os_string();
+                    nm.push(".bin");
+                    let _ = std::fs::write(stem.with_file_name(nm), &blob);
+                }
+                info!(
+                    records = recs.len(),
+                    "BLKSTREAM-EARLY: decode-era timeline flushed"
+                );
+            });
+        }
         let mut bank = [0u8; 64];
         let freeze_mode = std::env::var("MAGICMIDA_V2_FAILFREEZE").is_ok();
         // Licence-hash patch (`MAGICMIDA_V2_HASHPATCH=1`): the check's two

@@ -6057,3 +6057,23 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   op 带 → 节点构建 op ②外科 patch（仅键源字段，保留 .dat 校验和）→
   CALC 通过 → 部署启动。
 - 工件：dw132_runU34-U38.log。
+
+**续 22 补充 132x（2026-11-20）——专用早启 BLKSTREAM 线程：解码 era 时间线捕获成功**：
+
+- **根因定案**：主 watch 循环步距 ~370ms → BLKSTREAM 首达 ~370ms > 解码 era
+  末（220ms）= **结构性不可捕**。修复 = **专用早启线程**（0ms 起，[140,320]ms
+  1ms 级轮询 bank 态 ca/cb，变化即记录，FAIL_MARK 即停）。
+- **解码 era 时间线实锤**（56 记录，U39，blkstream_early.bin）：
+  - t=160-177ms：ca = **0x3530025→0x35301C2 顺序走读**（步距 ~0x35）=
+    **节点构建写入期**（buffer 明文区顺序写 = ba+0x25 起）
+  - **t=183ms：ca = 0xEEDC0014 = CHECK MAGIC 装载**（校验锚点就绪）
+  - t=185-187ms：收尾/中断态
+  - t=274-319ms：ca = **0x3540000（struct 页 = ba+0x10000！）** 与
+    0x1021axx（ops）交替 = **check era**
+- **结构映射**：ca = 机器指针（写游标）——节点构建 = buffer 明文顺序写
+  （[160,177]ms），校验 = struct 页 + ops（[274+]ms），magic 于两者间
+  装载。节点键源 = buffer [0x25,0x1C2] 区（构建期写入）。
+- **下一增量**：①构建期 ca 走读 × 节点阵列差分（buffer[X] → 阵列[Y]
+  映射）②外科 patch（仅节点键源 X 区 = 本机键，保留校验和/尾区）→
+  CALC 通过 → 部署启动。
+- 工件：CISC-1U.blkstream_early.bin（56 记录时间线）、dw132_runU39.log。
