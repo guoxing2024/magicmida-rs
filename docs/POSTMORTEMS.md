@@ -6120,3 +6120,14 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
 - **下一会话**：0x1020095 差分（改 buffer 输入 → 0x1020095 值变化？）=
   fp-middle 源确认 → 外科 patch → CALC 通过 → 部署启动 = forge 全闭环。
 - 工件：msgtrap_ops.bin + 本解码。
+
+**续 22 补充 132ab（2026-11-20）——0x1020095 差分阳性：fp-middle 源 = buffer 派生确认**：
+
+- **双 payload 差分**（U42a keys / U42b markers，dialog 态活体读）：
+  - RunA (keys)：0x1020095 = 00000000 01000000 **00585547**00000000
+  - RunB (markers)：0x1020095 = 00000000 01000000 **00d26a16**00000000
+  - **+8 dword 随 buffer 变化** = **fp-middle 源 = buffer 派生确认 ✓**
+  - 值 = 变换后形式（≠ 输入原值，编码非平凡）→ 源偏移 = 二分定位
+- **下一增量**：payload 二分（半区 keys/半区 markers）× log2(83)≈7 runs →
+  源偏移 → 外科 patch → CALC 通过 → 部署启动。
+- 工件：dw132_runU42a/b.log。
