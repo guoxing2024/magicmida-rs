@@ -1366,6 +1366,7 @@ pub fn unpack(
                 // the handler which dumps the live page and restores RW.
                 // The shell's later port-check may still bail — the dump is
                 // already on disk by then.
+                #[cfg_attr(target_arch = "x86_64", allow(unused_variables))]
                 if let Some((tp_lo, tp_sz)) = pagetrap {
                     #[cfg(target_arch = "x86")]
                     {

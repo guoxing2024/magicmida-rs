@@ -4561,6 +4561,110 @@ pub(super) fn spawn_dialog_killer(
                     }
                 }
                 // Phase 2: µs-snapshot the buffer through the decode.
+                // 补充 132: VERIFIERBYPASS state — hoisted to this scope so
+                // the restore-after-use block (further down, reached on
+                // every poll-loop iteration once the µs window has closed)
+                // shares it with the patch block inside the µs loop.
+                #[cfg(target_arch = "x86")]
+                static VB_ARMED: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                #[cfg(target_arch = "x86")]
+                static VB_VA: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                #[cfg(target_arch = "x86")]
+                static VB_OLD: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                #[cfg(target_arch = "x86")]
+                static VB_RESTORED: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                // 补充 132: the shared restore-after-use body.  Called from
+                // the µs window loop (vb_ms < 500 — kHz ticks, the patch
+                // window shrinks to [apply, vb_ms]) and from the bail-watch
+                // loop (vb_ms ≥ 500).  Rationale: the verifier verdict is
+                // consumed right after the op ([340,360]ms); a LATER
+                // integrity scan finding the je→jmp would self-kill with a
+                // fake 0xC0000005 — measured: the debugger receives NO AV
+                // debug event (only EXIT_PROCESS), so the death is a
+                // TerminateProcess-style kill, not a fault.  Measured
+                // 551 ms restore: the probe finds eb 0f (the patch is NOT
+                // re-encoded) and the death still lands at ~4.4 s → the
+                // scan window after the verdict is not the trigger either.
+                #[cfg(target_arch = "x86")]
+                let vb_restore = |h_process: windows::Win32::Foundation::HANDLE| {
+                    let vb_ms: u128 =
+                        std::env::var("MAGICMIDA_V2_VBRESTORE_MS")
+                            .ok()
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .map(|v| v as u128)
+                            .unwrap_or(550);
+                    if VB_ARMED
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        == 1
+                        && VB_RESTORED
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            == 0
+                        && watch_t0.elapsed().as_millis() >= vb_ms
+                    {
+                        let rva =
+                            VB_VA.load(std::sync::atomic::Ordering::Relaxed);
+                        let mut cur = [0u8; 2];
+                        let ok_c = unsafe {
+                            let mut n = 0;
+                            ReadProcessMemory(
+                                h_process,
+                                rva as *const core::ffi::c_void,
+                                cur.as_mut_ptr() as *mut core::ffi::c_void,
+                                2,
+                                Some(&mut n),
+                            )
+                            .is_ok()
+                                && n == 2
+                        };
+                        if ok_c {
+                            static VB_PROBED: std::sync::atomic::AtomicUsize =
+                                std::sync::atomic::AtomicUsize::new(0);
+                            if VB_PROBED.swap(
+                                1,
+                                std::sync::atomic::Ordering::Relaxed,
+                            ) == 0
+                            {
+                                info!(
+                                    va = format!("{rva:#x}"),
+                                    cur = %format!("{:02x} {:02x}", cur[0], cur[1]),
+                                    t_ms = (watch_t0.elapsed().as_millis() as u32),
+                                    "VBRESTORE probe — verifier bytes at restore time"
+                                );
+                            }
+                        }
+                        if ok_c && cur[0] == 0xEB {
+                            let old = VB_OLD
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                            let ob = [
+                                ((old >> 8) & 0xFF) as u8,
+                                (old & 0xFF) as u8,
+                            ];
+                            let _ = unsafe {
+                                WriteProcessMemory(
+                                    h_process,
+                                    rva as *const core::ffi::c_void,
+                                    ob.as_ptr() as *const core::ffi::c_void,
+                                    2,
+                                    None,
+                                )
+                            };
+                            VB_RESTORED.store(
+                                1,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            info!(
+                                va = format!("{rva:#x}"),
+                                old = %format!("{:02x} {:02x}", ob[0], ob[1]),
+                                t_ms = (watch_t0.elapsed().as_millis() as u32),
+                                "VERIFIERBYPASS restored — pristine bytes back"
+                            );
+                        }
+                    }
+                };
                 if let Some(ba) = buf_addr {
                     // Window extended to 500 ms: covers the three searches
                     // [331,412] — the block capture then holds the search
@@ -4683,8 +4787,6 @@ pub(super) fn spawn_dialog_killer(
                         // every vmhash(field) check passes.
                         #[cfg(target_arch = "x86")]
                         {
-                            static VB_ARMED: std::sync::atomic::AtomicUsize =
-                                std::sync::atomic::AtomicUsize::new(0);
                             if std::env::var("MAGICMIDA_V2_VERIFIERBYPASS")
                                 .is_ok()
                                 && VB_ARMED.load(
@@ -4737,6 +4839,15 @@ pub(super) fn spawn_dialog_killer(
                                         1,
                                         std::sync::atomic::Ordering::Relaxed,
                                     );
+                                    VB_VA.store(
+                                        va,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                    VB_OLD.store(
+                                        ((page[j + 2] as u32) << 8)
+                                            | (page[j + 3] as u32),
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
                                     info!(
                                         va = format!("{va:#x}"),
                                         old = %format!("{:02x} {:02x}", page[j+2], page[j+3]),
@@ -4744,6 +4855,7 @@ pub(super) fn spawn_dialog_killer(
                                     );
                                 }
                             }
+                            vb_restore(h_process);
                         }
                         // 补充 129: the FIELDPATCH injector —
                         // MAGICMIDA_V2_FIELDPATCH=<hexaddr>-<hexbytes>:
@@ -7371,6 +7483,10 @@ pub(super) fn spawn_dialog_killer(
                         }
                         return;
                     }
+                    // 补充 132: restore-after-use (see the vb_restore
+                    // closure above) — fires at >= VBRESTORE_MS.
+                    #[cfg(target_arch = "x86")]
+                    vb_restore(h_process);
                     // PASS-evidence probe (2026-11-07): a FRESH OpenProcess
                     // limited to VM_READ.  Once the shell deploys its
                     // protected state it strips VM_READ from foreign opens

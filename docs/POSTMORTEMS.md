@@ -4740,7 +4740,8 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   族，带解密常数）④**块链尾 `jmp 0x102888a`**（VMCTX 区延续）。
 - **rec#1（t=201.18，cb=0x1124e3c）= 数据页**：壳内嵌消息串
   （"Latest Instance"、"% 0x%X
-
+
+
 " 等）——cb 在短 jmp 边界，
   块体在 0x1124f2d。非代码页。
 - **f 结构直读路径确认**：解码时代机器 = 与检查时代同一家族的
@@ -5585,3 +5586,71 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
 - 过程缺陷：扫描窗口 RVA 错写 0x4000（正确 = 0x24000）一轮；b0=0x7c 误判
   = 活体页与冻结页同布局但初读时机错（300ms 太早，op 未解密）。
 - 工件：dw131_run1-7.log。
+
+**续 22 补充 132（2026-11-19，第一百一十六轮）——4.4s 崩溃全归因（WER dump 实锤）+ 组合拳联跑落地**：
+
+- **FIELDPATCH(PWNED) + FIELDPATCH2 + VERIFIERBYPASS 三仪器联跑（dw132_run2/
+  run5/run9）**：FP@0x1182522(65B)+FP2@0x10228c4(8B) @172-186ms → era1 输出
+  捕获 @188-202ms（PWNED 进 era1 输出窗口）→ VB patch @330-425ms → shell
+  运行 4.4-9.7s（pristine 0.5s exit 44）= **自定义 license 字段 + 全字段
+  check 短路同时成立，许可门通过**。前置条件 = DECODEWATCH 必须开（VB/FP
+  块在 `if let Some(ba) = buf_addr` 内，无 .dat buffer 定位 = 静默跳过，
+  dw132_run1 教训：只设 VB/FP env 仪器全不发）。
+- **排除法四连（restore-after-use 仪器 = VBRESTORE）**：
+  - 仪器形状：`MAGICMIDA_V2_VBRESTORE_MS=<ms>`（默认 550）——patch 字节存
+    VB_OLD（u32 高低字节），restore 调用点 = bail-watch 10ms 循环（vb_ms
+    ≥500）+ µs 窗口循环（vb_ms <500，kHz tick，run D restore @386ms）。
+    首版错误 = restore 块放在 `if VB_ARMED==0 && [320,420]` 的 else（patch
+    后恒短路）→ 移出；第二版放在主 poll 循环 dump 段（实测 = 整个 watch
+    函数单遍执行，dump 段只跑一次 @505ms）→ 最终 = DECODEWATCH bail-watch
+    循环内（10ms tick 全程）+ µs 循环双调用点。
+  - run B（restore@553ms、无 FP）：death 仍 ~4.4s → **FP 字段非触发器**
+  - run C/D（restore@514/386ms，µs 循环）：patch 窗口缩到 [338,386]≈9ms，
+    death 仍 ~5.4s → **verifier 页字节扫描（patch 检测）非触发器**
+  - probe @551ms 读回 `eb 0f`（patch 未被重编码）→ op 执行后页保持 patch 态
+- **late-attach mini-debugger（OUT/ps1/lateattach2.py）**：壳 init-era 端口
+  检查后（~2.5s）DebugActiveProcess——运行期检测存在（attached run 死状
+  不同）但可行；PEB32 走链枚举模块（64-bit 调用方 toolhelp 只见 WOW64 视
+  图；ProcessWow64Information→Peb32→Ldr.InLoadOrderModuleList，BaseDllName
+  UNICODE_STRING32 @+0x2C/+0x30）；解析 kernel32/ntdll 导出表（Optional
+  header magic @peh+24；EXPORT_DIRECTORY：NumberOfNames@0x18、AFNS@0x1C、
+  ANAMES@0x20、ANORDS@0x24——首轮 unpack_from(exp,20) 全错位）→ **4 个
+  terminate 路径 int3（kernel32!TerminateProcess/ExitProcess、
+  ntdll!NtTerminateProcess/RtlExitUserProcess）全部 arm 成功、全部未命中**，
+  EXIT_PROCESS code=0xC0000005 直接落地 → **attached 态的死亡 = 直连
+  syscall 自杀（绕过全部 user-mode terminate API），壳运行期反调试响应**
+  （64-bit DEBUG_EVENT 坑：union 8 对齐 @16 非 12；EXCEPTION_RECORD64
+  148B → dwFirstChance @164）。
+- **WER LocalDumps = 决定性武器（无调试器 = 自然路径保真）**：
+  `HKLM\...\Windows Error Reporting\LocalDumps\CISC-1.exe {DumpFolder,
+  DumpType=2, DumpCount}` → 干净 bypass run 写出 **34MB 全量 dump** →
+  **死亡 = 真实 unhandled AV，非 TerminateProcess**。
+- **dumpcrash.py 解析（OUT/ps1）**：MINIDUMP 手工解析（ExceptionStream@6、
+  ModuleListStream@4：MINIDUMP_MODULE=108B、ModuleNameRva @+20 非 +24；
+  Memory64ListStream@9）→ **裁决**：
+  - `EXCEPTION code=C0000005 addr=0102786F（image RVA 0x2786F）WRITE
+    target=54831A79`
+  - x86 CONTEXT（Eip@184 与 SegCs@188=0x23/EFlags@192 交叉验证 = 真实）：
+    **Ebp=EEDC0014（check-family magic）**、Edi=0102786B、Esi=010277F6、
+    Eax=54831A79（=写入目标=垃圾）、Edx=CA5E2899（垃圾）、Esp=B8C933A4
+    （VM 备用栈）
+  - 现场代码（dump Memory64 活体字节）：`...; b8 00 00 00 00 | 0b c0 |
+    74 58 | 83 bd 35 04 26 12 00（cmp [ebp+0x12260435],0 → 折叠
+    0x01020449 in-image）| 74 06 | ff 95 2d 0a 26 12（call [ebp+0x12260A2D]
+    → 0x01020A41）...` = ebp-magic 折叠寻址的原生混淆块（check op 家族）
+  - **结论：post-许可检查阶段的 VM op 以许可派生密钥解密/部署数据，解出
+    垃圾指针 → AV。垃圾根因 = 许可数据机器锁定（.dat = LCF-AT 硬件锁
+    license，本机身份不符 → f(license, machine) 密钥错）**
+  - **复现实锤（werdumps/CISC-1.exe.4796.dmp，第二次独立 run）**：crash
+    addr/target/Eax/Ebp/Edi/Esi/Esp **七项全部逐字节一致**（仅 Edx 高位随
+    per-run 键演化 0F4C2899 vs CA5E2899）= 确定性崩溃点
+- **campaign 语义定案**：许可门（verifier vmhash 比较）= **bypass 成立**
+  （gate 真通过）；4.4s crash = **机器锁定的许可数据在部署阶段解密失败**
+  ——不是反篡改响应、不是 FP 字段、不是壳字节码 bug。forge 全闭环 =
+  .dat 重加密（本机硬件字段）——已知的剩余缺口（补 129 定案的 check-op
+  emu 阻断 / Crypt* API dump 替代路线）。
+- 过程坑（工具层）：grep 对含 NUL 的日志静默返回空（26 个 NUL 字节 =
+  binary 判定）→ 全部日志分析走 python；64-bit 宿主解析 32-bit 目标的
+  DEBUG_EVENT 偏移错位一轮；后台 python 的相对 cwd 漂移 → 一律绝对路径。
+- 工件：dw132_run1-11/runB/runC/runD/runE-H.log、dw132_attach1-9.log、
+  werdumps/CISC-1.exe.29112.dmp（34MB）、lateattach2.py、dumpcrash.py。
