@@ -2813,6 +2813,20 @@ pub(super) fn spawn_dialog_killer(
                             }
                             return;
                         }
+                            // 补充 132w: unconditional flush at the
+                            // window end (the bail-only write missed the
+                            // non-bail exits).
+                            {
+                                let stem = out_path.with_extension("v2blkstream");
+                                if let Some(name) = stem.file_name() {
+                                    let mut n3 = name.to_os_string();
+                                    n3.push(".bin");
+                                    let _ = std::fs::write(
+                                        stem.with_file_name(n3),
+                                        &blobs,
+                                    );
+                                }
+                            }
                         for cont in [ca, cb] {
                             if cont == 0 || cont == 0xFFFF_FFFF {
                                 continue;
@@ -5601,6 +5615,92 @@ pub(super) fn spawn_dialog_killer(
                                         threads = tids.len(),
                                         bytes = blob.len(),
                                         "MSGTRAP: all-thread dump written"
+                                    );
+                                });
+                            }
+                        }
+                        // 补充 132r: FPLOCATE — poll the buffer for
+                        // the raw fingerprint string; on first sight,
+                        // log the offset AND patch the middle segments
+                        // (5E66-5E6D -> 254D-9F3C = this machine's fp)
+                        // in place, continuously (the decode may
+                        // rewrite) so the binding check reads ours.
+                        #[cfg(target_arch = "x86")]
+                        {
+                            static FL_ON: std::sync::atomic::AtomicUsize =
+                                std::sync::atomic::AtomicUsize::new(0);
+                            if std::env::var("MAGICMIDA_V2_FPLOCATE").is_ok()
+                                && FL_ON.swap(
+                                    1,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                ) == 0
+                            {
+                                let hraw2 = h_process.0 as isize;
+                                let ba2f: usize = ba;
+                                let t0f = watch_t0;
+                                std::thread::spawn(move || {
+                                    use windows::Win32::Foundation::HANDLE;
+                                    let hp2 = HANDLE(
+                                        hraw2 as *mut core::ffi::c_void,
+                                    );
+                                    while t0f.elapsed().as_millis() < 150 {
+                                        std::thread::sleep(
+                                            std::time::Duration::from_millis(2),
+                                        );
+                                    }
+                                    let fp_base = b"1051-BCEC-14F2-0C18-3745-";
+                                    let fp_new = b"254D-9F3C";
+                                    let mut found_off: Option<usize> = None;
+                                    while t0f.elapsed().as_millis() <= 1500 {
+                                        let mut b = [0u8; 480];
+                                        let mut n = 0;
+                                        let ok = unsafe {
+                                            ReadProcessMemory(
+                                                hp2,
+                                                ba2f as *const core::ffi::c_void,
+                                                b.as_mut_ptr() as *mut core::ffi::c_void,
+                                                480,
+                                                Some(&mut n),
+                                            )
+                                            .is_ok()
+                                                && n == 480
+                                        };
+                                        if ok {
+                                            if let Some(p) = b
+                                                .windows(fp_base.len())
+                                                .position(|w| w == fp_base)
+                                            {
+                                                if found_off.is_none() {
+                                                    found_off = Some(p);
+                                                    info!(
+                                                        off = p,
+                                                        t_ms = (t0f.elapsed().as_millis() as u32),
+                                                        "FPLOCATE: fp found in buffer"
+                                                    );
+                                                }
+                                                // patch the middle segments at
+                                                // p+25 (9 bytes)
+                                                let mut w2 = 0;
+                                                let patch =
+                                                    (fp_new).as_ptr() as *const core::ffi::c_void;
+                                                unsafe {
+                                                    let _ = WriteProcessMemory(
+                                                        hp2,
+                                                        (ba2f + p + 25) as *const core::ffi::c_void,
+                                                        patch,
+                                                        9,
+                                                        Some(&mut w2),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        std::thread::sleep(
+                                            std::time::Duration::from_micros(300),
+                                        );
+                                    }
+                                    info!(
+                                        off = ?found_off,
+                                        "FPLOCATE: window over"
                                     );
                                 });
                             }

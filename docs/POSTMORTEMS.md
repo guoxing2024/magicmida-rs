@@ -6042,3 +6042,18 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
 - **下一会话路径**：①BLKSTREAM + dialog OK 程序化关闭 → 解码 era op 带 →
   节点构建 op 定位 ②外科 patch（仅键源字段）→ CALC 通过 → 部署启动 =
   forge 全闭环。
+
+**续 22 补充 132w（2026-11-20）——BLKSTREAM 写入路径调查（会话收口）**：
+
+- **BLKSTREAM = FAIL_MARK-gated 且窗口 [150,300]ms**：U37 pristine =
+  FAIL_MARK @366ms（窗口已关）→ 无文件；U36 markers = dialog 挂起（无
+  FAIL_MARK）→ 无文件；U35 keys + OK = bail return 跳过 dump 段 → 无文件。
+- ** unconditional flush 修复**：插入 per-iteration 写（U38）→ 文件仍缺席
+  = **BLKSTREAM 块本身未进入**（门控/窗口需下轮排查——候选 = 块入口的
+  分支条件或 blobs 空判）。
+- **会话最终状态**：校验逻辑全链路可读（搜索=链表扫描/JIT/check-op 引用
+  全图/节点阵列）；仪器链完整（KEYBUF/KEYCOPY/PASSPATH/MSGTRAP/EIPHIST/
+  FPLOCATE/fpfind）；forge 最后一步 = ①BLKSTREAM 块入口排查 → 解码 era
+  op 带 → 节点构建 op ②外科 patch（仅键源字段，保留 .dat 校验和）→
+  CALC 通过 → 部署启动。
+- 工件：dw132_runU34-U38.log。
