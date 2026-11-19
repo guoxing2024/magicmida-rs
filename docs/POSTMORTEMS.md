@@ -6160,3 +6160,16 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   阻断 = 需解密后检查前窗口）②.dat 计数器字段定位（密文中）+ 重编码
   ③解码装载后重置的竞速强化（µs 连续重置 = KEYCOPY 形状）。
 - 工件：dw132_runU43-U45.log。
+
+**续 22 补充 132y4（2026-11-20）——counter/imm patch 全执行仍 corrupted：检查读取超出可达态**：
+
+- **全部 patch 执行**（U51）：counter 零化 @142ms ✓ + zero-imm patch
+  @301ms ✓（16 站点）+ re-load-triggered imm patch（新加，live 值）→
+  **CALC 对话框仍 corrupted**。
+- **判定**：校验 = 读取超出全部可达态（运行时 counter 副本/imm 均
+  patch 过仍 fail）→ **检查读取 .dat 原始计数器（密文侧直读）或
+  per-run 深层状态**——运行时侧全部绕过无效。
+- **剩余唯一路径 = .dat 计数器字段定位 + 重编码**（密文侧 = .dat 密码
+  阻断 = 闭环）或 **check-op 全量反汇编的深读**（msgtrap_ops 40KB
+  已捕获，比较逻辑逐指令）。
+- 工件：dw132_runU46-U51.log。

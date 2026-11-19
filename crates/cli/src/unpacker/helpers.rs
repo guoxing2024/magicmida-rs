@@ -1032,7 +1032,151 @@ pub(super) fn spawn_dialog_killer(
                             break;
                         }
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    // 补充 132y3b: the imm patch = AFTER the re-load —
+                    // poll the counter; when it becomes nonzero (the
+                    // re-load from the .dat = 0x7d1), patch the imm with
+                    // the live value = the compare [X] vs [X] = equal.
+                    {
+                        let caddr = (0xEEDC0014usize
+                            .wrapping_add(0x12262D29))
+                            & 0xFFFFFFFF;
+                        let mut patched_imm = false;
+                        while t0b.elapsed().as_millis() <= 300 {
+                            let mut cb2 = [0u8; 4];
+                            let mut n2 = 0;
+                            let okc = unsafe {
+                                ReadProcessMemory(
+                                    hp,
+                                    caddr as *const core::ffi::c_void,
+                                    cb2.as_mut_ptr() as *mut core::ffi::c_void,
+                                    4,
+                                    Some(&mut n2),
+                                )
+                                .is_ok()
+                                    && n2 == 4
+                            };
+                            if okc {
+                                let cv = u32::from_le_bytes(cb2);
+                                if cv != 0 && !patched_imm {
+                                    // the re-load detected — patch the imm
+                                    let scan_lo = 0x109E000usize;
+                                    let scan_sz = 0xA000usize;
+                                    let pat = [
+                                        0x81u8, 0xBD, 0x29, 0x2D, 0x26, 0x12,
+                                        0xD0, 0x07, 0x00, 0x00,
+                                    ];
+                                    let mut opsbuf = vec![0u8; scan_sz];
+                                    let mut nops = 0;
+                                    unsafe {
+                                        let _ = ReadProcessMemory(
+                                            hp,
+                                            scan_lo as *const core::ffi::c_void,
+                                            opsbuf.as_mut_ptr() as *mut core::ffi::c_void,
+                                            scan_sz,
+                                            Some(&mut nops),
+                                        );
+                                    }
+                                    let newimm = cv.to_le_bytes();
+                                    let mut cnt = 0usize;
+                                    for j in 0..scan_sz - pat.len() {
+                                        if opsbuf[j..j + pat.len()] == pat[..] {
+                                            let va = scan_lo + j + 6;
+                                            let mut w6 = 0;
+                                            unsafe {
+                                                let _ = WriteProcessMemory(
+                                                    hp,
+                                                    va as *const core::ffi::c_void,
+                                                    newimm.as_ptr() as *const core::ffi::c_void,
+                                                    4,
+                                                    Some(&mut w6),
+                                                );
+                                            }
+                                            cnt += 1;
+                                        }
+                                    }
+                                    patched_imm = true;
+                                    info!(
+                                        cnt,
+                                        cv = format!("{cv:#x}"),
+                                        t_ms = (t0b.elapsed().as_millis() as u32),
+                                        "BLKSTREAM-EARLY: imm patched with re-loaded counter"
+                                    );
+                                }
+                            }
+                            // NO sleep = the tight race loop
+                        }
+                    }
+                    // 补充 132y3: the check-instruction imm patch — the
+                    // check's cmp is per-run decrypted in the ops region;
+                    // scan the decrypted layout for
+                    //   cmp dword [ebp+0x12262d29], 0x7d0
+                    //   = 81 BD 29 2D 26 12 D0 07 00 00
+                    // and zero the imm so the counter check passes.
+                    {
+                        let scan_lo = 0x109E000usize;
+                        let scan_sz = 0xA000usize;
+                        let pat = [
+                            0x81u8, 0xBD, 0x29, 0x2D, 0x26, 0x12, 0xD0, 0x07,
+                            0x00, 0x00,
+                        ];
+                        let mut opsbuf = vec![0u8; scan_sz];
+                        let mut nops = 0;
+                        unsafe {
+                            let _ = ReadProcessMemory(
+                                hp,
+                                scan_lo as *const core::ffi::c_void,
+                                opsbuf.as_mut_ptr() as *mut core::ffi::c_void,
+                                scan_sz,
+                                Some(&mut nops),
+                            );
+                        }
+                        let mut patched = 0usize;
+                        // the imm = the counter's CURRENT value (read at
+                        // patch time) — the counter is re-loaded to 0x7D1
+                        // by the shell after our zeroing, so patching the
+                        // imm with the LIVE counter value makes the
+                        // compare [X] vs [X] = equal = pass
+                        let mut ctr = [0u8; 4];
+                        let mut nctr = 0;
+                        unsafe {
+                            let _ = ReadProcessMemory(
+                                hp,
+                                ((0xEEDC0014usize.wrapping_add(0x12262D29))
+                                    & 0xFFFFFFFF)
+                                    as *const core::ffi::c_void,
+                                ctr.as_mut_ptr() as *mut core::ffi::c_void,
+                                4,
+                                Some(&mut nctr),
+                            );
+                        }
+                        info!(
+                            ctr = format!("{:02x}{:02x}{:02x}{:02x}",
+                                ctr[3], ctr[2], ctr[1], ctr[0]),
+                            "BLKSTREAM-EARLY: imm = live counter value"
+                        );
+                        for j in 0..scan_sz - pat.len() {
+                            if opsbuf[j..j + pat.len()] == pat[..] {
+                                let va = scan_lo + j + 6;
+                                let zeroimm = ctr;
+                                let mut w6 = 0;
+                                unsafe {
+                                    let _ = WriteProcessMemory(
+                                        hp,
+                                        va as *const core::ffi::c_void,
+                                        zeroimm.as_ptr() as *const core::ffi::c_void,
+                                        4,
+                                        Some(&mut w6),
+                                    );
+                                }
+                                patched += 1;
+                            }
+                        }
+                        info!(
+                            patched,
+                            t_ms = (t0b.elapsed().as_millis() as u32),
+                            "BLKSTREAM-EARLY: check imm patched"
+                        );
                 }
                 let mut blob: Vec<u8> = Vec::new();
                 blob.extend_from_slice(&(recs.len() as u32).to_le_bytes());
