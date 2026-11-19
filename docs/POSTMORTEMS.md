@@ -5931,3 +5931,24 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
 - **MSGTRAP 冻结窗口验证**：挂起态进程 = 活体分析窗口（JIT 已填充可 dump、
   全内存可 RPM）——解析/差分实验可在冻结进程上无限期进行。
 - 工件：CISC-1U.msgtrap.bin（38 线程）、jit_live.bin。
+
+**续 22 补充 132q（2026-11-20）——调用序列时序定案：消息 @250ms → JIT 填充 @308ms → 19 calls 之后**：
+
+- **MSGTRAP 扩展**：JIT-only trap + **call-target 序列记录器**（0.2ms 轮询
+  struct+0x78，去重连续）+ 序列 dump（msgtrap_seq.bin = targets + 每 target
+  0x200 代码）。
+- **时序定案（U26c）**：消息写入 @250ms → **JIT 填充 @308ms**（代码首次写 =
+  trap 时刻）→ **19 calls 在填充之后**——recorder [250,308] = 捕获的 =
+  填充前垃圾值（0x1fbec35f，struct+0x78 填充前 = 复用态）。序列记录器
+  必须跑在 **填充后窗口** [308, ...]。
+- **targets=1 的含义**：recorder 窗口内 = 单一去重值 = 填充前态。19 calls
+  = 填充后 µs 级间隔 = 轮询不可分——**目标捕获需冻结时刻读**（填充后
+  SuspendThread 即读 struct+0x78 = 中断在 calls 中间）或填充后连续采样。
+- **修正链**：132m（同一函数）→132p（19 个不同）→**132q（19 calls =
+  填充后执行，fill 后指针值 = 有效目标，132m 模型大概率正确但待
+  填充后读数确认）**。
+- 下一增量：MSGTRAP trap 后（JIT 非零即 SuspendThread）读 struct+0x78 =
+  **首个有效目标** + dump 0x200 代码 = 字段 op；后续 calls = 同 fn 或
+  不同 = 由 [0x10078] 的连续读数（trap 后主线程恢复前多读几次）判定。
+- 工件：dw132_runU26c.log、CISC-1U.msgtrap_seq.bin（targets=1 + 0x200
+  零代码 = 时序证据）。

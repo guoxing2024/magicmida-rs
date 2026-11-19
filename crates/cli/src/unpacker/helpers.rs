@@ -5273,37 +5273,73 @@ pub(super) fn spawn_dialog_killer(
                                         THREAD_GET_CONTEXT, THREAD_SUSPEND_RESUME,
                                     };
                                     let hp = HANDLE(hraw as *mut core::ffi::c_void);
+                                    // 补充 132q: record every struct+0x78
+                                    // call-target while polling (the pointer
+                                    // is rewritten per call — the sequence
+                                    // = the 19 JIT fns).
+                                    let ba2: usize = ba;
+                                    let mut tgt_seq: Vec<usize> = Vec::new();
                                     // wait for the check era
                                     while t0m.elapsed().as_millis() < 250 {
                                         std::thread::sleep(
                                             std::time::Duration::from_millis(2),
                                         );
                                     }
-                                    let sites = [0x102133eusize, 0x102289ausize];
+                                    let _sites = [0x102133eusize, 0x102289ausize];
                                     let mut trapped = false;
+                                    #[allow(unused_assignments, unused_variables)]
+                                    let mut trap_kind = 0u32;
                                     while t0m.elapsed().as_millis() <= 4000 {
-                                        for site in sites {
-                                            let mut b = [0u8; 8];
-                                            let mut n = 0;
-                                            let ok = unsafe {
-                                                ReadProcessMemory(
-                                                    hp,
-                                                    site as *const core::ffi::c_void,
-                                                    b.as_mut_ptr() as *mut core::ffi::c_void,
-                                                    8,
-                                                    Some(&mut n),
-                                                )
-                                                .is_ok()
-                                                    && n == 8
-                                            };
-                                            if ok && b.iter().any(|&x| x != 0) {
-                                                trapped = true;
-                                                break;
+                                        // the JIT lazily fills at its first
+                                        // call — trap THERE (the check is
+                                        // mid-execution, ctx registers live)
+                                        let mut jb = [0u8; 16];
+                                        let mut nj = 0;
+                                        let ok_j = unsafe {
+                                            ReadProcessMemory(
+                                                hp,
+                                                0x75f4206 as *const core::ffi::c_void,
+                                                jb.as_mut_ptr() as *mut core::ffi::c_void,
+                                                16,
+                                                Some(&mut nj),
+                                            )
+                                            .is_ok()
+                                                && nj == 16
+                                        };
+                                        if ok_j && jb.iter().any(|&x| x != 0) {
+                                            trapped = true;
+                                            #[allow(unused_assignments)]
+                                            {
+                                                trap_kind = 2;
                                             }
-                                        }
-                                        if trapped {
                                             break;
                                         }
+                                        // record the call-target sequence
+                                        if ba2 != 0 {
+                                            let mut pb = [0u8; 4];
+                                            let mut np = 0;
+                                            if unsafe {
+                                                ReadProcessMemory(
+                                                    hp,
+                                                    (ba2 + 0x10078) as *const core::ffi::c_void,
+                                                    pb.as_mut_ptr() as *mut core::ffi::c_void,
+                                                    4,
+                                                    Some(&mut np),
+                                                )
+                                                .is_ok()
+                                                    && np == 4
+                                            } {
+                                                let pv = u32::from_le_bytes(pb) as usize;
+                                                if 0x10000 < pv && pv < 0x7FFD0000 {
+                                                    if tgt_seq.last() != Some(&pv) {
+                                                        tgt_seq.push(pv);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        // (the message sites fire BEFORE the
+                                        // JIT fills — poll the JIT only)
+
                                         std::thread::sleep(
                                             std::time::Duration::from_micros(200),
                                         );
@@ -5410,6 +5446,39 @@ pub(super) fn spawn_dialog_killer(
                                         let mut nm = name.to_os_string();
                                         nm.push(".bin");
                                         let _ = std::fs::write(stem.with_file_name(nm), &blob);
+                                    }
+                                    // 补充 132q: the recorded target sequence
+                                    // + each target's 0x200 code bytes
+                                    {
+                                        let mut seqblob: Vec<u8> = Vec::new();
+                                        seqblob.extend_from_slice(
+                                            &(tgt_seq.len() as u32).to_le_bytes(),
+                                        );
+                                        for tv in &tgt_seq {
+                                            seqblob.extend_from_slice(&(*tv as u32).to_le_bytes());
+                                            let mut cbuf = vec![0u8; 0x200];
+                                            let mut nc = 0;
+                                            unsafe {
+                                                let _ = ReadProcessMemory(
+                                                    hp,
+                                                    *tv as *const core::ffi::c_void,
+                                                    cbuf.as_mut_ptr() as *mut core::ffi::c_void,
+                                                    0x200,
+                                                    Some(&mut nc),
+                                                );
+                                            }
+                                            seqblob.extend_from_slice(&cbuf);
+                                        }
+                                        let stems = out2.with_extension("msgtrap_seq");
+                                        if let Some(name) = stems.file_name() {
+                                            let mut nm = name.to_os_string();
+                                            nm.push(".bin");
+                                            let _ = std::fs::write(stems.with_file_name(nm), &seqblob);
+                                        }
+                                        info!(
+                                            targets = tgt_seq.len(),
+                                            "MSGTRAP: call-target sequence dumped"
+                                        );
                                     }
                                     // 补充 132k: the ops region at the trap
                                     // moment = DECRYPTED (re-encrypted
