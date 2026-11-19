@@ -6188,3 +6188,21 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   miss 写入 + 0x1020095 读 = 全可读；运行时绕过 = 全部竞速输。
 - **forge 剩余 = .dat 重编码单点**（密码 = 壳自有实现 = 补 129-130
   阻断）。全部仪器/图谱/时间线已沉淀。
+
+**续 22 补充 132y6（2026-11-20）——limit-raise patch 执行（2 站点）+ 全 patch 组合仍 corrupted（会话最终状态）**：
+
+- **limit-raise patch 落地**（132y5）：ops 区扫 [0x1089000,0x1118000) 的
+  0x7D1 dword → patch 0xFFFF。U52 实测：**patched_lim=2 @142ms**（2 站点；
+  b15 的 98 站点 = 旧 run 快照地址，当前 run 仅 2 处该时刻可见）。
+- **全 patch 组合执行**：counter 零化 ✓ + limit-raise ×2 ✓ + imm patch
+  ×16 ✓ → **CALC 对话框仍 corrupted** = 校验 = 读取超出全部可达态
+  （.dat 原始计数器/深层状态/或多层校验的更深一层）。
+- **会话最终沉淀**（40 commits，92c2c5f→132y6）：校验逻辑全链路可读
+  （搜索 = 链表扫描已解码、check-op 引用全图 128 targets、校验 stage
+  解码、时序全定位、corrupted = 执行次数限制定案、fp 组装、.dat 自毁
+  洞察、节点阵列、解码 era 时间线）；仪器链完整（KEYBUF/KEYCOPY/
+  PASSPATH/MSGTRAP/EIPHIST/FPLOCATE/fpfind/BLKSTREAM-EARLY/limit-raise/
+  counter-reset/imm-patch）。
+- **forge 剩余路径（下会话）**：①limit-raise 站点全量（b15 的 98 站点
+  = 需当前 run 的全时刻扫描）②.dat 密码深耕 ③check-op 40KB 逐指令
+  深读（比较逻辑与输入源全图）。

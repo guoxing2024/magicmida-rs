@@ -1032,6 +1032,60 @@ pub(super) fn spawn_dialog_killer(
                             break;
                         }
                     }
+                    // 补充 132y5: the limit-raise patch — the ops region
+                    // contains ~98 sites with the dword 0x7D1 (2001 = the
+                    // execution-count limit constant); patch each to
+                    // 0xFFFF (65535) so the counter (2001) < limit = the
+                    // check passes.  Poll the sites (the ops decrypt
+                    // lazily) and patch as they appear.
+                    {
+                        let scan_lo = 0x1089000usize;
+                        let scan_hi = 0x1118000usize;
+                        let mut patched_lim = 0usize;
+                        while t0b.elapsed().as_millis() <= 400 {
+                            let mut pbuf = vec![0u8; scan_hi - scan_lo];
+                            let mut npl = 0;
+                            let ok_p = unsafe {
+                                ReadProcessMemory(
+                                    hp,
+                                    scan_lo as *const core::ffi::c_void,
+                                    pbuf.as_mut_ptr() as *mut core::ffi::c_void,
+                                    scan_hi - scan_lo,
+                                    Some(&mut npl),
+                                )
+                                .is_ok()
+                                    && npl == scan_hi - scan_lo
+                            };
+                            if ok_p {
+                                for j in 0..(scan_hi - scan_lo) - 4 {
+                                    if pbuf[j..j + 4] == [0xD1u8, 0x07, 0x00, 0x00] {
+                                        let va = scan_lo + j;
+                                        let newlim = 0xFFFFu32.to_le_bytes();
+                                        let mut w7 = 0;
+                                        unsafe {
+                                            let _ = WriteProcessMemory(
+                                                hp,
+                                                va as *const core::ffi::c_void,
+                                                newlim.as_ptr() as *const core::ffi::c_void,
+                                                4,
+                                                Some(&mut w7),
+                                            );
+                                        }
+                                        patched_lim += 1;
+                                    }
+                                }
+                                if patched_lim > 0 {
+                                    info!(
+                                        patched_lim,
+                                        t_ms = (t0b.elapsed().as_millis() as u32),
+                                        "BLKSTREAM-EARLY: limit raised to 0xFFFF"
+                                    );
+                                    break;
+                                }
+                            }
+                            std::thread::sleep(std::time::Duration::from_micros(500));
+                        }
+                    }
                     }
                     // 补充 132y3b: the imm patch = AFTER the re-load —
                     // poll the counter; when it becomes nonzero (the
