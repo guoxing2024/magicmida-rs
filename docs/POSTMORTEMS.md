@@ -6091,3 +6091,18 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   254D-9F3C（已知）→ license middle = 待定位（fp 组装编码逆向 = 最后
   差分目标）。
 - 工件：dw132_runU40/U41.log。
+
+**续 22 补充 132z（2026-11-20）——校验阶段解码实锤：比较 vs 2000 + 常数 0x1FF94595**：
+
+- **消息组装代码回溯成功**（msgtrap_ops 4 站点 @0x1021321/0x1021305/
+  0x102132d/0x1021335）→ stage @0x109EAB4+ 反汇编 = **校验逻辑直读**：
+  - mov [ebp+0x122601fd], edi = **miss 计数写入**（0x10201FD ✓）
+  - mov [ebp+0x12262561], **0x1FF94595** = **常数写入**（struct+0x2428）
+  - **cmp [ebp+0x12262d29], 0x7d0** = **比对 2000**（jne → 继续）
+  - sub [ebp+0x1226130d], edx / jnp 链 / push 0 → call 链 = 下一段
+- **含义**：校验 = 数值比较（vs 2000）+ 常数标记 + miss 写入 = **比较
+  逻辑全可读**；fp-middle = 相邻 stage 的操作数（0x10a1ffd/0x10a3882
+  阶段待解）。
+- 下一增量：0x10a1ffd/0x10a3882 两 stage 反汇编 = fp-middle 读取源 =
+  外科 patch 偏移 → CALC 通过。
+- 工件：msgtrap_ops.bin + 本解码。
