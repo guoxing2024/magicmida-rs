@@ -337,6 +337,9 @@ fn handle_access_violation(
     exc_type: u8,
     is_dll_target: bool,
     output_path: &std::path::Path,
+    // 补充 128: x86-only instrumentation — dead on the x64 build.
+    #[cfg_attr(target_arch = "x86_64", allow(unused_variables))]
+    pagetrap: Option<(usize, usize)>,
 ) -> Result<AvAction, anyhow::Error> {
     debug!(
         exc = %format!("{exception_addr:#x}"),
@@ -388,6 +391,70 @@ fn handle_access_violation(
         }
         dbg.continue_event(thread_id, ContinueStatus::Continue)?;
         return Ok(AvAction::Continue);
+    }
+
+    // ---- 补充 128: the generic page trap (MAGICMIDA_V2_PAGETRAP) ----------
+    //
+    // The init-era writers (PT/copyA decode ops) run µs bursts long before
+    // the first poll — passive RPM never sees them.  The trap arms
+    // PAGE_NOACCESS on the requested range at attach; the debuggee's FIRST
+    // touch faults here → dump the live page (the write instant!) + the
+    // wider neighborhood + registers → restore RW → the writer continues.
+    #[cfg(target_arch = "x86")]
+    if let Some((tp_lo, tp_sz)) = pagetrap {
+        if tp_lo <= target_address as usize && (target_address as usize) < tp_lo + tp_sz
+        {
+            use windows::Win32::System::Memory::{
+                VirtualProtectEx, PAGE_PROTECTION_FLAGS, PAGE_READWRITE,
+            };
+            let mut oldp = PAGE_PROTECTION_FLAGS(0);
+            let _ = unsafe {
+                VirtualProtectEx(
+                    h_process,
+                    tp_lo as *const core::ffi::c_void,
+                    tp_sz,
+                    PAGE_READWRITE,
+                    &mut oldp,
+                )
+            };
+            // dump the trapped range + 64KB context + registers
+            let mut buf = vec![0u8; tp_sz.max(0x10000)];
+            let got = dbg.read_memory(tp_lo, &mut buf).unwrap_or(0);
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros() as u32)
+                .unwrap_or(0);
+            let path = output_path.with_extension(format!(
+                "pagetrap_{:x}_{:x}.bin",
+                tp_lo, stamp
+            ));
+            match std::fs::write(&path, &buf[..got]) {
+                Ok(()) => info!(
+                    path = %path.display(),
+                    base = format!("{tp_lo:#x}"),
+                    got = got,
+                    fault = format!("{target_address:#x}"),
+                    "PAGETRAP hit — live page captured"
+                ),
+                Err(e) => warn!(error = %e, "PAGETRAP dump write failed"),
+            }
+            if let Ok(ctx) = dbg.get_thread_context_control(thread_id) {
+                let cpath = output_path.with_extension(format!(
+                    "pagetrap_{:x}_ctx.bin",
+                    stamp
+                ));
+                let mut rec = Vec::new();
+                for v in [
+                    ctx.Eip, ctx.Edi, ctx.Esi, ctx.Ebx, ctx.Edx, ctx.Ecx,
+                    ctx.Eax, ctx.Ebp, ctx.Esp, ctx.EFlags,
+                ] {
+                    rec.extend_from_slice(&v.to_le_bytes());
+                }
+                let _ = std::fs::write(&cpath, &rec);
+            }
+            dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+            return Ok(AvAction::Continue);
+        }
     }
 
     // ---- storm watchdog ---------------------------------------------------

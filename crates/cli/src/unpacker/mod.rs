@@ -338,8 +338,14 @@ pub fn unpack(
     // the exact exit code our debugged runs produce.  V2 samples therefore
     // run post-attach: PEB patched while suspended, main thread resumed
     // explicitly, observation via polling + debug-register BPs.
+    // 补充 128: `MAGICMIDA_V2_DEBUGGED=1` forces the debugged pipeline for
+    // V2 samples — the anti-debug withholds the .text decryption (measured
+    // AV crash) BUT the init-era µs ops (PT/copyA writers) run BEFORE the
+    // port check: a PAGETRAP at CREATE_PROCESS catches them first, then the
+    // crash is acceptable (the dump is on disk).
     let post_attach = pe_info.themida_version
-        == mida_packers_themida::ThemidaVersion::V2;
+        == mida_packers_themida::ThemidaVersion::V2
+        && std::env::var("MAGICMIDA_V2_DEBUGGED").is_err();
     let opts = CreateProcessOptions {
         executable: input.to_path_buf(),
         command_line: None,
@@ -471,6 +477,17 @@ pub fn unpack(
     // search-list build at VMCTX [0x20A00,0x20B00) + the live bank through
     // [150,340] ms.  See helpers (listwatch branch).
     let listwatch_on = std::env::var("MAGICMIDA_V2_LISTWATCH").is_ok();
+    // 补充 128: the generic page trap (`MAGICMIDA_V2_PAGETRAP=<hex>-<hex>`):
+    // PAGE_NOACCESS on the range at attach; the first touch faults, the
+    // handler dumps the live page + restores RW (the PT/copyA writers'
+    // µs-burst init ops = passive polls never see them).
+    let pagetrap: Option<(usize, usize)> =
+        std::env::var("MAGICMIDA_V2_PAGETRAP").ok().and_then(|v| {
+            let mut it = v.split('-');
+            let a = usize::from_str_radix(it.next()?.trim_start_matches("0x"), 16).ok()?;
+            let b = usize::from_str_radix(it.next()?.trim_start_matches("0x"), 16).ok()?;
+            Some((a, b))
+        });
     // V2 .dat decode watcher (`MAGICMIDA_V2_DECODEWATCH=1`): needle-finds
     // the 480-byte file copy and µs-snapshots the whole buffer + bank
     // through the decode window.  See helpers (decodewatch branch).
@@ -1344,6 +1361,36 @@ pub fn unpack(
                 // are now stored by the core's `wait_event` bookkeeping
                 // automatically — we no longer duplicate that state here.
                 //
+                // 补充 128: arm the PAGETRAP at t=0 (debugged runs): the
+                // init-era writers (PT/copyA decode, µs bursts) fault into
+                // the handler which dumps the live page and restores RW.
+                // The shell's later port-check may still bail — the dump is
+                // already on disk by then.
+                if let Some((tp_lo, tp_sz)) = pagetrap {
+                    #[cfg(target_arch = "x86")]
+                    {
+                        use windows::Win32::System::Memory::{
+                            VirtualProtectEx, PAGE_PROTECTION_FLAGS,
+                            PAGE_NOACCESS,
+                        };
+                        let mut oldp = PAGE_PROTECTION_FLAGS(0);
+                        let _ = unsafe {
+                            VirtualProtectEx(
+                                evt_h_process,
+                                tp_lo as *const core::ffi::c_void,
+                                tp_sz,
+                                PAGE_NOACCESS,
+                                &mut oldp,
+                            )
+                        };
+                        info!(
+                            base = format!("{tp_lo:#x}"),
+                            size = format!("{tp_sz:#x}"),
+                            "PAGETRAP armed at CREATE_PROCESS"
+                        );
+                    }
+                }
+
                 // Patch PEB (BeingDebugged, pShimData) via the core helper.
                 let peb_base = mida_core::patch_peb_anti_debug(evt_h_process)
                     .unwrap_or(image_base);
@@ -2416,7 +2463,7 @@ pub fn unpack(
                     h_process, guard_protection,
                     image_base_usize, image_boundary,
                     thread_id, exception_addr, target_address, exc_type, looks_like_dll,
-                    &output_path,
+                    &output_path, pagetrap,
                 )? {
                     AvAction::Continue => {}
                     AvAction::Break => break,

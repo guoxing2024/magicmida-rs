@@ -4263,10 +4263,114 @@ pub(super) fn spawn_dialog_killer(
                 // 补充 120: the buffer-hash state for the
                 // change-triggered snaps.
                 let mut b8_buf_last: u64 = 0;
+                // 补充 128: b16 = the VM stack (0x293E0000-base, 2 MB)
+                // captured WITH each b8 snap — the machine state
+                // lives there (补 125); the phase-1 ops derailing in
+                // the emu lacked it.  FNV dedup per page, cap 128 MB.
+                let mut b16_pages: Vec<u64> = Vec::new();
+                let mut b16_blobs: Vec<u8> = Vec::new();
                 // 补充 122: the phase-1 early-era thread handle.
                 let mut hc_early: Option<
                     windows::Win32::Foundation::HANDLE,
                 > = None;
+                // 补充 128: arm the VM-stack trap (once) —
+                // PAGE_NOACCESS on [0x293E0000,0x29400000); the first
+                // touch faults into the debug loop (av_handler) which
+                // dumps the region live and restores RW.
+                #[cfg(target_arch = "x86")]
+                {
+                    use windows::Win32::System::Memory::{
+                        VirtualProtectEx, PAGE_PROTECTION_FLAGS,
+                        PAGE_NOACCESS,
+                    };
+                    static PAGETRAP_ARMED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    let pagetrap: Option<(usize, usize)> =
+                        std::env::var("MAGICMIDA_V2_PAGETRAP")
+                            .ok()
+                            .and_then(|v| {
+                                let mut it = v.split('-');
+                                let a = usize::from_str_radix(
+                                    it.next()?.trim_start_matches("0x"),
+                                    16,
+                                )
+                                .ok()?;
+                                let b = usize::from_str_radix(
+                                    it.next()?.trim_start_matches("0x"),
+                                    16,
+                                )
+                                .ok()?;
+                                Some((a, b))
+                            });
+                    if let Some((tp_lo, tp_sz)) = pagetrap {
+                        if !PAGETRAP_ARMED.swap(
+                            true,
+                            std::sync::atomic::Ordering::Relaxed,
+                        ) {
+                            let mut oldp = PAGE_PROTECTION_FLAGS(0);
+                            let _ = unsafe {
+                                VirtualProtectEx(
+                                    h_process,
+                                    tp_lo as *const core::ffi::c_void,
+                                    tp_sz,
+                                    PAGE_NOACCESS,
+                                    &mut oldp,
+                                )
+                            };
+                            info!(
+                                base = format!("{tp_lo:#x}"),
+                                size = format!("{tp_sz:#x}"),
+                                "PAGETRAP armed: PAGE_NOACCESS"
+                            );
+                        }
+                    }
+                }
+                // 补充 128: the b16 VM-stack dump closure —                // 补充 128: the b16 VM-stack dump closure —
+                // 512 pages [0x293E0000,0x29400000), FNV dedup,
+                // record = t + pa + 4096 (b15 shape).
+                let dump_vmstack = |b16_pages: &mut Vec<u64>,
+                                    b16_blobs: &mut Vec<u8>,
+                                    h_process: windows::Win32::Foundation::HANDLE| {
+                    let t16 = (watch_t0.elapsed().as_micros() as u32)
+                        .to_le_bytes();
+                    for vbp in 0..512u32 {
+                        let vpa = 0x293E0000usize
+                            + (vbp as usize) * 0x1000;
+                        let mut vpg = vec![0u8; 0x1000];
+                        let _ = unsafe {
+                            let mut n = 0;
+                            ReadProcessMemory(
+                                h_process,
+                                vpa as *const core::ffi::c_void,
+                                vpg.as_mut_ptr()
+                                    as *mut core::ffi::c_void,
+                                0x1000,
+                                Some(&mut n),
+                            )
+                        };
+                        let mut hv: u64 = 0xCBF1_6CE9_C7A5_5CA9;
+                        for &x in &vpg {
+                            hv ^= x as u64;
+                            hv = hv
+                                .wrapping_mul(0x0000_0100_0000_01B3);
+                        }
+                        if vbp as usize >= b16_pages.len() {
+                            b16_pages.push(hv);
+                            b16_blobs.extend_from_slice(&t16);
+                            b16_blobs.extend_from_slice(
+                                &(vpa as u32).to_le_bytes(),
+                            );
+                            b16_blobs.extend_from_slice(&vpg);
+                        } else if b16_pages[vbp as usize] != hv {
+                            b16_pages[vbp as usize] = hv;
+                            b16_blobs.extend_from_slice(&t16);
+                            b16_blobs.extend_from_slice(
+                                &(vpa as u32).to_le_bytes(),
+                            );
+                            b16_blobs.extend_from_slice(&vpg);
+                        }
+                    }
+                };
                 // Phase 1: find the file copy (needle scan, MEM_PRIVATE).
                 while buf_addr.is_none() && watch_t0.elapsed().as_millis() < 260 {
                     polls += 1;
@@ -4387,6 +4491,10 @@ pub(super) fn spawn_dialog_killer(
                                 b8_blobs.extend_from_slice(&stk);
                             }
                         }
+                        // 补充 128: the b16 VM-stack dump with each
+                        // early b8 snap.
+                        dump_vmstack(&mut b16_pages, &mut b16_blobs,
+                                     h_process);
                     }
                     use windows::Win32::System::Memory::{
                         VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_PRIVATE,
@@ -4556,6 +4664,13 @@ pub(super) fn spawn_dialog_killer(
                                             &(slo as u32).to_le_bytes(),
                                         );
                                         b8_blobs.extend_from_slice(&stk);
+                                        // 补充 128: the b16 VM-stack
+                                        // dump with each b8 snap.
+                                        dump_vmstack(
+                                            &mut b16_pages,
+                                            &mut b16_blobs,
+                                            h_process,
+                                        );
                                     }
                                 }
                             }
@@ -6035,6 +6150,10 @@ pub(super) fn spawn_dialog_killer(
                                 n8.push(".b8.bin");
                                 let _ =
                                     std::fs::write(stem.with_file_name(n8), &b8_blobs);
+                                let mut n16 = name.to_os_string();
+                                n16.push(".b16.bin");
+                                let _ =
+                                    std::fs::write(stem.with_file_name(n16), &b16_blobs);
                                 let mut n9 = name.to_os_string();
                                 n9.push(".b9.bin");
                                 let _ =
@@ -6781,6 +6900,10 @@ pub(super) fn spawn_dialog_killer(
                     n8.push(".b8.bin");
                     let _ =
                         std::fs::write(stem.with_file_name(n8), &b8_blobs);
+                    let mut n16 = name.to_os_string();
+                    n16.push(".b16.bin");
+                    let _ =
+                        std::fs::write(stem.with_file_name(n16), &b16_blobs);
                     let mut n9 = name.to_os_string();
                     n9.push(".b9.bin");
                     let _ =

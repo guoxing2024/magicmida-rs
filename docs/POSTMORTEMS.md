@@ -5481,3 +5481,38 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   逐字节反推（双射保证可行）。
 - 阻断不变：expected 常数的来源（blob 编码 / caller 派生）= verifier caller
   框架态 = 需活体 era snap（Device Guard 限制）。
+
+**续 22 补充 128（2026-11-19，第一百一十二轮）——Device Guard 解除 + PAGETRAP 仪器 + 终模型：页面 = aPLib 解压的原始程序数据**：
+
+- **Device Guard 解除（实测 CISC-1.exe 可跑 4s+）**——活体路线重开。
+- **b16 VM 栈仪器落地（b8 每拍 + 0x293E0000 2MB dump，FNV 去重）**：实测
+  **只有 1 版全零 dump**——0x293e-f 区在 poll 时刻未提交（RPM 失败 = 零页
+  hash 恒定）。**0x293e-f = emu premap 伪迹定案**：era1 emu 的 185 万写 =
+  我们自己 premap 的 scratch；真机的 VM 栈 = x86 0xef000 栈（b8 一直拍着）。
+  补 125 的"状态载体 = 0x293EF000"修正为 emu 伪迹。
+- **PAGETRAP 通用仪器落地**（`MAGICMIDA_V2_PAGETRAP=<hexaddr>-<hexsize>`）：
+  CREATE_PROCESS 时 VirtualProtectEx(PAGE_NOACCESS) → AV handler 捕获 →
+  dump 64KB + 寄存器 40B → 恢复 RW。`MAGICMIDA_V2_DEBUGGED=1` 强制 V2 走
+  调试管线（post-attach 无调试端口 = 异常不可达，PAGE_NOACCESS 会直接崩）。
+- **PAGETRAP 命中两次（决定性）**：
+  - 0x1182000（PT 页）：fault @ **EIP 0x11eb119**（写入者）——反汇编 =
+    **aPLib/UCL 位流解压器**（`mov al,[esi]; [edi++]=al; add dl,dl; adc dl,dl`
+    LZ 匹配链 0x11eb13d+）——**该页 = aPLib 解压的原始 PE 数据**！
+  - 0x111e000（copyA 页）：**同一个 EIP 0x11eb119** = 同一解压器 = 同一
+    原始程序数据。
+- **终模型（全链闭合）**：CISC-1.exe（aPLib 打包）→ Themida 解压器
+  （0x11eb116）→ **原始程序页**（0x111e000 = 原 .data、0x1182000 = 许可
+  文本所在的原始数据页）→ 壳 VM op 以这些页为流消费（era1 "走表" = 读
+  原始程序静态数据）→ **许可字段 = 原始程序内嵌静态数据**；.dat = 独立
+  keystone（hash 校验后擦除，内容永不参与字段）。补 122"copy A = .dat
+  变换形态"撤回（= 解压的原始数据）；"密码 F" = VM 消费原始数据的解释
+  过程，无密码可言。
+- **forge 终路线**：字段 = 原始程序数据 → forge = ①重打包原始 payload
+  （aPLib 重压缩 + 重嵌）或 ②PAGETRAP 窗口期内存 patch（trap 恢复 RW 后
+  立刻 write_memory 覆盖目标字段，抢在消费前）——② = 仪器已就绪。
+  .dat 保持 pristine。
+- 下一增量：①PAGETRAP 变体 = trap hit 后不立即 restore，先 write_memory
+  patch 目标字段再 restore（forge 注入器，~30 行）②原始 payload 定位
+  （aPLib 块边界 = 0x11eb116 的 esi 起点）③真跑验证。
+- 工件：CISC-1U.pagetrap_1182000_ea707e1a.bin + _ctx、
+  CISC-1U.pagetrap_111e000_1afdc35b.bin、dw190/191、dw128_run3-8 日志。
