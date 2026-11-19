@@ -5971,3 +5971,22 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   0x10228ba = image 副本；buffer 原始态 = 未 patch 的早期 run 可读）→
   fp 中段 5E66-5E6D → 254D-9F3C patch → CALC 通过。
 - 工件：dw132_runU27-U31.log、msgtrap_jit.bin（mid-fill 态）。
+
+**续 22 补充 132s（2026-11-20）——fp 不在 buffer（二进制组装）+ U11 patch = .dat 自毁实锤**：
+
+- **FPLOCATE 实测（U32）**：buffer [0,480) 于 [150,1500]ms 扫 '1051-BCEC'
+  = **零命中**（off=None）→ **fp 字符串不在 buffer 明文** = fp 由二进制
+  字段运行时组装（base 段 + 机器中段 + dash 格式化，229ms 写入 image
+  0x10228ba 区）。
+- **U11 patch = .dat 自毁实锤**：buffer [52,480) = keys 覆盖 = **.dat 的
+  内部完整性校验被自己破坏** → "Your license key is corrupted" 对话框 =
+  **我们 patch 的后果**（非壳的另一道门！）——无 patch = 搜索 miss = 崩溃；
+  粗暴 patch = 校验和破坏 = corrupted 对话框。
+- **forge 正确形状 = 外科手术式 patch**：只改节点键源字段（搜索命中所需），
+  保留 .dat 校验和字段。节点键源 = 节点构建读 buffer 的偏移 = 待定位
+  （链表头 [ctx+0x2b4] → 节点键值 → buffer 源偏移反查；ctx = MSGTRAP
+  冻结态寄存器/栈可读）。
+- 下一增量：①MSGTRAP 冻结态读 ctx（JIT fn 的 [ebp-0x1c]）→ 链表头 →
+  节点键值 ②节点键值 → buffer 偏移反查（节点值 = buffer[X] 的解码形式）
+  ③外科 patch：仅 X 处 = 本机键，其余原样。
+- 工件：dw132_runU32.log。
