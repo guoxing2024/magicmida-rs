@@ -5901,3 +5901,22 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
 - msgtrap_jit.bin（9216B 零态）= 惰性填充的证据工件。
 - 下一增量 = 不变：dialog 态活体读 JIT 区（0x75f4206±0x1200）→ 全量
   反汇编重建校验式 → [ecx] 字段表 → buffer 差分 → 本机绑定值。
+
+**续 22 补充 132o（2026-11-20）——字段校验式完整解码：搜索 = 链表扫描实锤**：
+
+- **U23 dialog 态活体 JIT dump**（jit_full.bin 8KB，JIT ptr = 0x75f4206 =
+  per-boot 确定性 ✓）。校验函数全解码：
+  - **链表扫描**：[eax+0x2b4] = 链表头（eax = [ebp-0x1c] = 上下文结构），
+    节点遍历；**循环上界 = 0x100（256 元素）**
+  - **节点布局**：+0x7c = KEY1、+0x80 = KEY2、**+0x78 = 7-dword 数据区**
+  - **比较**：节点 [0x7c/0x80] vs **[ebx+4]/[ebx+8]（本机键块！）** →
+    全等 → **7-dword 数据区逐 dword 比较**（ecx=节点+0x78 vs edx=ebx，
+    ebx=0x1c 计数）→ 全等 = HIT → mov [esi], 结果 + call [0x7be920c]
+  - 入口 esi = 0xa8e907（结果槽/状态）
+- **19 次 call = 同一链表扫描函数 × 19 个链表/键组**；ebx = 调用方传入的
+  本机键块（= buffer [0,52) 的 13-dword 键 = KEYFORGE 键！）。
+- **forge 方程更新**：链表节点 = 从许可数据构建 → 节点键 = license 的
+  键值 → 扫描 vs 本机键 → **节点必须含本机键 = 许可数据 = 本机键**
+  （buffer patch = U11 已做 → 流程推进 ✓）→ 对话框 = 下一道门（绑定
+  校验 = fp/绑定字段）。
+- 工件：jit_full.bin（8KB 活体 dump）、dw132_runU23.log。
