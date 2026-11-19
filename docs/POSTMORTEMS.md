@@ -5516,3 +5516,27 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   （aPLib 块边界 = 0x11eb116 的 esi 起点）③真跑验证。
 - 工件：CISC-1U.pagetrap_1182000_ea707e1a.bin + _ctx、
   CISC-1U.pagetrap_111e000_1afdc35b.bin、dw190/191、dw128_run3-8 日志。
+
+**续 22 补充 129（2026-11-19，第一百一十三轮）——FIELDPATCH 注入器落地 + 字段 patch 端到端实证**：
+
+- **FIELDPATCH 仪器落地**（`MAGICMIDA_V2_FIELDPATCH=<hexaddr>-<hexbytes>` +
+  第二目标 `_FIELDPATCH2`）：post-attach 轮询 watch——目标页首现非零内容
+  （解压器完成）→ WriteProcessMemory 覆盖 → 日志。
+- **实测双命中（t=174ms）**：0x1182522（65B 许可文本）+ 0x10228c4（KP 名字
+  字段 8B）均成功写入活体进程。
+- **端到端传播实证**：b15 数据池 **13 个版本**（t=185810→365479，覆盖裁决
+  era）含 `(PWNED!)` @ struct-page 0x8c5（上下文 = 完整 .dat 路径 + 名字）——
+  **patch 字段穿透到裁决时代并持久化** ✓。
+- **裁决 = FAIL（exit 44 不变）**：verifier = vmhash(字段) vs expected
+  （expected 源自 .dat 解密 = 绑定 CISC-1）→ 改字段必须同步改 .dat。
+- **emu 预测侧修正**：dw192 —— era1 emu 的输出 = PT 走表前 32 字节后 park
+  （0x1031d72 等待环）；PT patch 偏移错位实验（0x1182522 写入使输出移位）
+  证明 **走表 = 逐字节 copy（页 [0x522+k] → out[k]）**，名块（page+0x54c）
+  patch 零 diff = 该块不被 era1 走表消费（era1 只走前 32 字节即 park）。
+  KP 名字块的消费者 = [313,316]ms 的逐字段构建（lw2-era 结论互证）。
+- **forge 剩余唯一缺口 = .dat 重加密**：verifier expected = .dat 解密字段
+  → 改字段需 .dat 携带新 license。路线 = ①check-op 函数 emu 拟合（261 态
+  + check_op_body3.bin）→ 哈希 fix-up（2-4 字节调校到期望常数）②API 级
+  字段解密的逆（Crypt* 导出函数 = 罕见但可从壳会话 dump）。
+- 工件：fp_payload.txt、dw129_run1-4.log、dw192.py、b15 PWNED 13 版本、
+  fp_block.txt。

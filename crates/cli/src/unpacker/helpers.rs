@@ -4580,6 +4580,204 @@ pub(super) fn spawn_dialog_killer(
                     };
                     while watch_t0.elapsed().as_millis() < 500 {
                         polls += 1;
+                        // 补充 129: the FIELDPATCH injector —
+                        // MAGICMIDA_V2_FIELDPATCH=<hexaddr>-<hexbytes>:
+                        // poll the page; at first nonzero content (the
+                        // decompressor done) WPM the patch, once; then
+                        // watch the decode buffer for the era1 output.
+                        #[cfg(target_arch = "x86")]
+                        {
+                            static FP_STATE: std::sync::atomic::AtomicUsize =
+                                std::sync::atomic::AtomicUsize::new(0);
+                            // target 2: MAGICMIDA_V2_FIELDPATCH2 (the
+                            // KP struct block, built [313,316]ms).
+                            if let Ok(fpv2) = std::env::var(
+                                "MAGICMIDA_V2_FIELDPATCH2",
+                            ) {
+                                let mut it2 = fpv2.splitn(2, '-');
+                                let fa2 = usize::from_str_radix(
+                                    it2.next().unwrap_or("")
+                                        .trim_start_matches("0x"),
+                                    16,
+                                )
+                                .unwrap_or(0);
+                                let fb2: Vec<u8> = it2
+                                    .next()
+                                    .unwrap_or("")
+                                    .as_bytes()
+                                    .chunks(2)
+                                    .filter_map(|h| {
+                                        u8::from_str_radix(
+                                            std::str::from_utf8(h)
+                                                .unwrap_or("zz"),
+                                            16,
+                                        )
+                                        .ok()
+                                    })
+                                    .collect();
+                                static FP2: std::sync::atomic::AtomicUsize =
+                                    std::sync::atomic::AtomicUsize::new(0);
+                                if fa2 != 0 && !fb2.is_empty()
+                                    && FP2.load(
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    ) == 0
+                                {
+                                    let mut pg2 = vec![0u8; 0x1000];
+                                    let ok2 = unsafe {
+                                        let mut n = 0;
+                                        ReadProcessMemory(
+                                            h_process,
+                                            (fa2 & !0xFFF)
+                                                as *const core::ffi::c_void,
+                                            pg2.as_mut_ptr()
+                                                as *mut core::ffi::c_void,
+                                            0x1000,
+                                            Some(&mut n),
+                                        )
+                                        .is_ok()
+                                            && n == 0x1000
+                                    };
+                                    if ok2 && pg2.iter().any(|&x| x != 0) {
+                                        let off2 = fa2 & 0xFFF;
+                                        if off2 + fb2.len() <= 0x1000 {
+                                            let _ = unsafe {
+                                                WriteProcessMemory(
+                                                    h_process,
+                                                    fa2 as *const core::ffi::c_void,
+                                                    fb2.as_ptr()
+                                                        as *const core::ffi::c_void,
+                                                    fb2.len(),
+                                                    None,
+                                                )
+                                            };
+                                            FP2.store(
+                                                1,
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            );
+                                            info!(
+                                                addr = format!("{fa2:#x}"),
+                                                len = fb2.len(),
+                                                t_ms = (watch_t0.elapsed().as_millis() as u32),
+                                                "FIELDPATCH2 applied"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            if let Ok(fpv) =
+                                std::env::var("MAGICMIDA_V2_FIELDPATCH")
+                            {
+                                let mut it = fpv.splitn(2, '-');
+                                let fa = usize::from_str_radix(
+                                    it.next().unwrap_or("")
+                                        .trim_start_matches("0x"),
+                                    16,
+                                )
+                                .unwrap_or(0);
+                                let fb: Vec<u8> = it
+                                    .next()
+                                    .unwrap_or("")
+                                    .as_bytes()
+                                    .chunks(2)
+                                    .filter_map(|h| {
+                                        u8::from_str_radix(
+                                            std::str::from_utf8(h)
+                                                .unwrap_or("zz"),
+                                            16,
+                                        )
+                                        .ok()
+                                    })
+                                    .collect();
+                                if fa != 0 && !fb.is_empty() {
+                                    let st = FP_STATE.load(
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                    if st == 0 {
+                                        let mut pg = vec![0u8; 0x1000];
+                                        let ok = unsafe {
+                                            let mut n = 0;
+                                            ReadProcessMemory(
+                                                h_process,
+                                                (fa & !0xFFF)
+                                                    as *const core::ffi::c_void,
+                                                pg.as_mut_ptr()
+                                                    as *mut core::ffi::c_void,
+                                                0x1000,
+                                                Some(&mut n),
+                                            )
+                                            .is_ok()
+                                                && n == 0x1000
+                                        };
+                                        if ok && pg.iter().any(|&x| x != 0) {
+                                            let off = fa & 0xFFF;
+                                            if off + fb.len() <= 0x1000 {
+                                                let _ = unsafe {
+                                                    WriteProcessMemory(
+                                                        h_process,
+                                                        fa as *const core::ffi::c_void,
+                                                        fb.as_ptr()
+                                                            as *const core::ffi::c_void,
+                                                        fb.len(),
+                                                        None,
+                                                    )
+                                                };
+                                                FP_STATE.store(
+                                                    2,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                );
+                                                info!(
+                                                    addr = format!("{fa:#x}"),
+                                                    len = fb.len(),
+                                                    t_ms = (watch_t0.elapsed().as_millis() as u32),
+                                                    "FIELDPATCH applied"
+                                                );
+                                            }
+                                        }
+                                    } else if st == 2 {
+                                        // post-patch: watch the decode
+                                        // buffer for the era1 plaintext
+                                        // window; dump once.
+                                        if let Some(baa) = buf_addr {
+                                            let mut bpg = [0u8; 0x1000];
+                                            let okb = unsafe {
+                                                let mut n = 0;
+                                                ReadProcessMemory(
+                                                    h_process,
+                                                    (baa & !0xFFF)
+                                                        as *const core::ffi::c_void,
+                                                    bpg.as_mut_ptr()
+                                                        as *mut core::ffi::c_void,
+                                                    0x1000,
+                                                    Some(&mut n),
+                                                )
+                                                .is_ok()
+                                                    && n == 0x1000
+                                            };
+                                            if okb {
+                                                let outw = &bpg[0x1d2..0x213];
+                                                if outw.iter().any(|&x| x != 0)
+                                                {
+                                                    FP_STATE.store(
+                                                        3,
+                                                        std::sync::atomic::Ordering::Relaxed,
+                                                    );
+                                                    let path = std::path::Path::new("CISC-1U.fieldpatch_verify.bin");
+                                                    let _ = std::fs::write(
+                                                        path,
+                                                        bpg,
+                                                    );
+                                                    info!(
+                                                        t_ms = (watch_t0.elapsed().as_millis() as u32),
+                                                        head = %String::from_utf8_lossy(&outw[..outw.len().min(40)]),
+                                                        "FIELDPATCH verify — era1 output captured"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         // 补充 93: the register snapshot (same
                             // beat; the decode machine = the main
                             // thread — its web base 0x102859e matches).
