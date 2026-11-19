@@ -5952,3 +5952,22 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   不同 = 由 [0x10078] 的连续读数（trap 后主线程恢复前多读几次）判定。
 - 工件：dw132_runU26c.log、CISC-1U.msgtrap_seq.bin（targets=1 + 0x200
   零代码 = 时序证据）。
+
+**续 22 补充 132p2（2026-11-20）——两段式动态 poll + JIT 编译门控实锤**：
+
+- **两段式动态 poll 落地**（U27-U31）：每轮重读 struct+0x78（指针逐 call
+  重写）→ 合法指针 → 轮询其代码非零 → trap。修正链：硬编码 0x75f4206
+  （stale VA = 堆复用 false-trigger）→ 首值锁定（指针变化后失效）→
+  **每轮重读 = 正确形状**。
+- **JIT 编译门控实锤（U30/U31 对照）**：U11 keys payload（本机键）=
+  **JIT 编译 @0x75f4206 填充 @300ms**（filled JIT caught ✓）；U24 markers
+  payload = **无 JIT**（15s 零填充）→ **JIT 编译 = 由 buffer 内容门控**
+  （本机键 → 编译；markers → 校验早退）。
+- **trap 时刻 = mid-fill**（检测到首字节非零即挂起 = 代码部分写入——
+  msgtrap_jit.bin = garbled 半成品；**完整代码 = dialog 态活体读**
+  （U20/132o 已有 = 链表扫描全解码 ✓）。
+- **下一步收敛**：校验式 = 已解码（132o 链表扫描）→ 剩余 = CALC 对话框的
+  fp 门 = buffer 的 fp 字段定位（原始 fp @buffer 未知偏移，b15 的
+  0x10228ba = image 副本；buffer 原始态 = 未 patch 的早期 run 可读）→
+  fp 中段 5E66-5E6D → 254D-9F3C patch → CALC 通过。
+- 工件：dw132_runU27-U31.log、msgtrap_jit.bin（mid-fill 态）。

@@ -5289,30 +5289,60 @@ pub(super) fn spawn_dialog_killer(
                                     let mut trapped = false;
                                     #[allow(unused_assignments, unused_variables)]
                                     let mut trap_kind = 0u32;
-                                    while t0m.elapsed().as_millis() <= 4000 {
-                                        // the JIT lazily fills at its first
-                                        // call — trap THERE (the check is
-                                        // mid-execution, ctx registers live)
-                                        let mut jb = [0u8; 16];
-                                        let mut nj = 0;
-                                        let ok_j = unsafe {
+                                    // 补充 132r: two-stage dynamic poll —
+                                    // stage 1 = wait for a plausible
+                                    // struct+0x78 pointer; stage 2 = wait
+                                    // for the pointed code to be filled
+                                    // (the lazy JIT).  The old hardcoded
+                                    // 0x75f4206 = a stale VA (per-run heap
+                                    // differs).
+                                    while t0m.elapsed().as_millis() <= 15000 {
+                                        // re-read the pointer EVERY iteration
+                                        // (it is rewritten per call)
+                                        let mut pb = [0u8; 4];
+                                        let mut np = 0;
+                                        if unsafe {
                                             ReadProcessMemory(
                                                 hp,
-                                                0x75f4206 as *const core::ffi::c_void,
-                                                jb.as_mut_ptr() as *mut core::ffi::c_void,
-                                                16,
-                                                Some(&mut nj),
+                                                (ba2 + 0x10078) as *const core::ffi::c_void,
+                                                pb.as_mut_ptr() as *mut core::ffi::c_void,
+                                                4,
+                                                Some(&mut np),
                                             )
                                             .is_ok()
-                                                && nj == 16
-                                        };
-                                        if ok_j && jb.iter().any(|&x| x != 0) {
-                                            trapped = true;
-                                            #[allow(unused_assignments)]
+                                                && np == 4
+                                        } {
+                                            let pv = u32::from_le_bytes(pb) as usize;
+                                            if 0x1000000 < pv && pv < 0x7FFD0000
+                                                && pv != 0x7ffdefff
                                             {
-                                                trap_kind = 2;
+                                                let mut jb = [0u8; 16];
+                                                let mut nj = 0;
+                                                let ok_j = unsafe {
+                                                    ReadProcessMemory(
+                                                        hp,
+                                                        pv as *const core::ffi::c_void,
+                                                        jb.as_mut_ptr() as *mut core::ffi::c_void,
+                                                        16,
+                                                        Some(&mut nj),
+                                                    )
+                                                    .is_ok()
+                                                        && nj == 16
+                                                };
+                                                if ok_j && jb.iter().any(|&x| x != 0) {
+                                                    info!(
+                                                        jit = format!("{pv:#x}"),
+                                                        t_ms = (t0m.elapsed().as_millis() as u32),
+                                                        "MSGTRAP: filled JIT caught"
+                                                    );
+                                                    trapped = true;
+                                                    #[allow(unused_assignments)]
+                                                    {
+                                                        trap_kind = 2;
+                                                    }
+                                                    break;
+                                                }
                                             }
-                                            break;
                                         }
                                         // record the call-target sequence
                                         if ba2 != 0 {
