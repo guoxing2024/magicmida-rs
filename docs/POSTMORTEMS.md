@@ -5990,3 +5990,20 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   节点键值 ②节点键值 → buffer 偏移反查（节点值 = buffer[X] 的解码形式）
   ③外科 patch：仅 X 处 = 本机键，其余原样。
 - 工件：dw132_runU32.log。
+
+**续 22 补充 132t（2026-11-20）——节点数组定位实锤（8B 步距 key 对阵列）**：
+
+- **活体扫描（U33 dialog 态）**：相邻 [KEY1][KEY2]（0x7DC80DE6/0x022869C8）
+  对全内存扫描 = 53 命中，**首簇 @0xb80052 起步距 8 字节连续对** =
+  **节点阵列实锤**（搜索的语料 = [KEY1][KEY2] 8B 对的数组，本机键 =
+  U11 buffer patch 已生效 = 搜索命中 ✓）。
+- **阵列 = buffer 派生副本**：对值 = 本机键（uniform）= U11 patch 的
+  buffer [52,480) 重建 → 源映射 = uniform 不可差分（marker 法 noise 墙）
+  → 精确源偏移需节点构建 op 反汇编（msgtrap_ops 阶段已捕获）。
+- **链表模型修正**：JIT fn 的「链表遍历」= 该阵列的顺序扫描（[ecx+0x7c/
+  0x80/0x78] = 节点内偏移，ecx = 节点指针步进），非 pointer-linked。
+- 下一增量：①msgtrap_ops 阶段反汇编 = 节点构建 op（buffer→阵列的复制
+  逻辑与偏移）②阵列补丁 = 直接 WPM 阵列（本机键已在 = 无需）③CALC
+  对话框 = 阵列命中后的下一道门 = fp/绑定校验 = 定位其检查点（消息
+  写入点 0x102133e 的写入者 = msgtrap_ops 阶段反汇编）。
+- 工件：dw132_runU33.log、fpfind.py（相邻对扫描扩展）。
