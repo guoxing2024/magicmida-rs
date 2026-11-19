@@ -6206,3 +6206,14 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
 - **forge 剩余路径（下会话）**：①limit-raise 站点全量（b15 的 98 站点
   = 需当前 run 的全时刻扫描）②.dat 密码深耕 ③check-op 40KB 逐指令
   深读（比较逻辑与输入源全图）。
+
+**续 22 补充 132y7（2026-11-20）——连续 limit-raise = 仅 2 站点（当前 run 的 ops 全时刻）+ 会话终点**：
+
+- **连续轮询修正**（去掉首批 break）→ U53：每轮 patched_lim=2（同 2 站点
+  = 当前 run 的 ops 全时刻仅 2 处 0x7D1）+ counter 零化 ✓ + imm patch ✓
+  → **CALC 对话框仍 PRESENT**。
+- **会话终点定案**：全部运行时可达 patch 组合执行（counter/limit/imm）
+  → corrupted 持续 = 校验 = 读取 .dat 原始态或 VM 深层状态 = **运行时
+  侧绕过穷尽**。b15 的 98 站点 = 旧 run 的 ops 布局（per-run 差异）。
+- **剩余路径**：.dat 密码深耕（补 129-130 阻断深耕）或 check-op 40KB
+  逐指令深读。全部仪器/图谱/时间线已沉淀（40+ commits）。

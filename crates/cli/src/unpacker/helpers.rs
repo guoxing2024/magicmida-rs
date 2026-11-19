@@ -1078,9 +1078,12 @@ pub(super) fn spawn_dialog_killer(
                                     info!(
                                         patched_lim,
                                         t_ms = (t0b.elapsed().as_millis() as u32),
-                                        "BLKSTREAM-EARLY: limit raised to 0xFFFF"
+                                        "BLKSTREAM-EARLY: limit raised (cumulative)"
                                     );
-                                    break;
+                                    // NO break = the continuous polling:
+                                    // the ops decrypt lazily, new sites
+                                    // appear through the era — keep
+                                    // patching all of them.
                                 }
                             }
                             std::thread::sleep(std::time::Duration::from_micros(500));
