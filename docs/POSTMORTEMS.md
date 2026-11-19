@@ -5856,3 +5856,23 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   + struct [0,0xC0) 引用定位 → 本机 48 dword 绑定值计算。
 - 工件：CISC-1U.msgtrap_ops.bin（40KB 解密态）、msgtrap_disp.bin、
   dw132_runU19.log。
+
+**续 22 补充 132l（2026-11-20）——绑定访问图谱：struct+0x78 = 19 次 call（字段迭代调度实锤）**：
+
+- **锚点机制实锤**：call-pop 锚点调整（pop ebp; sub ebp, 0x122DE379）=
+  **0x109E38D − 0x122DE379 = 0xEEDC0014 = CHECK MAGIC**（12 阶段全部
+  magic-anchored）——magic-relative disp 的高 16 位 = 常数 0x1226 →
+  **原始字节扫描 ?? ?? 26 12 = 全部 struct 引用指令定位器**（481 站点，
+  落在 image [0x1020100,0x1023400) = 许可数据区）。
+- **绑定区访问图谱**（[0x1020139,0x10201F9) 48 dword 过滤 = 33 站点、
+  11 偏移）：**struct+0x78 = 19 次 call = 字段迭代调度实锤**（19 =
+  字段数！）；数据访问 = +0x44/+0x5c/+0x68/+0x74/+0x7c/+0x88/+0x98/
+  +0x9c(sub)/+0xa4/+0xb8（mov 为主）。
+- struct+0x78 的 19 次 call = 通过绑定槽调用 per-field op = **字段迭代
+  = call 转发结构**（非 esi 步表！）。capstone 逐指令解码（对齐回溯
+  8B 匹配 disp）。
+- **下一增量**：struct+0x78 的 19 次 call 的目标（call [ebp+d] 的指针
+  值 = 运行时读 struct+0x78 的实值）+ 19 个字段 op 的反汇编 = 比较
+  逻辑；绑定值计算 = 已知明文差分（struct+0x44/0x5c/... = 数据字段
+  = vmhash 输入源）。
+- 工件：CISC-1U.msgtrap_ops.bin（40KB 解密态）+ 绑定图谱脚本输出。
