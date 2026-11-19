@@ -5841,3 +5841,18 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   Result（match/.ok()）；let-else 块内多语句需括号包裹。
 - 工件：dw132_runU18.log、CISC-1U.msgtrap.bin（27 线程 dump）、
   patch_msgtrap.py、patch_keycopy.py。
+
+**续 22 补充 132k（2026-11-20）——MSGTRAP 瞬间 ops 区解密态捕获成功（流水线可反汇编）**：
+
+- **MSGTRAP 扩展**：trap 瞬间同步 RPM **ops 区 [0x109E000,0x10A8000) 40KB
+  解密态**（msgtrap_ops.bin）+ 调度器 [0x1020000,+0x100)（msgtrap_disp.bin）。
+- **流水线阶段 = 解密态活体**（capstone 反汇编 6 阶段全部有意义）：
+  call-pop 锚点混淆（call $+8 / pop ebp / sub ebp, imm32 / 数据窗口
+  折叠寻址）+ 每阶段 prologue = push 0 / push reg / call $+8 / pop reg /
+  **mov [esp+4], reg / add [esp+4], imm**（窗口偏移 0x15/0x14/0x17/...）/
+  inc reg——真实 op 代码，逐阶段可读。
+- 调度器 0x102002b = trap 时已重加密（零/密文态）= per-run 解密。
+- **下一增量**：逐阶段全量反汇编（0x40KB 已在手）→ 绑定校验 op = 比较逻辑
+  + struct [0,0xC0) 引用定位 → 本机 48 dword 绑定值计算。
+- 工件：CISC-1U.msgtrap_ops.bin（40KB 解密态）、msgtrap_disp.bin、
+  dw132_runU19.log。

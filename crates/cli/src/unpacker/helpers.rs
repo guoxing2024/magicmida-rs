@@ -5411,6 +5411,48 @@ pub(super) fn spawn_dialog_killer(
                                         nm.push(".bin");
                                         let _ = std::fs::write(stem.with_file_name(nm), &blob);
                                     }
+                                    // 补充 132k: the ops region at the trap
+                                    // moment = DECRYPTED (re-encrypted
+                                    // right after) — capture now + the
+                                    // dispatcher + the struct page.
+                                    let mut ops = vec![0u8; 0xA000];
+                                    for (lo, sz) in [
+                                        (0x109E000usize, 0xA000usize),
+                                    ] {
+                                        let mut n3 = 0;
+                                        unsafe {
+                                            let _ = ReadProcessMemory(
+                                                hp,
+                                                lo as *const core::ffi::c_void,
+                                                ops.as_mut_ptr() as *mut core::ffi::c_void,
+                                                sz,
+                                                Some(&mut n3),
+                                            );
+                                        }
+                                    }
+                                    let stem2 = out2.with_extension("msgtrap_ops");
+                                    if let Some(name) = stem2.file_name() {
+                                        let mut nm = name.to_os_string();
+                                        nm.push(".bin");
+                                        let _ = std::fs::write(stem2.with_file_name(nm), &ops);
+                                    }
+                                    let mut disp = vec![0u8; 0x100];
+                                    let mut n4 = 0;
+                                    unsafe {
+                                        let _ = ReadProcessMemory(
+                                            hp,
+                                            0x1020000 as *const core::ffi::c_void,
+                                            disp.as_mut_ptr() as *mut core::ffi::c_void,
+                                            0x100,
+                                            Some(&mut n4),
+                                        );
+                                    }
+                                    let stem3 = out2.with_extension("msgtrap_disp");
+                                    if let Some(name) = stem3.file_name() {
+                                        let mut nm = name.to_os_string();
+                                        nm.push(".bin");
+                                        let _ = std::fs::write(stem3.with_file_name(nm), &disp);
+                                    }
                                     info!(
                                         threads = tids.len(),
                                         bytes = blob.len(),
