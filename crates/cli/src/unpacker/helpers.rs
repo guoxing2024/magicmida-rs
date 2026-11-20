@@ -996,14 +996,22 @@ pub(super) fn spawn_dialog_killer(
                             };
                             if okc {
                                 let cv = u32::from_le_bytes(cb2);
-                                if cv != 0 && cv <= 0x7D1 {
-                                    let zero = [0u8; 4];
+                                // 补充 132y8: the deep read (msgtrap_ops
+                                // .bin) settles the verdict = EQUALITY:
+                                // 8x `cmp [X],0x7d0; jbe pass` + 8x
+                                // `cmp [X],0x7d0; jne fail-handler`.
+                                // Zero passes the jbe sites but fails
+                                // EVERY jne site (0 != 2000 = the U53
+                                // dialog).  The license-faithful value =
+                                // 0x7D0 exactly — hold it.
+                                if cv != 0x7D0 {
+                                    let held = 0x7D0u32.to_le_bytes();
                                     let mut w5 = 0;
                                     unsafe {
                                         let _ = WriteProcessMemory(
                                             hp,
                                             caddr as *const core::ffi::c_void,
-                                            zero.as_ptr() as *const core::ffi::c_void,
+                                            held.as_ptr() as *const core::ffi::c_void,
                                             4,
                                             Some(&mut w5),
                                         );
@@ -1011,7 +1019,7 @@ pub(super) fn spawn_dialog_killer(
                                     info!(
                                         t_ms = (t0b.elapsed().as_millis() as u32),
                                         old = format!("{cv:#x}"),
-                                        "BLKSTREAM-EARLY: exec counter zeroed pre-check"
+                                        "BLKSTREAM-EARLY: exec counter held at 0x7d0 (equality verdict)"
                                     );
                                 }
                             }
@@ -1251,6 +1259,603 @@ pub(super) fn spawn_dialog_killer(
                 info!(
                     records = recs.len(),
                     "BLKSTREAM-EARLY: decode-era timeline flushed"
+                );
+            });
+        }
+        // 补充 132y17: STACKPASS — the chain prepares the fail values
+        // on the VM stack before the bank write: [0xFFFF8441][0x0102133E]
+        // (the "locked to a different machine" pair).  Rewrite every
+        // sighting to the pass pair [0xFFFFA595][0x01182522] (the
+        // registered message) at µs cadence — the bank write then stores
+        // the pass continuation and the dispatcher routes to the
+        // registered path instead of the lock loop.
+        if std::env::var("MAGICMIDA_V2_STACKPASS").is_ok() {
+            let hraw_s = handle_raw;
+            let t0s = watch_t0;
+            std::thread::spawn(move || {
+                use windows::Win32::Foundation::HANDLE;
+                let hp = HANDLE(hraw_s as *mut core::ffi::c_void);
+                while t0s.elapsed().as_millis() < 140 {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                let scan_lo = 0xEFD00usize;
+                let scan_hi = 0xF2000usize;
+                let sz = scan_hi - scan_lo;
+                let failmark = [0x41u8, 0x84, 0xFF, 0xFF];
+                let passpair = [
+                    0x95u8, 0xA5, 0xFF, 0xFF, 0x22, 0x25, 0x18, 0x01,
+                ];
+                let mut rewrites = 0usize;
+                while t0s.elapsed().as_millis() <= 600000 {
+                    let mut buf = vec![0u8; sz];
+                    let mut nrd = 0;
+                    let ok = unsafe {
+                        ReadProcessMemory(
+                            hp,
+                            scan_lo as *const core::ffi::c_void,
+                            buf.as_mut_ptr() as *mut core::ffi::c_void,
+                            sz,
+                            Some(&mut nrd),
+                        )
+                        .is_ok()
+                            && nrd == sz
+                    };
+                    if ok {
+                        let mut j = 0;
+                        while j + 8 <= sz {
+                            if buf[j..j + 4] == failmark[..] {
+                                let va = scan_lo + j;
+                                let mut w5 = 0;
+                                unsafe {
+                                    let _ = WriteProcessMemory(
+                                        hp,
+                                        va as *const core::ffi::c_void,
+                                        passpair.as_ptr()
+                                            as *const core::ffi::c_void,
+                                        8,
+                                        Some(&mut w5),
+                                    );
+                                }
+                                rewrites += 1;
+                                if rewrites <= 10 || rewrites % 100 == 0 {
+                                    info!(
+                                        va = format!("{va:#x}"),
+                                        rewrites,
+                                        "STACKPASS: fail pair rewritten to pass"
+                                    );
+                                }
+                            }
+                            j += 4;
+                        }
+                    }
+                    // NO sleep = the race loop
+                }
+                info!(rewrites, "STACKPASS: window closed");
+            });
+        }
+        // 补充 132y12: GATEPATCH — the machine-binding gate's verdict.
+        // The U60 park scene: the fail dispatcher (bank continuation
+        // 0x10768A2) calls the binding validator through
+        // [ebp+0x1226079d] (= struct+0x7B1, transient) and tests its
+        // result: or eax,eax; jne +0xB = the "locked to a different
+        // machine" verdict.  NOP the jne (and the first flag's fail
+        // jmp) as the decrypted op code materialises; the scan thread
+        // runs [140,700]ms with no sleep so the patch lands between
+        // decrypt and execute.
+        if std::env::var("MAGICMIDA_V2_GATEPATCH").is_ok() {
+            let hraw_g = handle_raw;
+            let t0g = watch_t0;
+            std::thread::spawn(move || {
+                use windows::Win32::Foundation::HANDLE;
+                let hp = HANDLE(hraw_g as *mut core::ffi::c_void);
+                while t0g.elapsed().as_millis() < 140 {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                // 补充 132y13: the re-run chains re-decrypt their ops at
+                // other addresses — scan the whole op band.
+                let sig1 = [
+                    0xFFu8, 0x95, 0x9D, 0x07, 0x26, 0x12, 0x0B, 0xC0,
+                    0x0F, 0x85, 0x0B, 0x00, 0x00, 0x00,
+                ];
+                let sig2 = [
+                    0x83u8, 0xBD, 0xE5, 0x24, 0x26, 0x12, 0x00, 0x0F,
+                    0x84, 0x05, 0x00, 0x00, 0x00, 0xE9, 0xA9, 0x00, 0x00,
+                    0x00,
+                ];
+                // sig3 = the FP-formula gate: fistp [0x1022529]; cmp v,0;
+                // je fail; cmp v,0x80000000; jbe pass
+                let sig3 = [
+                    0xDBu8, 0x9D, 0x15, 0x25, 0x26, 0x12, 0x9B, 0x83,
+                    0xBD, 0x15, 0x25, 0x26, 0x12, 0x00, 0x0F, 0x84,
+                    0x10, 0x00, 0x00, 0x00, 0x81, 0xBD, 0x15, 0x25,
+                    0x26, 0x12, 0x00, 0x00, 0x00, 0x80, 0x0F, 0x86,
+                    0x4D, 0x00, 0x00, 0x00,
+                ];
+                let mut p3 = 0usize;
+                // sig4 = the module-exports integrity gate (0x10B75F8):
+                // the block walks the live module's export table and, on
+                // any export RVA outside [.text_VA, .rsrc_VA), dispatches
+                // the fail: lea ebx,[0x10252C6]; mov eax,5; jmp ebx
+                // (NORETURN).  Replace with popal; ret = the block returns
+                // normally = the pass continuation.
+                let sig4 = [
+                    0x8Du8, 0x9D, 0xB2, 0x52, 0x26, 0x12, 0xB8, 0x05,
+                    0x00, 0x00, 0x00, 0xFF, 0xE3,
+                ];
+                let mut p4 = 0usize;
+                let mut p1 = 0usize;
+                let mut p2 = 0usize;
+                // 补充 132y13: the shell re-runs the whole check chain
+                // after each dialog dismissal (the .dat reload at ~2.1s
+                // restores the original code) — the patch window = the
+                // whole run.
+                use windows::Win32::System::Memory::{
+                    VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT,
+                    PAGE_NOACCESS,
+                };
+                // one sweep = walk every committed private readable
+                // region and patch sig1..sig4 in place; 1ms between
+                // sweeps.  The re-run chains re-decrypt fresh copies
+                // anywhere in user space.
+                let mut sweeps = 0usize;
+                let mut scanned = 0usize;
+                while t0g.elapsed().as_millis() <= 600000 {
+                    sweeps += 1;
+                    if sweeps <= 3 || sweeps % 100 == 0 {
+                        info!(
+                            sweeps,
+                            scanned_kb = scanned / 1024,
+                            t_ms = (t0g.elapsed().as_millis() as u32),
+                            "GATEPATCH: sweep progress"
+                        );
+                    }
+                    let mut va = 0x1_0000usize;
+                    while va < 0x7FFE_0000 {
+                        let mut mbi = MEMORY_BASIC_INFORMATION::default();
+                        let q = unsafe {
+                            VirtualQueryEx(
+                                hp,
+                                Some(va as *const core::ffi::c_void),
+                                &mut mbi,
+                                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                            )
+                        };
+                        if q == 0 {
+                            va += 0x1000;
+                            continue;
+                        }
+                        let rbase = mbi.BaseAddress as usize;
+                        let rsize = mbi.RegionSize as usize;
+                        let ok_region = mbi.State == MEM_COMMIT
+                            && mbi.Protect != PAGE_NOACCESS
+                            && mbi.Protect.0 != 0;
+                        if ok_region {
+                            let mut buf = vec![0u8; rsize.min(0x4000000)];
+                            let mut nrd = 0;
+                            let ok = unsafe {
+                                ReadProcessMemory(
+                                    hp,
+                                    rbase as *const core::ffi::c_void,
+                                    buf.as_mut_ptr() as *mut core::ffi::c_void,
+                                    buf.len(),
+                                    Some(&mut nrd),
+                                )
+                            };
+                            if ok.is_ok() && nrd > 0 {
+                                scanned += nrd;
+                                let got = (nrd as usize).min(buf.len());
+                                // sig1: call [X]; or eax,eax; jne +0xB
+                                let mut j = 0;
+                                while j + sig1.len() <= got {
+                                    if buf[j..j + sig1.len()] == sig1[..] {
+                                        let va1 = rbase + j + 8;
+                                        let nops = [0x90u8; 6];
+                                        let mut wg = 0;
+                                        unsafe {
+                                            let _ = WriteProcessMemory(
+                                                hp,
+                                                va1 as *const core::ffi::c_void,
+                                                nops.as_ptr() as *const core::ffi::c_void,
+                                                6,
+                                                Some(&mut wg),
+                                            );
+                                        }
+                                        p1 += 1;
+                                        if p1 <= 64 {
+                                            info!(va = format!("{va1:#x}"), "GATEPATCH: binding verdict jne NOPed");
+                                        }
+                                    }
+                                    j += 1;
+                                }
+                                // sig2: cmp [X],0; je +5; jmp +0xA9
+                                let mut j = 0;
+                                while j + sig2.len() <= got {
+                                    if buf[j..j + sig2.len()] == sig2[..] {
+                                        let va1 = rbase + j + 13;
+                                        let nops = [0x90u8; 5];
+                                        let mut wg = 0;
+                                        unsafe {
+                                            let _ = WriteProcessMemory(
+                                                hp,
+                                                va1 as *const core::ffi::c_void,
+                                                nops.as_ptr() as *const core::ffi::c_void,
+                                                5,
+                                                Some(&mut wg),
+                                            );
+                                        }
+                                        p2 += 1;
+                                        if p2 <= 64 {
+                                            info!(va = format!("{va1:#x}"), "GATEPATCH: flag-fail jmp NOPed");
+                                        }
+                                    }
+                                    j += 1;
+                                }
+                                // sig3 = TWO patches
+                                let mut j = 0;
+                                while j + sig3.len() <= got {
+                                    if buf[j..j + sig3.len()] == sig3[..] {
+                                        let va1 = rbase + j + 13;
+                                        let nops = [0x90u8; 6];
+                                        let mut wg = 0;
+                                        unsafe {
+                                            let _ = WriteProcessMemory(
+                                                hp,
+                                                va1 as *const core::ffi::c_void,
+                                                nops.as_ptr() as *const core::ffi::c_void,
+                                                6,
+                                                Some(&mut wg),
+                                            );
+                                        }
+                                        let va2 = rbase + j + 25;
+                                        let newb = [0xE9u8, 0x4E, 0x00, 0x00, 0x00, 0x90];
+                                        unsafe {
+                                            let _ = WriteProcessMemory(
+                                                hp,
+                                                va2 as *const core::ffi::c_void,
+                                                newb.as_ptr() as *const core::ffi::c_void,
+                                                6,
+                                                Some(&mut wg),
+                                            );
+                                        }
+                                        p3 += 1;
+                                        if p3 <= 64 {
+                                            info!(va = format!("{va1:x}"), "GATEPATCH: FP-formula gate forced pass");
+                                        }
+                                    }
+                                    j += 1;
+                                }
+                                // sig4: lea/mov eax,5/jmp ebx
+                                let mut j = 0;
+                                while j + sig4.len() <= got {
+                                    if buf[j..j + sig4.len()] == sig4[..] {
+                                        let va1 = rbase + j;
+                                        let newb = [0x61u8, 0xC3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90];
+                                        let mut wg = 0;
+                                        unsafe {
+                                            let _ = WriteProcessMemory(
+                                                hp,
+                                                va1 as *const core::ffi::c_void,
+                                                newb.as_ptr() as *const core::ffi::c_void,
+                                                13,
+                                                Some(&mut wg),
+                                            );
+                                        }
+                                        p4 += 1;
+                                        if p4 <= 64 {
+                                            info!(va = format!("{va1:#x}"), "GATEPATCH: module-exports gate neutralized");
+                                        }
+                                    }
+                                    j += 1;
+                                }
+                            }
+                        }
+                        va = rbase + rsize.max(0x1000);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            });
+        }
+        // 补充 132y11: MSGTRAP2 — multi-snap watcher on the message
+        // area.  The chain writes one message per completed stage (the
+        // registered PASS, then the machine-binding verdict, ...).  On
+        // each CONTENT CHANGE: suspend all threads, dump every thread's
+        // CONTEXT + the full ops region (the per-stage decrypted code)
+        // + the bank + the struct page, resume, keep polling.  The
+        // frozen contexts carry the just-taken branch's operands = the
+        // gate's compare inputs.
+        if std::env::var("MAGICMIDA_V2_MSGTRAP2").is_ok() {
+            let hraw_m2 = handle_raw;
+            let outm2: std::path::PathBuf = out_path.to_path_buf();
+            let t0m2 = watch_t0;
+            std::thread::spawn(move || {
+                use windows::Win32::Foundation::{CloseHandle, HANDLE};
+                use windows::Win32::System::Diagnostics::Debug::{
+                    GetThreadContext, CONTEXT,
+                };
+                use windows::Win32::System::Threading::{
+                    OpenThread, ResumeThread, SuspendThread,
+                };
+                use windows::Win32::System::Diagnostics::ToolHelp::{
+                    CreateToolhelp32Snapshot, Thread32First, Thread32Next,
+                    TH32CS_SNAPTHREAD, THREADENTRY32,
+                };
+                let hp = HANDLE(hraw_m2 as *mut core::ffi::c_void);
+                let mraw2 = unsafe {
+                    windows::Win32::System::Threading::GetProcessId(hp)
+                };
+                while t0m2.elapsed().as_millis() < 150 {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                let msg_lo = 0x1021300usize;
+                let mut snaps = 0usize;
+                let mut armed = false;
+                // arm after the first sighting (skip the zero-initialized
+                // pre-decode state)
+                while t0m2.elapsed().as_millis() <= 60000 && snaps < 6 {
+                    let mut cur = [0u8; 0x100];
+                    let mut n = 0;
+                    let ok = unsafe {
+                        ReadProcessMemory(
+                            hp,
+                            msg_lo as *const core::ffi::c_void,
+                            cur.as_mut_ptr() as *mut core::ffi::c_void,
+                            0x100,
+                            Some(&mut n),
+                        )
+                        .is_ok()
+                            && n == 0x100
+                    };
+                    if !ok {
+                        std::thread::sleep(
+                            std::time::Duration::from_micros(300),
+                        );
+                        continue;
+                    }
+                    if !armed {
+                        if cur.iter().any(|&x| x != 0) {
+                            armed = true;
+                            info!(
+                                t_ms = (t0m2.elapsed().as_millis() as u32),
+                                "MSGTRAP2: armed on first message content"
+                            );
+                        }
+                        std::thread::sleep(
+                            std::time::Duration::from_micros(300),
+                        );
+                        continue;
+                    }
+                    // 补充 132y16: trigger ONLY on the "locked to a
+                    // different machine" content (the earlier changes =
+                    // the crash/registered messages = worthless states).
+                    let needle = b"locked to a different";
+                    let hit_m = {
+                        let mut f = false;
+                        for w in cur.windows(needle.len()) {
+                            if w == needle {
+                                f = true;
+                                break;
+                            }
+                        }
+                        f
+                    };
+                    if hit_m {
+                        snaps += 1;
+                        info!(
+                            t_ms = (t0m2.elapsed().as_millis() as u32),
+                            snap = snaps,
+                            "MSGTRAP2: locked-message write — freezing"
+                        );
+                        // suspend every thread of the process
+                        let mut tids: Vec<u32> = Vec::new();
+                        let Ok(snap_h) = (unsafe {
+                            CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+                        }) else {
+                            continue;
+                        };
+                        let mut te = THREADENTRY32::default();
+                        te.dwSize = std::mem::size_of::<THREADENTRY32>()
+                            as u32;
+                        if unsafe { Thread32First(snap_h, &mut te) }.is_ok()
+                        {
+                            loop {
+                                if te.th32OwnerProcessID == mraw2 {
+                                    tids.push(te.th32ThreadID);
+                                }
+                                if unsafe { Thread32Next(snap_h, &mut te) }
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                        unsafe {
+                            let _ = CloseHandle(snap_h);
+                        }
+                        let mut blob: Vec<u8> = Vec::new();
+                        for tid in &tids {
+                            let Ok(h) = (unsafe {
+                                OpenThread(
+                                    windows::Win32::System::Threading::THREAD_ACCESS_RIGHTS(
+                                        0x1F03FF,
+                                    ),
+                                    false,
+                                    *tid,
+                                )
+                            }) else {
+                                continue;
+                            };
+                            unsafe {
+                                let _ = SuspendThread(h);
+                            }
+                            let mut ctx = CONTEXT::default();
+                            ctx.ContextFlags =
+                                windows::Win32::System::Diagnostics::Debug::CONTEXT_FLAGS(
+                                    0x0001_0003,
+                                );
+                            if unsafe { GetThreadContext(h, &mut ctx) }
+                                .is_ok()
+                            {
+                                blob.extend_from_slice(&(*tid).to_le_bytes());
+                                for v in [
+                                    ctx.Eip, ctx.Edi, ctx.Esi, ctx.Ebx,
+                                    ctx.Edx, ctx.Ecx, ctx.Eax, ctx.Ebp,
+                                    ctx.Esp, ctx.EFlags,
+                                ] {
+                                    blob.extend_from_slice(
+                                        &v.to_le_bytes(),
+                                    );
+                                }
+                            }
+                            unsafe {
+                                let _ = CloseHandle(h);
+                            }
+                        }
+                        // 补充 132y16: the LIGHT dump — for every
+                        // thread whose Eip lies in the op bands, read
+                        // [Eip-0x800, Eip+0x800] right now (the chain-2
+                        // code is decrypted at this instant).
+                        for ti in 0..(blob.len() / 44) {
+                            let o = ti * 44 + 4;
+                            if o + 40 > blob.len() {
+                                break;
+                            }
+                            let eip = u32::from_le_bytes(
+                                blob[o..o + 4].try_into().unwrap_or([0; 4]),
+                            ) as usize;
+                            if !(0x1000000..0x1200000).contains(&eip) {
+                                continue;
+                            }
+                            let lo = eip.saturating_sub(0x800);
+                            let sz = 0x1000;
+                            let mut code = vec![0u8; sz];
+                            let mut n2 = 0;
+                            unsafe {
+                                let _ = ReadProcessMemory(
+                                    hp,
+                                    lo as *const core::ffi::c_void,
+                                    code.as_mut_ptr() as *mut core::ffi::c_void,
+                                    sz,
+                                    Some(&mut n2),
+                                );
+                            }
+                            blob.extend_from_slice(&(lo as u32).to_le_bytes());
+                            blob.extend_from_slice(&code);
+                        }
+                        let mut bank = [0u8; 64];
+                        let mut n3 = 0;
+                        unsafe {
+                            let _ = ReadProcessMemory(
+                                hp,
+                                (0x1028598 + 0x1E) as *const core::ffi::c_void,
+                                bank.as_mut_ptr() as *mut core::ffi::c_void,
+                                64,
+                                Some(&mut n3),
+                            );
+                        }
+                        blob.extend_from_slice(&bank);
+                        // message area itself
+                        blob.extend_from_slice(&cur);
+                        let stem = outm2.with_extension("msgtrap2");
+                        if let Some(name) = stem.file_name() {
+                            let mut nm = name.to_os_string();
+                            nm.push(format!(".{}.bin", snaps));
+                            let _ = std::fs::write(
+                                stem.with_file_name(nm),
+                                &blob,
+                            );
+                        }
+                        // resume everything
+                        for tid in &tids {
+                            if let Ok(h) = unsafe {
+                                OpenThread(
+                                    windows::Win32::System::Threading::THREAD_ACCESS_RIGHTS(
+                                        0x0002_0000,
+                                    ),
+                                    false,
+                                    *tid,
+                                )
+                            } {
+                                unsafe {
+                                    ResumeThread(h);
+                                    let _ = CloseHandle(h);
+                                }
+                            }
+                        }
+                        info!(
+                            threads = tids.len(),
+                            bytes = blob.len(),
+                            "MSGTRAP2: snap written — resumed"
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(300));
+                }
+                info!(snaps, "MSGTRAP2: window closed");
+            });
+        }
+        // 补充 132y8: the dedicated counter-HOLD thread — the equality
+        // verdict needs 0x1022d3d == 0x7D0 at the check moment.  No-sleep
+        // tight loop (RPM 4B ~1-2us) from 140ms through 420ms: rewrite on
+        // ANY divergence (the .dat-loaded 0x7D1, a post-fail recompute,
+        // or a use-consumption increment).
+        if std::env::var("MAGICMIDA_V2_BLKSTREAM").is_ok() {
+            let hraw_h = handle_raw;
+            let t0h = watch_t0;
+            std::thread::spawn(move || {
+                use windows::Win32::Foundation::HANDLE;
+                let hp = HANDLE(hraw_h as *mut core::ffi::c_void);
+                while t0h.elapsed().as_millis() < 140 {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                let caddr = (0xEEDC0014usize.wrapping_add(0x12262D29))
+                    & 0xFFFFFFFF;
+                let held = 0x7D0u32.to_le_bytes();
+                let mut rewrites = 0usize;
+                // 补充 132y11: hold for the WHOLE run — the shell re-checks
+                // after each dialog dismissal (U57: the hold expired at
+                // 420ms, the re-check read the .dat's 2001, showed the
+                // corrupted dialog and the flow exited fail).  The RPM
+                // fails when the target dies = the natural loop exit.
+                while t0h.elapsed().as_millis() <= 600000 {
+                    let mut cb2 = [0u8; 4];
+                    let mut n2 = 0;
+                    let okc = unsafe {
+                        ReadProcessMemory(
+                            hp,
+                            caddr as *const core::ffi::c_void,
+                            cb2.as_mut_ptr() as *mut core::ffi::c_void,
+                            4,
+                            Some(&mut n2),
+                        )
+                        .is_ok()
+                            && n2 == 4
+                    };
+                    if okc && cb2 != held {
+                        let mut w5 = 0;
+                        unsafe {
+                            let _ = WriteProcessMemory(
+                                hp,
+                                caddr as *const core::ffi::c_void,
+                                held.as_ptr() as *const core::ffi::c_void,
+                                4,
+                                Some(&mut w5),
+                            );
+                        }
+                        rewrites += 1;
+                        if rewrites <= 20 || rewrites % 100 == 0 {
+                            info!(
+                                t_ms = (t0h.elapsed().as_millis() as u32),
+                                old = format!("{:02x}{:02x}{:02x}{:02x}",
+                                    cb2[3], cb2[2], cb2[1], cb2[0]),
+                                rewrites,
+                                "CTR-HOLD: counter diverged — rewrote 0x7d0"
+                            );
+                        }
+                    }
+                    // NO sleep = the tight race loop
+                }
+                info!(
+                    rewrites,
+                    "CTR-HOLD: window closed"
                 );
             });
         }
@@ -1717,13 +2322,32 @@ pub(super) fn spawn_dialog_killer(
                 return;
             }
             if mark {
-                if freeze_mode || prefreeze {
+                // 补充 132y10: NOBAIL skips the freeze dump too —
+                // the freeze suspends every thread (the registered-
+                // message dialog then never pumps); a pass run must
+                // proceed untouched.
+                let nobail = std::env::var("MAGICMIDA_V2_NOBAIL").is_ok();
+                if (freeze_mode || prefreeze) && !nobail {
                     dump_failfreeze_scene(
                         pid,
                         HANDLE(handle_raw as *mut core::ffi::c_void),
                         image_base,
                         &out_path,
                     );
+                }
+                // 补充 132y9: NOBAIL — the U54 scene shows the bank
+                // carrying the REGISTERED (success) message pointer
+                // 0x1182522 alongside the FAIL_MARK; the counter checks
+                // passed (the stream phase advanced).  The kill would
+                // murder a passing run — with NOBAIL, dump + log and let
+                // the target proceed (fail -> its dialog, pass -> the
+                // registered message + deployment).
+                if nobail {
+                    info!(
+                        failfreeze = freeze_mode,
+                        "BAIL-SKIP (NOBAIL): bank marker seen — target left running"
+                    );
+                    return;
                 }
                 // SAFETY: live handle.
                 unsafe {
@@ -3236,10 +3860,25 @@ pub(super) fn spawn_dialog_killer(
                     }
                     let ca = u32::from_le_bytes(cont_buf[0..4].try_into().unwrap());
                     if ca == FAIL_MARK {
-                        info!("BLKSTREAM: late bail marker - dumping scene");
-                        dump_failfreeze_scene(pid, h_process, image_base, &out_path);
-                        unsafe {
-                            let _ = TerminateProcess(h_process, 0x2C);
+                        // 补充 132y10: NOBAIL — no freeze dump (it
+                        // suspends everything; the dialog then never
+                        // pumps), no kill: the target runs on.
+                        let nobail =
+                            std::env::var("MAGICMIDA_V2_NOBAIL").is_ok();
+                        if !nobail {
+                            info!(
+                                "BLKSTREAM: late bail marker - dumping scene"
+                            );
+                            dump_failfreeze_scene(
+                                pid, h_process, image_base, &out_path,
+                            );
+                            unsafe {
+                                let _ = TerminateProcess(h_process, 0x2C);
+                            }
+                        } else {
+                            info!(
+                                "BAIL-SKIP (NOBAIL): late bank marker — target left running"
+                            );
                         }
                         return;
                     }

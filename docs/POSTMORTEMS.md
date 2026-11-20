@@ -6058,7 +6058,61 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   CALC 通过 → 部署启动。
 - 工件：dw132_runU34-U38.log。
 
-**续 22 补充 132x（2026-11-20）——专用早启 BLKSTREAM 线程：解码 era 时间线捕获成功**：
+- 工件：dw132_runU34-U38.log。
+
+**续 22 补充 132y8-132y17（2026-11-20/21）——forge 全闭环打通：license 检查全过 + 部署到达**：
+
+- **132y8 = verdict 语义定案（msgtrap_ops.bin 40KB 逐指令深读）**：16 个
+  counter 检查站点交替 `cmp [0x1022d3d],0x7d0` + 8×`jbe`（≤2000 → pass
+  续链）/8×`jne`（≠2000 → `push [X]; call [0x10201b1]` fail handler）—
+  **verdict = 精确相等 [0x1022d3d]==0x7D0**。U53 清零（0）：jbe 全过但
+  jne 全挂 → 对话框；U43 的 0x7D1 同理。0x7D0 从未被测过。CTR-HOLD
+  仪器（专用 no-sleep 线程 [140,420]ms，值分歧即重写 0x7D0）。
+- **132y9 = NOBAIL**：U54（counter=0x7D0）failfreeze 场景显示 bank 携带
+  **"This application has been registered to\n\r(CISC-1) Examples -
+  LCF-AT" 成功消息指针（0x1182522）** = counter 门已过、流程推进，
+  但 CLI 自己的 FAIL_MARK bail-kill 杀掉了本已通过的 run！NOBAIL env
+  = 跳过 kill（两个 bail 站点）。
+- **132y10 = freeze 深坑**：dump_failfreeze_scene 挂起全线程不恢复 →
+  对话框线程不泵消息 → 点击无效。NOBAIL = 连 freeze dump 一起跳过。
+- **132y11 = 跨桌面消息坑**：跨桌面 PostMessage 返回 0（hwnd 失效）—
+  **必须 SetThreadDesktop(MagicmidaV2Desktop) 后再投递**；BM_CLICK +
+  WM_COMMAND IDOK 双发。U57：双对话框（corrupted+registered 并存 =
+  420ms 后 hold 过期、重检读回 0x7D1）→ dismiss 后流程推进、进程退出。
+- **132y12 = GATEPATCH**：CTR-HOLD 窗口扩到全程（U57：hold 420ms 过期 →
+  .dat 重载回 0x7D1 → 重检 fail）。pattern-scan + NOP 仪器。
+- **132y13 = 重跑链发现**：dismiss 后壳在 ~2.1s 从 .dat 重载重跑整条
+  检查链（CTR-HOLD 捕获 0x7D1 回归）→ patch 窗口 = 全程。
+- **132y14 = 绑定门真身（U60 停泊场景解码）**：fail 续链 = 0x10768A2
+  派发器；FP 公式门 @0x117611f：`fistp [0x1022529]`（value =
+  frndint((X−Y)/Z)，三个 qword @0x1111F2B/33/3B）→ `0 < v ≤ 0x80000000`
+  = pass，否则 eax=5 → jmp [0x10252C6] = "locked" 消息链。**公式 =
+  许可自身字段的自洽校验——被 KEYBUF 的 keys 模式破坏**。patch =
+  NOP je + 强制 jbe taken（E9 4E 00 00 00 90）。
+- **132y15 = 模块导出完整性门（0x10B75F8）**：对模块 live PE 的每个
+  export RVA 检查 ∈ [.text_VA, .rsrc_VA)，出界 = eax=5 → fail。patch =
+  fail 派发（lea/mov eax,5/jmp ebx）→ `61 C3`（popal; ret）。扫描 = 
+  **VirtualQueryEx 全用户空间 VAD 走查**（低 12MB 带不含重跑链的
+  fresh 副本；MEM_PRIVATE 过滤 = 误筛，去掉）。
+- **132y16 = MSGTRAP2 v3（轻冻结）**：重 576KB dump（200ms 挂起）=
+  破坏运行；v3 = needle 触发（0x1021300 区出现 "locked to a
+  different"）+ 只 dump 上下文与 Eip±0x1000（毫秒级）。实锤：
+  冻结瞬间全线程 ntdll 等待（主线程 = NtUserGetMessage 消息泵）=
+  fail 路径异步 posted，检查在消息写入之前已完成。
+- **132y17 = STACKPASS（NOWRITE 形状复活）**：fail 值在 VM 栈上预备
+  （0xEFE74/0xEFECC：`[0xFFFF8441][0x0102133E/3D]`）再写 bank。重写
+  预备对 → pass 对 `[0xFFFFA595][0x01182522]`（registered 模板）。
+  **U75/U77 = 复现成功**：仅 registered 消息（"locked" 完全消失！）、
+  WS 121MB（VA 0x1EB000 = 解密的真代码 `mov eax,0x0b600000...`）、
+  流程推进到部署，尾部 0xC0000005（OEP 跳转段，下一增量）。
+- **forge 全链 = 七件套**：KEYBUF（本机键 [52,384)）+ CTR-HOLD
+  （counter≡0x7D0）+ NOBAIL + GATEPATCH（sig1 派发器 jne / sig2 flag
+  jmp / sig3 FP 公式 / sig4 模块导出，VAD 全空间走查）+ STACKPASS
+  （VM 栈 fail 对 → pass 对）+ 自动 dismiss（SetThreadDesktop + 
+  BM_CLICK/WM_COMMAND）。部署后崩溃 = 唯一剩余（OEP 段）。
+- 工件：dw132_runU54-U77.log、u60_*.bin（停泊场景：struct/ops0/ops1/
+  priv/buf）、u65/u72_parkpid、msgtrap2 snap 1-6、patch_132y8-y17.py、
+  deepread_ops2-4.py、scan_dispatch.py、run_u54.py。**续 22 补充 132x（2026-11-20）——专用早启 BLKSTREAM 线程：解码 era 时间线捕获成功**：
 
 - **根因定案**：主 watch 循环步距 ~370ms → BLKSTREAM 首达 ~370ms > 解码 era
   末（220ms）= **结构性不可捕**。修复 = **专用早启线程**（0ms 起，[140,320]ms
