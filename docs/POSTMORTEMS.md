@@ -6629,3 +6629,21 @@ forge 方程闭合：search 与 decode 共用 buffer = 冲突，唯一 forge = d
 - 工件：CISC-1.dat.orig（pristine 备份）、CISC-1.dat（forge）、
   probe_forge.py、forge.log（alive 30s）、probe_forgedlg.py、
   forgedlg_out.txt（fp 键像实锤）。
+
+**续 22 补充 132y40（2026-11-22）——解码 = 非 per-byte XOR（滚动键级联实锤）
++ forge 路线收敛到解码 oracle**：
+
+- **XOR 预映像否定（两轮）**：①.dat[0x50,0x59)↔fp"1051-BCEC" 校准 →
+  fp 仅 [2..] 移动（映射偏移错）；②dat[0x4E,0x57)↔fp[0,9) → fp =
+  **"10-1"（截断）** = 变换后提前终结 = **解码非 per-byte XOR = 滚动
+  键级联（补121 的结论在 fp 域直接成立）**。K 按 pristine 对取的静态
+  XOR 键对 .dat' 无效（键演化依赖输入）。
+- **正确的预映像求解 = 解码 oracle**：①emu 解码机 era 状态补全
+  （decode-era snap 复写全 derailed）；②或后向逐字节求解器（级联键态
+  末端已知→逐字节回溯，补121 的 g = XOR 族可逆结论待复核）；③或
+  live oracle 网格（1 run/变体 = 30s，只够校准不够求解）。
+- **forge 现状（90%）**：磁盘 .dat'（键@0x52 落盘）+ LIVEACC = 流程
+  存活 30s+（部署态永不 fail-exit）；键的解码像已进指纹（fp 组 1-2 =
+  键像）= 搜索命中 ✓ + check ✓（LIVEACC）+ 解析 ✓（尾区 pristine）。
+  **唯一剩余 = fp 组 1-2 = 合法 hex = 解码预映像 = decode 逆。**
+  CISC-1.dat 已恢复 pristine（forge 样本 = .orig 备份 + XOR 脚本）。
