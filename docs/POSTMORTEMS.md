@@ -6693,3 +6693,20 @@ forge 方程闭合：search 与 decode 共用 buffer = 冲突，唯一 forge = d
   38017 snaps 含栈）、failstate_pristine/forge.bin、fs_f*.bin、
   v4_buf/struct/corpus/img_*.bin。
 
+
+**续 22 补充 132y44（2026-11-22，贪心轮）——license = 烤入 shell 静态串，
+.dat 完全无关；"sweep 键字段→锁变化"全是 LIVEACC 污染假象；修复改道**：
+
+- **决定性实验**（greedy.py；桌面句柄 per-run 重开修掉陈旧句柄 bug）：
+  键字段 [0x52] 换 0x00/0x2d/0x66/0xaa + 键字段外 0x30/0x66/0x7a 翻转 =
+  **corrupted 对话框 license 全部恒等 "1051-BCEC-14F2-0C18-3745-254D-
+  9F3C-2536"**。此前"10"+decode(X) 模型作废：那是 LIVEACC 写 acc 进
+  image+0x2056F 显示串的假象（sweep 全带 LIVEACC，greedy 不带）。
+- **license = 烤入 shell 的静态串**（.dat 无关）：绑定 = 烤入 license
+  的 K1 vs 机器 K1（corpus 0x7DC80DE6）→ **.dat 修死路，修复 = patch
+  烤入 license**。license 在检查时组装（@2.0s 扫 16KB 工作区+1.7MB VM
+  数据无 "1051-BCEC"；静态消息拷贝 0x1022899、源 0x1021339 均为检查期
+  产物）。
+- **下一步**：loop-patch（组装后持续扫描替换，抢占比较操作数）；f(机器
+  键)→锁 = 剩余未知（VM op 静态分析或作者对推公式）。PASS 信号 = 点击
+  后无 different-machine 且流程进部署。工具：greedy.py、forge_v8.py。
