@@ -7100,6 +7100,24 @@ pub(super) fn spawn_dialog_killer(
                     // 132y41: persist the stack window too - the binding
                     // check's expected value lives on the stack.
                     blobs.extend_from_slice(&stack);
+                    // 132y42: persist 64B at esi/edi/ebx - the VM op's
+                    // operands (the binding compare) live in VM data the
+                    // registers point at, not on the stack.
+                    let mut mem = [0u8; 192];
+                    for (ki, rv) in [ctx.Esi, ctx.Edi, ctx.Ebx].iter().enumerate() {
+                        // SAFETY: live handle; VM data pages.
+                        unsafe {
+                            let _ = ReadProcessMemory(
+                                h_process,
+                                (*rv) as *const core::ffi::c_void,
+                                mem[ki * 64..].as_mut_ptr()
+                                    as *mut core::ffi::c_void,
+                                64,
+                                Some(&mut 0),
+                            );
+                        }
+                    }
+                    blobs.extend_from_slice(&mem);
                     ns += 1;
                     if ns % 300 == 0 {
                         info!(
