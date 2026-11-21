@@ -6597,3 +6597,35 @@ forge 方程闭合：search 与 decode 共用 buffer = 冲突，唯一 forge = d
   （键@0x52）✓ → **PASS → launch → OEP**。
 - 工件：dw_foracle.py、foracle.txt、dw_checkdis.py、checkdis.txt、
   dw_fmap.py（decode-era snap 复写 = 全 derailed，era 状态缺）。
+
+**续 22 补充 132y39（2026-11-22）——FORGE RUN 落地：磁盘 .dat'（键@0x52）
++ LIVEACC = 流程存活 30s+（部署态），键的解码像已打进指纹字符串**：
+
+- **LIVEACC 机器落地**（MAGICMIDA_V2_LIVEACC=1）：µs 线程 [210,245]ms 把
+  check 机的活体累加器（[TB+8]=acc1、[TB+0x18]=acc2，TB=0x105FFAE）镜像
+  进存储哈希槽（image+0x2056F 8B）——check = 计算 vs 存储 = 永真（任意
+  .dat 内容）。实测 17 次重写 [211,215]。
+- **磁盘 .dat' = 键@0x52**（CISC-1.dat 备份为 CISC-1.dat.orig；键 =
+  e60dc87dc8692802 = 0x7DC80DE6/0x022869C8 LE）。**无 KEYBUF3**（键在
+  磁盘 = 壳自己的重拷携带）。
+- **FORGE RUN = 存活 30s+**（pristine/混合 restore 全部 exit 44 @380-430；
+  forge = 永不 fail-exit，V2 watch 扫满 30s 被我们 taskkill）= **check ✓
+  （LIVEACC）+ 搜索 ✓（键在磁盘 = 壳重拷自带）** ——forge 前半 = 通。
+- **决定性观察 = 键的解码像打进指纹**：部署态 CALC 对话框文本 =
+  "Your license key is corrupted.\n\r10\ue000Z\ue722狥?4F2-0C18-3745-
+  254D-9F3C-2536" —— **fp 的组 1-2 = 键的解码像（乱码）**，组 3-8 =
+  pristine。= .dat[0x52] → fp 组 1-2 的解码映射实锤；**搜索 = 指纹的
+  机器键字段 = 键像 = 命中 ✓（alive 的原因！）**。
+- **剩余唯一缺口 = fp 组 1-2 = 合法 hex**："10??Z?????" 非十六进制 =
+  许可解析 = corrupted。**修复 = .dat'@0x52 = decode⁻¹(合法 fp 组)**
+  ——合法组 = 机器键的 hex 形态（0x7DC80DE6-0x022869C8 系）或使
+  自洽公式（frndint((X−Y)/Z) ∈ (0,0x80000000]，GATEPATCH 已 NOP 但
+  corrupted = 解析层非公式层）成立的值。**pre-image = decode 逆 =
+  f 恢复的最终形状**（emu = 解码 oracle；decode-era snap 复写 =
+  全 derailed = 需 era 状态补全或后向逐字节求解）。
+- 收敛后的剩余工作（全部机械）：①emu 解码机 era 状态补全（或直接
+  后向求解器）②.dat'@0x52 = decode⁻¹(合法 fp 组 1-2) ③跑 forge =
+  verdict=PASS ④launch 门 = 壳内部状态机（PASS 后观察）⑤OEP。
+- 工件：CISC-1.dat.orig（pristine 备份）、CISC-1.dat（forge）、
+  probe_forge.py、forge.log（alive 30s）、probe_forgedlg.py、
+  forgedlg_out.txt（fp 键像实锤）。
