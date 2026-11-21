@@ -6194,7 +6194,32 @@ deepread_ops2-4.py、scan_dispatch.py、run_u54.py。
   CALC 通过 → 部署启动。
 - 工件：CISC-1U.blkstream_early.bin（56 记录时间线）、dw132_runU39.log。
 
-**续 22 补充 132y（2026-11-20）——节点键源确认 + fp 二进制源不在常规区**：
+probe_deploy.py、probe5-8_out.txt。
+
+**续 22 补充 132y20（2026-11-21）——部署后 launch 门侦察**：
+
+- **dismiss 机器第四坑**：`SendMessageTimeout(WM_COMMAND/IDOK → 对话框
+  本体)` **无限挂死调用方**（SMTO_ABORTIFHUNG + 800ms 全部无效，实测
+  trace 停在 'send IDOK' >90s）——childed 对话框只发 BM_CLICK→Button、
+  childless 只发 PostMessage WM_CLOSE，两者都 fire-and-forget。
+- **对话框序列实测**：部署时代（WS 138MB）出现 childless CALC 对话框
+  （title='CALC'、style=0x94C801C5、无子控件、文本非消息区
+  ——0x1021300/0x1022800/0x102289a 在部署态全空），PostMessage
+  WM_CLOSE 可关；后续 pass dismissed=0 = 序列走完（单对话框）。
+- **walk 后停泊不变**：对话框全关后壳仍 137MB 停泊——主线程
+  GetMessage 泵（win32u+0x123C ← user32+0x8FA39）、全部线程内核等待、
+  **payload PE 从未物化**（V2 watch 的 image 扫描 10263 次
+  「image filtered out」全部 = 系统 DLL，无未知镜像）。
+- **定案**：launch 门 = 壳内部 verdict 状态机等待（132 时代
+  「哨兵 verdict 0x20CF1 累积恒 0」同型）——forge 过了全部可见门
+  （counter/binding/verifier/search/deployment）但壳内部累积裁决
+  仍未触发完成事件。V2 CreateThread 捕获（mod.rs CreateThread
+  handler + try_v2_watch_scan）在 post-attach 模式照常运行，payload
+  一旦物化即可捕获——当前缺的是壳侧 launch 触发，不是捕获侧。
+- 下一增量 = 部署时代 verdict 状态机（哨兵/累积槽在部署时代的
+  读写者定位 + 与 132y19 的 KEYBUF2 窗口交互）。
+- 工件：seq1-6.log（137MB walk）、dismiss_once.py（WM_CLOSE/
+  BM_CLICK 快速版）、pollws1-3.log。**续 22 补充 132y（2026-11-20）——节点键源确认 + fp 二进制源不在常规区**：
 
 - **节点键源确认**：U40 markers [0x25,0x1C2) → STRICT 扫描 = 0 命中 =
   节点键 ≠ 该区；U33 keys = 节点 = 本机键 ✓ → **节点键源 = buffer
