@@ -6647,3 +6647,49 @@ forge 方程闭合：search 与 decode 共用 buffer = 冲突，唯一 forge = d
   键像）= 搜索命中 ✓ + check ✓（LIVEACC）+ 解析 ✓（尾区 pristine）。
   **唯一剩余 = fp 组 1-2 = 合法 hex = 解码预映像 = decode 逆。**
   CISC-1.dat 已恢复 pristine（forge 样本 = .orig 备份 + XOR 脚本）。
+
+**续 22 补充 132y41（2026-11-22）——forge 通道打通到绑定检查：点确定 =
+搜索命中（counter=80）→ "locked to a different machine"；corrupted 对话框
+= 锁的 GBK 渲染 = decode(键字段) 的 oracle**：
+
+- **三件仪器修正**（helpers.rs）：①V2 master gate 补 FAILSTATE/LIVEACC/
+  KEYBUF3/STRUCTFIX/KEYPATCH3（单独用不武装 = 前几轮空转的根因之一）；
+  ②**BAIL-KILL 在 bank marker 上杀目标 = 杀的是注册（成功）消息指针**
+  （132y9 注释自证）——"pristine=搜索miss→exit44" 模型作废，exit 44 =
+  我们自己的 0x2C；③LIVEACC 窗口 [210,245]→[210,400]；
+  ④SEARCHSNATCH 窗口可调（env "start-end"，默认 [280,470]）+ 堆栈
+  2KB 入 blob（原来读了就丢！）+ 预算 2000→40000（30µs/snap，2000
+  只够 60ms）。
+- **corrupted 对话框真身（GBK 反演）**："10"+变字节+**"14F2-0C18-3745-
+  254D-9F3C-2536"** = image+0x20577 字面量；f30 变体 = "10?" = acc 内
+  NUL 截断；"10" = 常量前缀。**35 字符变体 = "1051-BCEC-14F2-…" 的
+  GBK 乱码形**（窄字符对吃掉 ASCII）。
+- **注册对话框 = 模态！流程停等点击。点确定（PostMessage BM_CLICK）→**
+  **~110ms 后锁检查**：v3/v4 实测 "The current key has been locked to a
+  different machine.\n\r**1051-BCEC**-14F2-0C18-3745-254D-9F3C-2536"
+  ——**license = 锁（2 词 = 1 dword）+ 身体（image 字面量 6 组）**；
+  锁 = .dat 键字段 [0x52,0x5A) 的解码（作者机 = 1051-BCEC）。
+- **v4 外部读取（点击后 60s）**：buffer@0x52 = blob 原样在
+  （e60dc87dc8692802）、struct serial = pristine、corpus 在、
+  **miss counter @0x201FD = 80 = 搜索命中（提前退出）**——搜索 ✓
+  （blob = 本机键 raw = T(corpus) 命中），**绑定检查 = 独立下一道门**。
+- **锁显示对 blob 全变体恒等**（无 blob/本机键/AA×8/00×8 = 全
+  "1051-BCEC"）→ 锁 ≠ buffer 派生 = 锁 = .dat 解码场。**corrupted
+  对话框 = 锁的乱码显示 = decode(键字段) 的 oracle**：sweep 的
+  "10?/10媙/10毒…" = 锁 = decode(翻转后键字段) 的乱码形。
+- **绑定检查 = VM op**：SEARCHSNATCH [1900,2800] + 点击 @2.0s =
+  38017 snaps [1.998,2.800]s；EIP 主簇 = **0x1095B50（VM 数据区瞬态
+  op）×1789 + 0x1095B40**，**ebp = 0xEEDC0014 = CHECK magic**（补117
+  互证）= 绑定检查在 VM 解释器里执行；栈 2KB 无 "1051-BCEC"/本机键
+  任何形态 = 操作数在 VM 数据区不在栈上。
+- **forge 全方程（最终形）**：①.dat'[0x52,0x5A) := decode⁻¹(本机锁
+  dword = 0x7DC80DE6 → "7DC8-0DE6")（**corrupted 对话框 oracle +
+  贪心逐字节**，~2048 run 上限）；②字段摘要 = fd(新字段)（168 handler
+  缝合）；③KEYBUF3 blob [336,341) = 本机键 raw（搜索 ✓）；④NOBAIL +
+  **点确定** → 锁检查 = decode(键字段) = 本机锁 → **PASS → launch →
+  OEP**。pristine .dat 注册对话框已实测（字段层全过）。
+- 工件：probe_oracle{,_dlg}.py、oracle_batch/sweep.py、probe_lock.py、
+  forge_v3/v4.py、probe_locksnatch.py、searchsnatch_lock.bin（89MB，
+  38017 snaps 含栈）、failstate_pristine/forge.bin、fs_f*.bin、
+  v4_buf/struct/corpus/img_*.bin。
+

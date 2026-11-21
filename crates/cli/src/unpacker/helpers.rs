@@ -883,6 +883,11 @@ pub(super) fn spawn_dialog_killer(
         && std::env::var("MAGICMIDA_V2_STACKFIX").is_err()
         && std::env::var("MAGICMIDA_V2_MSGSKIP").is_err()
         && std::env::var("MAGICMIDA_V2_NOPPATH2").is_err()
+        && std::env::var("MAGICMIDA_V2_FAILSTATE").is_err()
+        && std::env::var("MAGICMIDA_V2_LIVEACC").is_err()
+        && std::env::var("MAGICMIDA_V2_KEYBUF3").is_err()
+        && std::env::var("MAGICMIDA_V2_STRUCTFIX").is_err()
+        && std::env::var("MAGICMIDA_V2_KEYPATCH3").is_err()
         && sp_groups.is_none()
     {
         return None;
@@ -4084,45 +4089,92 @@ pub(super) fn spawn_dialog_killer(
                     return;
                 }
                 let target = ba + ka;
-                // 132y37: the window = [230,335] — AFTER the .dat
-                // integrity check (reads the buffer at [215,228]; the blob
-                // there = the check fail = 'corrupted', measured) and
-                // covering the search era [322,331]; the decode output
-                // lands atomically at ~337 ON TOP of the blob (the decode
-                // input = copy A in the image, not the buffer).
+                // 132y41 v3: the window model closed — the decode input =
+                // the buffer (the shell's own disk re-copy [294,307]), so
+                // ANY blob during [294,336] corrupts the decode and the
+                // field digests (the corrupted dialog = measured for every
+                // in-decode blob and for the disk .dat' alike).  The
+                // registered dialog needs the PRISTINE fields; the search
+                // needs the machine keys in the buffer.  Both = satisfied
+                // by: pristine .dat on disk + blob written [336,341) —
+                // AFTER the decode's atomic output write (336.8ms) and
+                // BEFORE the verdict read [340,360].  Phases: blob
+                // [230,293) (harmless, pre re-copy), restore [293,310)
+                // (pristine for the re-copy), blob [336,341) (the search
+                // keys, post-decode), idle [341,450] (the blob persists
+                // through the verdict).
                 while t0k.elapsed().as_millis() < 230 {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
                 let mut nwr = 0usize;
-                while t0k.elapsed().as_millis() <= 335 {
-                    let mut cur = vec![0u8; kb.len()];
-                    let mut n3 = 0usize;
-                    let okc = unsafe {
-                        ReadProcessMemory(
-                            hp,
-                            target as *const core::ffi::c_void,
-                            cur.as_mut_ptr() as *mut core::ffi::c_void,
-                            cur.len(),
-                            Some(&mut n3),
-                        )
-                        .is_ok()
-                            && n3 == cur.len()
-                    };
-                    if okc && cur[..] != kb[..] {
-                        let mut w4 = 0usize;
-                        unsafe {
-                            let _ = WriteProcessMemory(
+                let take = dat_disk_k.len().min(480);
+                while t0k.elapsed().as_millis() <= 450 {
+                    let tm = t0k.elapsed().as_millis();
+                    let want_blob =
+                        (tm >= 230 && tm < 293) || (tm >= 336 && tm < 341);
+                    if want_blob {
+                        let mut cur = vec![0u8; kb.len()];
+                        let mut n3 = 0usize;
+                        let okc = unsafe {
+                            ReadProcessMemory(
                                 hp,
                                 target as *const core::ffi::c_void,
-                                kb.as_ptr() as *const core::ffi::c_void,
-                                kb.len(),
-                                Some(&mut w4),
-                            );
+                                cur.as_mut_ptr() as *mut core::ffi::c_void,
+                                cur.len(),
+                                Some(&mut n3),
+                            )
+                            .is_ok()
+                                && n3 == cur.len()
+                        };
+                        if okc && cur[..] != kb[..] {
+                            let mut w4 = 0usize;
+                            unsafe {
+                                let _ = WriteProcessMemory(
+                                    hp,
+                                    target as *const core::ffi::c_void,
+                                    kb.as_ptr() as *const core::ffi::c_void,
+                                    kb.len(),
+                                    Some(&mut w4),
+                                );
+                            }
+                            nwr += 1;
+                            if nwr <= 8 || nwr % 200 == 0 {
+                                info!(t_ms = (tm as u32), n = nwr,
+                                    "KEYBUF3: blob written");
+                            }
                         }
-                        nwr += 1;
-                        if nwr <= 5 || nwr % 200 == 0 {
-                            info!(t_ms = (t0k.elapsed().as_millis() as u32),
-                                n = nwr, "KEYBUF3: blob written");
+                    } else if tm >= 293 && tm < 310 {
+                        // the restore phase [293,310): the pristine .dat
+                        // in place for the shell's own re-copy
+                        let mut cur = vec![0u8; take];
+                        let mut n4 = 0usize;
+                        let okr = unsafe {
+                            ReadProcessMemory(
+                                hp,
+                                ba as *const core::ffi::c_void,
+                                cur.as_mut_ptr() as *mut core::ffi::c_void,
+                                take,
+                                Some(&mut n4),
+                            )
+                            .is_ok()
+                                && n4 == take
+                        };
+                        if okr && cur[..] != dat_disk_k[..take] {
+                            let mut w6 = 0usize;
+                            unsafe {
+                                let _ = WriteProcessMemory(
+                                    hp,
+                                    ba as *const core::ffi::c_void,
+                                    dat_disk_k.as_ptr() as *const core::ffi::c_void,
+                                    take,
+                                    Some(&mut w6),
+                                );
+                            }
+                            nwr += 1;
+                            if nwr <= 8 || nwr % 200 == 0 {
+                                info!(t_ms = (tm as u32), n = nwr,
+                                    "KEYBUF3: pristine restored");
+                            }
                         }
                     }
                     std::thread::sleep(std::time::Duration::from_micros(200));
@@ -4444,6 +4496,94 @@ pub(super) fn spawn_dialog_killer(
                     std::thread::sleep(std::time::Duration::from_micros(200));
                 }
                 info!(nwr, "KEYPATCH3: window closed");
+            });
+        }
+        // 132y38: LIVEACC — mirror the check machine's live accumulators
+        // ([TB+8]=acc1, [TB+0x18]=acc2, TB=0x105FFAE family-4 window)
+        // into the stored-licence-hash slot (image+0x2056F, 8B).  The
+        // check compares its computed hash against that slot; with the
+        // slot always equal to the live acc the comparison passes for
+        // ANY .dat content (the forge's hash half without needing f
+        // explicitly).  132y41: the window now covers the VERDICT era
+        // too ([340,360]) — the corrupted dialog's key string = this
+        // slot rendered (sig bytes + the image literal at +0x20577
+        // "14F2-0C18-3745-254D-9F3C-2536"), i.e. the verdict-era
+        // re-check reads the same slot; the old [210,245] window ended
+        // before it and the re-check failed on the stale acc.
+        if std::env::var("MAGICMIDA_V2_LIVEACC").as_deref() == Ok("1") {
+            let hraw_la = handle_raw;
+            let t0la = watch_t0;
+            std::thread::spawn(move || {
+                use windows::Win32::Foundation::HANDLE;
+                let hp = HANDLE(hraw_la as *mut core::ffi::c_void);
+                while t0la.elapsed().as_millis() < 210 {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                let tb: usize = 0x105FFAE;
+                let stored: usize = 0x102056F;
+                let mut nla = 0usize;
+                while t0la.elapsed().as_millis() <= 400 {
+                    let mut acc = [0u8; 8];
+                    let mut na = 0usize;
+                    // acc1 dword @TB+8, acc2 dword @TB+0x18
+                    let ok1 = unsafe {
+                        ReadProcessMemory(
+                            hp,
+                            (tb + 8) as *const core::ffi::c_void,
+                            acc.as_mut_ptr() as *mut core::ffi::c_void,
+                            4,
+                            Some(&mut na),
+                        )
+                        .is_ok()
+                            && na == 4
+                    };
+                    let ok2 = unsafe {
+                        ReadProcessMemory(
+                            hp,
+                            (tb + 0x18) as *const core::ffi::c_void,
+                            acc.as_mut_ptr().add(4) as *mut core::ffi::c_void,
+                            4,
+                            Some(&mut na),
+                        )
+                        .is_ok()
+                            && na == 4
+                    };
+                    if ok1 && ok2 {
+                        let mut cur = [0u8; 8];
+                        let mut ns = 0usize;
+                        let oks = unsafe {
+                            ReadProcessMemory(
+                                hp,
+                                stored as *const core::ffi::c_void,
+                                cur.as_mut_ptr() as *mut core::ffi::c_void,
+                                8,
+                                Some(&mut ns),
+                            )
+                            .is_ok()
+                                && ns == 8
+                        };
+                        if oks && cur != acc {
+                            let mut w7 = 0usize;
+                            unsafe {
+                                let _ = WriteProcessMemory(
+                                    hp,
+                                    stored as *const core::ffi::c_void,
+                                    acc.as_ptr() as *const core::ffi::c_void,
+                                    8,
+                                    Some(&mut w7),
+                                );
+                            }
+                            nla += 1;
+                            if nla <= 10 || nla % 500 == 0 {
+                                info!(t_ms =
+                                    (t0la.elapsed().as_millis() as u32),
+                                    n = nla, "LIVEACC: stored := live acc");
+                            }
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(100));
+                }
+                info!(nla, "LIVEACC: window closed");
             });
         }
         // 132y37: FAILSTATE — at the corruption-message write (the verdict
@@ -6758,7 +6898,7 @@ pub(super) fn spawn_dialog_killer(
                 }
                 return;
             }
-            if std::env::var("MAGICMIDA_V2_SEARCHSNATCH").is_ok() {
+            if let Ok(ssv) = std::env::var("MAGICMIDA_V2_SEARCHSNATCH") {
                 use windows::Win32::Foundation::CloseHandle;
                 use windows::Win32::System::Diagnostics::Debug::{
                     GetThreadContext, CONTEXT,
@@ -6766,6 +6906,19 @@ pub(super) fn spawn_dialog_killer(
                 use windows::Win32::System::Threading::{
                     OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT,
                     THREAD_SUSPEND_RESUME,
+                };
+                // 132y41: the window is tunable — "1" = the default
+                // [280,470] verdict era; "<ms>-<ms>" = a custom window
+                // (the post-click lock/binding check runs ~[2050,2250]
+                // when the OK button is clicked at ~2.0 s).
+                let (w_start, w_end): (u128, u128) = if ssv.contains('-') {
+                    let mut it = ssv.splitn(2, '-');
+                    (
+                        it.next().unwrap_or("280").trim().parse().unwrap_or(280u128),
+                        it.next().unwrap_or("470").trim().parse().unwrap_or(470u128),
+                    )
+                } else {
+                    (280, 470)
                 };
                 let h_process = HANDLE(handle_raw as *mut core::ffi::c_void);
                 // Wait for the VERIFIER window: the field-verify op runs
@@ -6775,7 +6928,7 @@ pub(super) fn spawn_dialog_killer(
                 // stack.  2000 snaps over [330,470] also cover the fail
                 // decision (~382ms).  The wait starts at 280 ms so the
                 // thread find (~40 ms, see below) completes before 340.
-                while watch_t0.elapsed().as_millis() < 280 {
+                while watch_t0.elapsed().as_millis() < w_start {
                     std::thread::yield_now();
                 }
                 // find the VM thread: EIP inside the image.  The ops run
@@ -6788,7 +6941,7 @@ pub(super) fn spawn_dialog_killer(
                 let tids = list_target_thread_ids(pid);
                 let mut vm_tid: Option<u32> = None;
                 while vm_tid.is_none()
-                    && watch_t0.elapsed().as_millis() < 460
+                    && watch_t0.elapsed().as_millis() < w_end
                 {
                     if let Some(hm) = h_main {
                         // SAFETY: valid pre-opened handle.
@@ -6881,7 +7034,7 @@ pub(super) fn spawn_dialog_killer(
                 };
                 let mut blobs: Vec<u8> = Vec::new();
                 let mut ns = 0usize;
-                while ns < 2000 && watch_t0.elapsed().as_millis() < 470 {
+                while ns < 40000 && watch_t0.elapsed().as_millis() < w_end {
                     // SAFETY: valid handle.
                     let prev = unsafe { SuspendThread(h) };
                     if prev == u32::MAX {
@@ -6944,6 +7097,9 @@ pub(super) fn spawn_dialog_killer(
                     }
                     blobs.extend_from_slice(&(clen as u32).to_le_bytes());
                     blobs.extend_from_slice(&code[..clen]);
+                    // 132y41: persist the stack window too - the binding
+                    // check's expected value lives on the stack.
+                    blobs.extend_from_slice(&stack);
                     ns += 1;
                     if ns % 300 == 0 {
                         info!(
