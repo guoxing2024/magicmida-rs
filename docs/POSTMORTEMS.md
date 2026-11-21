@@ -6565,3 +6565,35 @@ forge 方程闭合：search 与 decode 共用 buffer = 冲突，唯一 forge = d
   CISC-1U.v2structtl{.A,.B}.bin、CISC-1U.v2corpus{.A,.B}.bin、
   CISC-1U.v2failstate.bin、probe_corpus/probe_combined/probe_pass*/probe_
   dlgtext/probe_failstate.py、corpus_A/B.log、combined/pass/dlgt.log。
+
+**续 22 补充 132y38（2026-11-22 同轮追加）——check = .dat 相关性 emu 实锤
++ forge 收敛到 f 的精确形状**：
+
+- **f-oracle 控制组复现 emu_final**（dw_foracle.py，run6 t=199863 锚 +
+  RET-stub 缺页填充）：pristine 无覆写 = 与 emu_final 逐位相同（3 faults
+  = API stub 0x76ace960/0x76acd770 + 0xffff9614，止于 pass 间过渡态）——
+  复现器自证 ✓。
+- **keys@0x52 变体 = 第一个派发即 junk（0xdd75e95f）**：check 字节机 =
+  数据相关路径（补25 的结论），**.dat 变一个字节 = 走另一条 handler
+  路径 = emu 缺该路径的深层状态 = 脱轨** —— check 的 .dat 相关性
+  由 emu 直接证明（补32 的单字节敏感从执行路径层面解释）。
+- **含义**：f（check 哈希）= .dat 相关，emu 复现任意 .dat 需 K 表全覆盖
+  = 168 handler 缝合 = f 恢复的精确工程形状。K = f(byte, old) 2D 表，
+  emu 现有覆盖 124 槽（pristine 路径），其余路径 = 缝合对象。
+- **HASHPATCH 复用形状**：STORED_SIG（2e15 77e5 1fef 05b3）@image+0x2056F
+  = 壳的期望哈希槽；COMPUTED（50fc 3964 0531 66a5）= 本机对 pristine .dat
+  的计算值（S1/Y2 跨 run 逐字节同 = per-license 常数）。**forge = .dat'
+  （键@0x52 落盘）+ 存储槽 := f(.dat')（emu 预测或 live-acc 补写）**
+  → check = f(.dat') vs f(.dat') = PASS。live-acc 变体 = µs 窗口在
+  compare 瞬间把 [TB+8]/[TB+0x18] 终值写回存储槽（MSGTRAP 形状）。
+- **四相 KEYBUF3 实测**：blob [230,293)/[310,335) + pristine 恢复
+  @293/@335 = 全部按相执行（nwr=4）；壳在 [294,307] 自己重拷 .dat
+  （磁盘重读！）→ 解码输入 = 壳自读 = blob 无关 ✓（decode = 磁盘侧）。
+  但 run 仍 exit 44 = verdict 的哈希/搜索/解析组合仍缺 f 修复。
+- **收敛后的 forge 全方程**：①.dat' = 键@0x52（磁盘，搜索/解码输入）；
+  ②存储哈希槽 := f(.dat')（emu 预测需 K 全覆盖，或 live-acc 补写）；
+  ③struct [0x8e,0xD6) 级联损伤 = STRUCTFIX 竞速（50%）或 decode 逆
+  （100%）；④verdict = 解析✓ + check（存储=f(.dat')）✓ + 搜索
+  （键@0x52）✓ → **PASS → launch → OEP**。
+- 工件：dw_foracle.py、foracle.txt、dw_checkdis.py、checkdis.txt、
+  dw_fmap.py（decode-era snap 复写 = 全 derailed，era 状态缺）。
