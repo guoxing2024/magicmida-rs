@@ -6114,7 +6114,69 @@ SuspendThread 后读——DATRIP 形状）。**触发即转储不等验证**（O
   priv/buf）、u65/u72_parkpid、msgtrap2 snap 1-6、patch_132y8-y17.py、
   deepread_ops2-4.py、scan_dispatch.py、run_u54.py。**续 22 补充 132x（2026-11-20）——专用早启 BLKSTREAM 线程：解码 era 时间线捕获成功**：
 
-- **根因定案**：主 watch 循环步距 ~370ms → BLKSTREAM 首达 ~370ms > 解码 era
+dw132_runU54-U77.log、u60_*.bin（停泊场景：struct/ops0/ops1/
+priv/buf）、u65/u72_parkpid、msgtrap2 snap 1-6、patch_132y8-y17.py、
+deepread_ops2-4.py、scan_dispatch.py、run_u54.py。
+
+**续 22 补充 132y18-132y19（2026-11-21）——0xC0000005 定案 = 缓存异常重放 +
+ dismiss 机器修复 + 部署态到达（138MB 无崩溃）**：
+
+- **dismiss 机器三连坑（本轮全部实测）**：① `GetThreadDesktop(对端线程)`
+  现在 gle=5 ACCESS_DENIED（132y11 时代可行，环境已变）——改用
+  `OpenDesktopW('MagicmidaV2Desktop')` + `SetThreadDesktop`（成功）。
+  ② **PostMessage 投递成功但永远不被执行**（r=1、对话框永不关闭）——
+  **SendMessage（同步）才是有效点击**（probe5：BM_CLICK → 对话框关闭 →
+  流程推进 → 0xC0000005 复现 ✓）。③ 对话框线程停泵后 SendMessage 会
+  **挂死调用方**——必须 `SendMessageTimeoutW(SMTO_ABORTIFHUNG, 1.5s)`。
+  `GetWindowTextW` 跨进程发 WM_GETTEXT，停泵线程同样挂死枚举方——
+  枚举一律 GetClassNameW（对象本地、无消息）。
+- **崩溃复现 + 时代态全捕获（新仪器 132y18）**：EIPHIST2（主线程采样，
+  WOW64 上 GetThreadContext 对运行线程必须 SuspendThread+3×retry）、
+  CRASHPOLL（崩块窗口 [0x1027800,0x10278A0) µs 轮询 + 时代快照）、
+  v2_era_snapshot（stksnap1=pair-prep 轻快照 / stksnap2=fault 即时重快照
+  + 全私有空间常量扫描）。**关键测量**：块字节自 245ms 起恒定 = 与 WER
+  dump 逐字节相同（「重加密致陈旧」假说作废）；stksnap2 在 t=2600ms
+  冻结到 fault 线程的精确寄存器（Eip=0102786F Eax=54831A79 Esp=B8C933A4
+  Ebp=EEDC0014）；**Esp=0xB8C933A4 = 0x102786B 处的 dword（块自身
+  movsb 字节）**；候选 2 = Esp=0x2522FFFF = STACKPASS pass 对字节流
+  +2 处——脱轨读上下文槽时把代码/对数据当 ESP。
+- **0xC0000005 = 不是真页面错误（决定性）**：VALLOC2 把 0x54830000+
+  0x20000 在 t=1ms 预映射（RW），崩溃 dump 时该区域 state=MEM_COMMIT
+  prot=PAGE_READWRITE——**页面已提交可写仍然 fault**；且 Eax=54831A79
+  与 Eip 值 0x102786F **在全内存 dump 中不存在**（堆/镜像/栈全扫 0 命中
+  ——值是算出来的、从未存储）。定案：**部署时代的 fault = 壳重放
+  「缓存的 verifier 时代内部异常」**（补 132 旧结论「UE filter 打印
+  缓存的 verifier-era 内部异常」的机制实锤）——Eip/target/寄存器组 =
+  缓存记录的字段，Ebp=EEDC0014 = 构造上下文的 magic。
+- **缓存的内容 = era-1 搜索 miss 状态**：KEYBUF（buffer 补丁 = 搜索
+  命中）→ 无重放 ✓（3 run 全部越过 fault 时代存活）；VALLOC 预映射
+  （era-1 的写落地、无 fault）→ 重放仍然发生 = **缓存的是 miss 状态
+  本身而非 fault 事件**。NOPPATH2（连续 NOP 站点）= 同样无崩溃但 era-1
+  流程被过早改道（早期停泊 14-22MB）。
+- **buffer 双重身份冲突 + KEYBUF2 窗口化（132y19，第五件 patch）**：
+  buffer 被【搜索】（需要本机键 [52,480)——U11/U13 解锁）与【部署时代】
+  （需要真 license 字节——持续 KEYBUF = 部署前停泊 25-50MB 振荡，实测）
+  双方读取。**KEYBUF2 = 窗口化独立线程**：仅 [40,2500]ms 打补丁（era-1
+  搜索命中 + era-2 重载重搜命中），2500ms 后停手让部署读到真字节。
+  实现坑：①needle 扫描必须 4 字节 memcmp 前缀 + 全 16B 验证（逐字节
+  Rust 循环太慢）；②**原始 .dat 副本只活 [150,300]ms**（读后即擦；
+  U13-era DECODEWATCH 在 t=174ms 抓到，buf=0xd10000）——首扫限定
+  [0x100000,0x2000000)（buffer 在 0xC70000-0xFE0000）+ rescan 40ms；
+  ③needle 不保证 16B 对齐。**结果：部署态到达 = WS 138MB @5s、运行
+  39s+ 无崩溃**（pollws2 实测）——第五件 patch 完成。
+- **部署后下一门**：138MB 稳定态 = 壳停在 payload-launch 等待（V2
+  CreateThread 捕获零命中、无 OEP 转移）——0x1EB000 页 = 真
+  continuation 块族（`b8 imm32 / 0b c0 / 74 68` 同族形状）已解密。
+  下一个增量 = 部署后 launch 门。
+- 过程坑：python 长探针挂在 GetWindowTextW（改 GetClassNameW）；psapi
+  GetProcessMemoryInfo 要从 windll.psapi 取；RPM 跨未提交洞整段失败
+  （快照读必须 4KB 分块）；esp-page 循环的 nctx 用 blob 长度推 = 读
+  风暴（41 线程 × 2KB × ~1700）；MSYS 相对路径 `../src/...` 启动 CLI
+  失败（用 python launcher + 绝对 Windows 路径）。
+- 工件：pollws2.log（138MB 部署态）、stksnap1/stksnap2（pair-prep +
+  fault 即时）、crashpoll_u79_*.bin、era_u75_*.bin（WER 时代态）、
+  patch_132y18.py-y19c.py、run_u79b/c/d.py、poll_ws.py、
+  probe_deploy.py、probe5-8_out.txt。- **根因定案**：主 watch 循环步距 ~370ms → BLKSTREAM 首达 ~370ms > 解码 era
   末（220ms）= **结构性不可捕**。修复 = **专用早启线程**（0ms 起，[140,320]ms
   1ms 级轮询 bank 态 ca/cb，变化即记录，FAIL_MARK 即停）。
 - **解码 era 时间线实锤**（56 记录，U39，blkstream_early.bin）：

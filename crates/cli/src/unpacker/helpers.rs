@@ -875,6 +875,11 @@ pub(super) fn spawn_dialog_killer(
         && std::env::var("MAGICMIDA_V2_POOLSNIFF").is_err()
         && std::env::var("MAGICMIDA_V2_REGSNATCH").is_err()
         && std::env::var("MAGICMIDA_V2_SEARCHSNATCH").is_err()
+        && std::env::var("MAGICMIDA_V2_EIPHIST2").is_err()
+        && std::env::var("MAGICMIDA_V2_CRASHPOLL").is_err()
+        && std::env::var("MAGICMIDA_V2_VALLOC2").is_err()
+        && std::env::var("MAGICMIDA_V2_NOPPATH2").is_err()
+        && std::env::var("MAGICMIDA_V2_KEYBUF2").is_err()
         && sp_groups.is_none()
     {
         return None;
@@ -1262,6 +1267,252 @@ pub(super) fn spawn_dialog_killer(
                 );
             });
         }
+        // 补充 132y18e: the derailment-input snapshot.  Freeze every
+        // thread, collect all contexts + the era regions (block ±0x800,
+        // bank, VM stack neighborhood [0xE0000,0x110000), the 0xDC000
+        // blob, per-thread ESP pages), resume, write one .bin.  The
+        // derailment consumes VM-stack context slots as ESP/Eax data
+        // (Esp=B8C933A4 = the dword AT 0x102786B; Esp=2522FFFF = the
+        // pass pair at +2) — the slot contents at pair-prep time are the
+        // input map.
+        #[cfg(target_arch = "x86")]
+        fn v2_era_snapshot(
+            hp: windows::Win32::Foundation::HANDLE,
+            out: &std::path::Path,
+            tag: &str,
+            heavy: bool,
+        ) {
+            use windows::Win32::Foundation::CloseHandle;
+            use windows::Win32::System::Diagnostics::Debug::{
+                GetThreadContext, CONTEXT, ReadProcessMemory,
+            };
+            use windows::Win32::System::Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, Thread32First, Thread32Next,
+                TH32CS_SNAPTHREAD, THREADENTRY32,
+            };
+            use windows::Win32::System::Threading::{
+                OpenThread, ResumeThread, SuspendThread,
+                THREAD_ACCESS_RIGHTS,
+            };
+            let Ok(snap_h) = (unsafe {
+                CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+            }) else {
+                return;
+            };
+            let pid = unsafe {
+                windows::Win32::System::Threading::GetProcessId(hp)
+            };
+            let mut tids: Vec<u32> = Vec::new();
+            let mut te = THREADENTRY32::default();
+            te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+            if unsafe { Thread32First(snap_h, &mut te) }.is_ok() {
+                loop {
+                    if te.th32OwnerProcessID == pid {
+                        tids.push(te.th32ThreadID);
+                    }
+                    if unsafe { Thread32Next(snap_h, &mut te) }.is_err() {
+                        break;
+                    }
+                }
+            }
+            unsafe {
+                let _ = CloseHandle(snap_h);
+            }
+            let mut blob: Vec<u8> = Vec::new();
+            blob.extend_from_slice(&(tids.len() as u32).to_le_bytes());
+            let mut sps: Vec<(u32, u32)> = Vec::new();
+            for tid in &tids {
+                let Ok(h) = (unsafe {
+                    OpenThread(THREAD_ACCESS_RIGHTS(0x1F03FF),
+                        false, *tid)
+                }) else {
+                    continue;
+                };
+                unsafe {
+                    let _ = SuspendThread(h);
+                }
+                let mut ctx = CONTEXT::default();
+                ctx.ContextFlags =
+                    windows::Win32::System::Diagnostics::Debug::CONTEXT_FLAGS(
+                        0x0001_0003,
+                    );
+                let mut okc = false;
+                for _ in 0..3 {
+                    if unsafe { GetThreadContext(h, &mut ctx) }.is_ok() {
+                        okc = true;
+                        break;
+                    }
+                    unsafe {
+                        let _ = windows::Win32::System::Threading::SwitchToThread();
+                    }
+                }
+                if okc {
+                    blob.extend_from_slice(&(*tid).to_le_bytes());
+                    for v in [
+                        ctx.Eip, ctx.Edi, ctx.Esi, ctx.Ebx, ctx.Edx,
+                        ctx.Ecx, ctx.Eax, ctx.Ebp, ctx.Esp, ctx.EFlags,
+                    ] {
+                        blob.extend_from_slice(&v.to_le_bytes());
+                    }
+                    sps.push((ctx.Eip, ctx.Esp));
+                }
+                unsafe {
+                    let _ = CloseHandle(h);
+                }
+            }
+            // 132y18f: the ~100 ms full snapshot at pair-prep DEFLECTS
+            // the timing-sensitive derailment (runs reached deployment
+            // 141 MB and hung instead of faulting).  stksnap1 = light:
+            // contexts + VM stack + bank (~2-3 ms).  stksnap2 (the fault
+            // is already active) runs heavy: full regions + the heap
+            // scan for the derailment constants.
+            let put = |va: u32, sz: usize, blob: &mut Vec<u8>| {
+                // 132y18e: chunked read — a range spanning an uncommitted
+                // hole fails wholesale (stksnap1 v1: the 192 KB VM-stack
+                // neighborhood read 0 bytes because 0xE0000 starts
+                // unmapped).  4 KB chunks keep the mapped parts.
+                let mut data = vec![0u8; sz];
+                let mut total = 0usize;
+                for chunk in (0..sz).step_by(0x1000) {
+                    let lo = va as usize + chunk;
+                    let take = 0x1000.min(sz - chunk);
+                    let mut n2 = 0;
+                    unsafe {
+                        let _ = ReadProcessMemory(
+                            hp,
+                            lo as *const core::ffi::c_void,
+                            data.as_mut_ptr().add(chunk)
+                                as *mut core::ffi::c_void,
+                            take,
+                            Some(&mut n2),
+                        );
+                    }
+                    total += n2;
+                }
+                blob.extend_from_slice(&va.to_le_bytes());
+                blob.extend_from_slice(&(total as u32).to_le_bytes());
+                blob.extend_from_slice(&data);
+            };
+            put(0x1021000, 0x8000, &mut blob);   // bank (the table copy)
+            put(0xE0000, 0x30000, &mut blob);    // VM stack neighborhood
+            if heavy {
+                put(0x1027000, 0x1100, &mut blob); // block ±0x800
+                put(0x10DC000, 0x1000, &mut blob); // the 0xDC000 blob
+                // The derailment constants (Esp=0xB8C933A4 = [0x102786B],
+                // Eax=54831A79) live outside the fixed regions — scan the
+                // committed private space for them + the 0x102786B/F
+                // pointer forms, and record 64 B around each hit.
+                use windows::Win32::System::Memory::{
+                    VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT,
+                    MEM_PRIVATE, PAGE_NOACCESS,
+                };
+                let pats: [(&str, [u8; 4]); 4] = [
+                    ("esp-src", [0xa4u8, 0x33, 0xc9, 0xb8]),
+                    ("eax-src", [0x79u8, 0x1a, 0x83, 0x54]),
+                    ("ctx-786b", [0x6bu8, 0x78, 0x02, 0x01]),
+                    ("ctx-786f", [0x6fu8, 0x78, 0x02, 0x01]),
+                ];
+                let mut addr = 0x10000usize;
+                while addr < 0x7FFE0000 {
+                    let mut mbi = MEMORY_BASIC_INFORMATION::default();
+                    let q = unsafe {
+                        VirtualQueryEx(
+                            hp,
+                            Some(addr as *const core::ffi::c_void),
+                            &mut mbi,
+                            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                        )
+                    };
+                    if q == 0 {
+                        break;
+                    }
+                    let base = mbi.BaseAddress as usize;
+                    let size = mbi.RegionSize as usize;
+                    let okr = mbi.State == MEM_COMMIT
+                        && mbi.Type == MEM_PRIVATE
+                        && mbi.Protect != PAGE_NOACCESS
+                        && mbi.Protect.0 != 0;
+                    if okr && size >= 8 {
+                        let mut nsc = 0usize;
+                        while nsc < size {
+                            let take = 0x100000.min(size - nsc);
+                            let mut buf = vec![0u8; take];
+                            let mut n2 = 0;
+                            unsafe {
+                                let _ = ReadProcessMemory(
+                                    hp,
+                                    (base + nsc)
+                                        as *const core::ffi::c_void,
+                                    buf.as_mut_ptr()
+                                        as *mut core::ffi::c_void,
+                                    take,
+                                    Some(&mut n2),
+                                );
+                            }
+                            if n2 > 8 {
+                                for (nm, pat) in pats.iter() {
+                                    let mut k = 0usize;
+                                    while k + 4 <= n2 {
+                                        if buf[k..k + 4] == *pat {
+                                            let hit = base + nsc + k;
+                                            blob.extend_from_slice(
+                                                nm.as_bytes(),
+                                            );
+                                            blob.extend_from_slice(
+                                                &(hit as u32).to_le_bytes(),
+                                            );
+                                            let lo =
+                                                k.saturating_sub(24);
+                                            let hi = (k + 40).min(n2);
+                                            blob.extend_from_slice(
+                                                &buf[lo..hi],
+                                            );
+                                            k += 4;
+                                        } else {
+                                            k += 1;
+                                        }
+                                    }
+                                }
+                            }
+                            nsc += take;
+                        }
+                    }
+                    addr = base.saturating_add(size.max(0x1000));
+                }
+                // per-thread ESP pages (real stacks only — the derailed
+                // thread's Esp is uncommitted; RPM just returns 0).
+                let cap = sps.len().min(6);
+                for i in 0..cap {
+                    let (eip, esp) = sps[i];
+                    if !(0x1000000..0x1200000).contains(&eip) {
+                        continue;
+                    }
+                    put(esp & !0xFFFu32, 0x2000, &mut blob);
+                }
+            }
+            for tid in &tids {
+                if let Ok(h) = unsafe {
+                    OpenThread(THREAD_ACCESS_RIGHTS(0x0002_0000),
+                        false, *tid)
+                } {
+                    unsafe {
+                        ResumeThread(h);
+                        let _ = CloseHandle(h);
+                    }
+                }
+            }
+            let stem = out.with_extension(tag);
+            if let Some(name) = stem.file_name() {
+                let mut nm = name.to_os_string();
+                nm.push(".bin");
+                let _ = std::fs::write(stem.with_file_name(nm), &blob);
+            }
+            info!(
+                threads = tids.len(),
+                bytes = blob.len(),
+                "ERA-SNAPSHOT: captured"
+            );
+        }
         // 补充 132y17: STACKPASS — the chain prepares the fail values
         // on the VM stack before the bank write: [0xFFFF8441][0x0102133E]
         // (the "locked to a different machine" pair).  Rewrite every
@@ -1272,6 +1523,7 @@ pub(super) fn spawn_dialog_killer(
         if std::env::var("MAGICMIDA_V2_STACKPASS").is_ok() {
             let hraw_s = handle_raw;
             let t0s = watch_t0;
+            let out_s: std::path::PathBuf = out_path.to_path_buf();
             std::thread::spawn(move || {
                 use windows::Win32::Foundation::HANDLE;
                 let hp = HANDLE(hraw_s as *mut core::ffi::c_void);
@@ -1324,6 +1576,17 @@ pub(super) fn spawn_dialog_killer(
                                         "STACKPASS: fail pair rewritten to pass"
                                     );
                                 }
+                                // 132y18e: the FIRST rewrite = the pair
+                                // prep instant — snapshot the derailment
+                                // INPUT state (pre-consumption).
+                                if rewrites == 1 {
+                                    v2_era_snapshot(
+                                        hp,
+                                        &out_s,
+                                        "stksnap1",
+                                        false,
+                                    );
+                                }
                             }
                             j += 4;
                         }
@@ -1331,6 +1594,1123 @@ pub(super) fn spawn_dialog_killer(
                     // NO sleep = the race loop
                 }
                 info!(rewrites, "STACKPASS: window closed");
+            });
+        }
+        // 补充 132y18: EIPHIST2 — whole-run instruction-address
+        // timeline.  The stock EIPHIST lives inside the DECODEWATCH µs
+        // loop (window [190,700]ms, needs that env); the fatal fault
+        // lands at ~10 s in the registered/deployment era (U75/U77/U78).
+        // This dedicated sampler sweeps EVERY thread (toolhelp) at
+        // ~2.5 ms cadence and records every thread executing inside the
+        // packed image — mapping WHEN the 0x102786F fault loop runs
+        // relative to the deployment markers and which stations the
+        // era-2 flow visits.
+        if std::env::var("MAGICMIDA_V2_EIPHIST2").is_ok() {
+            let hraw_e2 = handle_raw;
+            let oute2: std::path::PathBuf = out_path.to_path_buf();
+            let t0e2 = watch_t0;
+            std::thread::spawn(move || {
+                use windows::Win32::Foundation::{CloseHandle, HANDLE};
+                use windows::Win32::System::Diagnostics::Debug::{
+                    GetThreadContext, CONTEXT,
+                };
+                use windows::Win32::System::Diagnostics::ToolHelp::{
+                    CreateToolhelp32Snapshot, Thread32First, Thread32Next,
+                    TH32CS_SNAPTHREAD, THREADENTRY32,
+                };
+                use windows::Win32::System::Threading::{
+                    OpenThread, ResumeThread, SuspendThread,
+                    THREAD_ACCESS_RIGHTS,
+                };
+                let pid_e = unsafe {
+                    windows::Win32::System::Threading::GetProcessId(HANDLE(
+                        hraw_e2 as *mut core::ffi::c_void,
+                    ))
+                };
+                while t0e2.elapsed().as_millis() < 150 {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                let mut recs: Vec<[u32; 12]> = Vec::new();
+                // 132y18d: the reproduced crash lands at ~3.8 s
+                // (dialog @0.4s, SendMessage dismiss @~1s, fault @3.8s
+                // — probe5/dump 4328), so the window is [800,6500]ms.
+                // The crashing thread = the FIRST-created thread (the
+                // WER dump tid = the CreateProcess tid), so sample the
+                // main thread only — a full 30-40-thread sweep with
+                // suspend+ctx per thread would freeze the run.
+                while t0e2.elapsed().as_millis() < 800 {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                let mut main_tid = 0u32;
+                while t0e2.elapsed().as_millis() <= 6500
+                    && recs.len() < 60000
+                {
+                    std::thread::sleep(std::time::Duration::from_micros(2500));
+                    let t_us = t0e2.elapsed().as_micros() as u32;
+                    let Ok(snap_h) = (unsafe {
+                        CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+                    }) else {
+                        continue;
+                    };
+                    let mut te = THREADENTRY32::default();
+                    te.dwSize =
+                        std::mem::size_of::<THREADENTRY32>() as u32;
+                    if unsafe { Thread32First(snap_h, &mut te) }.is_ok() {
+                        loop {
+                            if te.th32OwnerProcessID == pid_e {
+                                // first thread of the process = main
+                                if main_tid == 0 {
+                                    main_tid = te.th32ThreadID;
+                                }
+                                if te.th32ThreadID != main_tid {
+                                    if unsafe { Thread32Next(snap_h, &mut te) }
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                if let Ok(th) = unsafe {
+                                    OpenThread(
+                                        THREAD_ACCESS_RIGHTS(0x004A),
+                                        false,
+                                        te.th32ThreadID,
+                                    )
+                                } {
+                                    // WOW64: GetThreadContext on a
+                                    // RUNNING thread fails (measured:
+                                    // records=1 in 11.5 s without the
+                                    // suspend), and SuspendThread is
+                                    // async — the first read usually
+                                    // still fails (4 records in 11.5 s).
+                                    // Suspend, retry ×3 with a yield
+                                    // between, then resume.
+                                    unsafe {
+                                        let _ = SuspendThread(th);
+                                    }
+                                    let mut ctx = CONTEXT::default();
+                                    ctx.ContextFlags =
+                                        windows::Win32::System::Diagnostics::Debug::CONTEXT_FLAGS(
+                                            0x0001_0003,
+                                        );
+                                    let mut got_ctx = false;
+                                    for _ in 0..3 {
+                                        if unsafe {
+                                            GetThreadContext(th, &mut ctx)
+                                        }
+                                        .is_ok()
+                                        {
+                                            got_ctx = true;
+                                            break;
+                                        }
+                                        unsafe {
+                                            let _ = windows::Win32::System::Threading::SwitchToThread();
+                                        }
+                                    }
+                                    unsafe {
+                                        let _ = ResumeThread(th);
+                                    }
+                                    if got_ctx
+                                    {
+                                        let eip = ctx.Eip;
+                                        if (0x1000000..0x1200000)
+                                            .contains(&eip)
+                                        {
+                                            recs.push([
+                                                t_us,
+                                                te.th32ThreadID,
+                                                eip,
+                                                ctx.Eax,
+                                                ctx.Ecx,
+                                                ctx.Edx,
+                                                ctx.Ebx,
+                                                ctx.Esp,
+                                                ctx.Ebp,
+                                                ctx.Esi,
+                                                ctx.Edi,
+                                                ctx.EFlags,
+                                            ]);
+                                        }
+                                    }
+                                    unsafe {
+                                        let _ = CloseHandle(th);
+                                    }
+                                }
+                            }
+                            if unsafe { Thread32Next(snap_h, &mut te) }
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    unsafe {
+                        let _ = CloseHandle(snap_h);
+                    }
+                }
+                let mut blob = Vec::with_capacity(recs.len() * 48 + 4);
+                blob.extend_from_slice(&(recs.len() as u32).to_le_bytes());
+                for r in &recs {
+                    for v in r {
+                        blob.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+                let stem = oute2.with_extension("eiphist2");
+                if let Some(name) = stem.file_name() {
+                    let mut nm = name.to_os_string();
+                    nm.push(".bin");
+                    let _ = std::fs::write(stem.with_file_name(nm), &blob);
+                }
+                info!(
+                    records = recs.len(),
+                    "EIPHIST2: whole-run timeline flushed"
+                );
+            });
+        }
+        // 补充 132y18: CRASHPOLL — the fault-site watcher.  The WER dumps
+        // hold STALE block bytes (the op block re-encrypts/normalises
+        // after the fault; all 10 dumps show imm=00000000 while Eax was
+        // 54831A79 at fault).  Poll the crash block window [0x1027800,
+        // 0x10278A0) at ~200 µs; on a content change capture the era
+        // state: all thread contexts + block ±0x800 + bank + VM stack +
+        // the 0xDC000 blob + per-thread ESP pages.  Triggers: the imm32
+        // at 0x102786F going non-zero (the live-pointer moment), any
+        // change after 9 s, or one forced capture at 9.8 s.
+        if std::env::var("MAGICMIDA_V2_CRASHPOLL").is_ok() {
+            let hraw_c = handle_raw;
+            let outc: std::path::PathBuf = out_path.to_path_buf();
+            let t0c = watch_t0;
+            std::thread::spawn(move || {
+                use windows::Win32::Foundation::{CloseHandle, HANDLE};
+                use windows::Win32::System::Diagnostics::Debug::{
+                    GetThreadContext, CONTEXT,
+                };
+                use windows::Win32::System::Diagnostics::ToolHelp::{
+                    CreateToolhelp32Snapshot, Thread32First, Thread32Next,
+                    TH32CS_SNAPTHREAD, THREADENTRY32,
+                };
+                use windows::Win32::System::Threading::{
+                    OpenThread, ResumeThread, SuspendThread,
+                    THREAD_ACCESS_RIGHTS,
+                };
+                let hp = HANDLE(hraw_c as *mut core::ffi::c_void);
+                while t0c.elapsed().as_millis() < 200 {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                const WLO: usize = 0x1027800usize;
+                const WLEN: usize = 0xA0usize;
+                // 132y18e: the fault-cycle detector.  In [1500,4000]ms
+                // poll the first thread at 10 ms — the fault/SEH cycle
+                // keeps Eax=54831A79/Esp=B8C933A4/Eip=0x102786F loaded;
+                // a hit = the fault instant → full era snapshot.
+                let mut fault_seen = false;
+                let fault_thread = std::thread::spawn({
+                    let hraw_c2 = hraw_c;
+                    let t0c2 = t0c;
+                    let outc = outc.clone();
+                    move || {
+                        use windows::Win32::Foundation::{CloseHandle, HANDLE};
+                        let hp = HANDLE(hraw_c2 as *mut core::ffi::c_void);
+                        let t0c = t0c2;
+                        use windows::Win32::System::Diagnostics::Debug::{
+                            GetThreadContext, CONTEXT,
+                        };
+                        use windows::Win32::System::Diagnostics::ToolHelp::{
+                            CreateToolhelp32Snapshot, Thread32First,
+                            TH32CS_SNAPTHREAD, THREADENTRY32,
+                        };
+                        use windows::Win32::System::Threading::{
+                            OpenThread, ResumeThread, SuspendThread,
+                            THREAD_ACCESS_RIGHTS,
+                        };
+                        let mut main_tid = 0u32;
+                        while t0c.elapsed().as_millis() < 1500 {
+                            std::thread::sleep(
+                                std::time::Duration::from_millis(5),
+                            );
+                        }
+                        while t0c.elapsed().as_millis() <= 6000
+                            && !fault_seen
+                        {
+                            std::thread::sleep(
+                                std::time::Duration::from_millis(10),
+                            );
+                            let Ok(snap_h) = (unsafe {
+                                CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+                            }) else {
+                                continue;
+                            };
+                            let pid_c = unsafe {
+                                windows::Win32::System::Threading::GetProcessId(hp)
+                            };
+                            let mut te = THREADENTRY32::default();
+                            te.dwSize =
+                                std::mem::size_of::<THREADENTRY32>() as u32;
+                            if unsafe { Thread32First(snap_h, &mut te) }
+                                .is_ok()
+                            {
+                                loop {
+                                    if te.th32OwnerProcessID == pid_c {
+                                        if main_tid == 0 {
+                                            main_tid = te.th32ThreadID;
+                                        }
+                                        if te.th32ThreadID == main_tid {
+                                            if let Ok(h) = unsafe {
+                                                OpenThread(
+                                                    THREAD_ACCESS_RIGHTS(0x004A),
+                                                    false,
+                                                    main_tid,
+                                                )
+                                            } {
+                                                unsafe {
+                                                    let _ = SuspendThread(h);
+                                                }
+                                                let mut ctx = CONTEXT::default();
+                                                ctx.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_FLAGS(0x0001_0003);
+                                                let mut okc = false;
+                                                for _ in 0..3 {
+                                                    if unsafe {
+                                                        GetThreadContext(h, &mut ctx)
+                                                    }
+                                                    .is_ok()
+                                                    {
+                                                        okc = true;
+                                                        break;
+                                                    }
+                                                    unsafe {
+                                                        let _ = windows::Win32::System::Threading::SwitchToThread();
+                                                    }
+                                                }
+                                                unsafe {
+                                                    let _ = ResumeThread(h);
+                                                }
+                                                unsafe {
+                                                    let _ = CloseHandle(h);
+                                                }
+                                                if okc
+                                                    && (ctx.Eip == 0x0102_786F
+                                                        || ctx.Eax == 0x5483_1A79
+                                                        || ctx.Esp == 0xB8C9_33A4)
+                                                {
+                                                    info!(
+                                                        eip = format!("{:#x}", ctx.Eip),
+                                                        eax = format!("{:#x}", ctx.Eax),
+                                                        "ERA-SNAPSHOT: fault cycle detected"
+                                                    );
+                                                    v2_era_snapshot(
+                                                        hp,
+                                                        &outc,
+                                                        "stksnap2",
+                                                        true,
+                                                    );
+                                                    fault_seen = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if unsafe {
+                                        Thread32Next(snap_h, &mut te)
+                                    }
+                                    .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
+                            unsafe {
+                                let _ = CloseHandle(snap_h);
+                            }
+                        }
+                    }
+                });
+                let _ = fault_thread;
+                let mut last: Vec<u8> = Vec::new();
+                let mut seen: std::collections::HashSet<Vec<u8>> =
+                    std::collections::HashSet::new();
+                let mut caps = 0usize;
+                let mut forced = false;
+                let mut forced_done = false;
+                let mut last_log_ms = 0u64;
+                while t0c.elapsed().as_millis() <= 600000 && caps < 8 {
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                    let t_ms = t0c.elapsed().as_millis() as u64;
+                    let mut win = vec![0u8; WLEN];
+                    let mut n0 = 0;
+                    let okr = unsafe {
+                        ReadProcessMemory(
+                            hp,
+                            WLO as *const core::ffi::c_void,
+                            win.as_mut_ptr() as *mut core::ffi::c_void,
+                            WLEN,
+                            Some(&mut n0),
+                        )
+                        .is_ok()
+                            && n0 == WLEN
+                    };
+                    if !okr {
+                        info!(t_ms = (t_ms as u32), "CRASHPOLL: read failed — window closed");
+                        break;
+                    }
+                    if win == last {
+                        // 132y18d: the forced capture fires ONCE at
+                        // 2.6 s — the fault lands at ~3.8 s in the
+                        // reproduced flow (9800 was past the death).
+                        if !forced_done && t_ms >= 2600 {
+                            forced = true;
+                            forced_done = true;
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        last = win.clone();
+                        let changed_late =
+                            !seen.insert(win.clone()) && t_ms >= 1500;
+                        if changed_late {
+                            if !forced_done && t_ms >= 2600 {
+                                forced = true;
+                                forced_done = true;
+                            } else {
+                                continue;
+                            }
+                        }
+                        if t_ms - last_log_ms >= 20 {
+                            last_log_ms = t_ms;
+                            let hx: String = win
+                                .iter()
+                                .map(|b| format!("{b:02x}"))
+                                .collect();
+                            info!(
+                                t_ms = (t_ms as u32),
+                                block = %hx,
+                                "CRASHPOLL: block content changed"
+                            );
+                        }
+                    }
+                    // trigger: the imm32 at 0x102786F going non-zero
+                    // (the live-pointer moment), a late-era change, or
+                    // the one forced 9.8 s capture.  imm_live is gated
+                    // on the block's FINAL form — during the build era
+                    // (201-245 ms) the window holds encrypted junk and
+                    // every byte pattern is "non-zero" (U79: capture 1
+                    // fired on junk).
+                    let final_form = win[0x6E] == 0xB8
+                        && win[0x73] == 0x0B
+                        && win[0x75] == 0x74
+                        && win[0x76] == 0x58;
+                    let imm_live =
+                        final_form && win[0x6F..0x73] != [0u8; 4];
+                    if !imm_live && t_ms < 9000 && !forced {
+                        continue;
+                    }
+                    forced = false;
+                    caps += 1;
+                    // suspend every thread
+                    let mut tids: Vec<u32> = Vec::new();
+                    let Ok(snap_h) = (unsafe {
+                        CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+                    }) else {
+                        continue;
+                    };
+                    let mut te = THREADENTRY32::default();
+                    te.dwSize =
+                        std::mem::size_of::<THREADENTRY32>() as u32;
+                    if unsafe { Thread32First(snap_h, &mut te) }.is_ok() {
+                        loop {
+                            if te.th32OwnerProcessID
+                                == unsafe {
+                                    windows::Win32::System::Threading::GetProcessId(hp)
+                                }
+                            {
+                                tids.push(te.th32ThreadID);
+                            }
+                            if unsafe { Thread32Next(snap_h, &mut te) }
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    unsafe {
+                        let _ = CloseHandle(snap_h);
+                    }
+                    let mut blob: Vec<u8> = Vec::new();
+                    blob.extend_from_slice(&(t_ms as u32).to_le_bytes());
+                    blob.extend_from_slice(&(tids.len() as u32).to_le_bytes());
+                    for tid in &tids {
+                        let Ok(h) = (unsafe {
+                            OpenThread(THREAD_ACCESS_RIGHTS(0x1F03FF),
+                                false, *tid)
+                        }) else {
+                            continue;
+                        };
+                        unsafe {
+                            let _ = SuspendThread(h);
+                        }
+                        let mut ctx = CONTEXT::default();
+                        ctx.ContextFlags =
+                            windows::Win32::System::Diagnostics::Debug::CONTEXT_FLAGS(
+                                0x0001_0003,
+                            );
+                        if unsafe { GetThreadContext(h, &mut ctx) }.is_ok() {
+                            blob.extend_from_slice(&(*tid).to_le_bytes());
+                            for v in [
+                                ctx.Eip, ctx.Edi, ctx.Esi, ctx.Ebx,
+                                ctx.Edx, ctx.Ecx, ctx.Eax, ctx.Ebp,
+                                ctx.Esp, ctx.EFlags,
+                            ] {
+                                blob.extend_from_slice(&v.to_le_bytes());
+                            }
+                        }
+                        unsafe {
+                            let _ = CloseHandle(h);
+                        }
+                    }
+                    // block ±0x800
+                    {
+                        let lo = 0x1027000usize;
+                        let sz = 0x1100usize;
+                        let mut code = vec![0u8; sz];
+                        let mut n2 = 0;
+                        unsafe {
+                            let _ = ReadProcessMemory(
+                                hp,
+                                lo as *const core::ffi::c_void,
+                                code.as_mut_ptr() as *mut core::ffi::c_void,
+                                sz,
+                                Some(&mut n2),
+                            );
+                        }
+                        blob.extend_from_slice(&(lo as u32).to_le_bytes());
+                        blob.extend_from_slice(&(n2 as u32).to_le_bytes());
+                        blob.extend_from_slice(&code);
+                    }
+                    // bank
+                    {
+                        let lo = 0x1021000usize;
+                        let sz = 0x8000usize;
+                        let mut code = vec![0u8; sz];
+                        let mut n2 = 0;
+                        unsafe {
+                            let _ = ReadProcessMemory(
+                                hp,
+                                lo as *const core::ffi::c_void,
+                                code.as_mut_ptr() as *mut core::ffi::c_void,
+                                sz,
+                                Some(&mut n2),
+                            );
+                        }
+                        blob.extend_from_slice(&(lo as u32).to_le_bytes());
+                        blob.extend_from_slice(&(n2 as u32).to_le_bytes());
+                        blob.extend_from_slice(&code);
+                    }
+                    // VM stack
+                    {
+                        let lo = 0xEFD00usize;
+                        let sz = 0x2300usize;
+                        let mut code = vec![0u8; sz];
+                        let mut n2 = 0;
+                        unsafe {
+                            let _ = ReadProcessMemory(
+                                hp,
+                                lo as *const core::ffi::c_void,
+                                code.as_mut_ptr() as *mut core::ffi::c_void,
+                                sz,
+                                Some(&mut n2),
+                            );
+                        }
+                        blob.extend_from_slice(&(lo as u32).to_le_bytes());
+                        blob.extend_from_slice(&(n2 as u32).to_le_bytes());
+                        blob.extend_from_slice(&code);
+                    }
+                    // the 0xDC000 blob
+                    {
+                        let lo = 0x10DC000usize;
+                        let sz = 0x1000usize;
+                        let mut code = vec![0u8; sz];
+                        let mut n2 = 0;
+                        unsafe {
+                            let _ = ReadProcessMemory(
+                                hp,
+                                lo as *const core::ffi::c_void,
+                                code.as_mut_ptr() as *mut core::ffi::c_void,
+                                sz,
+                                Some(&mut n2),
+                            );
+                        }
+                        blob.extend_from_slice(&(lo as u32).to_le_bytes());
+                        blob.extend_from_slice(&(n2 as u32).to_le_bytes());
+                        blob.extend_from_slice(&code);
+                    }
+                    // per-thread ESP pages (2 KB each, image-range Eip
+                    // only, capped).  132y18c: nctx was blob.len()/44 —
+                    // that counts the REGION bytes too (capture 1_1 with
+                    // 41 threads iterated ~1700 fake contexts = a read
+                    // storm); the contexts are the first ntid*44 bytes.
+                    let nctx = tids.len().min(6);
+                    for ti in 0..nctx {
+                        let o = 8 + ti * 44;
+                        if o + 40 > blob.len() {
+                            break;
+                        }
+                        let eip = u32::from_le_bytes(
+                            blob[o + 4..o + 8].try_into().unwrap_or([0; 4]),
+                        ) as usize;
+                        let esp = u32::from_le_bytes(
+                            blob[o + 32..o + 36].try_into().unwrap_or([0; 4]),
+                        ) as usize;
+                        if !(0x1000000..0x1200000).contains(&eip) {
+                            continue;
+                        }
+                        let lo = esp & !0xFFF;
+                        let sz = 0x2000usize;
+                        let mut stk = vec![0u8; sz];
+                        let mut n2 = 0;
+                        unsafe {
+                            let _ = ReadProcessMemory(
+                                hp,
+                                lo as *const core::ffi::c_void,
+                                stk.as_mut_ptr() as *mut core::ffi::c_void,
+                                sz,
+                                Some(&mut n2),
+                            );
+                        }
+                        blob.extend_from_slice(&(lo as u32).to_le_bytes());
+                        blob.extend_from_slice(&(n2 as u32).to_le_bytes());
+                        blob.extend_from_slice(&stk);
+                    }
+                    // resume everything
+                    for tid in &tids {
+                        if let Ok(h) = unsafe {
+                            OpenThread(THREAD_ACCESS_RIGHTS(0x0002_0000),
+                                false, *tid)
+                        } {
+                            unsafe {
+                                ResumeThread(h);
+                                let _ = CloseHandle(h);
+                            }
+                        }
+                    }
+                    let stem = outc.with_extension("crashpoll");
+                    if let Some(name) = stem.file_name() {
+                        let mut nm = name.to_os_string();
+                        nm.push(format!(".{}.bin", caps));
+                        let _ = std::fs::write(
+                            stem.with_file_name(nm),
+                            &blob,
+                        );
+                    }
+                    info!(
+                        t_ms = (t_ms as u32),
+                        capture = caps,
+                        threads = tids.len(),
+                        bytes = blob.len(),
+                        "CRASHPOLL: era state captured — resumed"
+                    );
+                }
+                info!(caps, "CRASHPOLL: window closed");
+            });
+        }
+        // 补充 132y19: VALLOC2 — the deployment-era write-op patch.
+        // The fault at image+0x2786F = a DESIGNED jump-into-imm entry
+        // (`00 00` = add [eax],al x2, eax=54831A79 = the wrong-key-derived
+        // write target; the value exists NOWHERE in memory = computed) —
+        // the SEH retry loop re-executes the SAME instruction, so mapping
+        // the target page makes the retry succeed and the flow advances
+        // by itself into the dispatcher (whose registered continuation is
+        // what STACKPASS prepared).  In [1500,6500]ms poll the first
+        // thread at 5 ms; any uncommitted user-mode Eax / Esp target gets
+        // its 64 KB region committed — each new garbage pointer per
+        // station is mapped the same way (the station-by-station walk).
+        if std::env::var("MAGICMIDA_V2_VALLOC2").is_ok() {
+            let hraw_v2 = handle_raw;
+            let t0v2 = watch_t0;
+            std::thread::spawn(move || {
+                use windows::Win32::Foundation::{CloseHandle, HANDLE};
+                use windows::Win32::System::Diagnostics::Debug::{
+                    GetThreadContext, CONTEXT,
+                };
+                use windows::Win32::System::Diagnostics::ToolHelp::{
+                    CreateToolhelp32Snapshot, Thread32First, Thread32Next,
+                    TH32CS_SNAPTHREAD, THREADENTRY32,
+                };
+                use windows::Win32::System::Memory::{
+                    VirtualAllocEx, VirtualQueryEx, MEMORY_BASIC_INFORMATION,
+                    MEM_COMMIT, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE,
+                };
+                use windows::Win32::System::Threading::{
+                    OpenThread, ResumeThread, SuspendThread,
+                    THREAD_ACCESS_RIGHTS,
+                };
+                let hp = HANDLE(hraw_v2 as *mut core::ffi::c_void);
+                let pid_v = unsafe {
+                    windows::Win32::System::Threading::GetProcessId(hp)
+                };
+                let mut mapped: std::collections::HashSet<usize> =
+                    std::collections::HashSet::new();
+                // 132y19: PRE-MAP the known fault target the instant the
+                // thread starts — the cache is written at the FIRST fault
+                // (~332 ms), so mapping on first SIGHTING (921 ms, the
+                // poll round-trip) is already too late.  0x54830000+64KB
+                // covers the constant 0x54831A79 target; the poll below
+                // handles the per-station new targets.
+                {
+                    let span = 0x54830000usize as *mut core::ffi::c_void;
+                    let r0 = unsafe {
+                        VirtualAllocEx(
+                            hp,
+                            Some(span),
+                            0x20000,
+                            MEM_RESERVE | MEM_COMMIT,
+                            PAGE_READWRITE,
+                        )
+                    };
+                    if !r0.is_null() {
+                        mapped.insert(0x54830000);
+                        mapped.insert(0x54831000);
+                        mapped.insert(0x54832000);
+                        info!(
+                            t_ms = (t0v2.elapsed().as_millis() as u32),
+                            "VALLOC2: fault page pre-mapped"
+                        );
+                    }
+                }
+                // 132y19: start at 200 ms — the ERA-1 fault (the search
+                // miss, ~332 ms) is what gets CACHED and replayed at the
+                // deployment era (~3.8 s); deflecting the era-1 write
+                // means nothing is cached.  KEYBUF would also stop the
+                // era-1 fault but poisons the deployment-era buffer reads
+                // (measured: the flow parks pre-deployment), so the
+                // page-mapping shape is the one that carries through.
+                while t0v2.elapsed().as_millis() < 200 {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                while t0v2.elapsed().as_millis() <= 6500 {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    // the first thread of the process = the faulting main
+                    let Ok(snap_h) = (unsafe {
+                        CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+                    }) else {
+                        continue;
+                    };
+                    let mut te = THREADENTRY32::default();
+                    te.dwSize =
+                        std::mem::size_of::<THREADENTRY32>() as u32;
+                    let mut mtid = 0u32;
+                    if unsafe { Thread32First(snap_h, &mut te) }.is_ok() {
+                        loop {
+                            if te.th32OwnerProcessID == pid_v {
+                                mtid = te.th32ThreadID;
+                                break;
+                            }
+                            if unsafe { Thread32Next(snap_h, &mut te) }
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    unsafe {
+                        let _ = CloseHandle(snap_h);
+                    }
+                    if mtid == 0 {
+                        continue;
+                    }
+                    let Ok(h) = (unsafe {
+                        OpenThread(THREAD_ACCESS_RIGHTS(0x004A),
+                            false, mtid)
+                    }) else {
+                        continue;
+                    };
+                    unsafe {
+                        let _ = SuspendThread(h);
+                    }
+                    let mut ctx = CONTEXT::default();
+                    ctx.ContextFlags =
+                        windows::Win32::System::Diagnostics::Debug::CONTEXT_FLAGS(
+                            0x0001_0003,
+                        );
+                    let mut okc = false;
+                    for _ in 0..3 {
+                        if unsafe { GetThreadContext(h, &mut ctx) }.is_ok()
+                        {
+                            okc = true;
+                            break;
+                        }
+                        unsafe {
+                            let _ = windows::Win32::System::Threading::SwitchToThread();
+                        }
+                    }
+                    unsafe {
+                        let _ = ResumeThread(h);
+                    }
+                    unsafe {
+                        let _ = CloseHandle(h);
+                    }
+                    if !okc {
+                        continue;
+                    }
+                    // targets: the write-op destination and the stack
+                    // pointer neighborhood (the next station may fault on
+                    // a push through a derailed Esp).
+                    let mut tgts: Vec<usize> = vec![ctx.Eax as usize];
+                    let esp = ctx.Esp as usize;
+                    if esp >= 0x10000 {
+                        tgts.push(esp.wrapping_sub(0x1000));
+                        tgts.push(esp);
+                    }
+                    for t in tgts {
+                        if t < 0x10000 || t >= 0x7FFE0000 {
+                            continue;
+                        }
+                        let pg = t & !0xFFFusize;
+                        if mapped.contains(&pg) {
+                            continue;
+                        }
+                        let mut mbi = MEMORY_BASIC_INFORMATION::default();
+                        let q = unsafe {
+                            VirtualQueryEx(
+                                hp,
+                                Some(pg as *const core::ffi::c_void),
+                                &mut mbi,
+                                std::mem::size_of::<
+                                    MEMORY_BASIC_INFORMATION,
+                                >(),
+                            )
+                        };
+                        let committed = q != 0
+                            && mbi.State == MEM_COMMIT
+                            && mbi.Protect != PAGE_NOACCESS
+                            && mbi.Protect.0 != 0;
+                        if committed {
+                            mapped.insert(pg);
+                            continue;
+                        }
+                        // 64 KB granularity: reserve the span first, fall
+                        // back to committing the single page.
+                        let span = (t & !0xFFFFusize) as *mut core::ffi::c_void;
+                        let r1 = unsafe {
+                            VirtualAllocEx(
+                                hp,
+                                Some(span),
+                                0x20000,
+                                MEM_RESERVE | MEM_COMMIT,
+                                PAGE_READWRITE,
+                            )
+                        };
+                        let ok1 = !r1.is_null();
+                        let (okv, how) = if ok1 {
+                            (true, "span")
+                        } else {
+                            let r2 = unsafe {
+                                VirtualAllocEx(
+                                    hp,
+                                    Some(pg as *const core::ffi::c_void),
+                                    0x1000,
+                                    MEM_COMMIT,
+                                    PAGE_READWRITE,
+                                )
+                            };
+                            (!r2.is_null(), if r2.is_null() { "fail" } else { "page" })
+                        };
+                        if okv {
+                            mapped.insert(pg);
+                            info!(
+                                t_ms = (t0v2.elapsed().as_millis() as u32),
+                                target = format!("{t:#x}"),
+                                how = how,
+                                reg = format!("{:#x}", ctx.Eax),
+                                "VALLOC2: fault target mapped — write lands"
+                            );
+                        }
+                    }
+                }
+                info!(
+                    mapped = mapped.len(),
+                    "VALLOC2: window closed"
+                );
+            });
+        }
+        // 补充 132y19b: NOPPATH2 — the continuous neutralization of the
+        // deployment-era replay site (image+0x2786F: `00 00 00 00` = the
+        // two `add [eax],al` write-op bytes before `0b c0 74 58`).  The
+        // old NOPPATH was one-shot in [300,500]ms; the site is REBUILT
+        // per era (the block re-encrypts after each handler pass), so the
+        // NOP must be re-applied continuously.  With the site NOPed the
+        // flow falls through to the dispatcher (0x10768A2) whose
+        // registered continuation is what STACKPASS prepared.
+        if std::env::var("MAGICMIDA_V2_NOPPATH2").is_ok() {
+            let hraw_n2 = handle_raw;
+            let t0n2 = watch_t0;
+            std::thread::spawn(move || {
+                use windows::Win32::Foundation::HANDLE;
+                let hp = HANDLE(hraw_n2 as *mut core::ffi::c_void);
+                let ib = unsafe {
+                    windows::Win32::System::Threading::GetProcessId(hp)
+                };
+                let _ = ib;
+                // the image base for the V2 target = 0x1000000 (fixed in
+                // this campaign; the packed module's base).
+                let scan_lo = 0x1027600usize;
+                let nops = [0x90u8; 4];
+                let mut applied = 0usize;
+                while t0n2.elapsed().as_millis() < 250 {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                while t0n2.elapsed().as_millis() <= 6500 {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    let mut pg = vec![0u8; 0x400];
+                    let mut n = 0;
+                    let ok_r = unsafe {
+                        ReadProcessMemory(
+                            hp,
+                            scan_lo as *const core::ffi::c_void,
+                            pg.as_mut_ptr() as *mut core::ffi::c_void,
+                            0x400,
+                            Some(&mut n),
+                        )
+                        .is_ok()
+                            && n == 0x400
+                    };
+                    if !ok_r {
+                        continue;
+                    }
+                    for j in 0..0x400 - 12 {
+                        if pg[j..j + 4] == [0x00u8, 0x00, 0x00, 0x00]
+                            && pg[j + 4..j + 8]
+                                == [0x0Bu8, 0xC0, 0x74, 0x58]
+                        {
+                            let va = scan_lo + j;
+                            let mut w = 0;
+                            let ok_w = unsafe {
+                                WriteProcessMemory(
+                                    hp,
+                                    va as *const core::ffi::c_void,
+                                    nops.as_ptr() as *const core::ffi::c_void,
+                                    4,
+                                    Some(&mut w),
+                                )
+                                .is_ok()
+                            };
+                            if ok_w {
+                                applied += 1;
+                                if applied <= 6 || applied % 50 == 0 {
+                                    info!(
+                                        t_ms = (t0n2.elapsed().as_millis()
+                                            as u32),
+                                        va = format!("{va:#x}"),
+                                        applied,
+                                        "NOPPATH2: replay site neutralized"
+                                    );
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                info!(applied, "NOPPATH2: window closed");
+            });
+        }
+        // 补充 132y19c: KEYBUF2 — the WINDOWED buffer patch (the fifth
+        // piece).  The buffer is read by BOTH the search (needs the
+        // machine keys in [52,480) — the U11/U13 unlock: no hit = no
+        // deployment) AND the deployment era (needs the real license
+        // bytes — a persistent patch parks the flow pre-deployment at
+        // 25-50 MB, measured).  Patch ONLY during [50,2500] ms: era-1
+        // search hits (nothing cached), era-2 re-search hits (the
+        // ~2.1 s reload rebuilds the buffer inside the window), then
+        // STOP — the deployment reads the restored real bytes.
+        if std::env::var("MAGICMIDA_V2_KEYBUF2").is_ok() {
+            let hraw_k2 = handle_raw;
+            let t0k2 = watch_t0;
+            let dat_disk2 = dat_disk.clone();
+            std::thread::spawn(move || {
+                use windows::Win32::Foundation::HANDLE;
+                use windows::Win32::System::Memory::{
+                    VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT,
+                    MEM_PRIVATE, PAGE_NOACCESS,
+                };
+                let hp = HANDLE(hraw_k2 as *mut core::ffi::c_void);
+                let needle: [u8; 16] = if dat_disk2.len() >= 16 {
+                    let mut n = [0u8; 16];
+                    n.copy_from_slice(&dat_disk2[..16]);
+                    n
+                } else {
+                    [0u8; 16]
+                };
+                if needle == [0u8; 16] {
+                    info!("KEYBUF2: no .dat needle — off");
+                    return;
+                }
+                // the machine keys over [52,480): 41 keys × 8 B = 328 B
+                // covers [52,380); pad the rest with the keys pattern to
+                // 480 — the U13-era [52,480) shape.
+                let keys = [
+                    0xE6u8, 0x0D, 0xC8, 0x7D, 0xC8, 0x69, 0x28, 0x02,
+                ];
+                let mut payload = vec![0u8; 480 - 52];
+                for (i, b) in payload.iter_mut().enumerate() {
+                    *b = keys[i % 8];
+                }
+                let mut cands: Vec<usize> = Vec::new();
+                let mut rescan_at = 0u128;
+                let mut patched = 0usize;
+                // 132y19c: the raw .dat copy lives only [150,400] ms
+                // (read-then-erase) and the needle sits at an arbitrary
+                // offset — the sweep must be FAST (4-byte memcmp prefix,
+                // full 16 B verify) and START at 40 ms.
+                let pat4: [u8; 4] = [needle[0], needle[1], needle[2],
+                    needle[3]];
+                while t0k2.elapsed().as_millis() < 40 {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                while t0k2.elapsed().as_millis() <= 2500 {
+                    let t_ms = t0k2.elapsed().as_millis();
+                    if t_ms >= rescan_at {
+                        // 132y19c: the raw-copy window is [150,300] ms —
+                        // the rescan interval must be far denser early.
+                        rescan_at = t_ms + if t_ms < 700 { 40 } else { 200 };
+                        cands.clear();
+                        // 132y19c: the raw .dat copy lives [150,300] ms
+                        // ONLY (read-then-erase; the U13-era DECODEWATCH
+                        // caught it at t=174) and sits in the low heap
+                        // (0xC70000-0xD10000 measured) — the FIRST sweep
+                        // covers just [0x100000,0x2000000) so it lands
+                        // inside the window; later sweeps = full space.
+                        let (scan_lo0, scan_hi) = if t_ms > 700 {
+                            (0x100000usize, 0x7FFE0000usize)
+                        } else {
+                            (0x100000usize, 0x2000000usize)
+                        };
+                        let mut addr_lo = scan_lo0;
+                        while addr_lo < scan_hi {
+                            let mut mbi =
+                                MEMORY_BASIC_INFORMATION::default();
+                            let q = unsafe {
+                                VirtualQueryEx(
+                                    hp,
+                                    Some(addr_lo as *const core::ffi::c_void),
+                                    &mut mbi,
+                                    std::mem::size_of::<
+                                        MEMORY_BASIC_INFORMATION,
+                                    >(),
+                                )
+                            };
+                            if q == 0 {
+                                break;
+                            }
+                            let base = mbi.BaseAddress as usize;
+                            let size = mbi.RegionSize as usize;
+                            let okr = mbi.State == MEM_COMMIT
+                                && mbi.Type == MEM_PRIVATE
+                                && mbi.Protect != PAGE_NOACCESS
+                                && mbi.Protect.0 != 0;
+                            if okr && size >= 480 {
+                                let mut nsc = 0usize;
+                                while nsc < size {
+                                    let take = 0x100000.min(size - nsc);
+                                    let mut buf = vec![0u8; take];
+                                    let mut n2 = 0;
+                                    unsafe {
+                                        let _ = ReadProcessMemory(
+                                            hp,
+                                            (base + nsc)
+                                                as *const core::ffi::c_void,
+                                            buf.as_mut_ptr()
+                                                as *mut core::ffi::c_void,
+                                            take,
+                                            Some(&mut n2),
+                                        );
+                                    }
+                                    if n2 >= 16 {
+                                        // 132y19c: 4-byte memcmp prefix
+                                        // then the full 16 B verify —
+                                        // the byte-loop was too slow and
+                                        // missed the [150,400] ms window.
+                                        let mut k = 0usize;
+                                        while k + 16 <= n2 {
+                                            match buf[k..n2]
+                                                .windows(4)
+                                                .position(|w| w == pat4)
+                                            {
+                                                Some(p) => {
+                                                    let q = k + p;
+                                                    if q + 16 <= n2
+                                                        && buf[q..q + 16]
+                                                            == needle
+                                                    {
+                                                        cands.push(
+                                                            base + nsc + q,
+                                                        );
+                                                    }
+                                                    k = q + 4;
+                                                }
+                                                None => break,
+                                            }
+                                        }
+                                    }
+                                    nsc += take;
+                                }
+                            }
+                            addr_lo = base.saturating_add(size.max(0x1000));
+                        }
+                        if !cands.is_empty() && patched == 0 {
+                            info!(
+                                t_ms = (t_ms as u32),
+                                bufs = cands.len(),
+                                "KEYBUF2: buffer candidates located"
+                            );
+                        }
+                    }
+                    // rewrite cadence: the candidates inside the window
+                    for ba in &cands {
+                        let target = ba + 52;
+                        let mut cur = vec![0u8; payload.len()];
+                        let mut n3 = 0;
+                        let ok_c = unsafe {
+                            ReadProcessMemory(
+                                hp,
+                                target as *const core::ffi::c_void,
+                                cur.as_mut_ptr() as *mut core::ffi::c_void,
+                                payload.len(),
+                                Some(&mut n3),
+                            )
+                            .is_ok()
+                                && n3 == payload.len()
+                        };
+                        if !ok_c || cur == payload {
+                            continue;
+                        }
+                        let mut w = 0;
+                        let ok_w = unsafe {
+                            WriteProcessMemory(
+                                hp,
+                                target as *const core::ffi::c_void,
+                                payload.as_ptr() as *const core::ffi::c_void,
+                                payload.len(),
+                                Some(&mut w),
+                            )
+                            .is_ok()
+                        };
+                        if ok_w {
+                            patched += 1;
+                            if patched <= 6 || patched % 100 == 0 {
+                                info!(
+                                    t_ms = (t0k2.elapsed().as_millis()
+                                        as u32),
+                                    buf = format!("{ba:#x}"),
+                                    patched,
+                                    "KEYBUF2: windowed buffer patch applied"
+                                );
+                            }
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                info!(
+                    patched,
+                    bufs = cands.len(),
+                    "KEYBUF2: window closed — buffer restored to real bytes"
+                );
             });
         }
         // 补充 132y12: GATEPATCH — the machine-binding gate's verdict.
