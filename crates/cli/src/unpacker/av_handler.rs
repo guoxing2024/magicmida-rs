@@ -457,6 +457,39 @@ fn handle_access_violation(
         }
     }
 
+    // ---- 补充 132y24: REPLAYSWALLOW (MAGICMIDA_V2_REPLAYSWALLOW) --------
+    //
+    // The dispatcher call `call eax` at 0x1027892 faults on the cached
+    // era-1 replay record (target 0xB8C933A0 = the OLD garbage Esp-4 —
+    // the record is replayed, not a fresh fault: measured Esp already
+    // repaired at 0xEFE70 while the target stayed cached).  STACKFIX
+    // repairs Esp during the debug-wait window, so resuming at the
+    // faulting instruction lets the push land and the dispatcher run
+    // (measured: ~3 s of real VM work before the replay came back and
+    // went unhandled at the shell's SEH — the dispatcher's stack work
+    // invalidated the SEH frame the handler needed).  Swallow EVERY
+    // delivery of this fault (first AND second chance): DBG_CONTINUE
+    // resumes at `call eax` with the current Esp and the dispatcher
+    // keeps running.  Cap the swallows so a dead loop falls through to
+    // the storm watchdog instead of burning the log forever.
+    #[cfg(target_arch = "x86")]
+    if std::env::var("MAGICMIDA_V2_REPLAYSWALLOW").is_ok()
+        && exception_addr == 0x0102_7892
+        && ls.rswallow_count < 5000
+    {
+        ls.rswallow_count += 1;
+        if ls.rswallow_count <= 6 || ls.rswallow_count % 50 == 0 {
+            info!(
+                thread_id,
+                n = ls.rswallow_count,
+                target = %format!("{target_address:#x}"),
+                "REPLAYSWALLOW: dispatcher-call fault swallowed"
+            );
+        }
+        dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+        return Ok(AvAction::Continue);
+    }
+
     // ---- storm watchdog ---------------------------------------------------
     //
     // Before anything else: if this is the same fault we have already seen a

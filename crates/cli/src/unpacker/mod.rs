@@ -89,6 +89,11 @@ struct LoopState {
     /// (CryptHashData, CryptDeriveKey, CryptDecrypt) once advapi32
     /// loads; the SingleStep handler captures the args at each hit.
     cypwatch: Option<(usize, usize, usize)>,
+    /// 补充 132y24: REPLAYSWALLOW — dispatcher-call fault swallow count
+    /// (the 5000 cap against a dead loop).  x86-only; the field is dead
+    /// on the x64 build.
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+    rswallow_count: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -633,6 +638,7 @@ pub fn unpack(
         iat_monitoring_done: false,
         av_storm: av_handler::AvStorm::default(),
         cypwatch: None,
+        rswallow_count: 0,
     };
     let guard_protection = PAGE_NOACCESS.0;
     // Image boundary from PE header (pre-ASLR value). Will be rebased after

@@ -6384,3 +6384,66 @@ seq1-6.log（137MB walk）、dismiss_once.py（WM_CLOSE/
   侧绕过穷尽**。b15 的 98 站点 = 旧 run 的 ops 布局（per-run 差异）。
 - **剩余路径**：.dat 密码深耕（补 129-130 阻断深耕）或 check-op 40KB
   逐指令深读。全部仪器/图谱/时间线已沉淀（40+ commits）。
+
+**续 22 补充 132y21-27（2026-11-21）——停泊态全解码：MessageBox 临界区
+死锁 + verdict="license corrupted" 实锤 + 第九/十件机器**：
+
+- **VERDICTWATCH（132y21）**：7 哨兵槽（0x20CF1 累积/0x201FD miss/
+  0x22D3D 计数/0x20449 gate/0x225260 cont/0x285B6 bank/0xEFE74 VM 栈对）
+  1ms 轮询 90s → **部署停泊态零变更**（状态机完全冻结 = 等外部事件）。
+- **fault 链逐站推进（132y22-24）**：①VALLOC2 映射写目标后
+  `add [eax],al` 落地；②FLAGSKIP（`74 06`→`EB 06` @0x102787E）跳过
+  fail-handler，流程到 0x1027892 = `call eax`，eax=0x10768A2 = **dispatcher
+  正确加载**；③STACKFIX：dispatcher 的 push 在脱轨 Esp=0xB8C933A4（未
+  提交）上 fault → SetThreadContext Esp := 0xEFE70（VM 栈已提交带）。
+  **实测：dispatcher 带真栈跑了 ~3 秒真实 VM 工作**（BLKSTREAM 风暴到
+  401ms + GATEPATCH 扫到 1223ms），随后死于缓存重放记录（WER dump:
+  Eip=0x1027892、Esp 已修复 0xEFE70、target 仍 = 缓存 0xB8C933A0）。
+- **REPLAYSWALLOW（132y24，第八件）**：av_handler 的 AV 臂按
+  exception_addr==0x1027892 吞掉（DBG_CONTINUE，两次机会都吞，5000
+  上限防死循环）——重放记录交壳 SEH 时 dispatcher 的栈工作已使
+  SEH 帧失效 → 二次机会 = 0xC0000005 退出。
+- **停泊态全景（132y25 探针链）**：主 VM 线程停泊在 win32u
+  （SendMessage/GetMessage 类等待），**用户栈上就是 dispatcher 帧**
+  ([0xEFEE8]=0x10768A2、[0xEFEB4]=0x107695E=dispatcher+0xBC)；~16 worker
+  各停泊在 **NtWaitForSingleObject(自有 Event, FALSE, NULL)**
+  （句柄 0x170-0x1B0 顺序分配，[esp+4]=h/[esp+8]=0/[esp+C]=0 形状）+
+  1 个 ALPC Port 等待者。主线程栈 3 层重复 ntdll+40fe2 = **临界区等待**。
+- **dispatcher 消息路径破译**：0x10768E3..0x1076958 = 消息序列 walker
+  （esi = 序列串，首字符 '0'/'3'/'4'/'5' = MB 图标选择，终结符 " \0"）→
+  `call [ebp+0x12263375]`（fold = *0x1023389）= **MessageBoxExA**，
+  caption="CALC"（0x10208A9）。镜像含明文 **"Your license key is
+  corrupted."** + 期望键 **"1051-BCEC-14F2-0C18-3745-254D-9F3C-2536"**
+  （0x102135F）。**verdict = "license corrupted" 实锤 = 壳在报我们注入
+  的 license 结构损坏**。
+- **唤醒实验全败记录**：WM_GETTEXT（SMTO 2s）= 泵不派发；
+  AttachThreadInput+SendInput(VK_RETURN) 与 PostThreadMessage 全无效；
+  对 16 个 Event SetEvent（DuplicateHandle 修 ctypes 截断后 res=1）→
+  **worker 醒→队列空→同 stub 再停泊（Eip 不变 = 假阴性）**，verdict 槽
+  零变更。dismiss「关完仍停泊」的真相 = **从来没人真正关掉过它**。
+- **MSGSKIP（132y25-25g，第九件）**：时间线定案 = CRC（user32 入口
+  完整性检查）@~250-300ms（patch 太早 = exit 2）、首个 box @~319ms、
+  部署 = 2s 且**带 box 照常推进**（box = 旁观者）。12 个模态对话框
+  导出入口（MessageBoxA/W/ExA/ExW、DialogBoxParamA/W、
+  DialogBoxIndirectParamA/W、MessageBoxIndirectA/W、
+  CreateDialogIndirectParamA/W）+ 2 个 fold 槽位全部 patch
+  （mov eax,1; ret imm16 按各自参数数）→ **box 仍以 CreateWindowExW
+  直建 #32770 出现**（壳自实现对话框，入口 patch 线穷尽）。owner 实锤 =
+  CISC-1 自己（GetWindowThreadProcessId 返回值 = TID，out 参数 = PID
+  ——两次踩坑）。
+- **KEYBUF 注入形态定案（132y26-27）**：`'52-'+('e60dc87dc8692802'*53)`
+  = **buffer+0x52 起 424 字节重复键 blob**——搜索命中位 = buffer+0x52
+  固定（变换定位，搜索命中即 80-miss 提前退出 ✓），但 **verdict 的输入 =
+  部署时刻（2s）的 buffer = blob = 结构毁 = "corrupted"**。最小注入
+  （8B @0x52，KEYBUF2 无窗口变体）与 [0,52) 结构头注入（KEYFORGE
+  形状）均 0/部署 = 搜索是**变换定位**（键必须在命中位 0x52）且需要
+  3 搜索各自的命中位。**.dat 校验哈希 = 对 raw 编码字节（磁盘侧），
+  buffer 补丁不参与哈希**（blob 可部署 = 实锤）。**下一增量 = 112B
+  已知明文结构布局（补 81-115）+ 3 搜索命中位精确落位 = blob + 结构
+  修复混合注入**，或 f 全恢复（168 handler 缝合）后造合法 license。
+- **机器清单（本次新增）**：VERDICTWATCH、FLAGSKIP、STACKFIX（泛化
+  Esp 修复）、REPLAYSWALLOW、MSGSKIP v8（12 导出+槽位，260ms 门控）、
+  KEYBUF2（无窗口 buffer 相对注入）。x86 零告警编译。
+- 工件：probe_park/probe_dlg/probe_wait/probe_msg/probe_msg2/probe_wake/
+  probe_owner/probe_iocp/probe_timeline.py（OUT/ps1/）+ waitcode_*.bin +
+  park_stk_*.bin + msg/wake/owner/tl.log。

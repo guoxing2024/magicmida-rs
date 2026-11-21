@@ -878,6 +878,10 @@ pub(super) fn spawn_dialog_killer(
         && std::env::var("MAGICMIDA_V2_EIPHIST2").is_err()
         && std::env::var("MAGICMIDA_V2_CRASHPOLL").is_err()
         && std::env::var("MAGICMIDA_V2_VALLOC2").is_err()
+        && std::env::var("MAGICMIDA_V2_VERDICTWATCH").is_err()
+        && std::env::var("MAGICMIDA_V2_FLAGSKIP").is_err()
+        && std::env::var("MAGICMIDA_V2_STACKFIX").is_err()
+        && std::env::var("MAGICMIDA_V2_MSGSKIP").is_err()
         && std::env::var("MAGICMIDA_V2_NOPPATH2").is_err()
         && sp_groups.is_none()
     {
@@ -2507,6 +2511,718 @@ pub(super) fn spawn_dialog_killer(
                     }
                 }
                 info!(applied, "NOPPATH2: window closed");
+            });
+        }
+        // 补充 132y22: FLAGSKIP — the sixth piece.  The deployment-era
+        // fault chain walked one station further (VALLOC2 mapped the
+        // write target: the `add [eax],al` pair lands, or eax,eax falls
+        // through) and the thread freezes at 0x1027880 = `call
+        // [0x1020A41]` — the FAIL handler, invoked because the verdict
+        // gate flag [0x1020449] != 0 (the era-1 search-miss state).
+        // Forcing the je taken (`74 06` → `EB 06`) skips the fail
+        // handler; the flow falls into the dispatcher (0x10768A2) whose
+        // registered continuation is what STACKPASS prepared.  The
+        // block is rebuilt per era → re-apply at 2 ms over the whole
+        // run (the sig = `83 bd 35 04 26 12 00` + `74 06`).
+        if std::env::var("MAGICMIDA_V2_FLAGSKIP").is_ok() {
+            let hraw_fs = handle_raw;
+            let t0fs = watch_t0;
+            std::thread::spawn(move || {
+                use windows::Win32::Foundation::HANDLE;
+                let hp = HANDLE(hraw_fs as *mut core::ffi::c_void);
+                let sig: [u8; 9] = [
+                    0x83u8, 0xBD, 0x35, 0x04, 0x26, 0x12, 0x00, 0x74,
+                    0x06,
+                ];
+                let patch = [0xEBu8, 0x06];
+                let scan_lo = 0x1027600usize;
+                let mut applied = 0usize;
+                while t0fs.elapsed().as_millis() <= 6500 {
+                    std::thread::sleep(
+                        std::time::Duration::from_millis(2),
+                    );
+                    let mut pg = vec![0u8; 0x400];
+                    let mut n = 0;
+                    let ok_r = unsafe {
+                        ReadProcessMemory(
+                            hp,
+                            scan_lo as *const core::ffi::c_void,
+                            pg.as_mut_ptr() as *mut core::ffi::c_void,
+                            0x400,
+                            Some(&mut n),
+                        )
+                        .is_ok()
+                            && n == 0x400
+                    };
+                    if !ok_r {
+                        continue;
+                    }
+                    for j in 0..0x400 - sig.len() {
+                        if pg[j..j + sig.len()] == sig[..]
+                            && pg[j + 7] == 0x74
+                        {
+                            let va = scan_lo + j + 7;
+                            let mut w = 0;
+                            let ok_w = unsafe {
+                                WriteProcessMemory(
+                                    hp,
+                                    va as *const core::ffi::c_void,
+                                    patch.as_ptr()
+                                        as *const core::ffi::c_void,
+                                    2,
+                                    Some(&mut w),
+                                )
+                                .is_ok()
+                            };
+                            if ok_w {
+                                applied += 1;
+                                if applied <= 6 || applied % 50 == 0 {
+                                    info!(
+                                        t_ms = (t0fs.elapsed().as_millis()
+                                            as u32),
+                                        va = format!("{va:#x}"),
+                                        applied,
+                                        "FLAGSKIP: fail branch forced taken"
+                                    );
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                info!(applied, "FLAGSKIP: window closed");
+            });
+        }
+        // 补充 132y25d: MSGSKIP — the ninth piece, slot sweep with an
+        // early window.  Evidence: code patches (call-site AND the
+        // user32 entry) are caught by the shell's anti-tamper — exit 2
+        // at ~250 ms; data-slot patches are NEVER detected (95 s
+        // survival); the boxes appear in [2000, 2500] ms.  => sweep the
+        // shell data region [0x1020000, 0x1080000) byte-wise for every
+        // slot holding the live MessageBoxExA address (from the known
+        // dispatcher slot [0x1023389]) and rewrite each with a stub in
+        // a freshly allocated RWX page (mov eax,1; ret 0x14 — instant
+        // IDOK, stdcall-balanced, outside the image).  Window = [600,
+        // 60000] ms: after the ~250 ms CRC, before the ~2000 ms first
+        // box.  Re-apply at 2 ms.
+        if std::env::var("MAGICMIDA_V2_MSGSKIP").is_ok() {
+            let hraw_ms = handle_raw;
+            let t0ms = watch_t0;
+            std::thread::spawn(move || {
+                use windows::Win32::Foundation::{CloseHandle, HANDLE};
+                use windows::Win32::System::Diagnostics::ToolHelp::{
+                    CreateToolhelp32Snapshot, Module32FirstW, Module32NextW,
+                    MODULEENTRY32W, TH32CS_SNAPMODULE,
+                };
+                use windows::Win32::System::Memory::{
+                    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE,
+                    PAGE_EXECUTE_READWRITE, VirtualAllocEx, VirtualFreeEx,
+                };
+                let hp = HANDLE(hraw_ms as *mut core::ffi::c_void);
+                let pid = unsafe {
+                    windows::Win32::System::Threading::GetProcessId(hp)
+                };
+                let stub_va = unsafe {
+                    VirtualAllocEx(
+                        hp,
+                        None,
+                        0x1000,
+                        MEM_RESERVE | MEM_COMMIT,
+                        PAGE_EXECUTE_READWRITE,
+                    )
+                };
+                let mut stub_slot: usize = 0;
+                if !stub_va.is_null() {
+                    let stub: [u8; 8] = [
+                        0xb8, 0x01, 0x00, 0x00, 0x00, 0xc2, 0x14, 0x00,
+                    ];
+                    let mut w = 0;
+                    let ok = unsafe {
+                        WriteProcessMemory(
+                            hp,
+                            stub_va as *const core::ffi::c_void,
+                            stub.as_ptr() as *const core::ffi::c_void,
+                            8,
+                            Some(&mut w),
+                        )
+                        .is_ok()
+                    };
+                    if ok {
+                        stub_slot = stub_va as usize;
+                    }
+                }
+                let mut slots: Vec<usize> = Vec::new();
+                let mut mba: usize = 0;
+                let mut applied = 0usize;
+                // 132y25e: the entry patch — the timeline is CRC at
+                // ~250 ms (any patch before = exit 2), first box at
+                // ~350 ms (the verdict reports), so the window = ~300
+                // ms.  Patch user32!MessageBoxExA's entry with mov
+                // eax,1; ret 0x14 (instant IDOK, stdcall-balanced) from
+                // 300 ms; the slot sweep stays as the fallback.
+                let mut wide: Vec<u16> = "user32.dll".encode_utf16()
+                    .collect();
+                wide.push(0);
+                let our_user32 = unsafe {
+                    windows::Win32::System::LibraryLoader::
+                        GetModuleHandleW(windows::core::PCWSTR(
+                            wide.as_ptr()))
+                        .unwrap_or_default()
+                };
+                // 132y25f: the workers' box = the DialogBox* family
+                // (the MessageBoxExA entry patch landed and a box STILL
+                // appeared).  All the modal dialogs = 5-arg stdcall =
+                // the same mov eax,1; ret 0x14 stub.
+                // (name, ret-imm16-lo, ret-imm16-hi): the stub ret must
+                // match each export's own stdcall arg cleanup.  132y25f:
+                // the workers' box survived MessageBoxExA+DialogBox*
+                // patches => it comes from the remaining modal-dialog
+                // APIs (MessageBoxIndirectA = 1 arg, the CreateDialog*
+                // = 4 args).
+                // 132y25g: the park = inside SoftModalMessageBox — the
+                // exported entries into it include the PLAIN MessageBoxA/W
+                // (4 args, ret 0x10) which the earlier family missed.
+                const FAMILY: [(&str, u8, u8); 12] = [
+                    ("MessageBoxA", 0x10, 0),
+                    ("MessageBoxW", 0x10, 0),
+                    ("MessageBoxExA", 0x14, 0),
+                    ("MessageBoxExW", 0x14, 0),
+                    ("DialogBoxParamA", 0x14, 0),
+                    ("DialogBoxParamW", 0x14, 0),
+                    ("DialogBoxIndirectParamA", 0x14, 0),
+                    ("DialogBoxIndirectParamW", 0x14, 0),
+                    ("MessageBoxIndirectA", 0x04, 0),
+                    ("MessageBoxIndirectW", 0x04, 0),
+                    ("CreateDialogIndirectParamA", 0x10, 0),
+                    ("CreateDialogIndirectParamW", 0x10, 0),
+                ];
+                let mut rvas: Vec<(usize, u8, u8)> = Vec::new();
+                for (name, lo, hi) in FAMILY {
+                    let mut nm: Vec<u8> = name.as_bytes().to_vec();
+                    nm.push(0);
+                    let r = unsafe {
+                        windows::Win32::System::LibraryLoader::
+                            GetProcAddress(
+                                our_user32,
+                                windows::core::PCSTR(nm.as_ptr()))
+                    }
+                    .map(|f| {
+                        (f as usize) - (our_user32.0 as usize)
+                    })
+                    .unwrap_or(0);
+                    if r != 0 {
+                        rvas.push((r, lo, hi));
+                    }
+                }
+                let mut entry_tgt: usize = 0;  // the user32 base
+                let mut entry_applied = 0usize;
+                let mut t = t0ms.elapsed().as_millis();
+                while t <= 60000 {
+                    if t >= 260 && !rvas.is_empty() && entry_tgt == 0 {
+                        let Ok(snap_h) = (unsafe {
+                            CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid)
+                        }) else {
+                            std::thread::sleep(
+                                std::time::Duration::from_millis(2));
+                            t = t0ms.elapsed().as_millis();
+                            continue;
+                        };
+                        let mut me = MODULEENTRY32W::default();
+                        me.dwSize =
+                            std::mem::size_of::<MODULEENTRY32W>() as u32;
+                        if unsafe {
+                            Module32FirstW(snap_h, &mut me)
+                        }
+                        .is_ok()
+                        {
+                            loop {
+                                let name: String = me
+                                    .szModule
+                                    .iter()
+                                    .take_while(|&&c| c != 0)
+                                    .map(|c| {
+                                        char::from_u32(*c as u32)
+                                            .unwrap_or('?')
+                                    })
+                                    .collect();
+                                if name.eq_ignore_ascii_case(
+                                    "user32.dll",
+                                ) {
+                                    entry_tgt = me.modBaseAddr as usize;
+                                    break;
+                                }
+                                if unsafe {
+                                    Module32NextW(snap_h, &mut me)
+                                }
+                                .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                        unsafe {
+                            let _ = CloseHandle(snap_h);
+                        }
+                        if entry_tgt != 0 {
+                            info!(
+                                tgt = format!("{entry_tgt:#x}"),
+                                "MSGSKIP: MessageBoxExA entry located"
+                            );
+                        }
+                    }
+                    if t >= 260 && entry_tgt != 0 && entry_applied
+                        < 9000
+                    {
+                        for (rva, lo, hi) in &rvas {
+                            let patch: [u8; 8] = [
+                                0xb8, 0x01, 0x00, 0x00, 0x00, 0xc2,
+                                *lo, *hi,
+                            ];
+                            let mut w = 0;
+                            let ok_w = unsafe {
+                                WriteProcessMemory(
+                                    hp,
+                                    (entry_tgt + rva)
+                                        as *const core::ffi::c_void,
+                                    patch.as_ptr()
+                                        as *const core::ffi::c_void,
+                                    patch.len(),
+                                    Some(&mut w),
+                                )
+                                .is_ok()
+                            };
+                            if ok_w {
+                                entry_applied += 1;
+                            }
+                        }
+                        if entry_applied > 0 && entry_applied
+                            <= rvas.len()
+                        {
+                            info!(
+                                n = entry_applied,
+                                "MSGSKIP: modal-dialog entries patched"
+                            );
+                        }
+                    }
+                    if t >= 600 && stub_slot != 0 {
+                        let mut v = [0u8; 4];
+                        let mut n = 0;
+                        let ok_r = unsafe {
+                            ReadProcessMemory(
+                                hp,
+                                0x0102_3389usize
+                                    as *const core::ffi::c_void,
+                                v.as_mut_ptr() as *mut core::ffi::c_void,
+                                4,
+                                Some(&mut n),
+                            )
+                            .is_ok()
+                                && n == 4
+                        };
+                        if ok_r {
+                            let mb = u32::from_le_bytes(v) as usize;
+                            if mb > 0x10000 && mb != mba {
+                                mba = mb;
+                                let mut buf = vec![0u8; 0x60000];
+                                let mut n2 = 0;
+                                let ok_s = unsafe {
+                                    ReadProcessMemory(
+                                        hp,
+                                        0x0102_0000usize
+                                            as *const core::ffi::c_void,
+                                        buf.as_mut_ptr()
+                                            as *mut core::ffi::c_void,
+                                        0x60000,
+                                        Some(&mut n2),
+                                    )
+                                    .is_ok()
+                                };
+                                if ok_s {
+                                    slots.clear();
+                                    let cnt =
+                                        (n2 as usize).saturating_sub(4);
+                                    for j in 0..cnt {
+                                        if buf[j] == (mb & 0xff) as u8
+                                            && buf[j + 1]
+                                                == ((mb >> 8) & 0xff)
+                                                    as u8
+                                            && buf[j + 2]
+                                                == ((mb >> 16) & 0xff)
+                                                    as u8
+                                            && buf[j + 3]
+                                                == ((mb >> 24) & 0xff)
+                                                    as u8
+                                        {
+                                            slots.push(0x102_0000 + j);
+                                        }
+                                    }
+                                    info!(
+                                        mba = format!("{mba:#x}"),
+                                        slots = slots.len(),
+                                        "MSGSKIP: MessageBoxExA slots located"
+                                    );
+                                }
+                            }
+                        }
+                        for va in &slots {
+                            let sv = (stub_slot as u32).to_le_bytes();
+                            let mut w = 0;
+                            let ok_w = unsafe {
+                                WriteProcessMemory(
+                                    hp,
+                                    *va as *const core::ffi::c_void,
+                                    sv.as_ptr()
+                                        as *const core::ffi::c_void,
+                                    4,
+                                    Some(&mut w),
+                                )
+                                .is_ok()
+                            };
+                            if ok_w {
+                                applied += 1;
+                            }
+                        }
+                        if applied > 0 && applied % 1000 == 0 {
+                            info!(
+                                applied,
+                                slots = slots.len(),
+                                "MSGSKIP: slots rewritten"
+                            );
+                        }
+                    }
+                    std::thread::sleep(
+                        std::time::Duration::from_millis(2),
+                    );
+                    t = t0ms.elapsed().as_millis();
+                }
+                if !stub_va.is_null() {
+                    unsafe {
+                        let _ = VirtualFreeEx(
+                            hp,
+                            stub_va as *mut core::ffi::c_void,
+                            0,
+                            MEM_RELEASE,
+                        );
+                    }
+                }
+                info!(
+                    applied,
+                    slots = slots.len(),
+                    "MSGSKIP: window closed"
+                );
+            });
+        }
+        // 补充 132y23: STACKFIX — the seventh piece.  FLAGSKIP skips the
+        // fail handler and the flow reaches 0x1027892 = `call eax` with
+        // eax = 0x10768A2 = the dispatcher; the call's push faults on
+        // the derailment's garbage Esp (0xB8C933A4, uncommitted).  When
+        // the faulting thread sits at the dispatcher call, SetThread
+        // Context Esp := 0xEFE70 (the committed VM-stack band just below
+        // the STACKPASS pair slots; grows down into 0xEFD00-) — the push
+        // lands and the dispatcher runs.
+        if std::env::var("MAGICMIDA_V2_STACKFIX").is_ok() {
+            let hraw_sf = handle_raw;
+            let t0sf = watch_t0;
+            std::thread::spawn(move || {
+                use windows::Win32::Foundation::{CloseHandle, HANDLE};
+                use windows::Win32::System::Diagnostics::Debug::{
+                    CONTEXT, GetThreadContext, SetThreadContext,
+                    CONTEXT_FLAGS,
+                };
+                use windows::Win32::System::Diagnostics::ToolHelp::{
+                    CreateToolhelp32Snapshot, Thread32First, Thread32Next,
+                    TH32CS_SNAPTHREAD, THREADENTRY32,
+                };
+                use windows::Win32::System::Threading::{
+                    OpenThread, ResumeThread, SuspendThread,
+                    THREAD_ACCESS_RIGHTS,
+                };
+                let hp = HANDLE(hraw_sf as *mut core::ffi::c_void);
+                let pid = unsafe {
+                    windows::Win32::System::Threading::GetProcessId(hp)
+                };
+                let mut fixed = 0usize;
+                while t0sf.elapsed().as_millis() <= 30000 {
+                    std::thread::sleep(
+                        std::time::Duration::from_millis(3),
+                    );
+                    let Ok(snap_h) = (unsafe {
+                        CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+                    }) else {
+                        continue;
+                    };
+                    let mut te = THREADENTRY32::default();
+                    te.dwSize =
+                        std::mem::size_of::<THREADENTRY32>() as u32;
+                    let mut cands: Vec<u32> = Vec::new();
+                    if unsafe { Thread32First(snap_h, &mut te) }.is_ok() {
+                        loop {
+                            if te.th32OwnerProcessID == pid {
+                                cands.push(te.th32ThreadID);
+                            }
+                            if unsafe { Thread32Next(snap_h, &mut te) }
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    unsafe {
+                        let _ = CloseHandle(snap_h);
+                    }
+                    for tid in &cands {
+                        let Ok(h) = (unsafe {
+                            OpenThread(THREAD_ACCESS_RIGHTS(0x1F03FF),
+                                false, *tid)
+                        }) else {
+                            continue;
+                        };
+                        unsafe {
+                            let _ = SuspendThread(h);
+                        }
+                        let mut ctx = CONTEXT::default();
+                        ctx.ContextFlags =
+                            CONTEXT_FLAGS(0x0001_0003);
+                        let mut okc = false;
+                        for _ in 0..3 {
+                            if unsafe {
+                                GetThreadContext(h, &mut ctx)
+                            }
+                            .is_ok()
+                            {
+                                okc = true;
+                                break;
+                            }
+                            unsafe {
+                                let _ = windows::Win32::System::Threading::SwitchToThread();
+                            }
+                        }
+                        // 补充 132y24: generalized — the replay may
+                        // restore ANY garbage Esp; repair whenever the
+                        // thread sits at the dispatcher call with an
+                        // Esp outside the committed VM-stack band.
+                        if okc
+                            && ctx.Eip == 0x0102_7892
+                            && (ctx.Esp < 0x000E_FD00
+                                || ctx.Esp >= 0x000F_0000)
+                        {
+                            // repair the stack pointer: the committed
+                            // VM-stack band below the pair slots
+                            ctx.Esp = 0x000E_FE70;
+                            ctx.ContextFlags = CONTEXT_FLAGS(0x0001_0003);
+                            let okw = unsafe {
+                                SetThreadContext(h, &ctx)
+                            }
+                            .is_ok();
+                            if okw {
+                                fixed += 1;
+                                info!(
+                                    tid = *tid,
+                                    esp = "0xefe70",
+                                    fixed,
+                                    "STACKFIX: dispatcher stack repaired"
+                                );
+                            }
+                        }
+                        unsafe {
+                            let _ = ResumeThread(h);
+                        }
+                        unsafe {
+                            let _ = CloseHandle(h);
+                        }
+                    }
+                }
+                info!(fixed, "STACKFIX: window closed");
+            });
+        }
+        // 补充 132y21: VERDICTWATCH — the deployment-era verdict state
+        // machine tracer.  Poll the verdict/sentinel slots at ~1 ms and
+        // log every change (t_us, slot, old→new) for 90 s; capture all
+        // thread contexts on the first 8 changes.  The slots = the
+        // state machine's verdict accumulation (0x20CF1), the miss
+        // counter (0x201FD), the counter (0x22D3D), the gate flag
+        // (0x20449), the continuation slot (0x225260), the bank cont_a
+        // (0x285B6) and the VM-stack pass-pair slots.
+        if std::env::var("MAGICMIDA_V2_VERDICTWATCH").is_ok() {
+            let hraw_vw = handle_raw;
+            let t0vw = watch_t0;
+            let outvw: std::path::PathBuf = out_path.to_path_buf();
+            std::thread::spawn(move || {
+                use windows::Win32::Foundation::{CloseHandle, HANDLE};
+                use windows::Win32::System::Diagnostics::Debug::{
+                    GetThreadContext, CONTEXT,
+                };
+                use windows::Win32::System::Diagnostics::ToolHelp::{
+                    CreateToolhelp32Snapshot, Thread32First, Thread32Next,
+                    TH32CS_SNAPTHREAD, THREADENTRY32,
+                };
+                use windows::Win32::System::Threading::{
+                    OpenThread, ResumeThread, SuspendThread,
+                    THREAD_ACCESS_RIGHTS,
+                };
+                let hp = HANDLE(hraw_vw as *mut core::ffi::c_void);
+                const SLOTS: [(u32, usize, &str); 7] = [
+                    (0x1020CF1, 4, "sentinel-verdict"),
+                    (0x10201FD, 4, "miss-counter"),
+                    (0x1022D3D, 4, "counter"),
+                    (0x1020449, 4, "gate-flag"),
+                    (0x1025260, 4, "cont-slot"),
+                    (0x10285B6, 4, "bank-cont"),
+                    (0xEFE74, 0x60, "vmstack-pairs"),
+                ];
+                let mut last: Vec<[u8; 64]> = vec![[0u8; 64]; 7];
+                let mut changes = 0usize;
+                let mut log = Vec::new();
+                while t0vw.elapsed().as_millis() < 90000 {
+                    std::thread::sleep(
+                        std::time::Duration::from_micros(900),
+                    );
+                    let t_us = t0vw.elapsed().as_micros() as u32;
+                    for (i, (va, sz, tag)) in SLOTS.iter().enumerate() {
+                        let mut cur = [0u8; 64];
+                        let mut n = 0;
+                        let ok = unsafe {
+                            ReadProcessMemory(
+                                hp,
+                                *va as *const core::ffi::c_void,
+                                cur.as_mut_ptr() as *mut core::ffi::c_void,
+                                *sz,
+                                Some(&mut n),
+                            )
+                            .is_ok()
+                                && n == *sz
+                        };
+                        if !ok {
+                            continue;
+                        }
+                        if cur[..*sz] != last[i][..*sz] {
+                            let oldv: String = last[i][..*sz]
+                                .iter()
+                                .map(|b| format!("{b:02x}"))
+                                .collect();
+                            let newv: String = cur[..*sz]
+                                .iter()
+                                .map(|b| format!("{b:02x}"))
+                                .collect();
+                            info!(
+                                t_us,
+                                slot = *tag,
+                                va = format!("{va:#x}"),
+                                old = %oldv,
+                                new = %newv,
+                                "VERDICTWATCH: slot changed"
+                            );
+                            log.extend_from_slice(
+                                &(t_us.to_le_bytes()),
+                            );
+                            log.extend_from_slice(
+                                &(*va as u32).to_le_bytes(),
+                            );
+                            log.extend_from_slice(&(*sz as u32).to_le_bytes());
+                            log.extend_from_slice(&last[i][..*sz]);
+                            log.extend_from_slice(&cur[..*sz]);
+                            last[i] = cur;
+                            changes += 1;
+                            // light capture: all thread contexts on the
+                            // first 8 changes
+                            if changes <= 8 {
+                                let Ok(snap_h) = (unsafe {
+                                    CreateToolhelp32Snapshot(
+                                        TH32CS_SNAPTHREAD, 0)
+                                }) else {
+                                    continue;
+                                };
+                                let pid = unsafe {
+                                    windows::Win32::System::Threading::GetProcessId(hp)
+                                };
+                                let mut te = THREADENTRY32::default();
+                                te.dwSize =
+                                    std::mem::size_of::<THREADENTRY32>()
+                                        as u32;
+                                let mut tids: Vec<u32> = Vec::new();
+                                if unsafe {
+                                    Thread32First(snap_h, &mut te)
+                                }
+                                .is_ok()
+                                {
+                                    loop {
+                                        if te.th32OwnerProcessID == pid {
+                                            tids.push(te.th32ThreadID);
+                                        }
+                                        if unsafe {
+                                            Thread32Next(snap_h, &mut te)
+                                        }
+                                        .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                }
+                                unsafe {
+                                    let _ = CloseHandle(snap_h);
+                                }
+                                for tid in &tids {
+                                    let Ok(h) = (unsafe {
+                                        OpenThread(
+                                            THREAD_ACCESS_RIGHTS(0x1F03FF),
+                                            false, *tid)
+                                    }) else {
+                                        continue;
+                                    };
+                                    unsafe {
+                                        let _ = SuspendThread(h);
+                                    }
+                                    let mut ctx = CONTEXT::default();
+                                    ctx.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_FLAGS(0x0001_0003);
+                                    let mut okc = false;
+                                    for _ in 0..3 {
+                                        if unsafe {
+                                            GetThreadContext(h, &mut ctx)
+                                        }
+                                        .is_ok()
+                                        {
+                                            okc = true;
+                                            break;
+                                        }
+                                        unsafe {
+                                            let _ = windows::Win32::System::Threading::SwitchToThread();
+                                        }
+                                    }
+                                    unsafe {
+                                        let _ = ResumeThread(h);
+                                    }
+                                    unsafe {
+                                        let _ = CloseHandle(h);
+                                    }
+                                    if okc {
+                                        log.extend_from_slice(&(*tid)
+                                            .to_le_bytes());
+                                        for v in [
+                                            ctx.Eip, ctx.Eax, ctx.Ecx,
+                                            ctx.Edx, ctx.Ebx, ctx.Esp,
+                                            ctx.Ebp, ctx.Esi, ctx.Edi,
+                                        ] {
+                                            log.extend_from_slice(
+                                                &v.to_le_bytes(),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // flush the change log
+                let stem = outvw.with_extension("verdictwatch");
+                if let Some(name) = stem.file_name() {
+                    let mut nm = name.to_os_string();
+                    nm.push(".bin");
+                    let _ = std::fs::write(stem.with_file_name(nm), &log);
+                }
+                info!(
+                    changes,
+                    "VERDICTWATCH: window closed"
+                );
             });
         }
         // 补充 132y12: GATEPATCH — the machine-binding gate's verdict.
@@ -8100,6 +8816,10 @@ pub(super) fn spawn_dialog_killer(
                                 for env_name in [
                                     "MAGICMIDA_V2_KEYPATCH",
                                     "MAGICMIDA_V2_KEYBUF",
+                                    // 132y26: buffer-relative WITHOUT the
+                                    // 2500 ms window — the deployment-era
+                                    // reads must also see the search keys
+                                    "MAGICMIDA_V2_KEYBUF2",
                                 ] {
                                     if let Ok(kv) = std::env::var(env_name) {
                                         for spec in kv.split(',') {
@@ -8132,11 +8852,25 @@ pub(super) fn spawn_dialog_killer(
                                                 // below); flag them by
                                                 // storing the raw offset
                                                 // and a marker bit.
-                                                let is_buf =
-                                                    env_name.ends_with("KEYBUF");
+                                                let is_buf = env_name
+                                                    .ends_with("KEYBUF");
+                                                // KEYBUF2 = buffer-rel +
+                                                // no-window (0x40000000)
+                                                let nowin = env_name
+                                                    .ends_with("KEYBUF2");
+                                                let flag = if is_buf {
+                                                    0x8000_0000
+                                                        | if nowin {
+                                                            0x4000_0000
+                                                        } else {
+                                                            0
+                                                        }
+                                                } else {
+                                                    0
+                                                };
                                                 v.push((
                                                     if is_buf {
-                                                        ka | 0x8000_0000
+                                                        ka | flag
                                                     } else {
                                                         ka
                                                     },
@@ -8164,6 +8898,7 @@ pub(super) fn spawn_dialog_killer(
                                 // this — the DECODEWATCH locates the
                                 // buffer reliably at ~184 ms.)
                                 if ka & 0x8000_0000 != 0
+                                    && ka & 0x4000_0000 == 0
                                     && watch_t0.elapsed().as_millis()
                                         > 2500
                                 {
@@ -8172,10 +8907,10 @@ pub(super) fn spawn_dialog_killer(
                                 let is_buf = *ka & 0x8000_0000 != 0;
                                 let target = if is_buf {
                                     // buffer-relative: ba + (addr without
-                                    // the marker bit)
+                                    // the marker bits)
                                     match buf_addr {
                                         Some(ba) => {
-                                            ba + (*ka & 0x7FFF_FFFF)
+                                            ba + (*ka & 0x0FFF_FFFF)
                                         }
                                         None => continue,
                                     }
