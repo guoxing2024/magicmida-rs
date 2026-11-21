@@ -9093,9 +9093,14 @@ pub(super) fn spawn_dialog_killer(
                                             // measured) and the verdict =
                                             // [340,360] ms — the hybrid
                                             // lands in the [310,340] gap
-                                            if t0_sr.elapsed().as_millis()
-                                                < 310
-                                            {
+                                            // 132y35: the sweep = [310,330]
+                                            // (the hybrid caught 2/2 there)
+                                            // and the verdict = [340,360] —
+                                            // write the hybrid ONLY inside
+                                            // the [333,360) verdict window
+                                            let tn = t0_sr.elapsed()
+                                                .as_millis();
+                                            if tn < 333 || tn > 360 {
                                                 continue;
                                             }
                                             let mut cur = vec![0u8; 480];

@@ -6479,3 +6479,21 @@ seq1-6.log（137MB walk）、dismiss_once.py（WM_CLOSE/
   合法 license（哈希匹配 = 检查自然通过）。
 - 工件：patch_132y28-32.py、probe_msg2（含 struct 扫描/buffer dump）、
   msg*-out.txt 系列、sr_block_old.txt。
+
+**续 22 补充 132y35（2026-11-21，会话终点）——verdict = struct 哈希校验
+实锤，PASS 唯一路径 = f（字段摘要）**：
+
+- hybrid@333ms → exit 2 @~350 = **verdict 本身**（不是额外扫描）。
+  全时间线矩阵闭合：pristine = 哈希匹配 → 机器绑定检查 → mismatch =
+  停泊（CALC 对话框报 "corrupted"）；修改 = 哈希失配 → **立即 exit 2**。
+  停泊与 exit-2 = 同一 verdict 的两种结局（pristine vs 修改）。
+- **PASS 的唯一路径 = struct 内 fd dwords（字段摘要）用 f 重算**——
+  正是补充 25 的 168-handler 恢复终点。哈希无运行时绕过（fd 在 struct
+  内、检查读 struct）。STRUCTRESTORE v6 机器全保留（扫描/捕获/hybrid
+  写入 = f 就绪后立即可用的注入通道）。
+- 会话沉淀（8720296 + 本节）：停泊态全解码（dispatcher=MessageBoxExA
+  模态循环+CS 死锁、16 worker=Event 等待、verdict=struct 哈希）、
+  十件机器（VALLOC2/FLAGSKIP/STACKFIX/REPLAYSWALLOW/MSGSKIP/
+  STRUCTRESTORE/KEYBUF2 + 既有六件）、时间线矩阵、FF×8×3 扫描定位。
+  下会话 = f 全恢复（handler 缝合 168）→ fd 重算 → hybrid(合法) →
+  verdict=PASS → launch → OEP。
