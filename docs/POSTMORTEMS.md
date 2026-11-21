@@ -6221,7 +6221,33 @@ probe_deploy.py、probe5-8_out.txt。
 - 工件：seq1-6.log（137MB walk）、dismiss_once.py（WM_CLOSE/
   BM_CLICK 快速版）、pollws1-3.log。**续 22 补充 132y（2026-11-20）——节点键源确认 + fp 二进制源不在常规区**：
 
-- **节点键源确认**：U40 markers [0x25,0x1C2) → STRICT 扫描 = 0 命中 =
+seq1-6.log（137MB walk）、dismiss_once.py（WM_CLOSE/
+  BM_CLICK 快速版）、pollws1-3.log。
+
+**续 22 补充 132y20b（2026-11-21）——needle「可见性危机」= 测试假阴性 +
+ KEYBUF 窗口化（真修复）**：
+
+- **整个「needle 漏检」调查 = 测试 regex 假阴性**：clean-env 重测时
+  `buffer located t_ms=184` **一直在**——regex `buffer located t_ms=`
+  撞上 ANSI 包裹（`[3mt_ms[0m=`）恒失配。DECODEWATCH 的 buffer 定位 =
+  每 run 可靠（182-184ms，buf=0xbc0000/0xdd0000）。教训：日志解析
+  先剥 ANSI（grep 对 ANSI 包裹字段静默失配）。
+- **真修复 = KEYBUF 窗口化（复用 DECODEWATCH µs 循环，弃 KEYBUF2
+  独立扫描器）**：KEYBUF 的重写块加 2500ms 窗口（`ka & 0x8000_0000
+  != 0 && t > 2500 → continue`）——era-1 + era-2 重搜在窗口内命中，
+  部署时代读到恢复的真字节。DECODEWATCH 定位 buffer ~184ms 可靠 =
+  独立扫描器（KEYBUF2）整体多余。
+- **B 版对照链**：abwt worktree（cc34944）+ .cargo/config.toml 拷贝
+  （忘拷 = i686 linker 找不到 w64devkit）→ cc34944+U13 env = 3/3
+  located。旧测试（pollws/seq/needlevis1-4）全被两个假阴性污染：
+  ①regex ANSI ②shell 导出泄漏（source run_env.sh 后全部后续
+  python 继承全量 MAGICMIDA_V2_* env）。
+- **launch 门 walk 结果**：部署态（138MB）CALC 对话框序列关完 → 壳
+  仍 137-138MB 停泊（78s+）、payload 从未物化（image 扫描全 = 系统
+  DLL）。定案：launch 门 = 壳内部 verdict 状态机等待（非对话框）。
+  V2 CreateThread 捕获侧照常运行，缺的是壳侧触发。
+- 工件：kw1.log（窗口化 KEYBUF 部署态 78s+ 稳定）、poll_keybuf2.py、
+  dismiss_once.py（IDOK 禁发版）。- **节点键源确认**：U40 markers [0x25,0x1C2) → STRICT 扫描 = 0 命中 =
   节点键 ≠ 该区；U33 keys = 节点 = 本机键 ✓ → **节点键源 = buffer
   [52,384)（U11 patch = 已正确覆盖节点键源 = 搜索命中 ✓）**。
 - **fp 二进制源未定位**：fp-words（1051/BCEC/14F2/0C18/3745 LE word 序列）

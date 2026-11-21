@@ -879,7 +879,6 @@ pub(super) fn spawn_dialog_killer(
         && std::env::var("MAGICMIDA_V2_CRASHPOLL").is_err()
         && std::env::var("MAGICMIDA_V2_VALLOC2").is_err()
         && std::env::var("MAGICMIDA_V2_NOPPATH2").is_err()
-        && std::env::var("MAGICMIDA_V2_KEYBUF2").is_err()
         && sp_groups.is_none()
     {
         return None;
@@ -2508,209 +2507,6 @@ pub(super) fn spawn_dialog_killer(
                     }
                 }
                 info!(applied, "NOPPATH2: window closed");
-            });
-        }
-        // 补充 132y19c: KEYBUF2 — the WINDOWED buffer patch (the fifth
-        // piece).  The buffer is read by BOTH the search (needs the
-        // machine keys in [52,480) — the U11/U13 unlock: no hit = no
-        // deployment) AND the deployment era (needs the real license
-        // bytes — a persistent patch parks the flow pre-deployment at
-        // 25-50 MB, measured).  Patch ONLY during [50,2500] ms: era-1
-        // search hits (nothing cached), era-2 re-search hits (the
-        // ~2.1 s reload rebuilds the buffer inside the window), then
-        // STOP — the deployment reads the restored real bytes.
-        if std::env::var("MAGICMIDA_V2_KEYBUF2").is_ok() {
-            let hraw_k2 = handle_raw;
-            let t0k2 = watch_t0;
-            let dat_disk2 = dat_disk.clone();
-            std::thread::spawn(move || {
-                use windows::Win32::Foundation::HANDLE;
-                use windows::Win32::System::Memory::{
-                    VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT,
-                    MEM_PRIVATE, PAGE_NOACCESS,
-                };
-                let hp = HANDLE(hraw_k2 as *mut core::ffi::c_void);
-                let needle: [u8; 16] = if dat_disk2.len() >= 16 {
-                    let mut n = [0u8; 16];
-                    n.copy_from_slice(&dat_disk2[..16]);
-                    n
-                } else {
-                    [0u8; 16]
-                };
-                if needle == [0u8; 16] {
-                    info!("KEYBUF2: no .dat needle — off");
-                    return;
-                }
-                // the machine keys over [52,480): 41 keys × 8 B = 328 B
-                // covers [52,380); pad the rest with the keys pattern to
-                // 480 — the U13-era [52,480) shape.
-                let keys = [
-                    0xE6u8, 0x0D, 0xC8, 0x7D, 0xC8, 0x69, 0x28, 0x02,
-                ];
-                let mut payload = vec![0u8; 480 - 52];
-                for (i, b) in payload.iter_mut().enumerate() {
-                    *b = keys[i % 8];
-                }
-                let mut cands: Vec<usize> = Vec::new();
-                let mut rescan_at = 0u128;
-                let mut patched = 0usize;
-                // 132y19c: the raw .dat copy lives only [150,400] ms
-                // (read-then-erase) and the needle sits at an arbitrary
-                // offset — the sweep must be FAST (4-byte memcmp prefix,
-                // full 16 B verify) and START at 40 ms.
-                let pat4: [u8; 4] = [needle[0], needle[1], needle[2],
-                    needle[3]];
-                while t0k2.elapsed().as_millis() < 40 {
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                }
-                while t0k2.elapsed().as_millis() <= 2500 {
-                    let t_ms = t0k2.elapsed().as_millis();
-                    if t_ms >= rescan_at {
-                        // 132y19c: the raw-copy window is [150,300] ms —
-                        // the rescan interval must be far denser early.
-                        rescan_at = t_ms + if t_ms < 700 { 40 } else { 200 };
-                        cands.clear();
-                        // 132y19c: the raw .dat copy lives [150,300] ms
-                        // ONLY (read-then-erase; the U13-era DECODEWATCH
-                        // caught it at t=174) and sits in the low heap
-                        // (0xC70000-0xD10000 measured) — the FIRST sweep
-                        // covers just [0x100000,0x2000000) so it lands
-                        // inside the window; later sweeps = full space.
-                        let (scan_lo0, scan_hi) = if t_ms > 700 {
-                            (0x100000usize, 0x7FFE0000usize)
-                        } else {
-                            (0x100000usize, 0x2000000usize)
-                        };
-                        let mut addr_lo = scan_lo0;
-                        while addr_lo < scan_hi {
-                            let mut mbi =
-                                MEMORY_BASIC_INFORMATION::default();
-                            let q = unsafe {
-                                VirtualQueryEx(
-                                    hp,
-                                    Some(addr_lo as *const core::ffi::c_void),
-                                    &mut mbi,
-                                    std::mem::size_of::<
-                                        MEMORY_BASIC_INFORMATION,
-                                    >(),
-                                )
-                            };
-                            if q == 0 {
-                                break;
-                            }
-                            let base = mbi.BaseAddress as usize;
-                            let size = mbi.RegionSize as usize;
-                            let okr = mbi.State == MEM_COMMIT
-                                && mbi.Type == MEM_PRIVATE
-                                && mbi.Protect != PAGE_NOACCESS
-                                && mbi.Protect.0 != 0;
-                            if okr && size >= 480 {
-                                let mut nsc = 0usize;
-                                while nsc < size {
-                                    let take = 0x100000.min(size - nsc);
-                                    let mut buf = vec![0u8; take];
-                                    let mut n2 = 0;
-                                    unsafe {
-                                        let _ = ReadProcessMemory(
-                                            hp,
-                                            (base + nsc)
-                                                as *const core::ffi::c_void,
-                                            buf.as_mut_ptr()
-                                                as *mut core::ffi::c_void,
-                                            take,
-                                            Some(&mut n2),
-                                        );
-                                    }
-                                    if n2 >= 16 {
-                                        // 132y19c: 4-byte memcmp prefix
-                                        // then the full 16 B verify —
-                                        // the byte-loop was too slow and
-                                        // missed the [150,400] ms window.
-                                        let mut k = 0usize;
-                                        while k + 16 <= n2 {
-                                            match buf[k..n2]
-                                                .windows(4)
-                                                .position(|w| w == pat4)
-                                            {
-                                                Some(p) => {
-                                                    let q = k + p;
-                                                    if q + 16 <= n2
-                                                        && buf[q..q + 16]
-                                                            == needle
-                                                    {
-                                                        cands.push(
-                                                            base + nsc + q,
-                                                        );
-                                                    }
-                                                    k = q + 4;
-                                                }
-                                                None => break,
-                                            }
-                                        }
-                                    }
-                                    nsc += take;
-                                }
-                            }
-                            addr_lo = base.saturating_add(size.max(0x1000));
-                        }
-                        if !cands.is_empty() && patched == 0 {
-                            info!(
-                                t_ms = (t_ms as u32),
-                                bufs = cands.len(),
-                                "KEYBUF2: buffer candidates located"
-                            );
-                        }
-                    }
-                    // rewrite cadence: the candidates inside the window
-                    for ba in &cands {
-                        let target = ba + 52;
-                        let mut cur = vec![0u8; payload.len()];
-                        let mut n3 = 0;
-                        let ok_c = unsafe {
-                            ReadProcessMemory(
-                                hp,
-                                target as *const core::ffi::c_void,
-                                cur.as_mut_ptr() as *mut core::ffi::c_void,
-                                payload.len(),
-                                Some(&mut n3),
-                            )
-                            .is_ok()
-                                && n3 == payload.len()
-                        };
-                        if !ok_c || cur == payload {
-                            continue;
-                        }
-                        let mut w = 0;
-                        let ok_w = unsafe {
-                            WriteProcessMemory(
-                                hp,
-                                target as *const core::ffi::c_void,
-                                payload.as_ptr() as *const core::ffi::c_void,
-                                payload.len(),
-                                Some(&mut w),
-                            )
-                            .is_ok()
-                        };
-                        if ok_w {
-                            patched += 1;
-                            if patched <= 6 || patched % 100 == 0 {
-                                info!(
-                                    t_ms = (t0k2.elapsed().as_millis()
-                                        as u32),
-                                    buf = format!("{ba:#x}"),
-                                    patched,
-                                    "KEYBUF2: windowed buffer patch applied"
-                                );
-                            }
-                        }
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                info!(
-                    patched,
-                    bufs = cands.len(),
-                    "KEYBUF2: window closed — buffer restored to real bytes"
-                );
             });
         }
         // 补充 132y12: GATEPATCH — the machine-binding gate's verdict.
@@ -8353,6 +8149,26 @@ pub(super) fn spawn_dialog_killer(
                                 v
                             });
                             for (ka, kb) in kp_list.iter() {
+                                // 132y20: the KEYBUF window — the buffer
+                                // is read by BOTH the search (needs the
+                                // machine keys, the U11/U13 unlock) AND
+                                // the deployment era (needs the real
+                                // license bytes — the persistent patch
+                                // parks the flow pre-deployment at 25-50
+                                // MB, measured).  Stop the buffer-key
+                                // rewrites at 2500 ms: era-1 and the
+                                // era-2 re-search both hit inside the
+                                // window; the deployment reads the
+                                // restored real bytes.  (KEYBUF2, the
+                                // standalone scanner, is superseded by
+                                // this — the DECODEWATCH locates the
+                                // buffer reliably at ~184 ms.)
+                                if ka & 0x8000_0000 != 0
+                                    && watch_t0.elapsed().as_millis()
+                                        > 2500
+                                {
+                                    continue;
+                                }
                                 let is_buf = *ka & 0x8000_0000 != 0;
                                 let target = if is_buf {
                                     // buffer-relative: ba + (addr without
