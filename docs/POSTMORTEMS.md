@@ -6447,3 +6447,35 @@ seq1-6.log（137MB walk）、dismiss_once.py（WM_CLOSE/
 - 工件：probe_park/probe_dlg/probe_wait/probe_msg/probe_msg2/probe_wake/
   probe_owner/probe_iocp/probe_timeline.py（OUT/ps1/）+ waitcode_*.bin +
   park_stk_*.bin + msg/wake/owner/tl.log。
+
+**续 22 补充 132y28-34（2026-11-21）——verdict 输入定位 + STRUCTRESTORE
+全链打通 + 结构防篡改检查 = 新 blocker**：
+
+- **停泊态 buffer 内容实测**：located 页 = [0,0x50) 全零 + [0x50+) 我们
+  的 blob（壳多周期解码**清空头部**、blob = 最后写入）→ verdict 读到
+  毁掉的结构 = "corrupted" ✓（verdict 输入 = located 页本身）。
+- **located 页身份翻转**：needle 命中 = dat 尾 verbatim @struct+0x17D →
+  located = **struct 页本身**；ba+0x10000 = **镜像基址**（MZ 实测，一次
+  方向性错判）。struct 布局 **per-boot 随机**（132y85 的 ba+0x10000 →
+  本轮 ba+0x100 → 0xAD818——固定偏移全灭）。
+- **FF×8×3 内存扫描定位**（probe 的 VirtualQueryEx walk → 3 段 FF×8
+  富集 480B 窗）= struct 唯一可靠定位法。捕获实测：struct 页 184ms =
+  密文态（FF×8 缺）→ 解码输出后 FF×8 ✓。
+- **µs 循环提前 break 实锤**（per-boot：本轮 1 次读取即 break）→
+  捕获/恢复都必须独立线程（132y30 v4）+ SR_ON 门必须在 buf_addr=Some
+  之内（早迭代消耗门 = 不 spawn，一次踩坑）。
+- **KEYBUF blob = verdict 毁灭者定案**：blob = [0x52,0x21A) 424B 重复键
+  → 结构毁。最小 8B / [0,52) 结构头注入均 0/部署 = **搜索是变换定位**
+  （命中位 buffer+0x52 固定）+ 3 搜索各自命中位。
+- **STRUCTRESTORE v6 全链打通**：FF×8×3 扫描 → pristine 捕获（186ms
+  sv=0xAD818）→ **hybrid 写入（pristine + 本机键@0x52）** → 部署到达。
+- **时间线矩阵（防篡改检查）**：hybrid@201ms → exit 2 @210；hybrid@312ms
+  → exit 2 @330；blob 自 178ms 连续写 → 50% 部署存活。**判定 = 结构
+  防篡改检查周期性扫描**：blob 因「连续写 + 壳重解码竞速」检查多读到
+  pristine 而 50% 存活；hybrid 单发即被抓。检查自身 = 下一个 disassembly
+  目标（exit-2 路径 = 哈希比较点）。
+- **下一增量**：①检查点定位（exit-2 调用链反汇编/哨兵写追踪）②检查
+  窗口与 hybrid 写的竞速强化（µs 连写 = blob 同款）③f 全恢复后造
+  合法 license（哈希匹配 = 检查自然通过）。
+- 工件：patch_132y28-32.py、probe_msg2（含 struct 扫描/buffer dump）、
+  msg*-out.txt 系列、sr_block_old.txt。

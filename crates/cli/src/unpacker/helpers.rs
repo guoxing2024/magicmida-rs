@@ -7437,6 +7437,15 @@ pub(super) fn spawn_dialog_killer(
                 #[cfg(target_arch = "x86")]
                 static VB_OLD: std::sync::atomic::AtomicU32 =
                     std::sync::atomic::AtomicU32::new(0);
+                // 补充 132y31: STRUCTRESTORE pristine halves (hoisted so
+                // the KEYBUF capture block and the restore thread share
+                // them)
+                #[cfg(target_arch = "x86")]
+                static SR_TAIL: std::sync::OnceLock<Vec<u8>> =
+                    std::sync::OnceLock::new();
+                #[cfg(target_arch = "x86")]
+                static SR_HEAD: std::sync::OnceLock<Vec<u8>> =
+                    std::sync::OnceLock::new();
                 #[cfg(target_arch = "x86")]
                 static VB_RESTORED: std::sync::atomic::AtomicUsize =
                     std::sync::atomic::AtomicUsize::new(0);
@@ -8882,6 +8891,265 @@ pub(super) fn spawn_dialog_killer(
                                 }
                                 v
                             });
+                            // 补充 132y30: STRUCTRESTORE — the hybrid
+                            // license, fully independent of the µs
+                            // loop (which breaks early per-boot; the
+                            // decode-output page commit lands after).
+                            // The located buffer = THE STRUCT (the
+                            // needle = the dat tail verbatim at
+                            // struct+0x17D).  The verdict reads the
+                            // struct; our KEYBUF blob = the last write
+                            // = a destroyed struct = "license
+                            // corrupted".  The spawned thread:
+                            //   capture [180,600] ms: poll until the
+                            //     FFx8 known-plaintext marker (the
+                            //     decode output),
+                            //   restore [500,30000] ms: re-write the
+                            //     hybrid (the pristine + the machine
+                            //     keys at the search-hit offset).
+                            #[cfg(target_arch = "x86")]
+                            {
+                                static SR_ON: std::sync::atomic::AtomicU32 =
+                                    std::sync::atomic::AtomicU32::new(0);
+                                if SR_ON.swap(
+                                    1,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                ) == 0
+                                {
+                                    let hraw_sr = h_process.0 as usize;
+                                    let t0_sr = watch_t0;
+                                    std::thread::spawn(move || {
+                                        use windows::Win32::Foundation::HANDLE;
+                                        use windows::Win32::System::Memory::{
+                                            MEM_COMMIT, MEM_PRIVATE,
+                                            PAGE_PROTECTION_FLAGS,
+                                            VirtualQueryEx,
+                                            MEMORY_BASIC_INFORMATION,
+                                        };
+                                        let hp2 = HANDLE(hraw_sr
+                                            as *mut core::ffi::c_void);
+                                        static PRISTINE:
+                                            std::sync::OnceLock<(usize, Vec<u8>)> =
+                                            std::sync::OnceLock::new();
+                                        // ---- the scan [180,600] ms ------
+                                        // the license struct = the 480B
+                                        // window with 3 distinct FFx8 runs
+                                        // (the known-plaintext paddings)
+                                        while t0_sr.elapsed().as_millis()
+                                            <= 600
+                                        {
+                                            std::thread::sleep(
+                                                std::time::Duration::from_millis(10),
+                                            );
+                                            let mut addr_q: usize = 0x10000;
+                                            let mut done = false;
+                                            while addr_q < 0x7FFF0000 {
+                                                let mut mbi =
+                                                    MEMORY_BASIC_INFORMATION::default();
+                                                let ok_q = unsafe {
+                                                    VirtualQueryEx(
+                                                        hp2,
+                                                        Some(addr_q
+                                                            as *const core::ffi::c_void),
+                                                        &mut mbi,
+                                                        std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                                                    )
+                                                };
+                                                if ok_q == 0 {
+                                                    break;
+                                                }
+                                                let base =
+                                                    mbi.BaseAddress as usize;
+                                                let size =
+                                                    mbi.RegionSize as usize;
+                                                if base == 0 && size == 0 {
+                                                    break;
+                                                }
+                                                let committed = mbi.State
+                                                    == MEM_COMMIT;
+                                                let private = mbi.Type
+                                                    == MEM_PRIVATE;
+                                                let readable = mbi.Protect
+                                                    != PAGE_PROTECTION_FLAGS(0x01)
+                                                    && mbi.Protect.0 != 0;
+                                                if committed
+                                                    && private
+                                                    && readable
+                                                    && size >= 480
+                                                    && size <= 0x400000
+                                                {
+                                                    let mut d = vec![0u8; size];
+                                                    let mut n = 0;
+                                                    let ok_r = unsafe {
+                                                        ReadProcessMemory(
+                                                            hp2,
+                                                            base as *const core::ffi::c_void,
+                                                            d.as_mut_ptr()
+                                                                as *mut core::ffi::c_void,
+                                                            size,
+                                                            Some(&mut n),
+                                                        )
+                                                        .is_ok()
+                                                    };
+                                                    if ok_r {
+                                                        let mut nff = 0usize;
+                                                        let mut first =
+                                                            0usize;
+                                                        let mut k = 0usize;
+                                                        while k + 8
+                                                            <= d.len()
+                                                        {
+                                                            if d[k] == 0xFF
+                                                                && d[k + 1]
+                                                                    == 0xFF
+                                                                && d[k + 2]
+                                                                    == 0xFF
+                                                                && d[k + 3]
+                                                                    == 0xFF
+                                                                && d[k + 4]
+                                                                    == 0xFF
+                                                                && d[k + 5]
+                                                                    == 0xFF
+                                                                && d[k + 6]
+                                                                    == 0xFF
+                                                                && d[k + 7]
+                                                                    == 0xFF
+                                                            {
+                                                                if nff == 0 {
+                                                                    first = k;
+                                                                }
+                                                                nff += 1;
+                                                                k += 8;
+                                                                if nff >= 3 {
+                                                                    break;
+                                                                }
+                                                                continue;
+                                                            }
+                                                            k += 1;
+                                                        }
+                                                        if nff >= 3
+                                                            && first + 480
+                                                                <= d.len()
+                                                        {
+                                                            let sv =
+                                                                base + first;
+                                                            let pv = d[first
+                                                                ..first + 480]
+                                                                .to_vec();
+                                                            let _ =
+                                                                PRISTINE.set((
+                                                                    sv, pv,
+                                                                ));
+                                                            info!(
+                                                                t_ms = (t0_sr
+                                                                    .elapsed()
+                                                                    .as_millis()
+                                                                    as u32),
+                                                                sv = format!("{sv:#x}"),
+                                                                "STRUCTRESTORE: pristine captured"
+                                                            );
+                                                            done = true;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                addr_q = if size > 0 {
+                                                    base + size
+                                                } else {
+                                                    addr_q + 0x1000
+                                                };
+                                            }
+                                            if done {
+                                                break;
+                                            }
+                                        }
+                                        // ---- restore [500,30000] ms -----
+                                        let (sv, pv2) = match PRISTINE.get() {
+                                            Some(v) => (v.0, v.1.clone()),
+                                            None => {
+                                                info!("STRUCTRESTORE: no pristine — restore skipped");
+                                                return;
+                                            }
+                                        };
+                                        let mut hybrid = pv2.clone();
+                                        if let Ok(kv) = std::env::var("MAGICMIDA_V2_KEYBUF2") {
+                                            let mut it = kv.splitn(2, '-');
+                                            let ka = usize::from_str_radix(it.next().unwrap_or("0").trim_start_matches("0x"), 16).unwrap_or(0);
+                                            let kb: Vec<u8> = it.next().unwrap_or("").as_bytes().chunks(2).filter_map(|h| u8::from_str_radix(std::str::from_utf8(h).unwrap_or("zz"), 16).ok()).collect();
+                                            if ka + kb.len() <= 480 {
+                                                hybrid[ka..ka + kb.len()].copy_from_slice(&kb);
+                                            }
+                                        }
+                                        let mut nwrites = 0u32;
+                                        while t0_sr.elapsed().as_millis()
+                                            <= 30000
+                                        {
+                                            std::thread::sleep(
+                                                std::time::Duration::from_millis(3),
+                                            );
+                                            // 132y34: the early tamper
+                                            // check = ~[210,300] ms (the
+                                            // hybrid at 201 = exit 2
+                                            // measured) and the verdict =
+                                            // [340,360] ms — the hybrid
+                                            // lands in the [310,340] gap
+                                            if t0_sr.elapsed().as_millis()
+                                                < 310
+                                            {
+                                                continue;
+                                            }
+                                            let mut cur = vec![0u8; 480];
+                                            let mut n = 0;
+                                            let ok_c = unsafe {
+                                                ReadProcessMemory(
+                                                    hp2,
+                                                    sv as *const core::ffi::c_void,
+                                                    cur.as_mut_ptr()
+                                                        as *mut core::ffi::c_void,
+                                                    480,
+                                                    Some(&mut n),
+                                                )
+                                                .is_ok()
+                                                    && n == 480
+                                            };
+                                            if !ok_c {
+                                                continue;
+                                            }
+                                            if cur[..] != hybrid[..] {
+                                                let mut w = 0;
+                                                let ok_w = unsafe {
+                                                    WriteProcessMemory(
+                                                        hp2,
+                                                        sv as *const core::ffi::c_void,
+                                                        hybrid.as_ptr()
+                                                            as *const core::ffi::c_void,
+                                                        480,
+                                                        Some(&mut w),
+                                                    )
+                                                    .is_ok()
+                                                };
+                                                if ok_w {
+                                                    nwrites += 1;
+                                                    if nwrites <= 3
+                                                        || nwrites % 100 == 0
+                                                    {
+                                                        info!(
+                                                            t_ms = (t0_sr
+                                                                .elapsed()
+                                                                .as_millis()
+                                                                as u32),
+                                                            n = nwrites,
+                                                            "STRUCTRESTORE: hybrid license written"
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        info!(nwrites, "STRUCTRESTORE: window closed");
+                                    });
+                                }
+                            }
+
                             for (ka, kb) in kp_list.iter() {
                                 // 132y20: the KEYBUF window — the buffer
                                 // is read by BOTH the search (needs the
@@ -8897,10 +9165,17 @@ pub(super) fn spawn_dialog_killer(
                                 // standalone scanner, is superseded by
                                 // this — the DECODEWATCH locates the
                                 // buffer reliably at ~184 ms.)
+                                // 132y28: the window = tighten 2500 ->
+                                // 500 ms: the searches run at 184-400 ms;
+                                // the deployment reads at ~2 s MUST see
+                                // the shell's own re-decode (the pristine
+                                // struct) or the verdict = 'corrupted'
+                                // (measured: the verdict input = the
+                                // buffer content at deployment time).
                                 if ka & 0x8000_0000 != 0
                                     && ka & 0x4000_0000 == 0
                                     && watch_t0.elapsed().as_millis()
-                                        > 2500
+                                        > 500
                                 {
                                     continue;
                                 }
@@ -8936,6 +9211,63 @@ pub(super) fn spawn_dialog_killer(
                                     .is_ok()
                                         && n == kb.len()
                                 };
+                                // 补充 132y31: the pristine capture —
+                                // the cur = the pre-write read = the
+                                // instant between the shell's decode
+                                // write and the next blob write.  The
+                                // FFx8 marker in cur = the decode
+                                // output; store the tail (cur) + the
+                                // head [0,0x52) for STRUCTRESTORE.
+                                #[cfg(target_arch = "x86")]
+                                {
+                                    if SR_TAIL.get().is_none()
+                                        && cur.len() >= 8
+                                    {
+                                        let mut fnd = false;
+                                        for k in 0..cur.len().saturating_sub(8)
+                                        {
+                                            if cur[k] == 0xFF
+                                                && cur[k + 1] == 0xFF
+                                                && cur[k + 2] == 0xFF
+                                                && cur[k + 3] == 0xFF
+                                                && cur[k + 4] == 0xFF
+                                                && cur[k + 5] == 0xFF
+                                                && cur[k + 6] == 0xFF
+                                                && cur[k + 7] == 0xFF
+                                            {
+                                                fnd = true;
+                                                break;
+                                            }
+                                        }
+                                        if fnd {
+                                            let _ = SR_TAIL.set(cur.clone());
+                                            // the head = never blobbed
+                                            let mut hv = vec![0u8; 0x52];
+                                            let mut hn = 0;
+                                            let ok_h = unsafe {
+                                                ReadProcessMemory(
+                                                    h_process,
+                                                    ba as *const core::ffi::c_void,
+                                                    hv.as_mut_ptr()
+                                                        as *mut core::ffi::c_void,
+                                                    0x52,
+                                                    Some(&mut hn),
+                                                )
+                                                .is_ok()
+                                                    && hn == 0x52
+                                            };
+                                            if ok_h {
+                                                let _ = SR_HEAD.set(hv);
+                                            }
+                                            info!(
+                                                t_ms = (watch_t0.elapsed()
+                                                    .as_millis()
+                                                    as u32),
+                                                "STRUCTRESTORE: pristine captured (KEYBUF cur)"
+                                            );
+                                        }
+                                    }
+                                }
                                 if ok_c && cur[..] != kb[..] {
                                     let _ = unsafe {
                                         WriteProcessMemory(
