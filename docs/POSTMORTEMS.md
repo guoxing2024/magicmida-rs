@@ -6497,3 +6497,71 @@ seq1-6.log（137MB walk）、dismiss_once.py（WM_CLOSE/
   STRUCTRESTORE/KEYBUF2 + 既有六件）、时间线矩阵、FF×8×3 扫描定位。
   下会话 = f 全恢复（handler 缝合 168）→ fd 重算 → hybrid(合法) →
   verdict=PASS → launch → OEP。
+
+**续 22 补充 132y36-37（2026-11-21/22）——verdict 输入全解 + 七件新机器 +
+forge 方程闭合：search 与 decode 共用 buffer = 冲突，唯一 forge = decode 逆**：
+
+- **FF×8×3 连续扫描 = 堆假阳性实锤**：STRUCTRESTORE v6 的 Rust 扫描
+  （24 连续 FF）命中的 0xAD818 = 堆对象非许可 struct（「pristine captured
+  sv=0xAD818」全错页！hybrid 写错页 = 前两轮时间线矩阵全部作废）。
+  真 locator = **dat 尾 16B needle**（struct+0x17D 携带 verbatim），
+  但 needle 也命中 buffer（dat 尾在 ba+0x180 verbatim）→ 双重判据 =
+  needle 命中 + 480B 窗含 FF×8（解码态 struct 独有）。
+- **struct 全布局实锤**（verdict 时刻 480B，tail needle 定位）：
+  头 [0x00,0x3A) 滚动态；字段 [0x3A,0xA9)：FF×8@0x3A + "(CISC-1)
+  Examples\0"+FF×8 + "LCF-AT\0"+FF×8 + "KuNgBiM/[CCG]\0"+FF×8 +
+  serial@0x80（39B）+\0\0；标志/摘要区 [0xA9,0xD6)：fd ff ff ff×2、
+  f1b0a98318、8b96d3dd、**counter@0xC4 = 0x07D9 = 2009**（= 执行计数
+  > 2000 = 132y2 的 corrupted 判决数！per-boot 恒定）；二进制区
+  [0xD6,0x17D)；dat 尾 verbatim [0x17D,0x21D)。struct = ba+0x10000。
+- **BUFFERDUMP（buffer 版本时间线 [170,345]ms，300µs 轮询 FNV 去重）**
+  六相定案：[175,191] .dat 逐字节拷入（ReadFile）→ [204,215] 全零擦除
+  → [215,228] 检查流写入（头滚动 7abc9f7a→6755753f→b4df6d12 = check
+  op 的 scratch，= .dat 完整性校验，buffer 补丁此窗内 = corrupted）→
+  [228,293] 静止 → **[293] 擦除 + [294,336] decode era（buffer = 解码
+  输入！）** → [336] 输出原子落盘（480B 重加密态）→ verdict [340,360]
+  读 buffer。**KEYBUF 旧 µs 循环 per-boot 提前 break = blob 从未写入
+  （keymatch 0-3/424 噪声）→ U11 时代结论全部失效于当前仪器。**
+- **CORPUSDUMP（0x10DC000 语料 [240,345]）**：语料 @240 已填满且
+  A/B（有无 blob）逐字节相同 = **语料 = 机器键参考表（本机派生、
+  per-boot 常量），不来自 buffer**。搜索 = 语料（参考）vs buffer
+  （被扫）——命中位 = buffer+0x52 = **搜索在 buffer 里找本机键**。
+- **KEYBUF3（独立 blob 线程，修复仪器）**：dat 头 needle 自定位 ba +
+  连续重写 [230,335]。实测：blob @230/296 两次写入即稳定（nwr=2 =
+  写后 buffer == payload）。**blob 存在 → 流程越过搜索失败直达装配
+  [305,310]（pristine run 的装配从未发生 = 搜索 miss 即中止！）**
+  = 搜索命中实锤 ✓。
+- **blob 的解码级联损伤图（决定性）**：blob run 的 struct vs pristine
+  struct = **仅 [0x8e,0xD6) 72B 被毁**（serial 尾 + fd/标志区），
+  字段 [0x41,0x8e) 与二进制区 [0xD6,0x17D) 解码完好 = 解码为字段块
+  结构非线性级联；.dat[0x52] 键区 → struct[0x8e,0xD6) = **键字段的
+  解码像 = 搜索的扫描目标**（"命中位 0x52" = transform-locating 实锤）。
+- **FAILSTATE（verdict 时刻 343ms 状态快照）**：struct = pristine ✓
+  （STRUCTFIX 赢得竞速时）；buffer @343 = **blob 残留全量**（KEYBUF3
+  停写 ≠ 移除！）→ verdict 读 buffer = "corrupted" 实锤。修复 =
+  KEYBUF3 @336 恢复 pristine .dat → exit 44（verdict 重跑搜索 =
+  键没了）；恢复 hybrid（.dat + 键@0x52 8B）→ exit 44（解码级联毁
+  struct[0x8e,0xD6)，STRUCTFIX 竞速 5 写仍 50/50）。
+- **alive-park 态突破**：blob [230,335] + GATEPATCH（4 门 NOP）+
+  CTR-HOLD → **流程永不 fail-exit，部署 142MB 稳定停泊 + CALC 对话框
+  （"Your license key is corrupted." + fp）**——failure dispatch 被
+  NOP 但 verdict 状态 = fail → launch 门持续挂起（132y20 同型）。
+  双模结果（alive-park ~40% / exit-44 ~60%）= STRUCTFIX vs 壳重解码
+  的竞速。
+- **forge 方程闭合（本会话头条）**：verdict = 【搜索：本机键在
+  buffer@0x52（变换定位）】+【许可校验：buffer 解码像无级联损伤】
+  ——两者同读 buffer[0x52,0x5A)：搜索要本机键、解码级联毁键像 →
+  **互斥！唯一解 = .dat' = decode⁻¹(期望输出)**（期望输出 = pristine
+  字段 + 键像@键字段位）→ **decode 逆 = f 全恢复（168-handler 终点）
+  = 下一会话唯一任务**。回放机资产 = 新鲜 b8 #27/#28（t=295.1/295.2，
+  eip=0x1064332/0x106b5f8，edi=0x105FFAE，esi=0x114fe3d/0x1147cc3 =
+  field op 中途态）+ dw133 两态 + failfreeze + 全 era 池。
+- 仪器清单（本次新增，全部 x86-gated、零告警）：STRUCTDUMP（struct
+  页+镜像区落盘）、BUFFERDUMP（buffer+struct 双时间线）、CORPUSDUMP、
+  KEYBUF3（独立 blob 线程 + hybrid .dat 恢复）、STRUCTFIX（72B 窗
+  连续重写）、KEYPATCH3（19 镜像槽连续重写，dw170 值）、FAILSTATE
+  （verdict 时刻快照）。
+- 工件：CISC-1U.v2structdump{,.verdict}.bin、CISC-1U.v2buffer{.A,.B}.bin、
+  CISC-1U.v2structtl{.A,.B}.bin、CISC-1U.v2corpus{.A,.B}.bin、
+  CISC-1U.v2failstate.bin、probe_corpus/probe_combined/probe_pass*/probe_
+  dlgtext/probe_failstate.py、corpus_A/B.log、combined/pass/dlgt.log。
