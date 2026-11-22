@@ -6837,3 +6837,54 @@ DRBP 机器 = 需 debug-loop 手术后再战**：
   ZF 强制 ③或 blob 变换 T 逆向（esi 滑动 = T(license) vs blob，
   marked-license snatch 的 esi 窗序列 = T 的输入输出对！）。
 - 工件：drbp.log、helpers.rs DRBP（Dr1=blob 版本）。
+
+**续 22 补充 132y50+51（2026-11-22 下午）——DRBP=架构性死亡定案；检查输入
+通道=[MAC(tail)][tail 29B 受控]；VM bank 全重建；license 依赖性=派发表
+2 个 handler 换位**：
+
+- **DRBP 定案（推翻 132y49 的"200ms 存活先例"）**：续 14 已实测「V2
+  post-attach = 故意无调试端口，DR 异常无接收方、被壳 SEH 吞，零命中
+  零事件」——全 OUT 树 drhit 文件数为 0 = DR 断点从未命中过。132y49 的
+  三跑死亡 = 架构性，不存在 anti-DR 死线。DRBP 线关闭，不再投入。
+- **检查 walk 全可视化**（orig/marked/gcomp 三份 snatch，6×256B 窗）：
+  edx 逐字节推 license 39B（~0.77ms/字节，39B 一遍后 API 解析时代开始
+  ——pass-2 = esi 扫 kernelbase 导出名表 = API resolution，非第二次
+  比较）；esi 每 license 字节全 blob 扫掠（+0x34..+0x265，无早退短扫
+  ——orig license 也全 miss = blob 非朴素 accept-list）。
+- **检查输入通道定案**：field = [head 10B = 壳自算 MAC(tail)][tail
+  29B]。G 补偿实验（forge_v19，写 W^G）失败但更有信息量：tail 不变
+  则 head 逐字节重现（0xcaEZA-BBS\xed\xde 两次相同）= head 与我们的
+  写入无关 = MAC(tail) 自洽。**tail [10,39) = 29B 精确受控**；失败
+  对话框回显检查输入 = 每 run 内建验证器。
+- **oracle 三连否定**：①esi 密度（hit=短扫）②步进时长 ③walk 形状
+  （重访计数）——marked 与 gcomp（同输入！）形状不同 = 噪声主导；
+  orig 系统性更干净 ∝ patch 事件本身非内容。计数槽三区
+  [0x20180/0x20C80/0x216E0] 三变体（noclick/orig/mark）post-check
+  零 diff = 裁决纯寄存器级（与 SFAKE 结论一致）。VM 帧 ebp=
+  0xEEDC0014 = magic 非指针（补充 117 一致），RPM 不可读。
+- **VM bank 全重建**（parse_bank.py，473B @0x102850d，多数投票 98%
+  置信）：[0x102850d **原生 atoi 十进制解析器**（strlen+逐位
+  sub '0'+×10 累加，全代码可见）][0x1028580 VM key 28B][0x102859e
+  **派发表**（edi=0x102859e，`movzx eax,al; jmp [edi+eax*4]` 派发器
+  @0x102f9b0；handler = op band 静态 + VM 堆瞬态混合）][0x10285ad
+  每 run 操作数流（含字段尾指针/K 区指针/anchor）][0x10285e6 64 项
+  handler 表]。
+- **★ license 依赖性 = 派发表 2 个 handler 换位**：orig vs marked
+  bank 463B **仅 2 字节差**——@0x10285a2（opcode 1 的 handler）：
+  0x01021320(orig) ↔ 0x01021365(mark)；@0x10285b6（opcode 2）：
+  0x010dd00c ↔ 0x010dd077。**检查 program 静态，license 分支走派发表
+  换位实现**（点击前写好 = encoder 期决定）。这两个 handler = 变换 T
+  的两条路径；λ≈1 次/check 未被 walk 采样抓到（walk eips 全在
+  0x28xxx-0x3cxxx）。
+- **对话框分类学**："different machine"（MAC ok、内容不匹配）vs
+  "corrupted"（encode 期被扰——snatch [150,700] 全窗采样 run 实测
+  corrupted = 重采样破坏 field 编码）。
+- **下一 session 首务**：①抓换位 handler 代码（0x21320/0x21365/
+  0x10dd00c/0x10dd077）——LITESNATCH（去 RPM 只留 ctx，~18µs/样本，
+  λ≈2）或 BLKSTREAM 式 µs 抓取，或 during-walk POOLSNIFF 高频扫
+  0x21000-0x22000 1KB 窗（µs 级解密瞬态）②VM program 解码（操作数流
+  + 64 handler 表 = 完整算法）③license* 构造 → forge → PASS。
+- 工件：CISC-1U.v2searchsnatch.{orig,marked,gcomp,enc}.bin、vm_bank.bin、
+  chain_sewn.txt、bodies_byfreq.txt、parse_{check_walk,hitmap,steps,
+  pass2,pass2b,eipdiff,sew,chain,byfreq,bytestep,bank,shape3}.py、
+  probe_{slots,vmctx,chainband,kregion}.py、forge_v18/19/20.py。
