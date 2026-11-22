@@ -6952,3 +6952,34 @@ Rosetta 石碑；serial = 纯装饰；web 捷径全断**：
   程序 = 块本身非字节码）③代理恢复后取 tuts4you 论坛帖。
 - 工件：RISC-64U.v2lite2.bin（58k 记录）、risc64_prog.bin（稀疏）、
   probe_{risc64,rprog,rprog2,serial2,hwid}.py、rprog_*.bin。
+
+**续 22 补充 132y55（同日夜）——★ RISC-64 = 完整 Rosetta 确认：同锁同
+license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
+
+- **两段式检查定案**：启动 = 显示烤入注册（"This application has been
+  registered to (RISC-64) Examples - LCF-AT" @0.76s，无需检查）；
+  **点击后 = 第二段 = 硬件锁检查** → "different machine" @1.31s。
+  CISC-1 同流程（此前所有点击实验 = 第二段检查）。
+- **★ 同锁同 license**：RISC-64 的失败对话框回显 **与 CISC-1 逐字节
+  相同的 license "1051-BCEC-14F2-0C18-3745-254D-9F3C-2536"**——四件套
+  = 同一把钥匙同一把锁，唯一差异 = VM 密码实现复杂度（RISC 简/CISC
+  繁）= WinLicense key type 参数。**RISC-64 = CISC-1 的 Rosetta 石碑
+  （方法学级别）**。
+- **★ 双搜索操作数全部物化（RISC-64 简版独有）**：搜索 = edx（列表
+  @0xDC0000，每 run 分配）vs **esi（license 侧缓冲 @image+0xAD2F9，
+  RISC-64 镜像基址 0x1020000，三次探测同址 = 固定可重复读！）**——
+  esi 随游标同步推进（+0x35 步幅）。RISC-64 = 两相式：先物化变换结果
+  进缓冲，再搜索；CISC-1 = 边变换边比（寄存器瞬间）= 同族不同实现。
+- **license 缓冲区结构**：r64_licbuf_50.bin（1KB @0x11ACEF9）——
+  +0x400 起 = 高熵条目表，**"b3d32e" 标记重复**（= RISC 密码族条目
+  标记，对应 CISC blob 的 "ea4e"/"76f84e"）；XOR-明文测试零命中 =
+  条目级密码非整体 XOR。ebp 锚 = 0xEB5C0014（RISC-64 变体，同族
+  magic）；派发 bank @0x10281cf（对应 CISC-1 的 0x102859e）。
+- **搜索期寄存器**：730 条记录，129 组 (eax,ebx,ecx,edi,ebp)——
+  edi 恒 = 0x10281cf（bank），eax/ebx = 比较操作数流。
+- **下一 session 首务（RISC-64 Rosetta 弧）**：①license 缓冲区结构
+  解码（"b3d32e" 条目 vs 明文 license → T_RISC 推导）②edx 列表
+  （0xDC0000）与 esi 表的匹配关系 → 搜索语义 ③RISC-64 的变换 T
+  逆出 → license* → 验证 PASS（在 RISC-64 上先打通！）④方法学迁移
+  → CISC-1（同锁同 license，差异 = 密码实现）。
+- 工件：r64_licbuf_50.bin、probe_r64data.py、risc64_flow/click.log。
