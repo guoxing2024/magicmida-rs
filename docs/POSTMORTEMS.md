@@ -6919,3 +6919,36 @@ DRBP 机器 = 需 debug-loop 手术后再战**：
   序列而非时间桶）③worker 线程的 lite 窗（finder 跳过主线程）。
 - 工件：CISC-1U.v2litesnatch.{orig,marked}.bin（54k/142k 记录）、
   forge_v21/22.py、helpers.rs LITESNATCH 分支。
+
+**续 22 补充 132y54（同日晚）——.dat = 预破解记录定案；RISC 家族 =
+Rosetta 石碑；serial = 纯装饰；web 捷径全断**：
+
+- **包内发现**：WinLicense 2.0.6.5.rar = 8 文件 = **四件套**
+  (CISC-1)/(CISC-2)/(RISC-64)/(RISC-128) Examples-LCF-AT——LCF-AT 的
+  教程进阶系列（RISC-64 最简 → CISC-2 最复杂），RISC 变体 = 同机制
+  简化版 = CISC-1 VM 的 Rosetta 石碑。rar 内无文档/keygen。
+- **.dat = 预破解定案**：struct 注册记录 = "(CISC-1) Examples" +
+  "LCF-AT" + "KuNgBiM/[CCG]" + serial 105A-… = **破解者的注册**——
+  .dat 硬件锁在 KuNgBiM 的机器上，"different machine" = 我们的机器
+  fingerprint ≠ 烤入锁。
+- **serial = 纯装饰**：全地址空间扫描 = 仅烤入 serial 的 6 处 ASCII
+  拷贝（0xFD1200 区 = .dat 解码区），二进制形式（u16/u32 LE/BE）零
+  命中——机器 HWID 无字符串形态，patch serial 路线无效。
+- **web 捷径全断**：archive.org tuts4you 合集 = 只范围下载过 76 个
+  rar（论坛帖未取）；代理 10808 已死；LCF-AT 解法 = 视频教程不被
+  索引。公开解法不可达。
+- **RISC-64 实跑**：检查 = 启动自动执行（~1.5s 自退 exit 1，无需
+  点击）= 比 CISC-1 更好分析。lite2 抓到 **edx 逐字节 +1 走
+  0xDC0037-0x85** = 搜索游标逐元素扫 **0xDC0000 搜索列表**（.dat 时代
+  的 1024-dword list，每 run 分配基址浮动 + 自擦除——RPM 快照跑空，
+  needle 搜索失败因投票组装字节被自修改污染）。PC=游标非程序计数，
+  拟议的"字节码程序存储器"解读撤回。
+- **配对分析**：heavy walk 的 (license pos → blob offset) 配对仅 59
+  条，不同 license 字符 → 同一 blob offset = 游标位置非逐字符映射，
+  blob = 搜索列表（132y47 模型回归）。
+- **下一步（下一 session 首务）**：①RISC-64 全弧（自动检查流程 +
+  简化 walk + 同地址解释器块 [0x1028502,0x103dc86] 与 CISC-1 同布局
+  = 同一 shell 版本）②VM 块链指令级缝合（1458 块 = 变异线程代码，
+  程序 = 块本身非字节码）③代理恢复后取 tuts4you 论坛帖。
+- 工件：RISC-64U.v2lite2.bin（58k 记录）、risc64_prog.bin（稀疏）、
+  probe_{risc64,rprog,rprog2,serial2,hwid}.py、rprog_*.bin。
