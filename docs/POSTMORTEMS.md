@@ -6710,3 +6710,51 @@ forge 方程闭合：search 与 decode 共用 buffer = 冲突，唯一 forge = d
 - **下一步**：loop-patch（组装后持续扫描替换，抢占比较操作数）；f(机器
   键)→锁 = 剩余未知（VM op 静态分析或作者对推公式）。PASS 信号 = 点击
   后无 different-machine 且流程进部署。工具：greedy.py、forge_v8.py。
+
+**续 22 补充 132y45（2026-11-22，license 全控制轮）——license 字段 patch
+通道打通：烤入 license = 完全受控（任意 39 字符进检查与消息）；绑定 =
+license vs KeyGen(硬件 HWID)，与 .dat/blob 完全无关；机器侧值 = VM 内
+深部，五种抢拍全部扑空**：
+
+- **license 字段 patch 通道（forge_v11-14，本轮最大突破）**：license 在
+  image 字段 [0x102056D,+39) 被 **in-place 增量解码**（transient ~[216,
+  450]ms，逐字节头先）→ **瞬时明文窗口内 in-place 替换** → 壳自重编码 →
+  点击时重解码 → **检查与消息全部携带我们的 license 串**（实测
+  "7DC8-0DE6-…"/"105A-0000-…"/"AAAA-BBBB-…" 全部上屏）。字段布局 =
+  [10B per-run 头][29B 静态尾]+NUL+bb 11 ee；解码 = 1:1 字节变换；
+  编码/重编码非确定（头 per-run、尾静态）。grep "1051-BCEC" 1ms 轮询
+  patch = 唯一所需仪器（forge_v11 形状）。
+- **五连否定（全实测）**：license := K1 渲染 → FAIL；:= K1K2 → FAIL；
+  := struct 串号 "105A-0000-0000-0800-9D78-0696-567A-25F0" → FAIL；
+  struct[0x52] := 本机键 + blob + license 三方全 = 本机键 → FAIL；
+  **pristine（无 blob）+ 点击 = 同一张 "different machine"** → **绑定 =
+  license vs KeyGen(硬件 HWID)，与 .dat/blob/搜索（counter 80 vs 622）
+  完全无关**。
+- **struct = 注册记录明文**：name "(CISC-1) Examples" @+0x41、"LCF-AT"
+  @+0x5B、"KuNgBiM/[CCG]" @+0x66、串号 "105A-0000-0000-0800-9D78-0696-
+  567A-25F0" @+0x81；串号 = 静态（无 blob/author blob/本机 blob 三跑
+  恒等）= .dat 派生，非 KeyGen。
+- **机器键实测**：K1 = 0x7DC80DE6 @0x10216F9、K2 = 0x022869C8
+  @0x1022D81（点击前稳定）；**K3 = 逐 run** @0x1023401（0xDDFAC122 /
+  0xE950C2F3 / 0x1E695A85 三跑三值）+ 常数 0x75D9BA30 @+4。
+- **比较操作数 = VM 深部，五种抢拍全扑空**：SEARCHSNATCH 30k 快照
+  （ebp=0xEEDC0014 ×7763）寄存器/栈2KB/esi-edi-ebx→64B 无 K1/license
+  任何形态；lane 1ms 轮询（65 态）无 marker；corpus 页 3.7k 次抢拍无
+  license-ASCII；marked-license snatch **无效化根因 = snatch 抖动把
+  decode transient 推迟到 1.03s（click 后）**——但实测 patch(1.03) <
+  检查(~1.05) < 消息(1.08) → **marked license 确实进了检查，marker 仍
+  零命中 = 操作数从不物化在被捕获窗口**（寄存器到寄存器比较）。
+- **VM 状态银行 @0x1028580（64B）**：[0x00-0x1B] = VM key 28B（静态
+  91ae5efc…）、[0x1E] = cont A（= lane 0x102859E）、[0x32] = EBP 锚
+  0xEEDC0014；字段尾 keystream（29B，2e4f8c0b…）≠ VM key XOR。
+- **snatch op 体已捕获**：1458 个 distinct EIP 的解密块
+  （0x102D600/0x102B9D1/0x10296D5 簇 = 检查链）= **缝合材料**；cmp 类
+  指令扫描 872 处（突变块，真 cmp 待链重建）。
+- **下一步（优先序）**：①**DR 断点路径**：链重建找到 cmp 的 EIP → CLI
+  硬件断点（DR0）→ 断点处寄存器 = 机器侧明文（CLI = 调试器，DRBP 机器
+  已有！）②license 解码器反转：字段 (enc→plain) 39B 对 = cascade
+  keystream → D(license_author 16B) = 作者 HWID → 验证 vs .dat 键字段
+  ③sewing：检查链全反汇编。
+- 工件：forge_v9-16.py、probe_field/keys/bufkeys/expected/key2/serial/
+  lane/crace.py、searchsnatch v2（49MB marked + 77MB original）、
+  CISC-1U.v2searchsnatch.bin。
