@@ -797,7 +797,7 @@ pub fn unpack(
                 if drbp_on
                     && post_attach
                     && !drbp_armed
-                    && started.elapsed().as_millis() >= 350
+                    && started.elapsed().as_millis() >= 200
                 {
                     helpers::arm_v2_dr_breakpoints(&mut dbg, image_base_usize);
                     drbp_armed = true;

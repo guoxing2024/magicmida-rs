@@ -14151,14 +14151,11 @@ pub(super) fn arm_v2_dr_breakpoints(dbg: &mut ProcessSession, image_base: usize)
     let bytes = unsafe {
         std::slice::from_raw_parts_mut((&mut ctx as *mut CONTEXT) as *mut u8, std::mem::size_of::<CONTEXT>())
     };
-    // 132y48: DR1 = the expected-blob entry (image+0x109458) READ/WRITE -
-    // the license compare slides esi through this table; the hit = the
-    // compare's exact instant.  R/W1 = 11 (rw), LEN1 = 11 (4B).
-    bytes[0x08..0x0C].copy_from_slice(&((image_base + 0x109458) as u32).to_le_bytes()); // Dr1
+    bytes[0x08..0x0C].copy_from_slice(&((image_base + 0x216F5) as u32).to_le_bytes()); // Dr1
     bytes[0x0C..0x10].copy_from_slice(&((image_base + 0x22D7D) as u32).to_le_bytes()); // Dr2
     bytes[0x10..0x14].copy_from_slice(&((image_base + 0x233FD) as u32).to_le_bytes()); // Dr3
     bytes[0x14..0x18].copy_from_slice(&0u32.to_le_bytes()); // Dr6: clear stale
-    bytes[0x18..0x1C].copy_from_slice(&0xDDFD_0054u32.to_le_bytes()); // Dr7
+    bytes[0x18..0x1C].copy_from_slice(&0xDDD0_0054u32.to_le_bytes()); // Dr7
     // SAFETY: suspended thread handle.
     unsafe {
         let _ = SetThreadContext(h, &ctx);
