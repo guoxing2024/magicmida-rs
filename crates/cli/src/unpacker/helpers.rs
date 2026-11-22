@@ -6907,6 +6907,11 @@ pub(super) fn spawn_dialog_killer(
                     OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT,
                     THREAD_SUSPEND_RESUME,
                 };
+                // 132y52: SNATCHWORKER = skip the main-thread fast path so
+                // the finder lands on the per-run worker thread (the field
+                // walk's executor) instead of the corpus-resident main.
+                let worker_only =
+                    std::env::var("MAGICMIDA_V2_SNATCHWORKER").is_ok();
                 // 132y41: the window is tunable — "1" = the default
                 // [280,470] verdict era; "<ms>-<ms>" = a custom window
                 // (the post-click lock/binding check runs ~[2050,2250]
@@ -6943,7 +6948,7 @@ pub(super) fn spawn_dialog_killer(
                 while vm_tid.is_none()
                     && watch_t0.elapsed().as_millis() < w_end
                 {
-                    if let Some(hm) = h_main {
+                    if let Some(hm) = h_main.filter(|_| !worker_only) {
                         // SAFETY: valid pre-opened handle.
                         let prev = unsafe { SuspendThread(hm) };
                         if prev != u32::MAX {
@@ -7039,7 +7044,14 @@ pub(super) fn spawn_dialog_killer(
                 // check (lambda~1 at the heavy cadence = usually missed);
                 // the light record makes lambda>2 and the code@eip capture
                 // self-identifies which handler ran.
-                let lite = std::env::var("MAGICMIDA_V2_LITESNATCH").is_ok();
+                // 132y52: LITESNATCH=2 adds 64B windows at EDX and ESI
+                // (the search's key and list-entry pair, ~35us/sample);
+                // SNATCHWORKER skips the main-thread fast path so the
+                // finder lands on the per-run worker that walks the field.
+                let lite_mode =
+                    std::env::var("MAGICMIDA_V2_LITESNATCH").unwrap_or_default();
+                let lite = !lite_mode.is_empty();
+                let lite_win = lite_mode == "2";
                 if lite {
                     while ns < 200000
                         && watch_t0.elapsed().as_millis() < w_end
@@ -7090,6 +7102,24 @@ pub(super) fn spawn_dialog_killer(
                         }
                         blobs.extend_from_slice(&(clen as u32).to_le_bytes());
                         blobs.extend_from_slice(&code[..clen]);
+                        if lite_win {
+                            // 64B at EDX then 64B at ESI: the compare pair.
+                            let mut w = [0u8; 64];
+                            for rv in [ctx.Edx, ctx.Esi] {
+                                // SAFETY: live handle; readable VM pages.
+                                unsafe {
+                                    let _ = ReadProcessMemory(
+                                        h_process,
+                                        rv as *const core::ffi::c_void,
+                                        w.as_mut_ptr()
+                                            as *mut core::ffi::c_void,
+                                        64,
+                                        Some(&mut 0),
+                                    );
+                                }
+                                blobs.extend_from_slice(&w);
+                            }
+                        }
                         ns += 1;
                     }
                 } else {
