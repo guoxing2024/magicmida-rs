@@ -6787,3 +6787,29 @@ license vs KeyGen(硬件 HWID)，与 .dat/blob 完全无关；机器侧值 = VM 
   寄存器（DRBP 机器已有）③tag "10" = 2B 常量 tag 的 encode 机制。
 - 工件：forge_v15/16.py、probe_postd.py、blob_dump.bin、
   CISC-1U.v2searchsnatch.bin（71MB，6×256B 窗）。
+
+**续 22 补充 132y47（同日）——字段解码器 = 32B 重复 XOR 级联（完全已知！）；
+blob = 静态表但 ≠ cascade-XOR；HWID 候选 32 相位 sweep = 全
+"different machine"；sweep 误报根因 = 对话框枚举丢检**：
+
+- **字段解码器定案**：字段 KS（head 10B + tail 22B）拼出 **32B 重复
+  XOR 密钥**，周期性验证成立（cascade[32:39] == cascade[0:7]）——
+  **KEY32 = 8b041b245aa75cbbe96d2e4f8c0b05192052b67eefcd8802163f
+  6cca861e2f4c（本机字段解码器，完全已知）**。
+- **blob 静态性**：blob（image+0x1094xx，1KB）两跑 **0/1024 字节差异**
+  = 烤入静态表（非 per-machine、非 per-run）——比较的机器性 = 在
+  T 变换里（机器键入），blob 本身恒定。
+- **blob ≠ cascade-XOR**：32 相位全扫（含 0x1109458 对齐）零
+  license-ASCII 零 HWID-形状 → blob 的变换 ≠ 字段 cascade（T = 机器
+  键入的独立变换，或 blob = 非许可格式的源数据）。
+- **HWID 候选 sweep（forge_v17）**：blob[0:16] ^ cascade32[phase] ×32
+  相位 → render → license patch → **全部 "different machine"**（deep
+  run 确认 phase-0 = patched=1 + 0.96s 对话框）；sweep 初版 "no-dialog"
+  = **误报**（对话框枚举丢检 + early-click 时序），deep-run 重试循环
+  修正。silence ≠ pass：**pass 判据 = patched=1 且 60s 无对话框且
+  进程活**，且必须 deep-run 验证。
+- **结论**：机器侧期望值 = T(blob) 或更深的 VM 计算，唯一剩余通路 =
+  ①检查链反汇编缝合（1458 EIP op 体已捕获）②DR 断点抓比较瞬间
+  （cmp EIP 定位后 CLI 硬件断点）③blob 变换 T 的逆向（T = 机器键入）。
+- 工件：forge_v17.py（sweep+retry）、blob_dump/blob_run0/1.bin、
+  deep{,0,1}.log。
