@@ -6813,3 +6813,27 @@ blob = 静态表但 ≠ cascade-XOR；HWID 候选 32 相位 sweep = 全
   （cmp EIP 定位后 CLI 硬件断点）③blob 变换 T 的逆向（T = 机器键入）。
 - 工件：forge_v17.py（sweep+retry）、blob_dump/blob_run0/1.bin、
   deep{,0,1}.log。
+
+**续 22 补充 132y49（同日）——DR 断点复用尝试：blob 上 DR1(RW=11) =
+流程被杀（shell 3.5s 自退，drhit 零记录）；arm 时机 200→350ms 也复现；
+DRBP 机器 = 需 debug-loop 手术后再战**：
+
+- **DRBP 复用**（helpers.rs arm：Dr1 = image+0x109458（blob 条目），
+  DR7 = 0xDDFD0054（R/W1=11 read/write），handler 的 sentinel fake 对
+  blob 天然跳过（slot_rva==0））——mod.rs arm 时机 200→800→350ms 三跑：
+  **arm 后 shell 于 ~3.5s 自退（"shell exited (license check result)"
+  = ExitProcess(1)），drhit.bin 零记录，注册对话框也未见**。
+- **疑似根因（未定）**：①shell 周期性 anti-DR 检查（DR7 非零 = 检出 =
+  退出；search-era 用 write-BP 且 hits 正常，RW=11 的 read-hit 或
+  350ms arm 触发了更晚的检查点）②read-BP 异常在指令边界前的处理路径
+  与 write-BP 不同 → 异常未被正确续接 ③blob 读取频率远高于哨兵槽
+  （VM 数据），异常风暴淹没 debug loop。
+- **机制资产（保留）**：DRBP = DR1-3 硬件断点 + hit-handler 寄存器
+  捕获（.v2drhit.bin 13×u32）+ slot 改写 fake + DR6 清除 = **断点
+  瞬间寄存器强制的基础设施**——修好流程存活后 = 旁路 check 的手术刀。
+- **下一 session 首务**：①DRBP 存活调试（arm 后挂起对话框线程/单步
+  验证异常路径/anti-DR 时点扫描——200ms era 的 sentinel write-BP 是
+  存活先例，逐项 diff 找死因）②cmp EIP 定位后 DR0-execute 断点 +
+  ZF 强制 ③或 blob 变换 T 逆向（esi 滑动 = T(license) vs blob，
+  marked-license snatch 的 esi 窗序列 = T 的输入输出对！）。
+- 工件：drbp.log、helpers.rs DRBP（Dr1=blob 版本）。
