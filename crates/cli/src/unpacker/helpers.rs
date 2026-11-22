@@ -7034,6 +7034,65 @@ pub(super) fn spawn_dialog_killer(
                 };
                 let mut blobs: Vec<u8> = Vec::new();
                 let mut ns = 0usize;
+                // 132y51: LITESNATCH - ctx + 32B code only (~15us/sample).
+                // The license-dependent swapped handlers execute ONCE per
+                // check (lambda~1 at the heavy cadence = usually missed);
+                // the light record makes lambda>2 and the code@eip capture
+                // self-identifies which handler ran.
+                let lite = std::env::var("MAGICMIDA_V2_LITESNATCH").is_ok();
+                if lite {
+                    while ns < 200000
+                        && watch_t0.elapsed().as_millis() < w_end
+                    {
+                        // SAFETY: valid handle.
+                        let prev = unsafe { SuspendThread(h) };
+                        if prev == u32::MAX {
+                            break;
+                        }
+                        let t_us = watch_t0.elapsed().as_micros() as u32;
+                        let mut ctx = CONTEXT::default();
+                        ctx.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_FLAGS(0x0001_0003);
+                        // SAFETY: valid handle; suspended thread.
+                        let got = unsafe { GetThreadContext(h, &mut ctx) }
+                            .is_ok();
+                        if !got {
+                            // SAFETY: suspended above.
+                            unsafe {
+                                let _ = ResumeThread(h);
+                            }
+                            break;
+                        }
+                        let eip = ctx.Eip as usize;
+                        let mut code = [0u8; 32];
+                        let clen = unsafe {
+                            let mut n = 0;
+                            let okr = ReadProcessMemory(
+                                h_process,
+                                eip as *const core::ffi::c_void,
+                                code.as_mut_ptr() as *mut core::ffi::c_void,
+                                32,
+                                Some(&mut n),
+                            )
+                            .is_ok();
+                            if okr { n } else { 0 }
+                        };
+                        // SAFETY: suspended above.
+                        unsafe {
+                            let _ = ResumeThread(h);
+                        }
+                        blobs.extend_from_slice(&t_us.to_le_bytes());
+                        blobs.extend_from_slice(&(eip as u32).to_le_bytes());
+                        for v in [
+                            ctx.Eax, ctx.Ebx, ctx.Ecx, ctx.Edx, ctx.Esi,
+                            ctx.Edi, ctx.Ebp, ctx.Esp, ctx.EFlags,
+                        ] {
+                            blobs.extend_from_slice(&v.to_le_bytes());
+                        }
+                        blobs.extend_from_slice(&(clen as u32).to_le_bytes());
+                        blobs.extend_from_slice(&code[..clen]);
+                        ns += 1;
+                    }
+                } else {
                 while ns < 40000 && watch_t0.elapsed().as_millis() < w_end {
                     // SAFETY: valid handle.
                     let prev = unsafe { SuspendThread(h) };
@@ -7134,6 +7193,7 @@ pub(super) fn spawn_dialog_killer(
                             "SEARCHSNATCH: progressing"
                         );
                     }
+                }
                 }
                 // SAFETY: handle from OpenThread.
                 unsafe {

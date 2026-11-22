@@ -6888,3 +6888,34 @@ DRBP 机器 = 需 debug-loop 手术后再战**：
   chain_sewn.txt、bodies_byfreq.txt、parse_{check_walk,hitmap,steps,
   pass2,pass2b,eipdiff,sew,chain,byfreq,bytestep,bank,shape3}.py、
   probe_{slots,vmctx,chainband,kregion}.py、forge_v18/19/20.py。
+
+**续 22 补充 132y52（同日傍晚）——LITESNATCH 落地；检查 = 双线程
+（worker 走字段 / 主线程驻 corpus）；corpus 页 = VM 主数据区**：
+
+- **LITESNATCH**（`MAGICMIDA_V2_LITESNATCH=1`，helpers.rs
+  SEARCHSNATCH 分支）：记录 = [t_us][eip][9 regs][clen][code≤32B]，
+  无 stack/mem 窗——实测 **14µs/样本**（heavy = 30-50µs），54286 记录
+  /858ms。x64/x86 cargo check 双绿零告警。
+- **线程真相**：heavy snatch 的 finder（偏好 eip∈[0x21000,0x24000]）
+  抓到 **worker 线程**（tid 19060/10528，逐 run 不同 = per-run 线程）
+  = 字段 walk 的执行者；lite 抓到 **主线程**（tid 2648 = CreateProcess
+  主 tid）= corpus 页驻留者。**检查至少双线程**：worker 消费 license
+  字段（heavy 窗所见），主线程同时在做另一套 VM 活动（lite 窗所见）。
+- **corpus 页 @image+0xDC000 = VM 主数据区**：lite run 的 esi 几乎全程
+  ∈[0x10DC000,0x10DD000)（53587/54286 记录！）——不只是 .dat 时代的
+  搜索列表，整个 4KB 页 = VM 状态/工作区。
+- **0x102d600/0x102b9d1/0x102d601 = VM 主解释循环块**（lite 全程
+  x15918，非检查专属）——heavy walk 时代对它们的观察 = 检查复用
+  解释器，非专属块。**heavy snatch 的 0.77ms/字节 walk 速度 =
+  snatch 自身拖慢的假象**（真实 walk ≈ 快 10×，14µs 采样下
+  field-edx = 0 次 = 字段消费快于采样粒度）。
+- **5ms 桶签名 diff = 时相错开无效**（marked run 的 VM 相位整体
+  平移，桶对桶全发散）——license 依赖性必须按相位内容对齐，非时间。
+- **主线程 lite 窗亮点**：edx 高频 @0x10285a0/0x1184960/0xefee0/
+  0x1021340（bank/heap/handler 区），esi 驻 corpus——0x1184960 =
+  操作数流里的 heap 指针目标（每 run 工作块）。
+- **下一 session**：①lite 加 edx/esi 64B 窗（+2 RPM，~35µs/样本）=
+  主线程搜索 key 与 corpus 条目同帧配对 ②相位对齐 diff（按 op 块
+  序列而非时间桶）③worker 线程的 lite 窗（finder 跳过主线程）。
+- 工件：CISC-1U.v2litesnatch.{orig,marked}.bin（54k/142k 记录）、
+  forge_v21/22.py、helpers.rs LITESNATCH 分支。
