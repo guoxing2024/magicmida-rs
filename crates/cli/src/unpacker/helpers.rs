@@ -7103,16 +7103,24 @@ pub(super) fn spawn_dialog_killer(
                     // 132y42: persist 64B at esi/edi/ebx - the VM op's
                     // operands (the binding compare) live in VM data the
                     // registers point at, not on the stack.
-                    let mut mem = [0u8; 192];
-                    for (ki, rv) in [ctx.Esi, ctx.Edi, ctx.Ebx].iter().enumerate() {
+                    // 132y46: widen to 6 regs x 256B - the compare is
+                    // register-to-register and the operands never showed
+                    // in the 3x64B windows; the machine side must live
+                    // near one of the other register pointers.
+                    let mut mem = [0u8; 6 * 256];
+                    for (ki, rv) in
+                        [ctx.Eax, ctx.Ebx, ctx.Ecx, ctx.Edx, ctx.Esi, ctx.Edi]
+                            .iter()
+                            .enumerate()
+                    {
                         // SAFETY: live handle; VM data pages.
                         unsafe {
                             let _ = ReadProcessMemory(
                                 h_process,
                                 (*rv) as *const core::ffi::c_void,
-                                mem[ki * 64..].as_mut_ptr()
+                                mem[ki * 256..].as_mut_ptr()
                                     as *mut core::ffi::c_void,
-                                64,
+                                256,
                                 Some(&mut 0),
                             );
                         }

@@ -6758,3 +6758,32 @@ license vs KeyGen(硬件 HWID)，与 .dat/blob 完全无关；机器侧值 = VM 
 - 工件：forge_v9-16.py、probe_field/keys/bufkeys/expected/key2/serial/
   lane/crace.py、searchsnatch v2（49MB marked + 77MB original）、
   CISC-1U.v2searchsnatch.bin。
+
+**续 22 补充 132y46（2026-11-22，检查机制可视化轮）——检查 = 字段 in-place
+逐组解析（re-decode→逐组读→逐组还原），esi = 期望数据 blob @image+0x1094xx
+与 edx（license 指针）同步推进 = 双指针逐字节比较；marker 仍零命中 =
+解析累积器只在寄存器瞬间存在**：
+
+- **snatch mem 窗扩至 6 regs×256B**（helpers.rs SEARCHSNATCH，132y46
+  注释）——edx = 0x102054C/0x102056D/0x102056E/0x1020571/0x1020574/
+  0x10205d0 = **解析指针逐字节推进字段**；esi = 0x1109458→0x1109577→
+  0x110966c→0x110967c = **期望 blob 指针同步推进** → 比较 = 双指针
+  逐字节（license vs blob），变换在寄存器里即时做。
+- **字段状态机全捕获**（probe_postd 1ms 轮询，13 态）：re-decode
+  （头先，~6ms 写满 39 字符）→ 逐组消费（group1@+120.6ms、group2@+122.2、
+  group3@+123.7、group4@+125.2，每组读后立刻还原编码字节 = 非破坏）→
+  全还原。**字段 = [2B tag][37B payload]**：patched "AA" tag 的 decode =
+  "?0"（0xca 0x30）= tag-encode 非恒等（"10" = 常量 tag 的来历）；
+  patched license 的消息 = "蔈ZA-BBBB-…" = tag 槽被检查破坏的形状。
+- **esi blob @image+0x1094xx**：加密形态、"ea4e"/"76f84e" 高频重复
+  （条目标记？）；两次滑动-XOR（tail-KS 29B）解码 = 零命中 → blob
+  变换 ≠ 字段尾 keystream 的朴素 XOR。blob 与 license 的比较 = 变换
+  即时在寄存器做（**T(license[i]) vs blob[i]** 或反向）。
+- **marker 仍零命中**（0xAAAABBBB 等 16 个 nibble-prefix，≥0x10000
+  过滤后 0 hit）→ 解析累积器 = 纯寄存器瞬间，30µs snatch 粒度不够。
+- **下一步**：①**blob 直读路线**：blob per-machine？两跑 diff；blob
+  条目解码（VM 解码器 = 字段解码器同源？）→ expected license → patch
+  → PASS ②**DR 断点**：检查链重建找 cmp EIP → CLI 硬件断点抓比较瞬间
+  寄存器（DRBP 机器已有）③tag "10" = 2B 常量 tag 的 encode 机制。
+- 工件：forge_v15/16.py、probe_postd.py、blob_dump.bin、
+  CISC-1U.v2searchsnatch.bin（71MB，6×256B 窗）。
