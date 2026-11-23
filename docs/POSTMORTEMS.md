@@ -7420,6 +7420,13 @@ license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
 - **双绿 420/413**（x64/x86）。缺口清单：#1 时光样本 ✓（本轮）、#4 FullVirtualize 样本 ✓（132y88/89）；剩 V2 OEP 边界（定案非欠账）、Themida 1.x OEP 分支、f 缝合弧。
 - 工件：`OUT/v2shm/yijianhong20U.exe`（产物）+ repro_*.exe（复现证据）。
 
+- **补充 132y93（同日续）——★ Tuts4You 改名壳段：Signal 1d 落地 + 删段实验回滚（可跑性优先）**：
+
+- **Signal 1d 落地**：`is_themida_section` 加 `tuts4you` 名（1.9.1 语料壳段用户改名）→ PE model shrink 删段生效（removed 0→1）+ 单测（正例 + 大小写）。
+- **删段实验（dump-stage names 加 tuts4you）→ 产物 0xC0000005 崩**：1.9.1 程序**运行时读 Tuts4You 段数据**（壳段非纯代码）。回滚 dump-stage（可跑性优先），Signal 1d 保留（PE model 层正确分类）。
+- **1.x 产物边界定案**：1.9.1 产物可跑（tuts4you.com 窗口 ✓）但**字节非确定**（Tuts4You 段运行时残留，2 跑 9.5KB 漂移）——1.x 产物适用结构+行为 gate，字节 golden 不适用（`expect_output_sha256: none` 语义）。1.9.1 全链已收口（classic OEP VERIFIED + IAT 74/0 + 行为对照）。
+- **双绿 421/414（+1 单测）**。阶梯矩阵终态：1.9.1 ✓ 全链 | 1.8.2 超时（壳方差） | 1.2.3/1.3.0/1.5.0 Ancient AV storm（守护链无对象，需 Ancient 专属判据） | 1.1.1 VM 解释型（定案） | WinLicense 2.0.1.0 = V2（研究轨道）。
+
 - **补充 132y92（同日续）——★ Themida 1.x 阶梯实测矩阵：1.9.1 全链绿（产物可跑）+ Ancient 分支卡点定位**：
 
 - **版本阶梯 /unpack 实测**（mida-cli-x86，OUT/v1oep/）：**1.9.1 = 全链绿**——`classic OEP VERIFIED at 0x4271dc`（CloseHandle 桩 → .text 守护 → 守护壳回家窗口 → 12s 静默接受）→ IAT 74/0（7 描述符、uncovered_slots=0）→ 产物 2,772,992 B、`Done.`；**行为对照绿**：产物与原样本同到 `http://www.tuts4you.com/` 对话框。**132y67 的「1.x 实测 OEP not found」已过时**——classic OEP 分支（2026-10-27 落地）覆盖 1.9.1。
