@@ -7420,6 +7420,14 @@ license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
 - **双绿 420/413**（x64/x86）。缺口清单：#1 时光样本 ✓（本轮）、#4 FullVirtualize 样本 ✓（132y88/89）；剩 V2 OEP 边界（定案非欠账）、Themida 1.x OEP 分支、f 缝合弧。
 - 工件：`OUT/v2shm/yijianhong20U.exe`（产物）+ repro_*.exe（复现证据）。
 
+- **补充 132y94（同日续）——★ Ancient 分支诊断定案：0x10080f24 锚点 = VM dispatch 形状但 120s 无收敛**：
+
+- **Ancient 锚点实证**：1.2.3/1.3.0/1.5.0 三样本 storm 全部 `(RIP=壳 VirtualAlloc 区, target=0x10080f24)`——0x10080f24 = Ancient VM 固定数据指针（跨 run/跨样本恒定）；RIP 每次 run 漂移（0x26ae770/0x283e770/0x289e770）= VM 从自分配区跑，不在 image 段内。
+- **is_vm_dispatch_fault 加 Ancient 分支**（`MAGICMIDA_ANCIENT_VMDISPATCH` 门控，target-only 锚）：首版带 in-image 边界测试 → 不触发（RIP 在分配区不在 image 段）；放宽 target-only → 分支生效（"VM decode storm"）。
+- **120s 墙钟跑满无收敛 = 定案**：Ancient VM 同字节码无限自旋——与 V3 null-read dispatch（~2s 收敛，36,450 次后 bootstrap）**形状同、结果不同**。Ancient = 壳数据依赖死循环（调试器配置下等待永不满足的条件），watchdog 豁免无效。**Ancient 需专属 OEP 方案**（待定：壳数据依赖定位 / 无调试器路线）。
+- 分支保留作诊断（注释含定案）。双绿 421/414。**1.x 线终态矩阵**：1.9.1 ✓ 全链收口 | Ancient = 定案（数据依赖死循环）| 1.1.1 = 定案（VM 解释型）| WinLicense 2.0.1.0 = V2 研究轨道。
+- 工件：OUT/v1oep/（T150_anc.log / T150_anc2.log 两版实验日志）。
+
 - **补充 132y93（同日续）——★ Tuts4You 改名壳段：Signal 1d 落地 + 删段实验回滚（可跑性优先）**：
 
 - **Signal 1d 落地**：`is_themida_section` 加 `tuts4you` 名（1.9.1 语料壳段用户改名）→ PE model shrink 删段生效（removed 0→1）+ 单测（正例 + 大小写）。
