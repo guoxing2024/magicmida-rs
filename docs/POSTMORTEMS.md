@@ -7153,3 +7153,24 @@ license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
   工件：r64_isa_full.txt、parse_isasim.py（Unicorn 链仿真）、
   r64_optrace2.txt、r64_stream_dec.bin、r64_stream_s00xx.bin x6、
   r64_tblarea_probe.bin、r64_vmmap_merged.json。
+
+- **补充 132y61（同日续）——★ VM 程序迹首次提取**：
+  ①**派发公式破解**（parse_disp.py，Unicorn 表 jmp 读钩子）：
+  **table_index = ((raw ^ bl) - 0x29) & 0x3F**（16 采样点 11 点精确
+  吻合；5 点偏差 = 哨兵 flags 条件路径噪声），表基 0x102820f。派
+  发链（0x1028502→0x1036969→0x102bb56→0x10316e0→0x1029fff→
+  0x102ab2c→…→jmp [edi+eax*4]）全静态可读，pop bx = 恢复原 bl
+  （派发本身不改钥）。②**VM init 全解**（0x10284be-0x1028502）：
+  edi = 自校验循环（[edi+0x48..] 0xa8 dwords = 派发表完整性检查）；
+  esi = [esp+0x24]（调用方栈传流基址）；**ebx = esi => bl_init =
+  流基址低字节**；esi += eax；lock cmpxchg 单实例闸。③**程序迹提
+  取**：651 条派发记录（eip=0x1028502/3）=> 118 个不同流位 x
+  (idx, ebx)；时间序 = **VM opcode 序列**（r64_prog_trace.txt）。
+  首 80 条 = fetch4B→stack-arith→flags 循环 + fetch1Bk（钥前进）
+  穿插 + call 形（op28/62）+ 94% 一致（op0/1/2 未用项 5 处 = 偏差
+  项）。④**解码路线闭合**：流内容 = per-run 键控但 **解码后程序 =
+  固定**（同一检查程序）；bl_init = 流基址低字节已知；自解密 = VM
+  运行即解密。**下一首务**：f-emu 从 VM init（0x10284be）整跑：流
+  区域一次性 RPM 全 dump（5KB）+ init 栈构造 + unicorn 原生解密执
+  行 = VM 程序全文（不依赖采样）。
+  工件：parse_disp.py、r64_prog_trace.txt。
