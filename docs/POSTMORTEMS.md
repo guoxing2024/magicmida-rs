@@ -7268,3 +7268,19 @@ license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
   add/sub K1/K2 对消模式）2)T 表达式 3)T^-1(表) = license* 4)RISC-64
   验证 verdict=PASS 5)迁移 CISC-1。
   工件：parse_wordflow.py、r64_datreads.txt。
+
+- **补充 132y68（同日续）——★ 流钥演化 = 线性可逆**：
+  **KEY SCHEDULE 发现**：fetch-op 链内含 'mov ebx, 0x...' 常数
+  （op45: 0x18406e83、op6: 0x28c2380a/0x3ef7ef7b、op19/20/22/39 各
+  自常数）= 流钥 = **处理器的确定性 schedule**。**Unicorn 差分实
+  测 op45 钥演化**：ebx 最终值 = X/K 字节的**线性函数**（X byte1
+  -1 => ebx byte1 -1；K byte0 +1 => ebx byte0 +2；K byte0 +0x10 =>
+  ebx byte0 -0x20 = 系数 +/-2 带进位翻转）=> **钥演化 = (X, K) 的
+  线性组合 = 完全可逆**！常量对消除器（parse_T.py）实测成功：op45
+  net delta = {0,0}（全对消）+ real ops = lodsd; xor eax,ebx; key
+  mix = **op45 = X^K + 线性钥混合**。**T = 全 fetch-op 链的线性
+  代数**（每 op = X^K + 线性钥演化，可逆）=> T^-1 = 反向线性代数
+  => license* 可直接构造！**下一首务**：1)eliminator 输出全
+  fetch-op 的线性系数表（符号字节级差分）2)流重放解码 = 程序全
+  文 3)T^-1(表) = license* 4)RISC-64 验证。
+  工件：parse_T.py（constants-pair 消除器）。
