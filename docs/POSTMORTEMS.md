@@ -7411,6 +7411,16 @@ license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
   ④RISC-64 验证 verdict=PASS ⑤迁移 CISC-1。
   工件：parse_classify.py、r64_iterclass.pkl。
 
+- **补充 132y80（同日续）——★ 迭代间链式状态实证 + emu 连续链重放天花板**：
+
+- **op41 = mov ax,[esp]**（r64_isa_full 直读）= 栈顶 word 读 —— **per-op 语义是栈依赖的**；132y78 差分扫描的 T 原子只在合成栈（0x11111111 固定栈）下成立，真实执行时 op41/op33/op32 等读真栈顶。op33 handler 全程 esp/edx 缠绕（anti-disasm 桩），静态读不可行。
+- **eax-arrival 关系**（53 unique 迭代 × semctx in 元组）：**eax arrival 携带前一 handler 的中间结果** —— it50: Y=eax+0xca、it62: Y=eax−0x33、it85: Y=eax−0x14、it87: Y=eax+0x46、it131: Y=eax−0xe —— **迭代不是独立 T 原子，是链式状态机**（Y 依赖 eax 链 + 栈顶 + X）。
+- **emu 连续链重放器**（parse_vmchain.py）：380 段 ×（累积观测态 + 真实寄存器 + 第二次到达 0x1028502 停止）=> **264/380 段到达下一派发**；count=20000 会静默砍半（16/30 vs 37/60 教训：emu 预算必须 ≥100000）。剩 116 段失败根因 = **VM init 阶段的真栈底缺失**（0xefec8-0xefef0 在 dispatch-0 之前的 push 无观测源；fail 块 21-36/68-83 全是 ret 类 handler 弹到垃圾 eip=0xe98ce929 不在表内）。
+- **修正认识**：表基址混乱澄清 —— emu 派发表在 0x102820f（parse_segfull 已证 100%）；semctx t=929k 的 3 次 [0x102820f]=0x200202 写 = flags 写恰好落在表[0]（op0 UNUSED，无实际影响）。
+- **路线定案**：净效应已 100% 记录（semctx writes + end7），语义模型不需要 emu 重跑 —— license* 构造走**参数化正向模型**：opcode 序列静态（132y62 流静态铁证）=> 程序固定 => 唯一自由变量 = license digits 经前段 fetch ops 流入的路径（132y73）。下一步 = 用 264 段已验证链 + 53 迭代 (X,Y,prevY,eax,bl) 全表做**逐迭代线性拟合**（含 eax 链项）。
+- **下一首务**：① 53 迭代 × (X, prevY, eax, bl_lo) 逐 op 线性拟合 = 全 T 表达式；② T⁻¹(表) = license*；③ RISC-64 PASS → 迁移 CISC-1。
+- 工件：parse_vmchain.py（264/380 链重放器）。
+
 - **补充 132y79（同日续）——★ bignum 迭代语义模型 v1（0x68f5 锚切 + 钥演化全表）**：
 
 - **133 迭代锚切**：全局 arena 写流（4943 写）按 0x68f5 锚切 = 133 语法迭代 ×28 写固定骨架；X_in = [0x7045] 首写（锚前 3 写），Y_out = 第二非常数写，Z=[0x703b] 2B、W=[0x703f] 2B。去重（emu 分片重复观测）=> **53 unique (X,Y) 迭代**（r64_iter_model.json）。
