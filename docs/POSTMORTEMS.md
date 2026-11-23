@@ -7194,3 +7194,20 @@ license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
   本节 = T 提取全套工具在手。
   工件：r64_heap_t050/t090/t130/t200.bin、probe_fullstream.py、
   parse_seed.py、parse_disp.py、parse_vmsim.py。
+
+- **补充 132y63（同日续）——★ 分段重放 100% 贯通**：
+  **派发表全尺寸定案**：runtime 表 = 240+ 项（非 62！dump 范围内
+  236 项非零，entry 64-80 = 0x103862c/0x1031101/... 全部真 handler
+  地址）；132y59 的「62 项」= bank 静态表，runtime 表 = 超集。
+  **parse_segfull.py**：全 240 项表写入 emu + 逐 dispatch record 重
+  启（真实 esi/ebx/eax/esp）=> **380/380 段 100% 完成回达 0x1028502
+  且 esi 正确前进**（哨兵状态下也全绿 = 表修好后分歧消失）。
+  opcode 分布（emu 派发）：op62 x28、op49(adc) x14、op45/50/54/15/
+  63/32 = 4-8x、其余 1-2x + 282 段 = clean-64 之外的扩展 ISA（=
+  dump 尾部内容，emu 实际派发成功）。**写迹机**（UC_HOOK_MEM_
+  WRITE）：seg0 实测 VM 写 0x102824f（表区上下文槽）= VM 自上下
+  文维护可见。**T 组装输入**：r64_segreplay.pkl（380 段全状态：
+  op、end_regs、PATH）+ 写迹 = 每 handler 的净语义可逐段提取。
+  **下一首务（纯机械）**：①全 380 段写迹 + net-reg 表 => 语义表
+  ②bignum 程序重构 ③T⁻¹(表) = license* ④RISC-64 验证。
+  工件：parse_segfull.py、r64_segreplay.pkl。
