@@ -7411,6 +7411,15 @@ license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
   ④RISC-64 验证 verdict=PASS ⑤迁移 CISC-1。
   工件：parse_classify.py、r64_iterclass.pkl。
 
+- **补充 132y88（同日续）——★ VMProtect FullVirtualize 样本落地（缺口 #4 收口）**：
+
+- **pigcore.dll 定性**：`OUT/qidongqi/out/ida/pigcore.dll` = **启动器家族 VMProtect 解码产物本体**（sha256 e7004e89…，12,782,080 B x64，9 段 .rdata0/.rdata1/.rdata2 = `Packed` 模板名）——它**不能**当 FullVirtualize 样本原料（它已是解码后产物，不是加壳输入），但它证实 pigcore 家族 = VMProtect 3.x Packed。
+- **FullVirtualize 样本实测产线**（VMProtect Demo 3.11 Con，GUI 自动化取 schema）：Con `-pf` 接受工程 XML，但**瞎猜 schema 无效**（4 种 `<Item Address/Name Type=Virtualization/Virtualize>` 变体全部 "Functions for protection not selected"）。**真 schema 经 GUI 自动化取得**：pywinauto UIA 驱动 GUI（添加函数 → 双击 `_WinMain@16` → 保护表），Ctrl+S 保存 = `<Document Version="2"><Protection InputFileName Options="332544" VMCodeSectionName=".???" VMComplexity="20"><Procedures><Procedure MapAddress="_WinMain@16" Options="0"/></Procedures></Protection>`（MapAddress = **符号名**不是地址！）。
+- **Con 编译**：`正在载入 [V] 0040151A _WinMain@16` = 虚拟化标记被受理；产物 `OUT/vmp_probe/x86_sample_fullvirt.exe` 901,120 B（11 段：原 7 段全 raw=0 + .k?R/.fnX 随机名双 exec 壳段）。**行为验收绿**：8s 内 "验证 x86 样本" MidaX86Sample 窗口出现 = 虚拟化后的主函数正常跑。
+- **新缺陷抓到**：Demo 3.11 产物（连 Packed-only 版）`/analyze` 全误判 Themida——`.k?R` = raw 0 + vsz 0x11c947 + exec → 撞 `is_themida_section` Signal 4；根因 = VMProtect 闸先落空（无 .vmp0/.rdata2 模板名，Demo 产物随机段名）。语料 6/6 判 min-protection 正常。
+- **修复判据已验证未落地**：`orphan-raw0-exec`（raw=0 + vsz>0x10000 + exec + 无 themida/winlice 名）在 Demo 产物 2/2 命中、语料 VMP 6/6 与 Themida 2.x 语料 2/2 不命中 = 安全信号；下一步 = Rust 落地 + 单测 + 语料 gate。
+- 工件：`OUT/vmp_probe/`（fullvirt/packed 产物 + gui_saved.vmp 真 schema + GUI 截图）。
+
 - **补充 132y85（同日续）——★ digit 位点收口：X = bignum 操作数字节序列**：
 
 - **57 digit-first X 全序列提取**：`64 00 49 00 00 56 04 00×8 20 00 00 26 26 c7 00×17 ff×19 0f`——**结构 = bignum 操作数字节阵列**（稀疏数据段 + 0xff 掩码尾 21 字节 + 0x0f 终止符），非 ASCII 注册名、非 .dat 密文直映（.dat[0:32]=7c4f2a7e… 与 X 无匹配 = .dat 加密 blob 未过 VM 流）。
