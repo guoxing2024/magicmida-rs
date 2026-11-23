@@ -7411,6 +7411,14 @@ license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
   ④RISC-64 验证 verdict=PASS ⑤迁移 CISC-1。
   工件：parse_classify.py、r64_iterclass.pkl。
 
+- **补充 132y82（同日续）——★ 双编号体系定案 + 多态派发实证（132y74 names 表错位修正）**：
+
+- **两套 op 编号并存**：① 6-bit 流 idx = ((raw^bl)−0x29)&0x3F（64 槽，parse_prog20/132y74 用）；② 240 项 handler 表索引（iterclass/132y77-81 用）。同 t 双编号无对应关系（trace_op=36 vs iterclass_op=145）——**132y74 的 names 表（idx36='FETCH4B' 等）= 错位解释，作废**；真语义单位 = 240 handler（132y78 全解）。
+- **多态派发实证**（parse_idxmap.py，r64_idx_handler_map.json）：380 dispatch 覆盖 48 个 idx，**23 个 idx 单值稳定**（idx2→op11、idx35→op45、idx39→op32…），**25 个 idx 多值**（idx52 6 个 handler、idx32 6 个、idx22 6 个…）= 同一 idx 分派到不同物理 handler —— **runtime 表换 bank 的多态派发**（与 132y56 的 runtime 240 项表 = bank 静态表子集定案互证）。
+- **语义闭环确认**：语义建模以 handler 为单位已闭环（digit 域 100%）；idx 只做流内定位/去重。T⁻¹ 样例固化：op11: X=Y−0x5e；op45: X=Y−0x42；op41: X=Y−0x1c；op191/op65 = 常数载入（X 自由）。
+- **下一首务**：① 133 迭代按 handler 序列分组 → digit 位点（57 digit-first 的 X 来源）逐位对接；② T⁻¹(表) = license* 构造；③ RISC-64 PASS → 迁移 CISC-1。
+- 工件：parse_idxmap.py、r64_idx_handler_map.json。
+
 - **补充 132y81（同日续）——★ T 原子合成模型 digit 域 100% 命中 + 迭代数据分类**：
 
 - **53 unique 迭代数据分类**：byte-byte 6 / byte-big 9 / big-byte 10 / big-big 26 / null 2 —— [0x7045] 首写只有 43% 是 digit；其余 = 指针/中间值流过镜像槽（Y 不是 X 的变换而是别的槽的值）。**133 语法迭代中 57 个 digit-first**。
