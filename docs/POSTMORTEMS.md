@@ -7211,3 +7211,18 @@ license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
   **下一首务（纯机械）**：①全 380 段写迹 + net-reg 表 => 语义表
   ②bignum 程序重构 ③T⁻¹(表) = license* ④RISC-64 验证。
   工件：parse_segfull.py、r64_segreplay.pkl。
+
+- **补充 132y64（同日续）——语义表 v2（真实上下文）+ bignum 竞技场定案**：
+  **真实 VM 上下文布局定案**：edi = 0x10281cf 恒定（381/381）= 上
+  下文基；flags = [edi+0x1c] = 0x00200246；lock = [edi+0x30] = 0；
+  handler 表 = [edi+4*idx]；VM 数据指针 edx = 0x10281db 等上下文内
+  字段 + dat 页（0xdb00df/0xdc00bc）。**parse_semctx.py** = 语义表
+  v2：真实 edi/edx/esp per record 重启 => **376/380 段完成（99%）**。
+  **写迹分布**：vmstack（0xefec8-0xefee8）x21403 = **THE bignum 竞
+  技场**（VM 栈 = 真内存低区）、ctx x3、dat x13（= 4 个发散段的
+  0xdb01bb 野写，可分离）。VM 栈值迹 = 机器指针（0xba/0xed90/
+  0x102820f/0xeb5c0014/0x11ace62）+ 小值（0x68f5/0x1c75/0x20a8/
+  0x690/0xd2 = **bignum 字节出现**）。**组装件状态**：380 段语义
+  表（真实状态）+ 写迹 + 栈值迹全在手；剩余 = bignum 程序重构
+  （栈值迹的算术重放）= 纯机械下一步。
+  工件：parse_semctx.py、r64_semctx.pkl、r64_semtable.pkl。
