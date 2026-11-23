@@ -7242,3 +7242,17 @@ license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
   digit 映射 = 算法核 3)digit 源 = license 字节关系 4)T^-1(表) =
   license* 5)RISC-64 验证。
   工件：parse_stackreplay.py、r64_semctx.pkl（133 迭代全部数据）。
+
+- **补充 132y66（同日续）——迭代语义提取：digit->transform->digit 实证**：
+  骨架对齐：21 个 skeleton 变体，公共 = 28 写（x67）；每迭代结构 =
+  **[0x7045]=X（输入 digit）-> [0x703d]=0x68f5 常数 -> [0x7039]=X ->
+  [0x7045]=0x1c75 常数 -> [0x7045]=Y（输出 digit）-> [0x7041]=0x20a8
+  常数 -> [0x703b]=Z 2B -> [0x703f]=W 2B**。三常数（0x68f5/0x1c75/
+  0x20a8）= 算法核常数。**16 对 (X->Y) 实测**：0x64->0xc2、
+  0x17441349->0x17441311（**xor=0x58 精确** = running-key XOR 步）、
+  0x46086bb->0x6d8fcad1 等 = 多精度字运算（word-by-word）。bignum
+  word 流（0x1744xxxx/0x4608xxxx 族）= 与 dat 校验区（op5 读的
+  dat[0x89..0x1b4]）对接。**T 的核**：digit-serial 变换（XOR running
+  key + 算术混合）。**下一首务**：1)全 word 流 vs dat 表字节对齐 =
+  完整算法链 2)T^-1(表) = license* 3)RISC-64 验证。
+  工件：parse_itermap.py、r64_semctx.pkl（16 对 + 全骨架）。
