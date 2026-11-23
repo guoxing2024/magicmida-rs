@@ -7398,3 +7398,15 @@ license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
   则）②线性拟合每类 = T 表达式 ③T⁻¹(表) = license* ④RISC-64 验
   证 verdict=PASS ⑤迁移 CISC-1。
   工件：parse_inverse.py（133 元语料库）。
+
+- **补充 132y77（同日续）——迭代分类完成 + per-op 拟合样本集**：
+  parse_classify.py：117/380 dispatch 分类到 op（emu 派发实判，
+  r64_iterclass.pkl）；与 semctx 的 (X,Y) join => **34 op 有真实
+  (X,Y) 样本**。**单样本 op 已显常数规则**：op11 = X+0x5e（许可证
+  digit 变换！）、op49 = X+0x7ce32db1、op208 = X+0xff23fec1、
+  op107 = X+0xa977b419——**每 op = 常数加法/异或 = 线性 T 原子**。
+  多样本 op（op32/33/45/65/215）非常数 = 读额外状态（VM 栈/上下
+  文）= 需差分扫描定全系数。**下一首务**：①34 op × 差分扫描（parse
+  _coef 模式扩展）= 全系数表 ②T 表达式合成 ③T⁻¹(表) = license*
+  ④RISC-64 验证 verdict=PASS ⑤迁移 CISC-1。
+  工件：parse_classify.py、r64_iterclass.pkl。
