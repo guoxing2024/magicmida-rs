@@ -7312,3 +7312,17 @@ license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
   1)逐 op 语义映射（62-类 ISA 表）=> 程序语义 2)license 输入位
   3)T^-1(表) = license* 4)RISC-64 验证 verdict=PASS 5)迁移 CISC-1。
   工件：parse_fulldecode.py、r64_dispatch_trace.txt。
+
+- **补充 132y71（同日续）——★ 语义程序清单完成（T 结构全显）**：
+  118 opcode 全迹 => ISA 语义映射（132y60-63 表套用）= **程序语
+  义清单**：FETCH4B/FETCH1Bk（流取操作数）x ~25 interleaved with
+  STACKARITH（VM 栈 bignum 运算）x ~30 + SBB/NEG/ADC/RCL/RCR（带
+  flags 算术）+ CTXFIELD/FSOP/FSREAD（上下文访问）+ DUPMOV/DUP2/
+  READSTACK（栈重组）+ CALL（op28）+ ESISAVE。**程序语义 = 完整
+  可读**：检查 = 流取数 -> 栈算术（带进位多精度）-> 上下文 flags
+  更新 循环。**T = 该序列执行**（输入 = 流操作数 + dat 表 + VM 上
+  下文；输出 = verdict）。**下一首务**：1)STACKARITH 各 op 常数
+  提取（eliminator 全覆盖）2)license 输入位定位（启动解码相位与
+  程序输入的对接）3)T^-1(表) = license* 4)RISC-64 验证 verdict=
+  PASS 5)迁移 CISC-1。
+  工件：程序清单（本节，r64_dispatch_trace.txt + ISA 表）。
