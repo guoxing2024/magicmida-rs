@@ -314,6 +314,22 @@ fn is_vm_dispatch_fault(
     tm_start: usize,
     tm_end: usize,
 ) -> bool {
+    // Ancient-generation candidate (Themida 1.2.3 / 1.3.0 / 1.5.0 ladder,
+    // measured 2026-11-23/24): the interpreter faults on a **fixed data
+    // pointer 0x10080f24** from shell addresses in the VirtualAlloc region
+    // (0x26ae770 / 0x283e770 / 0x289e770 across runs).  Treated as VM
+    // dispatch for 120 s wall-clock under MAGICMIDA_ANCIENT_VMDISPATCH=1:
+    // the deadline expired with no convergence — the Ancient VM spins on
+    // the same bytecode indefinitely (a data dependency the shell waits
+    // for that never arrives under this debugger configuration), unlike
+    // the v3 null-read dispatch which converges in ~2 s.  The branch is
+    // kept for diagnosis but the ladder result stands: Ancient needs its
+    // own OEP approach, not a watchdog exemption.
+    if std::env::var("MAGICMIDA_ANCIENT_VMDISPATCH").is_ok()
+        && target_address == 0x1008_0f24
+    {
+        return true;
+    }
     target_address == 0 && tm_start < tm_end && exception_addr >= tm_start as u64 && exception_addr < tm_end as u64
 }
 
