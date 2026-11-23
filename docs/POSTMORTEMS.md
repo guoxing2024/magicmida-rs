@@ -7386,3 +7386,15 @@ license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
   的代数反演 ②license* 构造 ③RISC-64 验证 verdict=PASS ④迁移
   CISC-1。
   工件：parse_call28.py。
+
+- **补充 132y76（同日续）——133 元 (X, Y, Z, W) I/O 语料库**：
+  parse_inverse.py：**133 元完整提取**（X=[0x7045] 首写、Y=[0x7045]
+  第三写、Z=[0x703b]、W=[0x703f]）；常数 0x68f5 x133 确认。
+  **关系候选**：X=0x64 -> Y=0xc2 = **X+0x5e 精确**；X=0 -> 0xad
+  (x7)/0xb4 (x2)/0x36d25f01 (x16) = 常数分支（零输入迭代 = 校验
+  和累积）；0x17441349 -> 0x17441311（xor=0x58）= running-key。
+  **语料库状态**：133 元 I/O + op 分类（emu 派发已知）= 反演的完
+  整样本集。**下一首务**：①按 op 分类 133 迭代（每类一组 X→Y 规
+  则）②线性拟合每类 = T 表达式 ③T⁻¹(表) = license* ④RISC-64 验
+  证 verdict=PASS ⑤迁移 CISC-1。
+  工件：parse_inverse.py（133 元语料库）。
