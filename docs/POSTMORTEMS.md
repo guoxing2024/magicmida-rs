@@ -7045,3 +7045,27 @@ license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
   收窄**：walk 在 dat 内的访问序（1017 个 distinct idx、93.5% 访问
   落在 dat 内）+ eax/ebx 操作数流 vs dat[idx] 值 ⇒ T 的输出空间 =
   纯离线可推；验证锚 = T(明文 license) 的输出必须命中 dat 表条目。
+
+- **补充 132y57（同日晚）——表反推第一轮：相位地图补全 + 检查相位差分否定**：
+  ①**相位地图**：lite2 的 dat 走查（3222 recs，2.5→1115ms）= **启动
+  解码相位**（.dat 拷入堆页 + 解码器走查，早于对话框 0.8s）；trace3
+  两跑（自动检查、无对话框、shell exit 44 自退 = 132y54「启动自动检
+  查」确认）的 edx 集中在 **page 0x106 = image RVA 0x60000 = 校验 op
+  带**（edx = VM 内部状态非数据指针）；检查相位 = pristine30 (页
+  0x121, 206 步) / marked29 (页 0x131, 291 步) 的每 run 堆走查。
+  ②**检查相位差分（P vs M）**：重建两 working buffer（P=62KB/898
+  非零，M=18KB/242 非零），非零窗零公共（高熵、每 run 键控）⇒
+  license 差分在缓冲级不可见（132y56-C 在检查相位再次成立）。③
+  **0xf1 假Sentinel 否定**：dat[0xf1]=0x77 恒定，90 次读取全 0x77，
+  「00 vs 77」= db/dc 两页混采假象；199ms 处 eax=0xd8 稳定自旋 =
+  VM 分支等待环。④**esi 与 dat 走查独立**：dat-visit 时刻 esi 散布
+  （0x3df/0x55e/0x261）= VM 在多对象间跳跃，无 idx↔esi 映射。⑤
+  **控制机缺陷**：RISC-64 有两种运行形态（对话框形态 vs 自动检查
+  静默自退形态，132y54 已记），trace2/3 两轮都落自动形态 ⇒ 对话
+  自动化对它不可靠；后续差分 oracle 若要做，必须先解决形态不可控
+  （否则输入差分被形态差分淹没）。⑥**结论**：T = VM 程序本身（f-emu
+  弧，bank 已重建 132y55），表数学路线（表反推）在本轮证据下关闭；
+  剩余 forge 路径 = f-emu 解码 VM 程序 or µs 机器（比较指令）。
+  工件：RISC-64U.v2trace2A/B.bin、v2trace3A/B.bin、r64_chkbuf_P/M.bin、
+  parse_tstat.py、parse_tracediff.py、parse_chkdiff.py、probe_r64mid
+  check/mid2/trace2/trace3.py。
