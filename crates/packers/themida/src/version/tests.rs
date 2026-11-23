@@ -505,3 +505,21 @@ fn import_surface_reader_never_panics_on_garbage() {
     let pe_zero = PeHeader::from_bytes(&image_zero).expect("zero-dir fixture must parse");
     assert!(read_import_surface(&image_zero, &pe_zero).is_none());
 }
+
+#[test]
+fn themida_section_by_renamed_tuts4you() {
+    // 1.9.1 ladder: the protector section renamed to `Tuts4You` (user choice).
+    // Measured 2026-11-23: without this name in Signal 1d the shrink pass
+    // keeps the section and its runtime residue makes products drift.
+    let mut s = make_packed_pe64().sections[1].clone();
+    s.name = "Tuts4You".to_string();
+    s.header.name = {
+        let mut n = [0u8; 8];
+        n[..8].copy_from_slice(b"Tuts4You");
+        n
+    };
+    assert!(is_themida_section(&s));
+    // Case-insensitive check.
+    s.name = "tuts4you".to_string();
+    assert!(is_themida_section(&s));
+}

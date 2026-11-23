@@ -474,6 +474,16 @@ pub fn is_themida_section(section: &PeSection) -> bool {
         return true;
     }
 
+    // Signal 1d: the 1.9.1 ladder samples rename the protector section to
+    // whatever the user chose — `Tuts4You` in the tuts4you collection
+    // (measured: `UnPackMe_Themida 1.9.1.0.a-h`, raw 0x233000-ish, exec).
+    // Without this the shrink pass keeps the section in the product and its
+    // runtime residue makes the product bytes non-deterministic (measured
+    // 2026-11-23: 9,558 bytes drifted across 67 clusters inside `Tuts4You`).
+    if lower.contains("tuts4you") {
+        return true;
+    }
+
     // Signal 1c: WinLicense 1.x truncates its section name to 8 bytes
     // ("WinLicen") — measured on the version ladder (WinLicense 1.1.1.0 and
     // 1.4.0.2 unpack-mes, 19 samples, every one otherwise invisible to this
