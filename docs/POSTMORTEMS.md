@@ -7411,6 +7411,15 @@ license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
   ④RISC-64 验证 verdict=PASS ⑤迁移 CISC-1。
   工件：parse_classify.py、r64_iterclass.pkl。
 
+- **补充 132y83（同日续）——★ verdict=PASS 实证（RISC-64 registered 对话框铁证）**：
+
+- **原始 .dat = 已注册 license**：RISC-64.dat 与 .dat.orig 逐字节相同（sha256 b3322fd1…）——样本出厂即带通过态 license。
+- **verdict=PASS 判据 = CALC #32770 对话框**（文本 "This application has been registered to (RISC-64) Examples - LCF-AT"）——实测 10 次启动 3 次进入对话框形态（7 次 exit 2 静默自退 = 双形态随机，132y66 定案复现）。**铁证固化**：`OUT/ps1/risc64_verdict_pass.bmp`（PrintWindow 截图 311x169）+ 控件文本枚举记录。
+- **launch 环节达成**：registered 对话框 = 应用主逻辑运行中（壳解码完成 + 检查通过 + UI 就位）= verdict=PASS → launch 全链实证。
+- **OEP 边界定案（重申）**：/dump-image 两跑（首跑 + --wait 后跑）结构相同——6 段加密壳形态、EP 在壳段 jusprbck、.idata 空——**V2 壳 = VM 解释型，原生镜像不以明文存在于进程任何位置**（与 CISC-1 定案一致），OEP 判定对 V2 无对象。mida-cli-x86 /unpack RISC-64 580s 超时（等 V2 OEP 判定）= 管线边界如实。**V2 = 研究轨道不出产物**（Release notes 已声明）。
+- **T⁻¹(表) = license* 状态更新**：原始 .dat 即 license* 的通过实例——bignum T 链的 digit 域 T 原子（6/6 命中）= 对该 license 的正向解释完成；反推 license* = 从 T⁻¹ 样例（op11: X=Y−0x5e、op45: X=Y−0x42、op41: X=Y−0x1c）逐位回代（digit 位点对接进行中）。
+- **下一首务**：① digit 位点对接收尾（57 digit-first 的 X ← 流内嵌数据映射）；② 迁移 CISC-1（同锁同 license 家族——CISC-1.dat 锻造验证已有 KEYFORGE 机器，registered 判据 = PigToGoLicenseDialog）；③ POSTMORTEMS 索引更新。
+
 - **补充 132y82（同日续）——★ 双编号体系定案 + 多态派发实证（132y74 names 表错位修正）**：
 
 - **两套 op 编号并存**：① 6-bit 流 idx = ((raw^bl)−0x29)&0x3F（64 槽，parse_prog20/132y74 用）；② 240 项 handler 表索引（iterclass/132y77-81 用）。同 t 双编号无对应关系（trace_op=36 vs iterclass_op=145）——**132y74 的 names 表（idx36='FETCH4B' 等）= 错位解释，作废**；真语义单位 = 240 handler（132y78 全解）。
