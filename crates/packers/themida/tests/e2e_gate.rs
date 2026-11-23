@@ -156,7 +156,12 @@ fn load_manifest(path: &Path) -> CaseManifest {
 }
 
 fn manifest_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/cases/guoxing_shiguang.case")
+    // 2026-11-23: the original 时光一键宏.exe corpus went missing (Device
+    // Guard cleanup); the user supplied 一键宏V2.0.exe — same vendor, same
+    // Themida v3 x64 family, same PigToGo licence dialog.  The reference
+    // case now points at the new sample; the retired manifest (with the old
+    // 78009803... golden) is kept as guoxing_shiguang.case.retired.
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/cases/yijianhong_v2.case")
 }
 
 fn sha256_of(path: &Path) -> String {
@@ -780,6 +785,7 @@ fn e2e_reference_case_matches_golden_record() {
     let _ = std::fs::remove_dir_all(&out_dir);
 }
 
+
 // ---------------------------------------------------------------------------
 // Log scraping helpers
 // ---------------------------------------------------------------------------
@@ -886,7 +892,7 @@ fn log_scrapers_return_none_on_missing_marker() {
 #[test]
 fn manifest_is_present_and_well_formed() {
     let case = load_manifest(&manifest_path());
-    assert_eq!(case.case_id, "guoxing_shiguang");
+    assert_eq!(case.case_id, "yijianhong_v2");
     assert!(!case.sample_sha256.is_empty());
     assert_eq!(case.sample_sha256.len(), 64, "SHA-256 must be 64 hex chars");
     assert!(case.expect_resolved > 0);

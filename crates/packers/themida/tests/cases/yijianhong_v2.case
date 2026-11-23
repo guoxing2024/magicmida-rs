@@ -1,0 +1,43 @@
+# Case manifest — reference Themida v3 x64 case (second sample)
+#
+# Second fully-successful end-to-end unpack, recorded 2026-11-23 after the
+# original 时光一键宏.exe corpus went missing (Device Guard cleanup,
+# 2026-10-29).  The user supplied 一键宏V2.0.exe — the same vendor, same
+# protection family (Themida v3 x64, .winlice + .boot, PigToGo
+# licence dialog), a newer build of the program.
+#
+# Identity: sha256 c61e1439bed1ba28e5f1... (8,185,360 B) — NOT the old
+# 78009803... sample; every metric below is a fresh measurement.
+
+case_id: yijianhong_v2
+
+# --- protected input -------------------------------------------------------
+sample_path: D:\Projects\shiguang\一键宏V2.0.exe
+sample_sha256: c61e1439bed1ba28e5f1182c04180969c31ad754dbaa36ed52e772e5a7f35f99
+sample_size: 8185360
+
+# --- frozen pipeline metrics -----------------------------------------------
+# `IAT trace complete: 208 resolved, 0 failed, 6 not-an-import`
+# (the 6 not-import slots hold bare RVAs into a non-executable section —
+# the same data-in-table shape the old case documented).
+expect_resolved: 208
+expect_failed: 0
+expect_not_import: 6
+expect_module_count: 11
+expect_thunk_count: 208
+expect_iat_slots_min: 1000
+
+# --- product ---------------------------------------------------------------
+expect_output_size: 1551872
+#
+# 3/3 independent runs byte-identical (2026-11-23, OUT/v2shm/repro_*.exe).
+expect_output_sha256: ff83084da5c732ba8bb2ec6bf130b2511bfb31c3d83e007e55e4474158d1f9d1
+
+# Product first section declares 0x60000020, identical to the packed input's
+# declaration (measured with a direct PE parse of 一键宏V2.0.exe).
+expect_first_section_characteristics: 0x60000020
+
+# The licence dialog both the packed original and the product reach.
+# Control runs measured 2026-11-23: original shows
+# ('软件授权验证', 'PigToGoLicenseDialog'), product shows the same pair.
+expect_window_title: 软件授权验证
