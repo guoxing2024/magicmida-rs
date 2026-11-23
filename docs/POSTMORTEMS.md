@@ -7284,3 +7284,15 @@ license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
   fetch-op 的线性系数表（符号字节级差分）2)流重放解码 = 程序全
   文 3)T^-1(表) = license* 4)RISC-64 验证。
   工件：parse_T.py（constants-pair 消除器）。
+
+- **补充 132y69（同日续）——★ 线性系数表全测 = 钥 schedule 完全可逆**：
+  parse_coef.py = 12 fetch-op x 8 字节（X/K 各 4）全差分实测：
+  **ebx 演化 = 每字节线性系数表**（op19/22: X0 系数 2、K2/K3 系数
+  1 直通；op39: 全系数 -12/-11；op61: K0/K1 系数 0 = 钥低 2 字节
+  不用；op21: K 全系数 0 = 钥不参与）。**钥 schedule = 完全线性可
+  逆**！流解码算法闭合：opcode[i] = s[i] ^ bl[i]；fetch-op 时
+  operand = s[i+k] ^ key_mix；bl[i+1] = linear(bl[i], operand)——
+  全可离线重放。**下一首务**：1)全流重放解码（系数表 + 实测 esi
+  派发点）= 程序全文 2)T^-1(表) = license* 3)RISC-64 验证
+  verdict=PASS 4)迁移 CISC-1。
+  工件：parse_coef.py（12 op x 8 字节系数表）。
