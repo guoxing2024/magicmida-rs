@@ -7411,6 +7411,14 @@ license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
   ④RISC-64 验证 verdict=PASS ⑤迁移 CISC-1。
   工件：parse_classify.py、r64_iterclass.pkl。
 
+- **补充 132y84（同日续）——★ 迁移 CISC-1 完成：verdict=PASS 双样本铁证**：
+
+- **CISC-1 原始 .dat = 通过态**（与 .dat.orig 逐字节同，sha256 5576d95c…）——与 RISC-64 同构：出厂 license 即注册态。
+- **CISC-1 verdict=PASS 实测**：启动 8s → CALC #32770 对话框 + 文本 "This application has been registered to (CISC-1) Examples - LCF-AT" + **截图固化 `OUT/ps1/cisc1_verdict_pass.bmp`**（311x169，PrintWindow）。失败对话框（460ms + exit 0x2C，132y67 记录）= 无 .dat/改名路径——本次原始 .dat 直达注册态。
+- **战役总目标实证链收口**：RISC-64 verdict=PASS ✓（132y83）→ launch ✓（registered 对话框 = 主逻辑运行）→ OEP = V2 边界（VM 解释型无原生镜像，如实）；CISC-1 迁移 ✓（同锁同 license 家族、同 verdict 机制、同 CALC 判据）。
+- **方法学意义**：V2 家族的 verdict 判据不在「逆向 .dat 密码」而在**原始 license 本身就是通过态**——之前 35 轮（补充 81-115）的失败态记录全部来自删除/改名/锻造实验路径；出厂态 = PASS。T⁻¹(表)=license* 的研究价值保留（判定机制理解），但 PASS 的工程实证不再依赖它。
+- **下一首务**：① digit 位点收尾（57 digit-first X ← 流内嵌数据映射，研究弧收口）；② POSTMORTEMS 索引行更新（132y79-84 六节）。
+
 - **补充 132y83（同日续）——★ verdict=PASS 实证（RISC-64 registered 对话框铁证）**：
 
 - **原始 .dat = 已注册 license**：RISC-64.dat 与 .dat.orig 逐字节相同（sha256 b3322fd1…）——样本出厂即带通过态 license。
