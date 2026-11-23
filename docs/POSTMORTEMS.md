@@ -7174,3 +7174,23 @@ license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
   区域一次性 RPM 全 dump（5KB）+ init 栈构造 + unicorn 原生解密执
   行 = VM 程序全文（不依赖采样）。
   工件：parse_disp.py、r64_prog_trace.txt。
+
+- **补充 132y62（同日续）——★ 流静态性定案 + 分段重放架构**：
+  1) **流跨 run 恒等铁证**：今日 heap dump（r64_heap_t050.bin，
+  393KB @0x11a0000，4 时刻仅 7 字节差）vs lite2 的 esi 窗 =
+  **73920/73920 字节全同**！132y56-C「per-run 键控」修正：键控对
+  象 = 0x11a2xxx 散布区（其他 VM 数据），**流 = 0x11acb33..0x11add0a
+  静态**（加密程序跨 run 逐字节恒定）。2) **VM init 全解 +
+  bl_init 实测**：esi=[esp+0x24]、ebx=esi、esi+=eax、lock cmpxchg
+  [edi+0x30]（单实例闸，emu 需先清零该槽）；真实首派发 =
+  esi=0x11ace61、ebx=0xba（bl 已被 init 后续代码赋值）。3) **派发
+  公式**：table_index = ((raw ^ bl) - 0x29) & 0x3F（16 点 11 精确），
+  派发链 pop ebx = 恢复原 bl（派发不改钥）；651 条真实派发记录 =
+  (esi, ebx, raw) 全状态 => **程序迹 = 118 流位的 opcode 序列**。
+  4) **emu 分歧定位**：哨兵状态在 ~50 handler 链后发散（esi 出现
+  野值 = 混淆地址运算放大哨兵误差）。**分段重放架构**：651 个真
+  实 checkpoint = 每 record 用真实 (esi,ebx,eax,esp) 重启 emu =>
+  分歧有界；段内语义提取 = T 的组装件。f-emu checkpoint 机器 +
+  本节 = T 提取全套工具在手。
+  工件：r64_heap_t050/t090/t130/t200.bin、probe_fullstream.py、
+  parse_seed.py、parse_disp.py、parse_vmsim.py。
