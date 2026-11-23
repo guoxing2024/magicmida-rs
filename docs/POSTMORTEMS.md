@@ -7256,3 +7256,15 @@ license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
   key + 算术混合）。**下一首务**：1)全 word 流 vs dat 表字节对齐 =
   完整算法链 2)T^-1(表) = license* 3)RISC-64 验证。
   工件：parse_itermap.py、r64_semctx.pkl（16 对 + 全骨架）。
+
+- **补充 132y67（同日续）——算法链数据完备**：
+  **dat 读迹全提取**（r64_datreads.txt）：1017 distinct dat 读取
+  （0x37-0x50 digit 区 + 0xf1 锚），读序 = 检查的表访问模式全迹；
+  与 bignum word 流（1601 值，797 含表字节）合并 = **算法链双流齐
+  备**（表读流 + 栈算术流）。**T = 表读流（输入）x bignum 骨架
+  （变换）-> verdict**——T 的全部输入输出数据在手，剩余 = 骨架代
+  数的精确重组（op7/8/9 链的常数消除 = 机械工作）。
+  **下一首务**：1)骨架代数重组（constants-pair 消除器 = 132y60 的
+  add/sub K1/K2 对消模式）2)T 表达式 3)T^-1(表) = license* 4)RISC-64
+  验证 verdict=PASS 5)迁移 CISC-1。
+  工件：parse_wordflow.py、r64_datreads.txt。
