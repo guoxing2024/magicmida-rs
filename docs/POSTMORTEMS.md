@@ -7326,3 +7326,16 @@ license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
   程序输入的对接）3)T^-1(表) = license* 4)RISC-64 验证 verdict=
   PASS 5)迁移 CISC-1。
   工件：程序清单（本节，r64_dispatch_trace.txt + ISA 表）。
+
+- **补充 132y72（同日续）——STACKARITH 全解 = 字节对齐/移位族**：
+  Sentinel 分析（每槽独立哨兵）：op7/9/38 = word-shuffle（S0 低
+  16 位<<16）；op8 = 字节混合；op35 = S0 高位<<1 变体；op41/59/63
+  = S0 字节提取移位族；op43 = 双槽 word-shift；op44 = **槽 +1 递
+  增**；op30 = **esp 地址算术**；op10/40 = 常数/计数；op32/52 =
+  清零。**形状定案**：STACKARITH 族 = bignum 引擎的 **digit 对
+  齐/移位/计数 ops**（16 位 word 处理 = [0x703b] 2B 写对应），真
+  正算术 = SBB/ADC（已解）+ 移位 = RCL/RCR（已解）。**ISA 表 =
+  完整**：所有 op 的语义类别全部实测覆盖。**下一首务**：license
+  输入位定位（启动解码相位对接）→ T⁻¹(表) = license* → RISC-64
+  验证 verdict=PASS → 迁移 CISC-1。
+  工件：Sentinel 分析（本节，POSTMORTEMS）。
