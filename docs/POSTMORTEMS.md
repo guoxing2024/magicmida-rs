@@ -7069,3 +7069,31 @@ license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
   工件：RISC-64U.v2trace2A/B.bin、v2trace3A/B.bin、r64_chkbuf_P/M.bin、
   parse_tstat.py、parse_tracediff.py、parse_chkdiff.py、probe_r64mid
   check/mid2/trace2/trace3.py。
+
+- **补充 132y58（同日深夜）——★ f-emu 弧开题：VM 全结构首次可读**：
+  ①**bank 全解码**：vm_bank.bin[0x13..0x5d] = 完整 stdcall atoi 十
+  进制解析器（strlen + 逐位 sub '0' + mul 10 累加，ret 4）；后随
+  jmp-over-data 链 + **62 项 handler 表 [ptr24 LE][01] 全解**（首项
+  = 0x102f9b9 = 派发器体；handlers = 0x103xxxx/0x102xxxx 真地址）；
+  EEDC0014 锚 @bank+0xa5/0xbd。②**执行时明文代码图**：lite2 snatch
+  的 eip 窗 = **2798 个 eip x 32B 代码，run 内 100% 稳定**（每 eip
+  唯一片段！代码不自我修改）=> r64_vmcode_lite2.bin + sparse 逐字节
+  多数投票图 33868B（595 连续 run，54104 洞）。③**助记符普查** =
+  真寄存器 VM：mov/push/pop/add/sub/xor/xchg/shl/or/not/and/inc/
+  dec/neg/shr + jcc(69 je/58 jne...) + pushfd + lodsd；混淆 = 常数对
+  包裹（add K1; sub K2; sub K1 = 净效 sub K2）。④**派发器解码**
+  （0x1028502，image snapshot + disp 一次性捕获 896B 双源全同）：
+  **lodsb [esi] -> xor al,bl -> push bx/ecx -> jmp 0x1036969** => esi =
+  **VM 字节码流指针**、bl = 流解密钥！132y55「esi=license缓冲」修
+  正定案：esi 走查 = **VM opcode 流**（per-run 键控 = 流加密）。
+  VM init @0x10284be 也已读（checksum + lock cmpxchg + esi/ebx 初始
+  化）。⑤**f-emu Unicorn 落地 + 实测**：checkpoint 重放（691 步
+  trace）：lite2 无栈 49.3% exact8；heavy 全栈 0.2%（栈窗 [esp-0x400,
+  +0x800) 修后仍崩 = VM 流数据缺页）；image-union 34%（image = 静态
+  但表 = 运行时构建）。**缺口定位**：派发表基址（jmp [edi+eax*4] 的
+  edi 在指令瞬间 = 采样常数 0x10281cf）+ VM 流内容（DATA map 稀疏）。
+  **下一首务**：1)定向探针抓派发瞬间 edi 2)VM 流全量捕获（esi
+  走查页全 dump）-> 流解密（bl 已知链）-> 62 handler 语义 -> T。
+  工件：parse_bankdis.py、r64_vmcode_lite2.bin、r64_vmmap_lite2.json、
+  r64_vmmap_lite2_img.json、r64_disp_t0xx.bin、parse_femu3/4/5.py、
+  parse_heavyemu2.py、probe_disp.py、RISC-64U.v2heavy.bin。
