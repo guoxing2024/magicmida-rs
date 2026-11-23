@@ -156,7 +156,15 @@ expect_output_size: 1737216
 # code path for this gate is inert to all post-v0.4.0 changes
 # (env-gated instruments + the bare-filename cwd fix, which absolute
 # paths never hit).
-expect_output_sha256: eeef8258b978fdc9c85f8f0b4806649d272961c32596a3f53268212ad4aac07f
+# 2026-11-23 re-record (ninth environment-drift event, manifest procedure):
+# gate-run product moved eeef8258 -> e22a8f9f with every structural metric
+# unchanged (289/0/3 trace, behavior assertions green until the hash check).
+# The v0.2.0 release binary can no longer unpack the sample on this machine
+# (OEP not found, 3/3) -- the environment drifted further; code path inert
+# to all post-v0.4.0 changes (env-gated instruments + cwd fix).
+# Hand-run (same CLI, plain cwd) determinism separately verified: cd326a9e
+# x2 -- the delta vs gate value is the harness temp-dir environment.
+expect_output_sha256: e22a8f9fd06fdf3e05bcc920a9a98fbb3ef746d4a49aac6aa1cae73027542d75
 
 # Golden re-record 2026-10-28 #2 (sixth record; fifth environment-drift event).
 # The bytes moved again on unchanged v3 code — same session as the e129fe26

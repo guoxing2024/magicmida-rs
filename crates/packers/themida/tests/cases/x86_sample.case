@@ -136,7 +136,13 @@ expect_output_size: 110592
 # the Release, verified) on the same machine and the same command produced
 # the IDENTICAL product (2ffaf067...) -- the drift predates the fix and is
 # not code-caused.  Evidence: OUT/x86 A/B run log.
-expect_output_sha256: 2ffaf0679d50ae5497921530d3e009daecb0fcefdad19278ca66eba0d9364891
+# 2026-11-23 re-record #9 (eighth environment-drift event): A/B with the
+# v0.2.0 release binary (OUT/release_assets, sha256 6234de21... same file as
+# the 2026-10-25 record) on the same machine + same command now produces
+# 0cdcabce... byte for byte -- identical to the current pipeline product.
+# The 2026-11-14 value (2ffaf067) no longer reproduces; drift predates all
+# local changes and is not code-caused.
+expect_output_sha256: 0cdcabce966913ce739d7027b8deef0a8ff57f360be530f6c6fea8a93af90499
 
 # Golden re-record 2026-10-28 #2 (seventh record; sixth environment-drift
 # event) — same session as the 397c259c record above (sixth record, earlier
