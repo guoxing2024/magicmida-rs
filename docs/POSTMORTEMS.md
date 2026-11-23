@@ -7360,3 +7360,16 @@ license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
   license 变化 => 流变化（marked run 的流在不同堆区 = 0x1123a10
   = 不同流实例）。**T⁻¹ 攻击面**：前 20 op 的取数 ops = license
   字节的消费点；20 op 的逆 = license* 构造器。
+
+- **补充 132y74（同日续）——20-op 逐 op 展开（真实流字节注释版）**：
+  parse_prog20.py：20 op 完整注释（t/esi/bl/raw/opcode/语义/流字
+  节）：op36 FETCH4B → op53 → op27 PUSHCTX → op21 FETCH4Bk →
+  op13 DUP2 → op8 → op58 ESISAVE → op47 → op57 SUB4 → op32 →
+  op22 FETCH1Bk → op32 → op40 → op35 → op28 CALL → op8 →
+  op31 FETCH4B → op43 → op7 → op44 INC。**修正**：132y70 的迹 =
+  时间序去重；本表 = sorted unique（真解码序）。**形态**：FETCH4B
+  ×3 + FETCH1Bk + CALL + INC + 栈操作族 = 解码程序 = 完整可注
+  释（每 op 的流字节在手）。**下一首务**：①CALL(op28) 目标解
+  析（子程序 = 解码核）②每 op 的流操作数对齐 ③license* 逆推 ④
+  RISC-64 验证。
+  工件：parse_prog20.py（注释清单）。
