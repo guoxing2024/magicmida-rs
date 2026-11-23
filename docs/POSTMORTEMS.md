@@ -7410,3 +7410,16 @@ license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
   _coef 模式扩展）= 全系数表 ②T 表达式合成 ③T⁻¹(表) = license*
   ④RISC-64 验证 verdict=PASS ⑤迁移 CISC-1。
   工件：parse_classify.py、r64_iterclass.pkl。
+
+- **补充 132y78（同日续）——★ 34-op 差分扫描 = 扩展 ISA 解码完成**：
+  parse_sweep.py（X byte0 扫描）：**op191/198/199/208/212/215/216/
+  220/232/235 = Y = X 字节直通**（0x41414100→0x41414101）= **bignum
+  字节存储 ops** = license digits 的数据通路实证！op11/49/41/44/
+  81 = 常数/flags 响应（0x46/0xae = flags 值）；op32/52/68/107 =
+  清零；op30 = 地址算术；op147 = flags 常数。**扩展 ISA 全解码 =
+  240 项表全覆盖**（分类 + 扫描）。**T 的构件全解**：字节直通族
+  （license 数据通路）+ 常数族 + flags 族 + 对齐族 = 完整算子集。
+  **下一首务**：①bignum 程序重构（118 迹 × 全 ISA = 语义执行模
+  型）②license 输入位对接 ③T⁻¹(表) = license* ④RISC-64 验证
+  verdict=PASS ⑤迁移 CISC-1。
+  工件：parse_sweep.py（34 op 扫描）。
