@@ -7420,6 +7420,14 @@ license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
 - **双绿 420/413**（x64/x86）。缺口清单：#1 时光样本 ✓（本轮）、#4 FullVirtualize 样本 ✓（132y88/89）；剩 V2 OEP 边界（定案非欠账）、Themida 1.x OEP 分支、f 缝合弧。
 - 工件：`OUT/v2shm/yijianhong20U.exe`（产物）+ repro_*.exe（复现证据）。
 
+- **补充 132y92（同日续）——★ Themida 1.x 阶梯实测矩阵：1.9.1 全链绿（产物可跑）+ Ancient 分支卡点定位**：
+
+- **版本阶梯 /unpack 实测**（mida-cli-x86，OUT/v1oep/）：**1.9.1 = 全链绿**——`classic OEP VERIFIED at 0x4271dc`（CloseHandle 桩 → .text 守护 → 守护壳回家窗口 → 12s 静默接受）→ IAT 74/0（7 描述符、uncovered_slots=0）→ 产物 2,772,992 B、`Done.`；**行为对照绿**：产物与原样本同到 `http://www.tuts4you.com/` 对话框。**132y67 的「1.x 实测 OEP not found」已过时**——classic OEP 分支（2026-10-27 落地）覆盖 1.9.1。
+- **1.9.1 产物非确定性定位**：2 跑尺寸同（2,772,992 B）但 9,558 字节漂移/67 簇 = ①PE header offset 292 单字节 ②Tuts4You 壳段 0x1124bd 起 ~9.5KB。根因 = `is_themida_section` 不认 tuts4you 改名壳段 → shrink 漏掉 → 壳运行时残留进产品。修法方向 = Tuts4You 段名加入 shrink 集合（1.9.1 语料段名实测）。
+- **Ancient 分支（1.2.3/1.3.0/1.5.0）卡点**：AV storm 死（1024 次同址 0x10080f24，storm 地址 0x26ae770/0x283e770/0x289e770）——Ancient 不走 CloseHandle 桩（T150 日志零守护链触发），守护链对 Ancient 无对象。1.1.1 = VM 解释型（132y73 定案无物化镜像）。1.8.2 = 200s 超时（壳方差）。WinLicense 2.0.1.0 = V2 家族（研究轨道）。
+- **缺口矩阵更新**：1.x OEP 分支对 **V1 classic（1.9.x）已收口**（本节）；剩 Ancient 分支（守护链无对象，需 Ancient 专属 OEP 判据）+ Tuts4You shrink 漏段（小修）。
+- 工件：OUT/v1oep/（T191aU.exe + T191_repro_*.exe + 各版本日志）。
+
 - **补充 132y88（同日续）——★ VMProtect FullVirtualize 样本落地（缺口 #4 收口）**：
 
 - **pigcore.dll 定性**：`OUT/qidongqi/out/ida/pigcore.dll` = **启动器家族 VMProtect 解码产物本体**（sha256 e7004e89…，12,782,080 B x64，9 段 .rdata0/.rdata1/.rdata2 = `Packed` 模板名）——它**不能**当 FullVirtualize 样本原料（它已是解码后产物，不是加壳输入），但它证实 pigcore 家族 = VMProtect 3.x Packed。
