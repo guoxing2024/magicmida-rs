@@ -110,6 +110,38 @@ pub fn fptable_section(pe: &PeHeader) -> Option<&PeSection> {
         .find(|s| section_name(s) == ".fptable")
 }
 
+/// Executable section with **no file bytes**, a large virtual size, and a
+/// name that is neither Themida's nor WinLicense's — the signature of
+/// VMProtect's own VM sections when the build gives them **random names**.
+///
+/// Measured on VMProtect Demo 3.11 console products (`x86_sample_fullvirt.exe`:
+/// `.k?R` raw 0, virtual 0x11c947, exec; `x86_sample_packed.exe`: `.fV]`) —
+/// both classified Themida before this signal because the VMProtect gate ran
+/// first, found none of `.vmp0/.rdata2/.fptable/notpaged`, and fell through.
+/// The corpus (6 min-protection/mutated samples) and the Themida 2.x ladder
+/// (RISC-64.exe `.jusprbck`, WinLicense 2.0.1.0 `kdmaxftt`) never trigger it:
+/// their shell sections carry file bytes.
+///
+/// The name filter is load-bearing.  Themida's `.winlice` is raw 0 + exec +
+/// big; without the exclusion this predicate would swallow the whole V1/V2
+/// ladder and route Themida targets into the VMProtect pipeline.
+pub fn orphan_raw0_exec_sections(pe: &PeHeader) -> Vec<&PeSection> {
+    pe.sections
+        .iter()
+        .filter(|s| {
+            let name = section_name(s).to_lowercase();
+            let other_packer_named = name.contains("themida")
+                || name.contains("winlice")
+                || name.contains(".boot")
+                || name.starts_with("upx");
+            is_executable(s)
+                && s.raw_size == 0
+                && s.virtual_size >= PACKED_MIN_VIRTUAL_SIZE
+                && !other_packer_named
+        })
+        .collect()
+}
+
 /// Sections that carry VMProtect's own code and metadata: executable,
 /// non-pageable, and actually present in the file.
 ///
@@ -328,10 +360,28 @@ impl Packer for VmProtectDetector {
         let notpaged = notpaged_executable_sections(pe);
         let fptable = fptable_section(pe);
         let runtime = runtime_sections(pe, image);
+        let orphan = orphan_raw0_exec_sections(pe);
 
         // Decisive condition — see the module docs for the measured counts.
+        // The orphan signal additionally requires the **entry point to sit in
+        // a file-backed executable section** — the measured VMProtect console
+        // builds put EP inside their own (raw>0) shell section, while the 6
+        // genuine raw-0-exec Themida samples have EP in the raw-0 section
+        // itself (the reason `is_themida_section` cannot be tightened into a
+        // VMProtect test).  A raw-0 exec section alone stays non-decisive.
+        let ep_backed = pe
+            .sections
+            .iter()
+            .any(|s| {
+                is_executable(s)
+                    && s.raw_size > 0
+                    && s.virtual_address <= pe.entry_point
+                    && pe.entry_point
+                        < s.virtual_address.saturating_add(s.virtual_size.max(1))
+            });
         let decisive = !vmp_named.is_empty()
-            || (!notpaged.is_empty() && (fptable.is_some() || !runtime.is_empty()));
+            || (!notpaged.is_empty() && (fptable.is_some() || !runtime.is_empty()))
+            || (!orphan.is_empty() && ep_backed);
         if !decisive {
             return None;
         }
@@ -363,6 +413,24 @@ impl Packer for VmProtectDetector {
                 format!(
                     "sections {names:?} ({} B of VM code/metadata in file)",
                     runtime.iter().map(|s| s.raw_size as u64).sum::<u64>()
+                ),
+            ));
+        }
+        if !orphan.is_empty() {
+            let names: Vec<&str> = orphan.iter().map(|s| section_name(s)).collect();
+            ev.push(Evidence::new(
+                "orphan-raw0-exec-section",
+                format!(
+                    "sections {names:?} (raw 0, exec, random-named — VMProtect build output)"
+                ),
+            ));
+        }
+        if !orphan.is_empty() && ep_backed {
+            ev.push(Evidence::new(
+                "entry-in-file-backed-section",
+                format!(
+                    "entry point {:#x} sits in a shell section with file bytes",
+                    pe.entry_point
                 ),
             ));
         }
@@ -680,4 +748,62 @@ mod tests {
         let absent = sec(".text", 0, 0x12b05c, 0x6000_0020);
         assert!(is_vm_carrier(&absent, &img));
     }
+
+    #[test]
+    fn orphan_raw0_exec_matches_vmp_random_named_build_output_only() {
+        let exe = 0x6000_0020;
+
+        // Measured: VMProtect Demo 3.11 fullvirt product — `.k?R` raw 0,
+        // virtual 0x11c947, exec; EP sits in `.fnX` (file-backed).  Only
+        // `.k?R` qualifies as an orphan: `.fnX` has file bytes and `.text`'s
+        // virtual size is below the threshold.
+        let mut demo = pe_with(vec![
+            sec(".text", 0, 0x1c30, exe),
+            sec(".k?R", 0, 0x11c947, exe),
+            sec_at(".fnX", 0xdb59c, 0xdb59c, exe, 0x1000),
+        ]);
+        assert_eq!(orphan_raw0_exec_sections(&demo).len(), 1);
+        // EP inside the file-backed `.fnX` — the decisive partner condition.
+        // (The test helpers give every section RVA 0, so give `.fnX` its real
+        // RVA first; EP 0x1467e5 must land inside it.)
+        demo.sections[2].virtual_address = 0x127000;
+        demo.entry_point = 0x1_467e5;
+        let ev = detect(&demo, &vec![0u8; 0x1000]);
+        assert!(ev.is_some(), "demo product must reach the VMProtect verdict");
+        // Without the file-backed EP the same shape stays non-decisive
+        // (the 6-genuine-Themida-samples protection).
+        let mut no_ep = pe_with(vec![
+            sec(".text", 0, 0x1c30, exe),
+            sec(".k?R", 0, 0x11c947, exe),
+        ]);
+        no_ep.entry_point = 0;
+        assert!(
+            detect(&no_ep, &vec![0u8; 0x1000]).is_none(),
+            "raw-0 exec alone (EP not file-backed) must stay non-decisive"
+        );
+
+        // Themida's `.winlice` shape (raw 0 + exec + big) must NOT match —
+        // the name filter is what keeps the V1/V2 ladder out of this gate.
+        let winlice = pe_with(vec![
+            sec(".text", 0x400, 0x400, exe),
+            sec(".winlice", 0, 0x6d6000, 0xe000_0060),
+        ]);
+        assert!(orphan_raw0_exec_sections(&winlice).is_empty());
+        assert!(
+            detect(&winlice, &vec![0u8; 0x1000]).is_none(),
+            "themida-named orphan must not produce VMProtect evidence"
+        );
+
+        // Small raw-0 sections are ordinary PE padding, not VM sections.
+        let pad = pe_with(vec![sec(".text", 0x200, 0x200, exe), sec(".pad", 0, 0x80, exe)]);
+        assert!(orphan_raw0_exec_sections(&pad).is_empty());
+
+        // Corpus min-protection shape: shell section has file bytes -> no orphans.
+        let corpus = pe_with(vec![
+            sec(".text", 0x72400, 0x722a4, exe),
+            sec(".kbB0", 0x217c44, 0xfcfbc, 0x6800_0060),
+        ]);
+        assert!(orphan_raw0_exec_sections(&corpus).is_empty());
+    }
 }
+
