@@ -7411,6 +7411,14 @@ license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
   ④RISC-64 验证 verdict=PASS ⑤迁移 CISC-1。
   工件：parse_classify.py、r64_iterclass.pkl。
 
+- **补充 132y81（同日续）——★ T 原子合成模型 digit 域 100% 命中 + 迭代数据分类**：
+
+- **53 unique 迭代数据分类**：byte-byte 6 / byte-big 9 / big-byte 10 / big-big 26 / null 2 —— [0x7045] 首写只有 43% 是 digit；其余 = 指针/中间值流过镜像槽（Y 不是 X 的变换而是别的槽的值）。**133 语法迭代中 57 个 digit-first**。
+- **T 原子合成模型 digit 域对拍**：6 个 byte-byte 迭代**全部命中**已知 T 原子（op11 X+0x5e、op191→0xc7、op41 X+0x1c、op65→0xad/0xb4、op45 X+0x42）= **digit 域模型 100%**；47 个非 digit 迭代需要槽间数据流模型（Y = 邻槽/栈值流过 [0x7045]，非 X 变换）。
+- **ecx 链量化**（dispatch 级 end[5]→in[2] 242/379 = 64% 连续）：26 op 无断链（100/63/228/147/81/15/230/89/62/73/26/173/50/84/76/49/208/235/220/216/212/65/164/199/68/44）= 数据通路保持族；断链 op（op215 4/4、op232 3/3、op79 3/3 等）= 用掉 ecx 不恢复。
+- **拟合结论**：迭代间 (X, prevY, eax, bl_lo) 线性拟合在非 digit 域无解（Y 来自槽间流，非寄存器代数）——T 表达式合成只需覆盖 **digit 域 6 类 T 原子**（已全命中）；license* 构造的输入位 = 133 迭代中 57 个 digit-first 迭代的 X 来源（= fetch ops 读的流内嵌数据，132y73 位点）。
+- **下一首务**：① 57 个 digit-first 迭代的 X ← 流字节位点对接（license 输入位）；② 由 digit 域 T 链反推 license*；③ RISC-64 PASS → 迁移 CISC-1。
+
 - **补充 132y80（同日续）——★ 迭代间链式状态实证 + emu 连续链重放天花板**：
 
 - **op41 = mov ax,[esp]**（r64_isa_full 直读）= 栈顶 word 读 —— **per-op 语义是栈依赖的**；132y78 差分扫描的 T 原子只在合成栈（0x11111111 固定栈）下成立，真实执行时 op41/op33/op32 等读真栈顶。op33 handler 全程 esp/edx 缠绕（anti-disasm 桩），静态读不可行。
