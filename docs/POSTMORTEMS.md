@@ -7411,6 +7411,16 @@ license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
   ④RISC-64 验证 verdict=PASS ⑤迁移 CISC-1。
   工件：parse_classify.py、r64_iterclass.pkl。
 
+- **补充 132y79（同日续）——★ bignum 迭代语义模型 v1（0x68f5 锚切 + 钥演化全表）**：
+
+- **133 迭代锚切**：全局 arena 写流（4943 写）按 0x68f5 锚切 = 133 语法迭代 ×28 写固定骨架；X_in = [0x7045] 首写（锚前 3 写），Y_out = 第二非常数写，Z=[0x703b] 2B、W=[0x703f] 2B。去重（emu 分片重复观测）=> **53 unique (X,Y) 迭代**（r64_iter_model.json）。
+- **骨架定案**（28 写）：[0x7045]=X → [0x7041]×2 → [0x703d]=0x68f5 → … → [0x7039]=X 镜像 → [0x7045]=0x1c75 → [0x7045]=Y → [0x7041]=0x20a8 → [0x703b]=Z → [0x703f]=W。三常数 = 迭代分隔符（各 133 次，间距 28/49/46/48 写 = 分段长度可变）。
+- **语义重现验证**（53 unique 上直接成立）：it5 X=0x64→Y=0xc2 = **op11: Y=X+0x5e** ✓；it127 X=0x17441349→0x17441311 = **op44: Y=X^0x58** ✓；it66 X=0x26→0x68 = **op45: +0x42**；it49 X=0x04→0x20 = **op41: +0x1c**；X=0 常数分支族（op65→0xad/0xb4、op140→0x36d25f01×15、op191→0xc7）与 132y76 全一致。
+- **钥演化全表**（r64_bl_esi_delta.json，79 op）：bl_delta 主规则 = **+op（op10-107 与 op215-235）/ op-256（op145-213，两补码低字节同 op）**——bl 低字节演化 = opcode 自身加法；21 特例 = 5 字节 op（op6/45/54/140/164 读流内嵌 dword）+ word-shuffle 族（op69/73/126/131/230），delta 含 operand 贡献（54/140 MULTI 实证数据相关）。esi_delta = 1（主流）/ 2（2 字节 op）/ 5（5 字节 op）= 程序控制流。
+- **执行模型形状**：53 unique 迭代 = 每迭代 T 原子链 f_op(X, ctx) → Y；'other' 的低位 delta 与 X&0xff 无关（ctx 参与）=> 下一层 = 每迭代多输入拟合（机器栈 0xefxxx + 邻槽）。
+- **下一首务**：① 53 迭代 × 多输入（ctx=栈+邻槽）线性拟合 = 全 T 表达式；② it65 op32（-0xb6）/it48 op41（大变）的 ctx 输入定位；③ T⁻¹(表) = license* → RISC-64 PASS → 迁移 CISC-1。
+- 工件：parse_itermodel.py、r64_iter_model.json、r64_bl_esi_delta.json。
+
 - **补充 132y78（同日续）——★ 34-op 差分扫描 = 扩展 ISA 解码完成**：
   parse_sweep.py（X byte0 扫描）：**op191/198/199/208/212/215/216/
   220/232/235 = Y = X 字节直通**（0x41414100→0x41414101）= **bignum
