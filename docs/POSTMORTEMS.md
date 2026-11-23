@@ -7411,6 +7411,15 @@ license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
   ④RISC-64 验证 verdict=PASS ⑤迁移 CISC-1。
   工件：parse_classify.py、r64_iterclass.pkl。
 
+- **补充 132y91（同日续）——★ EXE gate 样本轮换完成（缺口 #1 收口）**：
+
+- 用户供样 `D:\Projects\shiguang\一键宏V2.0.exe`（8,185,360 B，sha256 c61e1439…）= 时光同厂商**新版**（非旧样本 78009803… 的复得）：Themida V3 x64（.winlice + .boot）+ PigToGo 授权对话框 = 同家族。triage 实测 `Packer: Themida V3`。
+- **/unpack 全链绿**：OEP found → IAT **208 resolved / 0 failed / 6 not-an-import**（11 模块 208 thunks）→ 产物 1,551,872 B sha256 `ff83084d…` **3/3 独立运行逐字节复现**（OUT/v2shm/repro_*.exe）。
+- **行为对照绿**（gate 判定表的对照法）：原样本与产物同到 `软件授权验证`（PigToGoLicenseDialog）窗口——"dump is broken" 与 "机器跑不了样本" 分离判据满足。
+- **case manifest 轮换**：新 `yijianhong_v2.case`（金标 ff83084d + 全结构指标）+ 旧 `guoxing_shiguang.case.retired`（78009803 金标保留历史）；`e2e_gate.rs` manifest_path() 改指新 case + case_id 断言同步；12 static + 1 e2e（--ignored）全绿。
+- **双绿 420/413**（x64/x86）。缺口清单：#1 时光样本 ✓（本轮）、#4 FullVirtualize 样本 ✓（132y88/89）；剩 V2 OEP 边界（定案非欠账）、Themida 1.x OEP 分支、f 缝合弧。
+- 工件：`OUT/v2shm/yijianhong20U.exe`（产物）+ repro_*.exe（复现证据）。
+
 - **补充 132y88（同日续）——★ VMProtect FullVirtualize 样本落地（缺口 #4 收口）**：
 
 - **pigcore.dll 定性**：`OUT/qidongqi/out/ida/pigcore.dll` = **启动器家族 VMProtect 解码产物本体**（sha256 e7004e89…，12,782,080 B x64，9 段 .rdata0/.rdata1/.rdata2 = `Packed` 模板名）——它**不能**当 FullVirtualize 样本原料（它已是解码后产物，不是加壳输入），但它证实 pigcore 家族 = VMProtect 3.x Packed。
