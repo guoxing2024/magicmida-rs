@@ -7121,3 +7121,35 @@ license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
   jmp 链到叶）= 完整 ISA 表 2)VM 流捕获+bl 解密 = 字节码程序文本
   3)bignum 程序语义 = T。工件：r64_tblarea_probe.bin、
   r64_vmmap_merged.json、r64_stream_s00xx.bin x6、probe_stream.py。
+
+- **补充 132y60（同日续）——★ VM 流解码模型闭合：滚动 XOR 流密码确认**：
+  ①**Unicorn 链仿真全绿**：61/61 handler（op14 一项 EMU FAIL 除外）
+  以哨兵输入（X=流操作数/K=流钥/S=VM栈/M=VM数据字节）干净跑完，
+  eax/ebx/esp 全部合理（parse_isasim.py）。**ISA 语义表**：op3=
+  push word[edx]（VM 数据字节入栈）、op4=pop[edx]（VM 数据写回）、
+  op5=movzx ax,[edx]（表字节读）、op6/18/21/31/36/45/54/61=lodsd+
+  xor ebx（4B 操作数解密变体）、op19/20/22/39=lodsb+xor bl（字节
+  取数+**流钥前进**）、op23=neg word[esp]+pushfd、op24=[edi+0x1c]
+  flags 读（0/1=carry）、op28/62=代码指针压栈（call 形）、
+  op29/30/60=sbb 族、op48/55=rcr/rcl、op49=adc、op7/8/9/34/38/40/
+  41/63=word 栈算术。
+  ②**流密码定案**：op20 实测 bl: 0x44332211->0x443322cc，0xcc =
+  X1 低字节 0xdd ^ 0x11 = **bl_new = 流字节 ^ bl_old（滚动 XOR
+  反馈）**；bl 初始 = VM init 0x10284f0-0x10284f2（esi+eax 低字节）。
+  ③**VM 程序迹提取**：handler closure 反向映射（6829 地址，406 歧
+  义）=> walk 1383 步中 **150 步解析出 opcode**（11%，采样落共享块
+  所限），前 60 步 = 12,6,16,12,30,6,30,30,62,6,39,62,6,30x8,16,6,6,
+  30,62,16,6,5,39,62,16,12,5,30,62,16,6,62,30x4,39,30x4,5,30,6,16,6,
+  5,39,39,30x4,5 = **op6(取操作数)->op30(栈算术)xN->op62(flags) 的
+  bignum 循环骨架**。④**op5 表字节读实测**：11 次命中 dat[0x89,0x8c,
+  0xba,0xc2,0xcd,0x176,0x18e,0x1a2,0x1b4] = **校验表区域**（= bignum
+  数字），ebx=0x7d 恒定、esi=0x11acd8b 流位。⑤**forge 方程收口**：
+  dat 表 = 保护器用真 license 烘焙的 bignum 数字；license* 必须满足
+  T(license*) = 表；T = VM 程序（固定）+ license 解码相位（启动 dat
+  走查）。**下一首务（机械性，无需新机制）**：1)捕 bl_init（VM init
+  时刻 esi/ebx 采样）2)walk 的 esi 窗 = 加密流全量 + op19/20/22/39
+  时刻（key-op）=> 逐字节重放解密 = **VM 程序全文** 3)程序语义 = T
+  4)T^-1(表) = license*。
+  工件：r64_isa_full.txt、parse_isasim.py（Unicorn 链仿真）、
+  r64_optrace2.txt、r64_stream_dec.bin、r64_stream_s00xx.bin x6、
+  r64_tblarea_probe.bin、r64_vmmap_merged.json。
