@@ -6983,3 +6983,65 @@ license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
   逆出 → license* → 验证 PASS（在 RISC-64 上先打通！）④方法学迁移
   → CISC-1（同锁同 license，差异 = 密码实现）。
 - 工件：r64_licbuf_50.bin、probe_r64data.py、risc64_flow/click.log。
+
+**续 22 补充 132y56（2026-11-23）——RISC-64 Rosetta 弧第一轮：四定案 + 两否定 + 门清单**：
+
+- **★ 定案 A：搜索列表 = .dat 原始拷贝（字节全同）**。lite2 snatch 的
+  edx 页重建（0xdb 页 [0x30..0x1e0]）== RISC-64.dat[0x30..0x1e0]
+  **逐字节相同**（多偏移验证 0x30/0x38 全对齐）。列表 = 原始 .dat
+  表，不做解码映射。edx 游标 = 0xdbXXYY/0xdcXXYY 形式 = 两页 64KB
+  堆地址（每 run 分配），dc 页 = db 页的**延迟镜像**（00→c6 时序
+  追赶 = 复制循环），表内容只在检查窗口存在（固定 0xDB0000 RPM 失败
+  = 每run基址；0.61s/2.01s 定点扫 needle 零命中 = 自擦除）。
+- **★ 定案 B：license 明文从不物化（检查前）**。全空间 ANSI+UTF-16
+  扫描：注册对话框期（0.80/1.05s）= **0 命中**；点击后 0.01s = 0 命中；
+  判决对话框出现后才出现 6 处（0x62dac0 对话框数据 / 0x1020387+
+  0x1021ec3 = 镜像内判决消息串 = license 编进消息模板）。⇒ 检查消费
+  license 而不落盘明文（CISC-1 同墙）。RISC-64 无 CISC-1 的
+  0x1020560 明文字段等价物。
+- **★ 定案 C：esi 走查缓冲 = 每 run 键控，非 license 纯函数**。
+  控制实验（两个 pristine run）：重建缓冲内容**零公共 16B 窗**、
+  needle0（bb41152a…）在 run B 完全缺席；pristine vs marked（AAAA
+  license）同样零公共。run 内 100% 稳定（1152 地址 50461 重访零差）。
+  「b3d32e」条目标记 = run 内重复单元（13B 单元 7f297113 b3d32e
+  8a75d9c771 重复 3 次），非 run 间不变量。**132y55 的「固定地址
+  license 缓冲」解读修正**：0x11ACEF9 命中 = 该 run 的堆基址巧合；
+  needle0 字节 = 该 run 键控产物。
+- **★ 定案 D：.dat 完整性门 = 第一道门**。patch dat[0x100] 一字节
+  → 0.43s（**早于注册对话框**）"Your license key is corrupted" +
+  license 仍回显（license 解码先于完整性裁决，license 字段在验证区
+  之外或先解码）。CISC-1 同结论（补丁 .dat 被校验门拒）跨家族确认。
+- **否定 1：T_RISC 差分攻击死亡**。缓冲内容 = f(license, per-run
+  key)，pristine-vs-pristine 都不同 ⇒ 无法从 (明文, 缓冲) 对推 T。
+- **否定 2：ZF 采样语义无解**。lite 记录 ZF=1（710 条）与 walk 交集
+  30 条全 zfmatch=False（14µs 采样粒度下 ZF 属邻指令）。
+- **esi 走查形态**：字节粒度游标（delta 1/4/2），0x11acb33→0x11adcca
+  ~950B；marked run 走查 span 20030B vs pristine 3207B = **垃圾
+  license 改变走查路径长度**（输入进检查的确证）；eax 值分布双峰
+  （<256 占 63%），edx = (页<<16|idx)，idx 非单调、页间镜像。
+- **门清单（RISC-64 forge 剩余路径）**：①静态 .dat 补丁 = 完整性门
+  拒（定案 D）②license 明文字段补丁 = 无物化点（定案 B）③缓冲/
+  列表运行时补丁 = 需 µs 机器（KEYFORGE 式，比较指令未定位）④VM
+  程序解码（f-emu 弧，bank 已重建 132y55）⑤**表反推（下一首务）**：
+  表 = dat[0x30..] 全在手 + T 输出迹 = walk 操作数流（eax/ebx 730
+  组）已捕获 ⇒ 离线对齐「操作数 vs 表条目」= T 的输出空间直接观察。
+- 工件：r64_esi_pristine.bin、r64_esi_marked.bin、r64_pagedb/dc_lite2.bin、
+  r64_listbuf_lite2.bin、r64_17f0000_pre/post.bin、RISC-64U.v2marked29.bin、
+  RISC-64U.v2pristine30.bin、probe_r64field3/4.py、probe_datpatch.py、
+  probe_r64dw.py、probe_dcwatch.py、parse_r64lic1-24.py、parse_r64diff*.py、
+  parse_zf.py、forge_v27-30.py。
+
+- **补充（同轮晚）——页分裂修正 + 完整四态模型**：按页分裂后（db=
+  0xDB0000 页，dc=0xDC0000 页）：**db 页 3219/3222 (99.9%) == dat[idx]
+  = 原始 .dat 拷贝铁证**；dc 页仅 62% 相同，且**全部 mismatch = 0**
+  （175 个位置全是被清零，无一个非零解码值）⇒ dc = **擦除镜像**
+  （读后逐字节清零，CISC-1「读后擦除」同款），**不是解码目标**。
+  解码输出 = esi 走查缓冲（每 run 键控，定案 C）⇒ 闭环：dat 原文
+  (db) + 擦除镜像 (dc) + 每 run 键控解码缓冲 (esi) + 寄存器瞬间变换
+  (eax/ebx)。dat[0x0f1] 在 walk 中内容变化 = 两代缓冲混采（0xDB0041
+  vs 0xDC0041 同 idx 不同页），非原地改写。**CISC-1 对比**：CISC-1
+  snatch 全文无 dat 拷贝（list = 4KB 独立 blob「不从 B 构建」132y47）
+  ⇒ raw-dat-list = RISC 家族简化，非通用结构。**下一首务（表反推）
+  收窄**：walk 在 dat 内的访问序（1017 个 distinct idx、93.5% 访问
+  落在 dat 内）+ eax/ebx 操作数流 vs dat[idx] 值 ⇒ T 的输出空间 =
+  纯离线可推；验证锚 = T(明文 license) 的输出必须命中 dat 表条目。
