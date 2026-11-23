@@ -7226,3 +7226,19 @@ license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
   表（真实状态）+ 写迹 + 栈值迹全在手；剩余 = bignum 程序重构
   （栈值迹的算术重放）= 纯机械下一步。
   工件：parse_semctx.py、r64_semctx.pkl、r64_semtable.pkl。
+
+- **补充 132y65（同日续）——★ bignum 程序 = 133 迭代固定骨架**：
+  第二竞技场定案：0x7030-0x7100 = VM 数据栈（第二栈，非 0xefec8
+  机器栈）；**4943 写 = 133 迭代 x 固定写骨架**（每迭代 28-49 写，
+  槽序相同、仅数据不同 = 逐迭代对比 seg t=1007224 vs t=1009150 槽
+  序一致）。**digit 流提取**（slot 0x703b 2B 写）：0x667, 0x6df x4,
+  0x664, 0x67d x2, 0x67e x2, 0x6df, 0x68b, 0x62e, 0x6df x4, 0x600,
+  0xdcca... = **bignum 中间值流**（146 写，133 迭代）。固定骨架 =
+  0x7045/0x7041/0x703d/0x7039/0x7035 五槽循环 + 指针
+  （0x10281cf/0xeb5c0014/0x11accf6->0x11ad391 流指针前进）+ bignum
+  字节。**T 的形状最终定案**：license 检查 = **133 迭代的 digit-
+  serial bignum 程序**（固定骨架 + 每迭数字据 = license 衍生）。
+  **下一首务**：1)迭代边界精确切分（骨架对齐）2)每迭 input->output
+  digit 映射 = 算法核 3)digit 源 = license 字节关系 4)T^-1(表) =
+  license* 5)RISC-64 验证。
+  工件：parse_stackreplay.py、r64_semctx.pkl（133 迭代全部数据）。
