@@ -7411,6 +7411,13 @@ license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
   ④RISC-64 验证 verdict=PASS ⑤迁移 CISC-1。
   工件：parse_classify.py、r64_iterclass.pkl。
 
+- **补充 132y85（同日续）——★ digit 位点收口：X = bignum 操作数字节序列**：
+
+- **57 digit-first X 全序列提取**：`64 00 49 00 00 56 04 00×8 20 00 00 26 26 c7 00×17 ff×19 0f`——**结构 = bignum 操作数字节阵列**（稀疏数据段 + 0xff 掩码尾 21 字节 + 0x0f 终止符），非 ASCII 注册名、非 .dat 密文直映（.dat[0:32]=7c4f2a7e… 与 X 无匹配 = .dat 加密 blob 未过 VM 流）。
+- **位点链定案**：license(.dat) → .dat 解码器（壳侧，f 逆向弧）→ **大数操作数** → VM digit 流（57 X）→ bignum T 链 → verdict。VM 流之前已有一次解码——位点对接收口：**VM 内弧全解**（T 原子 6/6 + 操作数序列在手），**VM 外弧 = .dat 解码器**（f handler 缝合弧，补充 25 定案方向）。
+- **研究弧收口判定**：RISC-64 bignum 检查 = 对固定大数操作数的验证变换（出厂 .dat 即通过态）。T⁻¹ 研究价值保留；工程 PASS 已由出厂 license 直达（132y83/84 铁证）。
+- **下一首务**：POSTMORTEMS 索引行更新（132y79-85 七节）+ v2-campaign-state 收口。
+
 - **补充 132y84（同日续）——★ 迁移 CISC-1 完成：verdict=PASS 双样本铁证**：
 
 - **CISC-1 原始 .dat = 通过态**（与 .dat.orig 逐字节同，sha256 5576d95c…）——与 RISC-64 同构：出厂 license 即注册态。
