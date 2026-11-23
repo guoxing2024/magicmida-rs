@@ -7097,3 +7097,27 @@ license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
   工件：parse_bankdis.py、r64_vmcode_lite2.bin、r64_vmmap_lite2.json、
   r64_vmmap_lite2_img.json、r64_disp_t0xx.bin、parse_femu3/4/5.py、
   parse_heavyemu2.py、probe_disp.py、RISC-64U.v2heavy.bin。
+
+- **补充 132y59（次日晨）——★ VM ISA 全解：61 个 handler 全部反汇编可读**：
+  **派发表运行时定案**：r64_tblarea_probe.bin = 0x102820f 处 64 项
+  u32 LE handler 地址全解（[3]=0x1039349 … [63]=0x103d587，[0..2]=0
+  未用；edi 采样常数 0x10281cf = 表基-0x40 的参数区；派发前 edi :=
+  表基）。**合并代码图**（lite2 33868B + heavy 147945B + image 静态
+  基座）= 920638B => **61/61 handler 头部反汇编全可读**：
+  - 流取数：op6/18/21/31/36/45/54/61 = lodsd [esi]（+xor ebx 流钥）；
+    op19/20/22/39 = lodsb [esi]（+xor bl）
+  - VM 数据：op3 = push word [edx]（edx = VM 数据指针）、op4 =
+    pop [edx]（写回）、op5 = movzx ax,[edx]
+  - **算术核 = 带 flags 的 bignum 风格**：op23 = neg word [esp]+pushfd；
+    op29/60 = popfd+pop+sbb [esp]；op48 = rcr [esp],cl；op49 = adc
+    [esp],eax；op55 = rcl [esp],cl——**flags 存于 VM 上下文 [edi+0x1c]**
+    （op24/27/29/48/49/55/60/62 全部读写它）
+  - 栈算术：op7/8/9/10/34/38/40/41/44/63 = mov ax,[esp] + 加/或/异或
+  - 结构：每 handler 尾 jmp 0x1028502（回派发器取下一 opcode）或
+    jmp 中继块（常数对混淆）
+  **T 的形状定案**：VM = 以 [esi] 流驱动的 bignum/算术解释器，数据
+  = [edx] VM 数据区，flags = [edi+0x1c]，栈 = esp。license 检查 =
+  该 VM 的一段 bignum 程序。**下一首务**：1)全 handler 体展开（跟
+  jmp 链到叶）= 完整 ISA 表 2)VM 流捕获+bl 解密 = 字节码程序文本
+  3)bignum 程序语义 = T。工件：r64_tblarea_probe.bin、
+  r64_vmmap_merged.json、r64_stream_s00xx.bin x6、probe_stream.py。
