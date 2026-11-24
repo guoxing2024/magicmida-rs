@@ -220,6 +220,33 @@ pub struct ThemidaState {
     /// instruction, the -1 AV) have been seen — the marker that the decode
     /// phases are running/finished and the stub-guard may be armed.
     pub decode_av_seen: bool,
+    /// 132y99: per-phase base-fix (`MAGICMIDA_ANCIENT_BASEFIX`).  The
+    /// Ancient hash resolver scans kernel32's export-name table for a CRC16
+    /// target (op(7) phase: 0x9CA8B852 = VirtualAlloc), but its scan-base
+    /// slot (`[esp+0x28]` at the hash-loop entry) is never relocated — it
+    /// holds a stale shell-image address instead of the real kernel32 base,
+    /// so the scan never matches and the shell spins in its int1-op storm
+    /// forever.  Verified live (132y98): a DR execute breakpoint at the
+    /// hash-loop entry plus a stack patch (`[esp+0x28] := [esp+0x2c]`)
+    /// unblocks the resolver and the shell goes silent-native.  The
+    /// resolver runs once per decode phase, so the fix is a loop, not a
+    /// one-shot.
+    ///
+    /// Absolute addresses of every hash-loop entry (`33 c0 33 db ac …
+    /// 66 35 41 50 66 81 f3 49 54 … 75 eb 33 c8 33 d3 4f 75 d5` — the CRC16
+    /// core, 2 copies in the 1.5.0 image) found by the signature scan;
+    /// armed as DR0/DR1 execute breakpoints on the first base-fix hit.
+    pub basefix_bp_addrs: Vec<usize>,
+    /// Set once the breakpoints are armed (the signature scan runs once).
+    pub basefix_armed: bool,
+    /// Number of int1-AV storm hits seen (`MAGICMIDA_PASSTHROUGH` arming
+    /// path): the DRs are armed on the 3rd repeated 0x64bb1e AV — late
+    /// enough that the UD's SEH frames were built with DRs clear, early
+    /// enough for the resolver phase.
+    pub basefix_storm_hits: u32,
+    /// Number of stack patches applied (each = one resolver invocation
+    /// unblocked).  Logged as the run's progress evidence.
+    pub basefix_patches: u32,
 }
 
 impl ThemidaState {
@@ -274,6 +301,10 @@ impl ThemidaState {
             stub_guard_page: 0,
             stub_api_addrs: Vec::new(),
             decode_av_seen: false,
+            basefix_bp_addrs: Vec::new(),
+            basefix_armed: false,
+            basefix_storm_hits: 0,
+            basefix_patches: 0,
             iat_write_addresses: HashSet::new(),
             // Default: wait for 3 unique write addresses before considering IAT ready.
             // This is a low threshold because the VM may write to the same address

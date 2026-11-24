@@ -60,7 +60,7 @@ use helpers::{
     resolve_host_api, compute_data_section_bounds, detect_packed_dll, pe_section_name_remote_rva,
     dotnet_dump_and_dump_output, handle_hw_breakpoint, section_table, step_until_in_image,
 };
-use av_handler::{AvAction, handle_access_violation, try_intercept_oem_op};
+use av_handler::{AvAction, handle_access_violation, try_intercept_oem_op, try_ancient_basefix};
 // Re-export public functions for commands.rs
 pub use verify::verify_unpacked;
 pub use dump::dump_process_code;
@@ -1158,7 +1158,13 @@ pub fn unpack(
                 // recorder's 5 ms cadence that would be 200 full-image
                 // RPMs/sec of self-inflicted perturbation.  Skip them while
                 // recording (the recorder IS the observation then).
-                if !recording_now {
+                // 132y99: skip them under passthrough too — the probe's
+                // event loop does NOTHING on timeout ( WaitForDebugEvent
+                // just returns), and the shell's decode phases are
+                // timing-sensitive (rdtsc checks in the resolver's success
+                // path).  A full-address-space sweep every 500 ms tick
+                // freezes the shell mid-phase repeatedly.
+                if !recording_now && !passthrough_on {
                     try_map_scan(&mut dbg, &mut state, image_base_usize, &output_path);
                     try_ancient_watch_scan(&mut dbg, &mut state, image_base_usize, &output_path);
                     try_v2_watch_scan(&mut dbg, &mut state, image_base_usize, &output_path, started.elapsed().as_millis() as u64);
@@ -1316,7 +1322,28 @@ pub fn unpack(
             }
         };
         state.last_event_at = Some(std::time::Instant::now());
-        log::log(LogType::Info, &format!("event received: {event:?}"));
+        // 132y99: with the Ancient base-fix active, per-event INFO logging
+        // through the resolver's 8-round hash loop changes the shell's
+        // rdtsc anti-debug window (the resolver's success path carries a
+        // `rdtsc / jb` timing check — measured run14: 181 logged DR hits
+        // stretched the phase and the shell jumped to k32base+3 = anti-
+        // debug bogus target; the python probe logs nothing per event and
+        // the resolver completed).  Log DR hits at debug level only.
+        let ancient_basefix_on = std::env::var("MAGICMIDA_ANCIENT_BASEFIX").is_ok()
+            && state.pe_info.themida_version
+                == mida_packers_themida::ThemidaVersion::Ancient;
+        if ancient_basefix_on
+            && matches!(event, DebugEvent::SingleStep { .. })
+        {
+            // Diagnostic escape hatch only: DR-hit spam stays silent by
+            // default.  Keeps the resolver's rdtsc window quiet while
+            // preserving diagnosability.
+            if std::env::var("MAGICMIDA_ANCIENT_BASEFIX_VERBOSE").is_ok() {
+                log::log(LogType::Info, &format!("event received: {event:?}"));
+            }
+        } else {
+            log::log(LogType::Info, &format!("event received: {event:?}"));
+        }
 
         // DR write-breakpoint hits (`MAGICMIDA_V2_DRBP`): the sentinel miss
         // stores trap here INSIDE the search handler.  Capture the handler
@@ -1354,6 +1381,38 @@ pub fn unpack(
                     // python-probe equivalent: no PEB patches, no header
                     // fixes, no API resolution — just close the file handle
                     // and continue.
+                    // 132y99 A/B (probe_arm21f vs probe_armcp3): arming DR0
+                    // at the WOW64 initial breakpoint (0x4000001f) NEVER
+                    // FIRES (the wow64 context is already established; the
+                    // shell storms unpatched — 1.13M AVs in 150 s), while
+                    // arming at the CREATE_PROCESS event (before the wow64
+                    // context snapshot) fires, patches, and the shell runs
+                    // silent.  Arming at CREATE_PROCESS is also what run19's
+                    // DR fire + patch evidence showed.  Keep the arm here.
+                    if state.pe_info.themida_version
+                        == mida_packers_themida::ThemidaVersion::Ancient
+                        && !state.basefix_armed
+                        && std::env::var("MAGICMIDA_ANCIENT_BASEFIX").is_ok()
+                    {
+                        state.basefix_bp_addrs
+                            .push(image_base as usize + 0x186_483);
+                        match dbg.set_hw_breakpoint(
+                            0,
+                            image_base as usize + 0x186_483,
+                            HwbpType::Execute,
+                        ) {
+                            Ok(()) => {
+                                state.basefix_armed = true;
+                                info!(
+                                    dr0 = %format!("{:#x}", image_base as usize + 0x186_483),
+                                    "basefix: resolver hash entry armed at CreateProcess (hardcoded 1.5.0 offset)"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "basefix: DR0 arm failed at CreateProcess");
+                            }
+                        }
+                    }
                     unsafe {
                         let _ = windows::Win32::Foundation::CloseHandle(h_file);
                     }
@@ -1365,6 +1424,38 @@ pub fn unpack(
                 // The shell's main thread: the jump into the materialised
                 // image (Themida 1.1.1) happens on it.
                 state.main_thread_id = thread_id;
+
+                // 132y99: with `MAGICMIDA_ANCIENT_BASEFIX`, arm the hash
+                // resolver's loop-entry DR HERE — at the CREATE_PROCESS
+                // event, before the wow64 context snapshot.  A/B-proven
+                // (probe_arm21f vs probe_armcp3 + mida-cli run23): arming
+                // later (0x4000001f BP / UD dispatch) never fires or poisons
+                // the shell's SEH; arming here fires, patches, and the shell
+                // then runs the resolver phase silently (run23: 300 s alive,
+                // zero exceptions).
+                if state.pe_info.themida_version
+                    == mida_packers_themida::ThemidaVersion::Ancient
+                    && !state.basefix_armed
+                    && std::env::var("MAGICMIDA_ANCIENT_BASEFIX").is_ok()
+                {
+                    state.basefix_bp_addrs.push(image_base as usize + 0x186_483);
+                    match dbg.set_hw_breakpoint(
+                        0,
+                        image_base as usize + 0x186_483,
+                        HwbpType::Execute,
+                    ) {
+                        Ok(()) => {
+                            state.basefix_armed = true;
+                            info!(
+                                dr0 = %format!("{:#x}", image_base as usize + 0x186_483),
+                                "basefix: resolver hash entry armed at CreateProcess (hardcoded 1.5.0 offset)"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "basefix: DR0 arm failed at CreateProcess");
+                        }
+                    }
+                }
 
                 // Ancient targets: arm the exit-window watch from the start.
                 // The CloseHandle breakpoint is skipped for Ancient (DR0
@@ -1939,6 +2030,13 @@ pub fn unpack(
                         == mida_packers_themida::ThemidaVersion::Ancient;
                     if ancient {
                         debug!("Ancient target — skipping the CloseHandle breakpoint (DR0 poisons decode phase 2)");
+                        // 132y99: with `MAGICMIDA_ANCIENT_BASEFIX` the DR slots
+                        // are reserved for the hash-resolver base-fix, but they
+                        // are NOT armed here — any arming before the shell's
+                        // SEH frames exist poisons the stream (the shell's SEH
+                        // validates DRs mid-exception).  The arming happens on
+                        // the int1-AV storm in the AccessViolation passthrough
+                        // arm (3rd 0x64bb1e hit).
                     } else if no_chbp {
                         info!("MAGICMIDA_NO_CHBP=1 — skipping the CloseHandle breakpoint (diagnostic)");
                     } else if looks_like_dll {
@@ -2410,6 +2508,11 @@ pub fn unpack(
             // ---------------------------------------------------------------
             DebugEvent::Breakpoint { thread_id, address } => {
                 if passthrough_on {
+                    // 132y99 A/B: arming here (0x4000001f) does NOT work —
+                    // the wow64 context is already established and the DR
+                    // never reaches the 32-bit view (probe_arm21f: DR armed
+                    // but never fired, 1.13M unpatched AVs).  The arm lives
+                    // in the CREATE_PROCESS branch above.
                     dbg.continue_event(thread_id, ContinueStatus::Continue)?;
                     continue;
                 }
@@ -2543,6 +2646,30 @@ pub fn unpack(
                 // passthrough probes.  Storm counting OFF (the point is to
                 // observe the raw flow).
                 if passthrough_on {
+                    // 132y99: the int1-AV storm (repeated 0x64bb1e AVs after
+                    // the OEM-op UD) is the window where the shell's SEH
+                    // chain is running its op stream — arming DRs HERE (on
+                    // the 3rd storm AV) is late enough that the UD's SEH
+                    // frames were built with DRs still clear, and early
+                    // enough that the resolver phase (which runs after the
+                    // storm converges) gets patched.
+                    if state.pe_info.themida_version
+                        == mida_packers_themida::ThemidaVersion::Ancient
+                        && exception_addr == 0x64bb1e
+                    {
+                        state.decode_av_seen = true;
+                        state.basefix_storm_hits += 1;
+                        if state.basefix_storm_hits == 3 {
+                            let _ = try_ancient_basefix(
+                                &mut dbg,
+                                &mut state,
+                                thread_id,
+                                exception_addr as usize,
+                                image_base_usize,
+                                image_boundary,
+                            );
+                        }
+                    }
                     dbg.continue_event(thread_id, ContinueStatus::ExceptionNotHandled)?;
                     continue;
                 }
@@ -2569,8 +2696,41 @@ pub fn unpack(
             // SINGLE_STEP — re-arm the code section guard after a guarded access
             // ---------------------------------------------------------------
             DebugEvent::SingleStep { thread_id, address } => {
-                if passthrough_on {
+                // 132y99: the base-fix patch phase must run BEFORE the
+                // passthrough routing — a DR hit on the resolver hash entry
+                // is OUR breakpoint, not a shell int1-op; the patch +
+                // RF + DBG_CONTINUE consume it (probe-faithful).  In
+                // passthrough runs the check below would otherwise hand
+                // OUR hit to the shell's SEH, which self-terminates on an
+                // unexpected single-step (measured run13: 2 hits delivered
+                // NOT_HANDLED → shell exit 0x40010002 in 7 s).
+                if state.pe_info.themida_version
+                    == mida_packers_themida::ThemidaVersion::Ancient
+                    && try_ancient_basefix(
+                        &mut dbg,
+                        &mut state,
+                        thread_id,
+                        address as usize,
+                        image_base_usize,
+                        image_boundary,
+                    )
+                {
+                    // The patch phase already finished the context (DR6
+                    // cleared, RF set, CONTROL|DEBUG_REGISTERS groups
+                    // written) — plain DBG_CONTINUE is enough here.
                     dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+                    continue;
+                }
+                if passthrough_on {
+                    // 132y99: the Ancient int1-op channel (CD xx) delivers its
+                    // ops as EXCEPTION_SINGLE_STEP, and the shell's own int1
+                    // handler IS the SEH for that code — the probe continues
+                    // every int1 with DBG_EXCEPTION_NOT_HANDLED so the shell
+                    // decodes the op.  DBG_CONTINUE here swallows the op and
+                    // diverges the stream into the 0x587c5f park (measured:
+                    // probe storms 13.5k AVs and stays alive; mida-cli parks
+                    // at 0x587c5f after the first delivered AV).
+                    dbg.continue_event(thread_id, ContinueStatus::ExceptionNotHandled)?;
                     continue;
                 }
                 // Workspace-stub trap, API-hit handling: the payload is
@@ -2651,6 +2811,31 @@ pub fn unpack(
                     addr = %format!("{address:#x}"),
                     "SingleStep at known HW-BP address — treating as CloseHandle hit"
                 );
+
+                // 132y99: Ancient base-fix (`MAGICMIDA_ANCIENT_BASEFIX`) — the
+                // hash resolver's scan base is never relocated; a DR hit on a
+                // hash-loop entry is the per-phase patch point.  Must run
+                // BEFORE the shared handler (which would route the hit as a
+                // CloseHandle milestone and clear the slots).
+                if state.pe_info.themida_version
+                    == mida_packers_themida::ThemidaVersion::Ancient
+                    && try_ancient_basefix(
+                        &mut dbg,
+                        &mut state,
+                        thread_id,
+                        address as usize,
+                        image_base_usize,
+                        image_boundary,
+                    )
+                {
+                    // Consumed: set RF so the hash-loop instruction executes
+                    // without re-firing the DR, and continue.
+                    let mut ctx = dbg.get_thread_context_control(thread_id)?;
+                    ctx.EFlags |= 0x10000; // RF (Resume Flag)
+                    dbg.set_thread_context(thread_id, &ctx)?;
+                    dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+                    continue;
+                }
 
                 // 补充 132b: CYPWATCH hits — capture the Crypt* args and
                 // buffers, disable the one-shot slot, and resume.  The
@@ -2874,15 +3059,14 @@ pub fn unpack(
                                 MEM_RESERVE | MEM_COMMIT,
                                 PAGE_EXECUTE_READWRITE,
                             );
-                            // Gadget must live FAR from the shell's own
-                            // workspace allocations (measured 132y97: a
-                            // gadget at 0xD30000 — inside the shell's
-                            // workspace range — diverges the flow into the
-                            // park-at-0x587c5f path; python-probe gadgets at
-                            // 0x12e0000 advanced the op stream normally).
+                            // 132y99 A/B: gadget placement is load-bearing —
+                            // the probe with a LOW natural allocation (None →
+                            // ~0x12e0000) runs the resolver phase silently to
+                            // completion; forced high (0x20000000) storms.
+                            // Mirror the probe: None.
                             let g = VirtualAllocEx(
                                 h_process,
-                                Some(0x2000_0000 as *const core::ffi::c_void),
+                                None,
                                 0x1000,
                                 MEM_RESERVE | MEM_COMMIT,
                                 PAGE_EXECUTE_READWRITE,
@@ -2913,6 +3097,13 @@ pub fn unpack(
                         info!("PASSTHROUGH: fill check [0x10080f24]={:02x?} ({rn}) gadget={:02x?} ({gn})",
                               &s4[..rn.min(4)], &gb[..gn.min(6)]);
                         info!("PASSTHROUGH: UD NOPped + custom-IAT gadget-filled");
+                        // 132y99: arming does NOT happen here.  DRs set while
+                        // suspended inside the UD's exception dispatch poison
+                        // the stream — the shell's SEH validates DRs mid-
+                        // exception (measured runs 9-12: park at 0x587c5f +
+                        // threads 0xC0000005).  Arming waits for the int1-AV
+                        // storm (AccessViolation passthrough arm, 3rd
+                        // 0x64bb1e hit).
                     }
                     dbg.continue_event(thread_id, ContinueStatus::ExceptionNotHandled)?;
                     continue;
@@ -2931,6 +3122,16 @@ pub fn unpack(
                         image_boundary,
                     )
                 {
+                // 132y99: with `MAGICMIDA_ANCIENT_BASEFIX`, the DR arming must
+                // NOT happen here.  Arming DRs while suspended inside the UD's
+                // exception dispatch makes the kernel deliver the exception
+                // with DR0 != 0 in the saved context, and the shell's SEH
+                // validates the debug registers mid-stream (measured runs
+                // 7-11: park at 0x587c5f + threads 0xC0000005 at ~13 s, vs
+                // the python probe which armed DR0 at the *initial* BP —
+                // before any shell SEH frame existed — and stormed normally).
+                // Arming instead waits for the int1-AV storm to be running
+                // (first repeated 0x64bb1e AV below).
                     // NOT_HANDLED, not Continue: the delivered exception still
                     // goes to the shell's SEH (measured 132y97: with the bytes
                     // NOPped the handler body chain continues into the shell's

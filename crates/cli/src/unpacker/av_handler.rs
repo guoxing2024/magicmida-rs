@@ -4,6 +4,8 @@ use windows::Win32::Foundation::HANDLE;
 use mida_core::{
     ctx_sp, set_ctx_ip, set_ctx_sp, ContinueStatus, DebugEvent, DebuggerCore,
 };
+#[cfg(target_arch = "x86")]
+use mida_core::HwbpType;
 use mida_pe::PeHeader;
 use mida_packers_themida::{
     GuardAccessResult, ThemidaState,
@@ -390,6 +392,11 @@ fn ensure_ancient_custom_iat(dbg: &mut ProcessSession, h_process: HANDLE) {
     }
     // Shared gadget: `ret` (0xC3).  cdecl callers clean their own args, so a
     // bare ret is the correct universal no-op for every slot.
+    // Placement is load-bearing (132y99 A/B): the probe with the gadget at a
+    // LOW natural allocation (VirtualAllocEx(None) → ~0x12e0000) runs the
+    // resolver phase SILENTLY to completion; the same probe with the gadget
+    // forced high (0x20000000) storms.  The fill pointer value participates
+    // in the op stream's path selection — mirror the probe (None).
     let gadget_va = unsafe {
         VirtualAllocEx(
             h_process,
@@ -517,6 +524,203 @@ pub(super) fn try_intercept_oem_op(
         let _ = image_boundary;
         false
     }
+}
+
+// ---------------------------------------------------------------------------
+// Ancient per-phase hash-resolver base-fix (132y99)
+// ---------------------------------------------------------------------------
+
+/// Byte signature of the Ancient CRC16 hash-resolver loop entry (the `33 c0
+/// 33 db` after `33 c9 49 8b d1`, through the `75 eb 33 c8 33 d3 4f 75 d5`
+/// round tail).  Scanned in debuggee memory once, on the first base-fix
+/// opportunity; the 1.5.0 image carries exactly 2 copies (verified 132y98 on
+/// the stuck-process full dump: 0x586483 and 0x6535de with base 0x400000).
+/// The earlier ladder builds (1.2.3/1.3.0) share the resolver algorithm
+/// (same Oreans generation), so the signature — not a hardcoded offset — is
+/// the locator.
+#[cfg(target_arch = "x86")]
+const HASH_ENTRY_SIG: [u8; 43] = [
+    0x33, 0xC0, 0x33, 0xDB, 0xAC, 0x32, 0xC1, 0x8A, 0xCD, 0x8A, 0xEA, 0x8A,
+    0xD6, 0xB6, 0x08, 0x66, 0xD1, 0xEB, 0x66, 0xD1, 0xD8, 0x73, 0x09, 0x66,
+    0x35, 0x41, 0x50, 0x66, 0x81, 0xF3, 0x49, 0x54, 0xFE, 0xCE, 0x75, 0xEB,
+    0x33, 0xC8, 0x33, 0xD3, 0x4F, 0x75, 0xD5,
+];
+
+/// kernel32-base sanity window for the stack-patch value.
+#[cfg(target_arch = "x86")]
+const K32BASE_LO: u32 = 0x7000_0000;
+#[cfg(target_arch = "x86")]
+const K32BASE_HI: u32 = 0x8000_0000;
+
+/// One base-fix opportunity, invoked from the `SingleStep` handler when the
+/// event address matches an armed base-fix breakpoint (DR0/DR1 on the
+/// resolver's hash-loop entries).
+///
+/// Semantics mirror the verified python probe (132y98 `basefix2.py`)
+/// exactly: read the 0x30-byte stack frame at the faulting Esp; treat
+/// `[esp+0x2c]` as the candidate kernel32 base; when it lands in the
+/// system-DLL window and `[esp+0x28]` (the resolver's un-relocated scan
+/// base) differs, overwrite `[esp+0x28]` with the base.  Each patch unblocks
+/// one resolver invocation; the resolver runs once per decode phase, so
+/// this fires repeatedly — it is a loop, not a one-shot.  DR6 is cleared and
+/// the event continues with `DBG_CONTINUE`; the breakpoint stays armed for
+/// the next phase.
+///
+/// Returns `true` when the event was consumed (caller must NOT route it
+/// further); `false` when the address is not a base-fix hit (caller falls
+/// through to its existing handling).
+pub(super) fn try_ancient_basefix(
+    dbg: &mut ProcessSession,
+    state: &mut ThemidaState,
+    thread_id: u32,
+    address: usize,
+    image_base_usize: usize,
+    image_boundary: usize,
+) -> bool {
+    if std::env::var("MAGICMIDA_ANCIENT_BASEFIX").is_err() {
+        return false;
+    }
+    // x86-only: measured on the 32-bit Ancient ladder (the x64 v3 shells do
+    // not run this resolver).
+    #[cfg(target_arch = "x86")]
+    {
+        // ---- Arm phase (once): scan the shell image for the hash entries ----
+        if !state.basefix_armed {
+            // NOTE: `basefix_armed` stays false until the scan actually
+            // lands hits — every event is an arming opportunity (the
+            // decisive one is the OEM-op UD arm, right before the resolver
+            // phase starts; the earlier LoadDll-era calls find only
+            // ciphertext and are expected to return empty).
+            // Scan the whole Themida section span in 64 KB chunks.  The
+            // resolver bytes only exist in memory after the shell decrypts
+            // its code.
+            let scan_lo = image_base_usize + 0x10000;
+            let scan_hi = image_boundary;
+            let mut candidates: Vec<usize> = Vec::new();
+            let mut cursor = scan_lo;
+            while cursor < scan_hi {
+                let chunk_len = 0x1_0000.min(scan_hi - cursor);
+                let mut buf = vec![0u8; chunk_len];
+                if dbg.read_memory(cursor, &mut buf).unwrap_or(0) == chunk_len {
+                    let mut off = 0;
+                    while let Some(rel) = find_sig(&buf[off..]) {
+                        let abs = cursor + off + rel;
+                        // Require the resolver prologue (`fc 33 c9 49 8b d1`)
+                        // immediately before the loop entry — the signature
+                        // is short enough to appear inside VM data otherwise.
+                        if abs >= image_base_usize + 6 {
+                            let mut pre = [0u8; 6];
+                            if dbg.read_memory(abs - 6, &mut pre).unwrap_or(0) == 6
+                                && pre == [0xFC, 0x33, 0xC9, 0x49, 0x8B, 0xD1]
+                            {
+                                candidates.push(abs);
+                            }
+                        }
+                        off += rel + 1;
+                        if off >= chunk_len {
+                            break;
+                        }
+                    }
+                }
+                cursor += chunk_len;
+            }
+            if candidates.is_empty() {
+                // Resolver not decrypted yet — allow retry on later events.
+                return false;
+            }
+            for (i, &abs) in candidates.iter().take(2).enumerate() {
+                match dbg.set_hw_breakpoint(i, abs, HwbpType::Execute) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        warn!(slot = i, addr = %format!("{abs:#x}"), error = %e,
+                              "basefix: failed to arm DR breakpoint");
+                    }
+                }
+            }
+            state.basefix_bp_addrs = candidates.into_iter().take(2).collect();
+            info!(
+                addrs = ?state.basefix_bp_addrs.iter().map(|a| format!("{a:#x}")).collect::<Vec<_>>(),
+                "basefix: resolver hash entries armed (DR0/DR1)"
+            );
+            return false; // this event itself is not a hit yet
+        }
+
+        // ---- Patch phase: hit on an armed hash entry ----
+        if !state.basefix_bp_addrs.contains(&address) {
+            return false;
+        }
+        let ctx = match dbg.get_thread_context_control(thread_id) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "basefix: context read failed");
+                return false;
+            }
+        };
+        let esp = ctx_sp(&ctx);
+        let mut stack = [0u8; 0x30];
+        if dbg.read_memory(esp, &mut stack).unwrap_or(0) < 0x30 {
+            return false;
+        }
+        let k32base = u32::from_le_bytes(stack[0x2C..0x30].try_into().unwrap());
+        let cur = u32::from_le_bytes(stack[0x28..0x2C].try_into().unwrap());
+        if K32BASE_LO <= k32base && k32base < K32BASE_HI && cur != k32base {
+            stack[0x28..0x2C].copy_from_slice(&k32base.to_le_bytes());
+            match dbg.write_memory(esp, &stack) {
+                Ok(_) => {
+                    state.basefix_patches += 1;
+                    info!(
+                        bp = %format!("{address:#x}"),
+                        k32base = %format!("{k32base:#x}"),
+                        was = %format!("{cur:#x}"),
+                        patches = state.basefix_patches,
+                        "basefix: resolver scan base patched — phase unblocked"
+                    );
+                }
+                Err(e) => warn!(error = %e, "basefix: stack patch write failed"),
+            }
+        }
+        // Probe-faithful context finish (132y99 probe_armcp3.py): the probe
+        // reads the FULL wow64 context, clears Dr6, writes ALL groups back
+        // (flags 0x10017) and does NOT set RF.  mida-cli's split
+        // control+DR write left EFlags/RF handling divergent; a partial
+        // SetThreadContext on a wow64 thread mid-exception also risks
+        // group-dependent behaviour.  Mirror the probe exactly: full
+        // context read, Dr6 = 0, write everything.
+        let mut ctx2 = match dbg.get_thread_context(thread_id) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "basefix: full-context read failed");
+                return false;
+            }
+        };
+        ctx2.Dr6 = 0;
+        if let Err(e) = dbg.set_thread_context(thread_id, &ctx2) {
+            warn!(error = %e, "basefix: full-context write failed");
+            return false;
+        }
+        true // consumed: caller continues with plain DBG_CONTINUE
+    }
+    #[cfg(not(target_arch = "x86"))]
+    {
+        let _ = dbg;
+        let _ = state;
+        let _ = thread_id;
+        let _ = address;
+        let _ = image_base_usize;
+        let _ = image_boundary;
+        false
+    }
+}
+
+/// Naive substring search (std's `slice::find` over bytes is available via
+/// `windowslice`, but the dependency budget is closed — 45 bytes at
+/// exception rate is nothing).
+#[cfg(target_arch = "x86")]
+fn find_sig(hay: &[u8]) -> Option<usize> {
+    if hay.len() < HASH_ENTRY_SIG.len() {
+        return None;
+    }
+    (0..=hay.len() - HASH_ENTRY_SIG.len()).find(|&i| &hay[i..i + HASH_ENTRY_SIG.len()] == HASH_ENTRY_SIG)
 }
 
 /// Handle an AccessViolation event in the debug loop.

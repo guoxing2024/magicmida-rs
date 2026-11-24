@@ -7733,3 +7733,56 @@ python 探针（DR0 0x586483 + 栈补丁）：
 - 工件：OUT/ps1/anc150_{handler_alloc,orig_image,apphelp_image,
   stage_image,ws_writer}.bin
 - 双绿 421/414（本轮 mida-cli 零改动；全部探针侧 python + /tmp 工具）
+
+## 132y99: base-fix 集成 mida-cli —— 探针机制全量移植 + 联跑突破（2026-11-24）
+
+132y98 的 python 探针机制（DR0@hash入口 + 栈补丁）移植进 mida-cli，23 轮
+A/B 实测锁定三条环境定律，最终联跑突破：
+
+### 新增基建（`MAGICMIDA_ANCIENT_BASEFIX=1`，x86 门控）
+- `av_handler.rs::try_ancient_basefix`：DR 命中处理（读栈 0x30 字节、
+  [esp+0x2c]=kernel32 基址校验 0x70000000-0x80000000、写 [esp+0x28]、
+  **全上下文读回 + Dr6=0 + 全组写回**、DBG_CONTINUE）。
+- 硬编码 DR0 = image_base + 0x186483（1.5.0 hash 循环入口；byte 签名
+  `33c033db…4f75d5` 在 stuck 转储中唯一锚定，43 字节，双副本）。
+- `ThemidaState` 新增 basefix_{bp_addrs,armed,storm_hits,patches}。
+- SingleStep 臂在 passthrough 路由**之前**处理 basefix 命中（否则命中被
+  交给壳 SEH → 壳 0x40010002 自终，run13 实测）。
+- CreateProcess 臂（passthrough 与非 passthrough 两条）武装 DR0。
+- OEM-op UD 臂/LoadDll 臂的武装尝试已撤下（见定律 2/3）。
+
+### 三条环境定律（全部 A/B 实测）
+1. **武装点 = CREATE_PROCESS 事件，唯一有效**。probe A/B：0x80000003 或
+   CreateProcess 武装 → DR 火并修复成功（静默 150-300s）；0x4000001f
+   武装 → DR **永不火**（wow64 上下文已建立，1.13M 次 0x64bb1e AV 风暴，
+   150s）。
+2. **上下文收尾 = 全上下文读写，探针等价**。CONTROL|DR 部分写 → 壳在
+   resolver 完成后跳 k32base+3（伪造地址）崩溃；全上下文读回（Dr6=0）
+   + 全组写 → 崩溃消失（run23 vs run14-19）。
+3. **gadget 放置 = 低址自然分配（None）**。强制 0x20000000 → 风暴路径；
+   None（落 0x26f0000/0x12e0000）→ 静默路径。132y97 的「必须远离」结论
+   修正为「必须走探针的 None 分配」。
+
+### 联跑结果
+- **run23（passthrough+BASEFIX）**：DR 火 → patch 1 次（was=0x58a9df →
+  0x76250000，与 132y98 探针逐字节一致）→ 壳静默原生运行 **300s 存活**
+  （超时杀掉，exit 143 = 我们的 SIGTERM），零异常零崩溃。
+- **run_full1（完整 /unpack 管线，OEMOP+BASEFIX）**：同形状，5 分钟时壳
+  自建新线程（相位推进迹象），600s 超时。
+- **per-phase 循环 = 下一增量**：132y98 定案「剩余 = 数量」（109 原程序
+  导入 + 壳自身每个 hash 相位，每相位同款修复）；patches 计数器已就绪。
+
+### mida-cli 与探针的等价性矩阵（本轮钉死）
+| 项 | 探针 | mida-cli | 结论 |
+|---|---|---|---|
+| CREATE flags | 2 | 2\|NO_WINDOW\|DEFAULT_ERROR_MODE | 非承重（deltas-probe 风暴过） |
+| PEB.pShimData | 不改 | 非 passthrough 清 | 非承重 |
+| ScyllaHide | 无 | 非 passthrough 注入 | 非承重（--no-scylla 同形状） |
+| 每 tick 扫描 | 无 | 已在 passthrough 门控 | 修正完成 |
+| 上下文写 | 全组 | 全组（本轮改） | **承重** |
+| gadget | None | None（本轮改） | **承重** |
+| 武装点 | 0x80000003/CreateProcess | CreateProcess | **承重** |
+
+### 工件
+- OUT/v1oep/run_bf{1..23}.log、run_full1.log（23 轮 A/B 证据链）
+- OUT/v1oep/probe_{instr,arm21f,armcp3}.py（武装点 A/B 探针）
