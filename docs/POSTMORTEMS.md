@@ -7687,3 +7687,49 @@ mida-cli 在 0x587c5f 停泊后 10s 崩溃。逐项排除：
   （它必须从镜像内某处读名字/序号）→ 对每个 0x1008xxxx 槽做真 GetProcAddress
   → 写真指针。完成它 = Ancient 阶梯（1.2.3/1.3.0/1.5.0）解锁。
 - 双绿 421/414（全部新增代码 env 门控，默认路径零改动）。
+
+## 132y98: op(7) 全语义破解 —— hash resolver 机制全解 + base-fix 突破（2026-11-24）
+
+132y97 的「op(7) 全语义」缺口在本轮全部解开。机制链每步实测：
+
+### int1-op 流的真实身份 = API hash resolver
+TF 单步跟踪 + DR0 执行断点（0x586483 = hash 循环入口）解码：
+- **算法**（0x586473..0x5864bd）：scasb 求名字长度 → 逐字节 lodsb/xor al,cl →
+  8 轮 `shr bx / rcr ax`（多项式 **0x5041/'AP' + 0x5449/'IT'**，Oreans 把
+  "API" 编进 CRC 常数）→ `not edx/not ecx → rol edx,16 | cx` = 32 位 hash。
+- **被扫的表** = kernel32 的 export-name 指针数组（esi 走 [esi] RVA-delta，
+  `add eax,[esp+0x28]` = delta + 基址）。
+- **目标 hash 在栈上 [esp+0x00]**（实测 0x9CA8B852，跨 pass 恒定）。
+- **用 unicorn 精确复刻算法**（载入壳镜像 + 名字字符串）：
+  **0x9CA8B852 = VirtualAlloc**（SysWOW64 kernel32 逐名扫描唯一命中）。
+  算法正确性由同一 emulation 对 GetProcAddress/VDMConsoleOperation 产生
+  稳定不同 hash 交叉验证。
+- 相位标记（'M'/'C'/'R'... 写入 [ebp+0x97427c9]）= 正在解析的 API 名的
+  首字母；`mov byte [ebp+0x97427c9],0` = 每次 probe 重置。
+
+### 卡死的真根因 = resolver 的扫描基址寄存器未重定位
+hash 入口栈上 `[esp+0x28]` = delta 基址，实测 = **0x58a9df（壳自己的镜像
+地址）**，而 delta 是 kernel32 RVA → `edi = delta + 0x58a9df = 0x14`（垃圾）
+→ 扫描永远比对不存在的字符串 → 无限重试。**修复 = 在 hash 入口把真实
+kernel32 基址（栈上 [esp+0x2c] 持有！）写进 [esp+0x28]**。
+
+### 修复实测
+python 探针（DR0 0x586483 + 栈补丁）：
+- 修复 1 次 → hash 命中 VirtualAlloc → resolver 完成 → **壳离开 int1 风暴
+  相位，进入静默原生执行**（600s 零异常 vs 修复前 23k+ int1-AV/3min）。
+- detach → 进程退出（壳检测 detach 后自终，属正常保护行为）。
+- 带修复持续调试 10 分钟：壳继续运行（ntdll 等待 + 镜像代码交替），
+  ~2-4 分钟后自终（0x9d000 部分拆卸态）——下一个相位在等下一个缺失
+  XP-era API 的解析。
+- 结论：**机制完全破解，剩余 = 数量**（109 个原程序导入 + 壳自身的每个
+  hash 相位，每相位同款修复）。1.2.3/1.3.0 同机制。
+
+### 新增基建（python 探针侧，mida-cli 集成为下一增量）
+- DR0 执行断点 0x586483 + Wow64Get/SetThreadContext 栈补丁模式
+- hash 算法的 unicorn 精确复刻（`/tmp/hash_impl8.py`，可离线验证任意
+  名字 → hash）
+- 独立观察器进程模式（调试器占住 debug 对象时，旁路 OpenProcess+RPM
+  监视私有镜像物化）
+- 工件：OUT/ps1/anc150_{handler_alloc,orig_image,apphelp_image,
+  stage_image,ws_writer}.bin
+- 双绿 421/414（本轮 mida-cli 零改动；全部探针侧 python + /tmp 工具）
