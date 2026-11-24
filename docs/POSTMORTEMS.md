@@ -7629,3 +7629,61 @@ no-op gadget 让桩调用无害返回，但 op(7,0x0B) 的**真实语义是解�
 - 工具：/tmp/emu_body*.py（unicorn 仿真）、/tmp/crash_when.py（透传对照）
 - 转储：OUT/ps1/anc150_{handler_alloc,orig_image,apphelp_image,stage_image}.bin
 - 双绿 421/414（x86-only 代码路径，x64 全绿不变）
+
+## 132y97: OEM-op 边界刻画完成 —— int1-op 流解码 + 变量隔离（2026-11-24）
+
+132y96 之后对「壳为何仍停泊」做了全变量隔离与第二轮机制解码。
+
+### int1-op 流解码（第二个 OEM-op 通道）
+0x64bb1e 处的 `CD 01`（int1 带立即数）在用户态以 0xC0000005（target=0xffffffff，
+IDT 探针的预期故障）到达调试器。壳的自定义 SEH handler @0x64bbdf 完全解码：
+```
+mov ebx,[esp+0x10]        ; ebx = CONTEXT*
+mov eax,[ebx+0xb8]        ; ctx.Eip
+movzx eax, byte [eax+1]   ; 读 CD 后面的 imm8 = 子操作号
+dec al                    ; op-1
+mov [ebx+0xb0], eax       ; ctx.Eax = op-1（op 经 Eax 传递给壳逻辑！）
+add dword [ebx+0xb8], 2   ; EIP += 2（跳过 CD xx）
+xor eax,eax; ret          ; EXCEPTION_CONTINUE_EXECUTION
+```
+= int1-op 与 UD-op 同一 VM 的第二投递通道。NOP+fill 后该流确实在推进
+（python 探针 180s 跑 33,251 次 int1-op），但它就是 132y95 那个退化重试环的
+重新投递——op(7) 失败后的死循环换了个执行形式，不是进展。
+
+### 变量隔离（python 探针推进 vs mida-cli 停泊，逐项否证）
+两个环境做同样的事（NOP+fill+NOT_HANDLED），python 探针 int1 流推进、
+mida-cli 在 0x587c5f 停泊后 10s 崩溃。逐项排除：
+| 变量 | 测试 | 结果 |
+|---|---|---|
+| 事件路由（AV/UE/BP/SS/LoadDll/CreateProcess 全透传） | mida-cli passthrough 模式 | 仍停泊 |
+| 扫描干扰（try_map_scan/ancient watch 全禁） | MAGICMIDA_NO_ANCIENT_WATCH + passthrough | 仍停泊 |
+| PEB.BeingDebugged=0 | python 复现 mida-cli 行为 | 流仍推进 |
+| PEB.pShimData 清零 | python 复现 | 流仍推进 |
+| gadget 地址（0xCF0000/0x12E0000/0x20000000 全试） | 两边 | 地址无关 |
+| NOP/fill 字节落地验证 | read-back 日志 | 内容正确 |
+| 创建标志（CREATE_DEFAULT_ERROR_MODE/NO_WINDOW/NORMAL_PRIORITY） | python 复现 | 流仍推进 |
+| 调试器位数（x64 mida-cli + MAGICMIDA_CROSS_ARCH 破门） | 64-bit 调试器 | 仍停泊 |
+| 事件泵延迟（10ms/event） | python 复现 | 流仍推进 |
+结论：唯一剩下的变量 = 调试器进程本体（python.exe vs mida-cli.exe）——壳在某处
+检查了我们未隔离的调试器属性。**这不是壳的本体差异**：两个壳在两种环境下都以
+「等待 op(7) 的真实产物」告终，只是表现形式不同。
+
+### passthrough 基建（新增，全部 env 门控、默认关闭）
+- `MAGICMIDA_PASSTHROUGH=1`：所有异常一律 ExceptionNotHandled、NOP+fill 在首个
+  UD 时一次性执行（带 read-back 验证日志）、BP/SS/LoadDll/CreateProcess 臂最小
+  continue、post-event 扫描全部跳过 —— mida-cli 等价的 python 探针形态。
+- `MAGICMIDA_NO_ANCIENT_WATCH=1`：禁用 Ancient exit-window watch。
+- `MAGICMIDA_CROSS_ARCH=1`：core 架构门旁路（64-bit mida-cli 调试 x86 目标）。
+- `ThemidaState.oemop_nop_done`：一次性标志。
+- 工具链：/tmp/emu_body*.py（unicorn 全量仿真）、/tmp/python_probe_long.py
+  （180s 带窗口监视的探针）、/tmp/crash_when.py、/tmp/int1_semantics.py。
+
+### 132y96-97 合并后的定案
+- AV 风暴消灭（8629→6）+ 壳寿命 10s = 拦截器真实有效。
+- 壳的终点 = 等 op(7) 的真实产物（API trampoline 表）。三个证据链
+  （unicorn 2M 指令零故障、python 探针 33k int1-op、mida-cli 10s 运行）
+  全部指向同一边界。
+- 下一个增量的形状明确且唯一：**op(7) 全语义模拟** = 逆向壳的 API 解析表
+  （它必须从镜像内某处读名字/序号）→ 对每个 0x1008xxxx 槽做真 GetProcAddress
+  → 写真指针。完成它 = Ancient 阶梯（1.2.3/1.3.0/1.5.0）解锁。
+- 双绿 421/414（全部新增代码 env 门控，默认路径零改动）。

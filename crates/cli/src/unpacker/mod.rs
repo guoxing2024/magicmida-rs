@@ -443,6 +443,9 @@ pub fn unpack(
             let hi = usize::from_str_radix(it.next()?.trim().trim_start_matches("0x"), 16).ok()?;
             (lo < hi).then_some((lo, hi))
         });
+    // 132y97 passthrough diagnostic: every exception -> the shell's SEH,
+    // no unpacker processing, no storm counting.
+    let passthrough_on = std::env::var("MAGICMIDA_PASSTHROUGH").is_ok();
     // V2 RIP sampling (`MAGICMIDA_V2_RIPSAMPLE=1`): every poll tick,
     // SuspendThread+GetThreadContext the main thread and record
     // (t, rip, esp, 256B stack).  No bytes are modified in the target, so
@@ -1347,6 +1350,16 @@ pub fn unpack(
                 h_process: evt_h_process,
                 h_file,
             } => {
+                if passthrough_on {
+                    // python-probe equivalent: no PEB patches, no header
+                    // fixes, no API resolution — just close the file handle
+                    // and continue.
+                    unsafe {
+                        let _ = windows::Win32::Foundation::CloseHandle(h_file);
+                    }
+                    dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+                    continue;
+                }
                 debug!(image_base = %format!("{image_base:#x}"), "CREATE_PROCESS_DEBUG_EVENT");
 
                 // The shell's main thread: the jump into the materialised
@@ -1364,6 +1377,7 @@ pub fn unpack(
                 // cascade has settled.
                 if state.pe_info.themida_version
                     == mida_packers_themida::ThemidaVersion::Ancient
+                    && std::env::var("MAGICMIDA_NO_ANCIENT_WATCH").is_err()
                 {
                     state.ancient_watch = true;
                 }
@@ -1437,7 +1451,9 @@ pub fn unpack(
                 // Close the file handle (the debugger doesn't need it).
                 // SAFETY: h_file is valid per the DebugEvent contract.
                 unsafe {
-                    let _ = windows::Win32::Foundation::CloseHandle(h_file);
+                    unsafe {
+                        let _ = windows::Win32::Foundation::CloseHandle(h_file);
+                    }
                 }
 
                 // Resolve kernel32 API addresses (in the debugger's own
@@ -1505,6 +1521,14 @@ pub fn unpack(
                 base_address,
                 h_file,
             } => {
+                if passthrough_on {
+                    // The h_file must still be closed (core passes it through).
+                    unsafe {
+                        let _ = windows::Win32::Foundation::CloseHandle(h_file);
+                    }
+                    dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+                    continue;
+                }
                 debug!(base = %format!("{base_address:#x}"), "DLL loaded");
                 // Track LoadDll bases for the V2 watch filter (the module
                 // snapshot misses some DLLs during the shell's rapid
@@ -1561,7 +1585,9 @@ pub fn unpack(
                 }
                 // SAFETY: h_file is valid per contract.
                 unsafe {
-                    let _ = windows::Win32::Foundation::CloseHandle(h_file);
+                    unsafe {
+                        let _ = windows::Win32::Foundation::CloseHandle(h_file);
+                    }
                 }
 
                 // ---- DLL targets: retarget onto the packed DLL and arm .text --
@@ -2383,6 +2409,10 @@ pub fn unpack(
             // BREAKPOINT — CloseHandle / VirtualAlloc / .text+0x1000
             // ---------------------------------------------------------------
             DebugEvent::Breakpoint { thread_id, address } => {
+                if passthrough_on {
+                    dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+                    continue;
+                }
                 debug!(addr = %format!("{address:#x}"), "Breakpoint hit");
 
                 // ---- FTMGuard re-arm trigger --------------------------------
@@ -2507,6 +2537,15 @@ pub fn unpack(
                 target_address,
                 exc_type,
             } => {
+                // MAGICMIDA_PASSTHROUGH=1 (132y97 diagnostic): deliver every
+                // exception to the shell's own SEH with zero unpacker
+                // processing — the mida-cli equivalent of the python
+                // passthrough probes.  Storm counting OFF (the point is to
+                // observe the raw flow).
+                if passthrough_on {
+                    dbg.continue_event(thread_id, ContinueStatus::ExceptionNotHandled)?;
+                    continue;
+                }
                 // Decode marker for the stub guard: the Ancient decode's
                 // probe exceptions (illegal/privileged instruction, the -1
                 // AV) are the observable "decode is running/ending" signal.
@@ -2530,6 +2569,10 @@ pub fn unpack(
             // SINGLE_STEP — re-arm the code section guard after a guarded access
             // ---------------------------------------------------------------
             DebugEvent::SingleStep { thread_id, address } => {
+                if passthrough_on {
+                    dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+                    continue;
+                }
                 // Workspace-stub trap, API-hit handling: the payload is
                 // launching.  The stack top ([esp]) is the return address
                 // into the workspace stub — dump the surrounding 64 KB while
@@ -2805,6 +2848,75 @@ pub fn unpack(
                 address,
                 code,
             } => {
+                if passthrough_on {
+                    // python-probe equivalent: on the FIRST UD, NOP the op
+                    // bytes + map/fill the custom-IAT block, then hand the
+                    // (already-delivered) exception to the shell SEH.
+                    if code == 0xC000_001D && !state.oemop_nop_done {
+                        use windows::Win32::System::Memory::{
+                            MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE,
+                            VirtualAllocEx,
+                        };
+                        let nops = [0x66u8, 0x90, 0x66, 0x90];
+                        match dbg.write_memory(address as usize, &nops) {
+                            Ok(n) => {
+                                let mut back = [0u8; 4];
+                                let rn = dbg.read_memory(address as usize, &mut back).unwrap_or(0);
+                                info!("PASSTHROUGH NOP write {n} bytes; read-back {rn}: {:02x?}", &back[..rn.min(4)]);
+                            }
+                            Err(e) => warn!("PASSTHROUGH NOP write FAILED: {e}"),
+                        }
+                        unsafe {
+                            let va = VirtualAllocEx(
+                                h_process,
+                                Some(0x1000_0000 as *const core::ffi::c_void),
+                                0xCB_000,
+                                MEM_RESERVE | MEM_COMMIT,
+                                PAGE_EXECUTE_READWRITE,
+                            );
+                            // Gadget must live FAR from the shell's own
+                            // workspace allocations (measured 132y97: a
+                            // gadget at 0xD30000 — inside the shell's
+                            // workspace range — diverges the flow into the
+                            // park-at-0x587c5f path; python-probe gadgets at
+                            // 0x12e0000 advanced the op stream normally).
+                            let g = VirtualAllocEx(
+                                h_process,
+                                Some(0x2000_0000 as *const core::ffi::c_void),
+                                0x1000,
+                                MEM_RESERVE | MEM_COMMIT,
+                                PAGE_EXECUTE_READWRITE,
+                            );
+                            if !g.is_null() {
+                                let _ = dbg.write_memory(
+                                    g as usize,
+                                    &[0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3],
+                                );
+                                if !va.is_null() {
+                                    let fill: Vec<u8> = (g as u32)
+                                        .to_le_bytes()
+                                        .iter()
+                                        .copied()
+                                        .cycle()
+                                        .take(0xCB_000)
+                                        .collect();
+                                    let _ = dbg.write_memory(0x1000_0000, &fill);
+                                }
+                            }
+                        }
+                        state.oemop_nop_done = true;
+                        // verify fill landed
+                        let mut s4 = [0u8; 4];
+                        let rn = dbg.read_memory(0x1008_0f24, &mut s4).unwrap_or(0);
+                        let mut gb = [0u8; 6];
+                        let gn = dbg.read_memory(0x2000_0000, &mut gb).unwrap_or(0);
+                        info!("PASSTHROUGH: fill check [0x10080f24]={:02x?} ({rn}) gadget={:02x?} ({gn})",
+                              &s4[..rn.min(4)], &gb[..gn.min(6)]);
+                        info!("PASSTHROUGH: UD NOPped + custom-IAT gadget-filled");
+                    }
+                    dbg.continue_event(thread_id, ContinueStatus::ExceptionNotHandled)?;
+                    continue;
+                }
                 // 132y96: the Ancient shells' self-defined `0F 3F` opcode stream
                 // (STATUS_ILLEGAL_INSTRUCTION) deadloops inside its own SEH on
                 // Win11 — intercept it before it reaches the shell's error
@@ -2819,7 +2931,12 @@ pub fn unpack(
                         image_boundary,
                     )
                 {
-                    dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+                    // NOT_HANDLED, not Continue: the delivered exception still
+                    // goes to the shell's SEH (measured 132y97: with the bytes
+                    // NOPped the handler body chain continues into the shell's
+                    // normal op-stream path, while resuming at the fault skips
+                    // the SEH body and parks the shell in an ntdll wait).
+                    dbg.continue_event(thread_id, ContinueStatus::ExceptionNotHandled)?;
                 } else {
                     debug!(
                         thread_id,
@@ -2832,15 +2949,17 @@ pub fn unpack(
             }
         }
 
-        // Also scan after events: the materialised image loads during busy
-        // periods (the decompression storm), where no 2 s quiet gap ever
-        // arrives for the timeout scan to fire.
-        try_map_scan(&mut dbg, &mut state, image_base_usize, &output_path);
-        // Ancient exit-window watch: after the CloseHandle hit, snapshot
-        // the materialised image at every event freeze (the image exists
-        // only for the last tens of milliseconds before ExitProcess, and
-        // each debug event is a freeze inside that window).
-        try_ancient_watch_scan(&mut dbg, &mut state, image_base_usize, &output_path);
+        if !passthrough_on {
+            // Also scan after events: the materialised image loads during busy
+            // periods (the decompression storm), where no 2 s quiet gap ever
+            // arrives for the timeout scan to fire.
+            try_map_scan(&mut dbg, &mut state, image_base_usize, &output_path);
+            // Ancient exit-window watch: after the CloseHandle hit, snapshot
+            // the materialised image at every event freeze (the image exists
+            // only for the last tens of milliseconds before ExitProcess, and
+            // each debug event is a freeze inside that window).
+            try_ancient_watch_scan(&mut dbg, &mut state, image_base_usize, &output_path);
+        }
         // NOTE: the V2 watch is NOT called here.  Running it after every
         // event (measured: ~5-20 ms per event) changes the V2 shell's
         // decode timing and causes it to hang (run2-7: all timed out at

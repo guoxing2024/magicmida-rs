@@ -551,13 +551,20 @@ fn pe_inspect(path: &Path) -> Result<PeInfo, CoreError> {
     let expected_machine = IMAGE_FILE_MACHINE_AMD64;
 
     if fh.Machine != expected_machine {
-        let expected_name = if cfg!(target_arch = "x86") { "32-bit" } else { "64-bit" };
-        let actual_name = if cfg!(target_arch = "x86") { "64-bit" } else { "32-bit" };
-        return Err(CoreError::ProcessCreation(format!(
-            "File is for the wrong architecture (Machine={machine:?}): \
-             expected {expected_name}, please use the {actual_name} version of Magicmida.",
-            machine = fh.Machine,
-        )));
+        // 132y97: MAGICMIDA_CROSS_ARCH=1 bypasses the gate for diagnostics -
+        // a 64-bit debugger CAN debug a 32-bit WOW64 process; the WOW64 debug
+        // event shapes differ, which is exactly what the Ancient OEM-op
+        // bisection needs (the 64-bit python probes advance the op stream
+        // while the 32-bit mida-cli parks).
+        if std::env::var("MAGICMIDA_CROSS_ARCH").is_err() {
+            let expected_name = if cfg!(target_arch = "x86") { "32-bit" } else { "64-bit" };
+            let actual_name = if cfg!(target_arch = "x86") { "64-bit" } else { "32-bit" };
+            return Err(CoreError::ProcessCreation(format!(
+                "File is for the wrong architecture (Machine={machine:?}): \
+                 expected {expected_name}, please use the {actual_name} version of Magicmida.",
+                machine = fh.Machine,
+            )));
+        }
     }
 
     Ok(PeInfo {

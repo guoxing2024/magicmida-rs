@@ -6,6 +6,8 @@ use crate::init::ThemidaPeInfo;
 /// Mutable state shared across the Themida unpacking pipeline.
 #[derive(Debug, Clone)]
 pub struct ThemidaState {
+    /// 132y97: one-shot flag for the passthrough UD NOP+fill (x86 diag).
+    pub oemop_nop_done: bool,
     pub pe_info: ThemidaPeInfo,
     pub create_data_sections: bool,
     pub guard_addrs: Vec<usize>,
@@ -224,6 +226,7 @@ impl ThemidaState {
     #[must_use]
     pub fn new(pe_info: ThemidaPeInfo, create_data_sections: bool) -> Self {
         Self {
+            oemop_nop_done: false,
             pe_info,
             create_data_sections,
             guard_addrs: Vec::new(),
