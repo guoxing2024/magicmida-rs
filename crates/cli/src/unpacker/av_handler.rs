@@ -315,16 +315,31 @@ fn is_vm_dispatch_fault(
     tm_end: usize,
 ) -> bool {
     // Ancient-generation candidate (Themida 1.2.3 / 1.3.0 / 1.5.0 ladder,
-    // measured 2026-11-23/24): the interpreter faults on a **fixed data
-    // pointer 0x10080f24** from shell addresses in the VirtualAlloc region
-    // (0x26ae770 / 0x283e770 / 0x289e770 across runs).  Treated as VM
-    // dispatch for 120 s wall-clock under MAGICMIDA_ANCIENT_VMDISPATCH=1:
-    // the deadline expired with no convergence — the Ancient VM spins on
-    // the same bytecode indefinitely (a data dependency the shell waits
-    // for that never arrives under this debugger configuration), unlike
-    // the v3 null-read dispatch which converges in ~2 s.  The branch is
-    // kept for diagnosis but the ladder result stands: Ancient needs its
-    // own OEP approach, not a watchdog exemption.
+    // measured 2026-11-23/24; root cause resolved 2026-11-24, 132y95):
+    // the faulting instruction is an **unrelocated API stub**
+    // `jmp dword ptr [0x10080f24]` (bytes ff 25 24 0f 08 10) inside the
+    // shell workspace (workspace+0xe770 across runs), NOT a VM dispatch.
+    // 132y95 causal chain (all live-measured): the Ancient shell builds
+    // workspace API stubs with ABSOLUTE refs into preferred-base land
+    // (0x10000000 + RVA); three private images (soi 0xf0000 = an
+    // apphelp-era copy carrying "SdbGetPathCustomSdb" strings, 0x1f3000 =
+    // the original program, 0x86000) all prefer base 0x10000000 but are
+    // mapped at alt bases (0x2670000/0x2720000/0x2920000 per run) — the
+    // 0x10080000 custom-IAT region is never committed, so every stub read
+    // faults.  The shell's own OEM-op SEH (`0F 3F 07 0B` illegal opcode,
+    // handler 0x654087 → body 0x653de8) hits its error branch
+    // (wsprintfA "3An internal exception occured (Address: 0x%x)" + CRLF +
+    // "Please, contact support@oreans.com.") and re-executes the same op forever.
+    // contact support@oreans.com.") and re-executes the same op forever.
+    // Refuted rescue paths, all live-tested: perfect SEH passthrough
+    // (1.77M UD faults, no convergence), PEB flag patching (standalone is
+    // already clean), manual mapping of the preferred-base image (early
+    // 0.089s race AND late 8s — zero windows either way).  The shells
+    // also fail STANDALONE (no window, no module loads beyond the loader
+    // baseline), so this is a shell-level environment failure on
+    // Win11 26300, not an unpacker bug.  The branch stays as a diagnostic
+    // classifier; a real rescue needs an OEM-op (0F 3F) VM emulator, not
+    // page patches.  See POSTMORTEMS 132y95.
     if std::env::var("MAGICMIDA_ANCIENT_VMDISPATCH").is_ok()
         && target_address == 0x1008_0f24
     {

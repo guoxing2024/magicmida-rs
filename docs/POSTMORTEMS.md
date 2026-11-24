@@ -7524,3 +7524,59 @@ license、双搜索操作数全部物化、license 缓冲区 = 固定地址**：
   型）②license 输入位对接 ③T⁻¹(表) = license* ④RISC-64 验证
   verdict=PASS ⑤迁移 CISC-1。
   工件：parse_sweep.py（34 op 扫描）。
+
+## 132y95: Ancient 专属方案 — 根因因果链定案（2026-11-24）
+
+「壳等待的数据依赖」找到了，而且是**壳自己在 Win11 上先死**，不是我们调试器的干扰。
+
+### 因果链（每一步都是实测）
+
+1. **风暴指令真身**：mida-cli 日志里 8629 条「同形故障」的故障指令 = workspace+0xe770 处的
+   `ff 25 24 0f 08 10` = **`jmp dword ptr [0x10080f24]`**——不是 VM 派发，是一条
+   **未重定位的 API 跳转桩**。桩前有 `eb f4`（向后跳 12 字节）= 等指针有效的重试环。
+   9 张 workspace 快照逐字节全同 = 壳零推进。
+2. **完美 SEH 透传对照**（`OUT/ps1/anc_probe.py`，DEBUG_ONLY_THIS_PROCESS + 全部异常
+   `DBG_EXCEPTION_NOT_HANDLED`，无 DR、无守护页、无写内存）：壳**同样不过去**——
+   75 秒 **1,774,143 次 `0xC000001D`（非法指令）@0x64b0e4**（镜像内）。无任何 AV。
+3. **UD-op 机制解码**：`0F 3F 07 0B` = Oreans 自造 OEM 操作码。SEH 链
+   （`Wow64GetThreadSelectorEntry` 取 fs 基址 0x22a000 → 链头 0x1aff50）：
+   自定义 handler @0x654087 = `mov ebx,[esp+0xc]`（CONTEXT*）→ 保存 ctx.Eip 到
+   workspace 槽 → `mov [ebx+0xb8], ebp+0x981162c`（跳到 body @0x653de8）→
+   `xor eax,eax; ret` = EXCEPTION_CONTINUE_EXECUTION。body：状态门
+   `[ebp+0x97408d1]` → 错误分支 `wsprintfA(out, "3An internal exception occured
+   (Address: 0x%x)
+Please, contact support@oreans.com. Thank you!", fault_addr)`
+   → push/ret 混淆链 → **回到同一条 UD-op** = 无限自指错误循环。
+4. **standalone 对照**：1.5.0 无调试器裸跑 40s = 无窗口、无进展、模块表止步于
+   loader 基线（只有 ntdll/kernel32/kernelbase/apphelp/COMCTL32/ADVAPI32/msvcrt/
+   sechost/RPCRT4/GDI32/win32u/gdi32full/msvcp_win/ucrtbase/USER32/IMM32）；
+   对照 1.9.1 同机同测 = tuts4you 窗口照常出现、全套 ole/shell 模块加载成功。
+   → **1.2.3/1.3.0/1.5.0 的壳自己在这台 OS 上活不过初始化**。
+5. **0x10080000 悬空区**：`0x10080f24` = 0x10000000 + 0x80f24。进程内三张
+   MEM_PRIVATE PE 镜像（soi 0xf0000 / 0x1f3000 / 0x86000）的 PE 头
+   **ImageBase 全部 = 0x10000000**，实际却映射在 0x2670000/0x2720000/0x2920000
+   （逐 run 漂）。soi 0xf0000 那张带 apphelp 字符串（"SdbGetPathCustomSdb /
+   Failed to get runtime platform [%x]"）= apphelp 时代副本。workspace 桩持有
+   **未重定位的绝对引用**，指向从未提交的 preferred-base 区
+   （0x10080000 区域 VirtualQuery = MEM_FREE，0x4a000000 宽）。
+6. **救援路径逐一否证**（全部实测）：
+   - 手动把 apphelp 副本映射到 0x10000000（`VirtualAllocEx` 成功 = 区位可用，
+     壳只是从不尝试）+ 复制镜像 + RWX：晚映射（8s 卡死态）零窗口；
+     早映射（0.089s 赛跑，赶在桩创建前）也零窗口 → 壳不认被动映射。
+   - PEB 标志：standalone 本来就是 BeingDebugged=0 → 不是 PEB 问题。
+   - 透传调试器：见第 2 步 → 不是调试器干扰。
+
+### 结论与边界
+
+- Ancient 1.2.3/1.3.0/1.5.0 的死点在 **Oreans OEM-op VM 的 op(7,0x0B)**（桩/IAT 创建
+  操作）内部——它在 Win11 26300 环境检查上失败并进入错误自旋。真正的救援 =
+  **实现 0F 3F OEM-op 流模拟器**（把 op 7 的环境检查用我们的答案喂回去），或找到
+  壳在检查的那个环境对象并伪造——页补丁、SEH 透传、PEB 清洗都不够。
+- 我们的 AV 风暴（eip=workspace+0xe770, target=0x10080f24）是**同一失败透过
+  调试器看到的形状**：壳建出了桩但 custom-IAT 区从未提交。
+- `is_vm_dispatch_fault` 的 Ancient 锚点分支保留为诊断分类器（注释已更新为完整
+  因果链）；矩阵终态不变：1.9.1 ✓ 全链、Ancient 三版 = 壳级环境失败、1.1.1 VM
+  解释型、1.8.2 壳方差超时。
+- 工具：`OUT/ps1/anc_probe.py`（透传探针）+ /tmp 系列分析脚本（SEH 链走查、
+  私有镜像枚举、分配监控、映射实验）。
+
