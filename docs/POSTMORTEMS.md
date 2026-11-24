@@ -7580,3 +7580,52 @@ Please, contact support@oreans.com. Thank you!", fault_addr)`
 - 工具：`OUT/ps1/anc_probe.py`（透传探针）+ /tmp 系列分析脚本（SEH 链走查、
   私有镜像枚举、分配监控、映射实验）。
 
+## 132y96: OEM-op 拦截器落地 —— 死锁已破，边界定在 op(7) 全语义（2026-11-24）
+
+132y95 的因果链导向一个可检验的模型：**跳过 UD-op 本身**（不进壳 SEH 的错误分支）。
+全部实测，三层递进：
+
+### 1. Unicorn 前导实验（/tmp/emu_body*.py）
+以真实卡死进程的镜像转储 + 真实故障上下文（eip=0x64b0e4, eax=1, ecx=0x6280e0df,
+esi=edi=0xffffbe34, ebp=0xf6e427bc, esp=0x1aff50）全量仿真：
+- 拦截 `0F 3F`、EIP+4、继续执行 → **500k / 2M 指令零故障**，执行域从镜像转入
+  workspace（0x2400000+）= 壳的解压/installer 阶段真的跑起来了。
+- 对照（无拦截）= 停在第一条指令。
+- 仿真的 int1（`CD 01`/`F1`）异常同样按「继续」处理。
+
+### 2. mida-cli 拦截器（`try_intercept_oem_op` + `ensure_ancient_custom_iat`）
+`UnhandledException(0xC000001D)` 分支插在 NotHandled 路由之前：
+- 门控 `MAGICMIDA_ANCIENT_OEMOP=1` + 镜像内地址 + 读回 `0F 3F` 前缀；
+- **原位补丁**：`0F 3F xx yy` → `66 90 66 90`（两条 2 字节 NOP，长度守恒），
+  DBG_CONTINUE 原地恢复——写内存而不是写 EIP，后续同址重执行自动生效；
+- **custom-IAT 回填**：`VirtualAllocEx(0x10000000, 0xCB000, RWX)`（实测区位
+  本来就空闲，壳自己从不尝试）+ 全域填充共享 gadget `mov eax,1; ret`，
+  每个 `jmp [0x1008xxxx]` 桩落地为一次无副作用 API 调用。
+- x64 上该函数 cfg_attr dead_code 门控（x86-only 特性）。
+
+### 3. 实测（1.5.0 阶梯样本）
+| 配置 | 之前 | 之后 |
+|---|---|---|
+| AV 风暴 | 8629 条同形故障 → 1024 即 FATAL | **6 条**，风暴消失 |
+| 壳寿命 | 卡死即杀 | **10s 真实运行**后 0xC0000005 退出 |
+| 停泊点 | workspace+0xe770 桩 | 0x587c5f（sidt 探针环），esp=0xb1000 |
+| ExitProcess 扫描 | 无候选 | **22 张镜像**（三张私有 stage 全在） |
+
+对照透传调试器（无 ScyllaHide）+ 同样的 NOP+fill：45s 无崩溃、无窗口、
+int1 `0xCD 01`@0x64bb1e 的首经 AV（读 0xffffffff = IDT 探针的预期故障，
+壳 SEH 自吞）以 ~7k/40s 的速率循环——壳活着但在等一个永远不会来的状态变化。
+
+### 边界定案
+no-op gadget 让桩调用无害返回，但 op(7,0x0B) 的**真实语义是解析 API 并在
+0x10000000+RVA 处写真 trampoline**——跳过它 = 每个槽都返回假成功，壳后续
+算法等不到真实结果（LoadLibrary/信号量类调用）。工程缺口 = **单个 OEM-op
+的全语义模拟**（读壳内解析表、对每个槽位做真 GetProcAddress、写真指针）。
+这是后续增量的明确形状；死锁本身已经不再是墙。
+
+### 落盘
+- `crates/cli/src/unpacker/av_handler.rs`：`try_intercept_oem_op` +
+  `ensure_ancient_custom_iat`（完整因果链注释）
+- `crates/cli/src/unpacker/mod.rs`：UnhandledException 分支路由 + import
+- 工具：/tmp/emu_body*.py（unicorn 仿真）、/tmp/crash_when.py（透传对照）
+- 转储：OUT/ps1/anc150_{handler_alloc,orig_image,apphelp_image,stage_image}.bin
+- 双绿 421/414（x86-only 代码路径，x64 全绿不变）

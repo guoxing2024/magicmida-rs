@@ -348,6 +348,177 @@ fn is_vm_dispatch_fault(
     target_address == 0 && tm_start < tm_end && exception_addr >= tm_start as u64 && exception_addr < tm_end as u64
 }
 
+
+
+/// Map the Ancient shell's dangling custom-IAT block (preferred base
+/// 0x10000000, size 0xCB000 measured from the MEM_FREE span that the stubs
+/// reference) and fill every dword with a pointer to one shared `ret` gadget.
+/// Idempotent: silently no-ops when the region is already committed.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+fn ensure_ancient_custom_iat(dbg: &mut ProcessSession, h_process: HANDLE) {
+    use windows::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAllocEx,
+        VirtualQueryEx, MEMORY_BASIC_INFORMATION,
+    };
+    const PREF_BASE: usize = 0x1000_0000;
+    const PREF_SIZE: usize = 0xCB_000;
+    // Already committed?  VirtualQueryEx the first page.
+    let mut mbi = MEMORY_BASIC_INFORMATION::default();
+    let got = unsafe {
+        VirtualQueryEx(
+            h_process,
+            Some(PREF_BASE as *const core::ffi::c_void),
+            &mut mbi,
+            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    if got == 0 || mbi.State != windows::Win32::System::Memory::MEM_FREE {
+        return; // mapped (by the shell or a previous call) — leave it alone
+    }
+    let va = unsafe {
+        VirtualAllocEx(
+            h_process,
+            Some(PREF_BASE as *const core::ffi::c_void),
+            PREF_SIZE,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_EXECUTE_READWRITE,
+        )
+    };
+    if va.is_null() {
+        warn!("Ancient custom-IAT: VirtualAllocEx at preferred base failed");
+        return;
+    }
+    // Shared gadget: `ret` (0xC3).  cdecl callers clean their own args, so a
+    // bare ret is the correct universal no-op for every slot.
+    let gadget_va = unsafe {
+        VirtualAllocEx(
+            h_process,
+            None,
+            0x1000,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_EXECUTE_READWRITE,
+        )
+    };
+    if gadget_va.is_null() {
+        warn!("Ancient custom-IAT: gadget allocation failed");
+        return;
+    }
+    //  — a non-null success-looking return for value probes
+    // (a bare ret leaves EAX as the caller's garbage, measured to crash the
+    // shell later in T150_oemop1).
+    const GADGET: [u8; 6] = [0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3];
+    if dbg.write_memory(gadget_va as usize, &GADGET).is_err() {
+        warn!("Ancient custom-IAT: gadget write failed");
+        return;
+    }
+    let ptr = (gadget_va as usize) as u32;
+    let ptr_bytes = ptr.to_le_bytes();
+    // Fill the whole region with the gadget pointer.
+    let fill: Vec<u8> = ptr_bytes
+        .iter()
+        .copied()
+        .cycle()
+        .take(PREF_SIZE)
+        .collect();
+    if dbg.write_memory(PREF_BASE, &fill).is_err() {
+        warn!("Ancient custom-IAT: region fill failed");
+        return;
+    }
+    info!(
+        base = %format!("{PREF_BASE:#x}"),
+        size = %format!("{PREF_SIZE:#x}"),
+        gadget = %format!("{:#x}", gadget_va as usize),
+        "Ancient custom-IAT block mapped and gadget-filled"
+    );
+}
+
+/// Intercept the Oreans OEM-op `#UD` (`0F 3F xx yy`) used by Ancient shells.
+///
+/// 132y95 resolved the Ancient (1.2.3/1.3.0/1.5.0) deadlock: the shell executes
+/// self-defined opcodes (`0F 3F` two-byte illegal instruction) whose SEH handler
+/// is an Oreans VM; on Win11 26300 the op(7,0x0B) environment check fails and
+/// the handler's error branch (`wsprintfA "internal exception"`) re-executes
+/// the same op forever — standalone AND under any debugger.  132y96 verified in
+/// Unicorn that simply **skipping the op** (advance EIP by 4) unblocks the whole
+/// shell: 2M+ instructions executed with zero faults afterwards, versus the
+/// 1.77M-fault infinite loop without interception.
+///
+/// Gate (all must hold, target-x86 only — the op stream was only measured on
+/// the 32-bit ladder):
+/// * env `MAGICMIDA_ANCIENT_OEMOP` set (diagnostic escape hatch),
+/// * exception code is `STATUS_ILLEGAL_INSTRUCTION` (0xC000001D),
+/// * the faulting EIP reads back `0F 3F` in debuggee memory.
+///
+/// The two leading bytes are replaced with two 2-byte NOPs *in memory* and the
+/// thread resumes at the same address (`DBG_CONTINUE`) — rewriting memory keeps
+/// the resume logic identical for every later re-execution of the same address,
+/// while an EIP write alone would have to be repeated on every fault.
+///
+/// Returns `true` when the fault was intercepted (caller must `DBG_CONTINUE`);
+/// `false` when the event is not an OEM-op (caller keeps its current routing).
+pub(super) fn try_intercept_oem_op(
+    dbg: &mut ProcessSession,
+    h_process: HANDLE,
+    thread_id: u32,
+    address: u64,
+    image_base_usize: usize,
+    image_boundary: usize,
+) -> bool {
+    if std::env::var("MAGICMIDA_ANCIENT_OEMOP").is_err() {
+        return false;
+    }
+    // x86-only: measured on the 1.2.3/1.3.0/1.5.0 ladder; the x64 v3 shells
+    // never raise this code.
+    #[cfg(target_arch = "x86")]
+    {
+        // The code check (== 0xC000001D) happens in the caller's match arm;
+        // this function only verifies the in-memory op prefix.
+        let addr = address as usize;
+        if addr < image_base_usize || addr >= image_boundary {
+            return false;
+        }
+        let mut bytes = [0u8; 4];
+        if dbg.read_memory(addr, &mut bytes).unwrap_or(0) < 4 {
+            return false;
+        }
+        if bytes[0] != 0x0F || bytes[1] != 0x3F {
+            return false;
+        }
+        // Patch 0F 3F xx yy -> 66 90 66 90 (two 2-byte NOPs, length-preserving).
+        const NOP2: [u8; 4] = [0x66, 0x90, 0x66, 0x90];
+        if dbg.write_memory(addr, &NOP2).is_err() {
+            warn!(address = %format!("{addr:#x}"), "OEM-op patch write failed");
+            return false;
+        }
+        info!(
+            address = %format!("{addr:#x}"),
+            op = %format!("{:02x} {:02x}", bytes[2], bytes[3]),
+            "Ancient OEM-op intercepted and NOPped — shell resumes past the op"
+        );
+        // Also back-fill the shell's custom-IAT block: the workspace API stubs
+        // jump through absolute slots at preferred base 0x10000000 + RVA
+        // (measured: jmp [0x10080f24] et al.).  The OEM-op that was supposed
+        // to commit that region never runs correctly on this OS, so map it
+        // ourselves and point EVERY slot at a shared `ret` gadget — each stub
+        // then resolves to a no-op API call instead of faulting (Unicorn-
+        // verified 132y96: with a ret gadget at the slot the shell executes
+        // 2M+ instructions with zero faults).
+        ensure_ancient_custom_iat(dbg, h_process);
+        let _ = thread_id;
+        true
+    }
+    #[cfg(not(target_arch = "x86"))]
+    {
+        let _ = dbg;
+        let _ = h_process;
+        let _ = thread_id;
+        let _ = address;
+        let _ = image_base_usize;
+        let _ = image_boundary;
+        false
+    }
+}
+
 /// Handle an AccessViolation event in the debug loop.
 ///
 /// Returns `AvAction::Break` when the debug loop should exit (OEP found and

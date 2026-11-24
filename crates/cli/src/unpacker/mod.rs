@@ -60,7 +60,7 @@ use helpers::{
     resolve_host_api, compute_data_section_bounds, detect_packed_dll, pe_section_name_remote_rva,
     dotnet_dump_and_dump_output, handle_hw_breakpoint, section_table, step_until_in_image,
 };
-use av_handler::{AvAction, handle_access_violation};
+use av_handler::{AvAction, handle_access_violation, try_intercept_oem_op};
 // Re-export public functions for commands.rs
 pub use verify::verify_unpacked;
 pub use dump::dump_process_code;
@@ -2805,13 +2805,30 @@ pub fn unpack(
                 address,
                 code,
             } => {
-                debug!(
-                    thread_id,
-                    address = %format!("{address:#x}"),
-                    code = %format!("{code:#x}"),
-                    "First-chance exception — handing to the program's SEH"
-                );
-                dbg.continue_event(thread_id, ContinueStatus::ExceptionNotHandled)?;
+                // 132y96: the Ancient shells' self-defined `0F 3F` opcode stream
+                // (STATUS_ILLEGAL_INSTRUCTION) deadloops inside its own SEH on
+                // Win11 — intercept it before it reaches the shell's error
+                // branch.  See `try_intercept_oem_op` in av_handler.rs.
+                if code == 0xC000_001D
+                    && try_intercept_oem_op(
+                        &mut dbg,
+                        h_process,
+                        thread_id,
+                        address,
+                        image_base_usize,
+                        image_boundary,
+                    )
+                {
+                    dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+                } else {
+                    debug!(
+                        thread_id,
+                        address = %format!("{address:#x}"),
+                        code = %format!("{code:#x}"),
+                        "First-chance exception — handing to the program's SEH"
+                    );
+                    dbg.continue_event(thread_id, ContinueStatus::ExceptionNotHandled)?;
+                }
             }
         }
 
